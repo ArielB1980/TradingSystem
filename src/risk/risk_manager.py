@@ -109,6 +109,22 @@ class RiskManager:
                 rejection_reasons.append(
                     f"Liquidation buffer {liquidation_buffer_pct:.1%} < minimum {min_buffer:.1%}"
                 )
+        else:
+            # Enforce liquidation safety using proxy checks
+            # 1. Effective leverage must not be too close to max
+            max_effective_leverage = requested_leverage * Decimal("0.90")  # 90% of max
+            if effective_leverage > max_effective_leverage:
+                rejection_reasons.append(
+                    f"Effective leverage {effective_leverage:.2f}× too close to max {requested_leverage}×"
+                )
+            
+            # 2. Require minimum free margin buffer
+            min_free_margin_pct = Decimal("0.15")  # 15% safety buffer
+            free_margin_pct = (account_equity - margin_required) / account_equity
+            if free_margin_pct < min_free_margin_pct:
+                rejection_reasons.append(
+                    f"Insufficient margin buffer: {free_margin_pct:.1%} < {min_free_margin_pct:.1%}"
+                )
         
         # Calculate basis divergence
         basis_divergence_pct = abs(spot_price - perp_mark_price) / spot_price
@@ -248,7 +264,7 @@ class RiskManager:
     
     def _estimate_costs(self, position_notional: Decimal) -> Decimal:
         """
-        Estimate total fees and funding costs.
+        Estimate total fees and funding costs using configurable parameters.
         
         Args:
             position_notional: Position size in USD notional
@@ -256,10 +272,9 @@ class RiskManager:
         Returns:
             Estimated total cost
         """
-        # Simplified: assume one entry + one exit at taker fee
-        # Plus estimated funding for 24h hold
-        taker_fee_bps = Decimal("5")  # 5 bps (0.05%)
-        funding_rate_daily = Decimal("10")  # 10 bps per day (conservative)
+        # Use configurable fee assumptions
+        taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
+        funding_rate_daily = Decimal(str(self.config.funding_rate_daily_bps))
         
         entry_fee = position_notional * (taker_fee_bps / Decimal("10000"))
         exit_fee = position_notional * (taker_fee_bps / Decimal("10000"))

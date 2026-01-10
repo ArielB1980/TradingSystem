@@ -313,13 +313,25 @@ class SMCEngine:
                     # The displacement must break the high of the OB candle
                     move = nxt.close - cand.high
                     if move > 0 and (nxt.high - nxt.low) >= min_displacement:
+                        # Calculate entry price based on configured mode
+                        if self.config.ob_entry_mode == "mid":
+                            entry_price = (cand.high + cand.low) / Decimal("2")
+                        elif self.config.ob_entry_mode == "open":
+                            entry_price = cand.open
+                        elif self.config.ob_entry_mode == "discount":
+                            # Enter at discount (lower in the OB zone)
+                            discount_pct = Decimal(str(self.config.ob_discount_pct))
+                            entry_price = cand.low + (cand.high - cand.low) * discount_pct
+                        else:  # high_low (legacy)
+                            entry_price = cand.high
+                        
                         return {
                             "type": "bullish",
                             "index": i,
                             "timestamp": cand.timestamp,
                             "low": cand.low,
                             "high": cand.high,
-                            "price": cand.high # Entry at OB high
+                            "price": entry_price
                         }
             else: # bearish
                 # 1. Origin must be a bullish candle
@@ -327,13 +339,25 @@ class SMCEngine:
                     # 2. Must be followed by an impulsive move down
                     move = cand.low - nxt.close
                     if move > 0 and (nxt.high - nxt.low) >= min_displacement:
+                        # Calculate entry price based on configured mode
+                        if self.config.ob_entry_mode == "mid":
+                            entry_price = (cand.high + cand.low) / Decimal("2")
+                        elif self.config.ob_entry_mode == "open":
+                            entry_price = cand.open
+                        elif self.config.ob_entry_mode == "discount":
+                            # Enter at discount (higher in the OB zone for shorts)
+                            discount_pct = Decimal(str(self.config.ob_discount_pct))
+                            entry_price = cand.high - (cand.high - cand.low) * discount_pct
+                        else:  # high_low (legacy)
+                            entry_price = cand.low
+                        
                         return {
                             "type": "bearish",
                             "index": i,
                             "timestamp": cand.timestamp,
                             "low": cand.low,
                             "high": cand.high,
-                            "price": cand.low # Entry at OB low
+                            "price": entry_price
                         }
         return None
     

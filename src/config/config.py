@@ -35,6 +35,12 @@ class RiskConfig(BaseSettings):
     basis_max_pct: float = Field(default=0.0075, ge=0.001, le=0.02)
     basis_max_post_pct: float = Field(default=0.0075, ge=0.001, le=0.02)
     
+    # Fee & Funding Assumptions (configurable for accuracy)
+    taker_fee_bps: float = Field(default=5.0, ge=1.0, le=10.0)
+    maker_fee_bps: float = Field(default=2.0, ge=0.0, le=5.0)
+    funding_rate_daily_bps: float = Field(default=10.0, ge=0.0, le=50.0)
+    use_live_funding_rate: bool = Field(default=False)  # Future: fetch from API
+    
     # Cost-aware validation
     max_fee_funding_rr_distortion_pct: float = Field(default=0.20, ge=0.05, le=0.30)
     rr_distortion_strict_limit_pct: float = Field(default=0.10, ge=0.05, le=0.30)
@@ -66,6 +72,8 @@ class StrategyConfig(BaseSettings):
     
     # SMC Parameters
     orderblock_lookback: int = Field(default=50, ge=20, le=200)
+    ob_entry_mode: Literal["high_low", "mid", "open", "discount"] = Field(default="mid")
+    ob_discount_pct: float = Field(default=0.25, ge=0.1, le=0.5)
     fvg_min_size_pct: float = Field(default=0.001, ge=0.0001, le=0.01)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
