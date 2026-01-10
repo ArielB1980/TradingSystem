@@ -262,13 +262,20 @@ class SMCEngine:
         if fvg:
             reasoning.append(f"✓ Fair value gap detected at ${fvg['price']}")
         
-        # Detect break of structure
+        # Detect break of structure (configurable requirement for trade validity)
         bos = self._detect_break_of_structure(candles_1h, bias)
+        
+        # Check if BOS is required (configurable)
+        require_bos = getattr(self.config, 'require_bos_confirmation', False)
+        
+        if require_bos and not bos:
+            reasoning.append("❌ No break of structure - waiting for confirmation (BOS required)")
+            return None
         
         if bos:
             reasoning.append(f"✓ Break of structure confirmed")
         else:
-            reasoning.append("○ No break of structure yet")
+            reasoning.append("○ No break of structure yet (not required)")
         
         return {
             'order_block': order_block,

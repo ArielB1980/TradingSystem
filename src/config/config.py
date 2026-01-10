@@ -68,6 +68,7 @@ class StrategyConfig(BaseSettings):
     orderblock_lookback: int = Field(default=50, ge=20, le=200)
     fvg_min_size_pct: float = Field(default=0.001, ge=0.0001, le=0.01)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
+    require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"
     fvg_partial_fill_pct: float = Field(default=0.5, ge=0.0, le=1.0)
 
