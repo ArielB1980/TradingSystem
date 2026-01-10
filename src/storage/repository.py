@@ -4,7 +4,7 @@ Persistence functions for storing and retrieving trading data.
 Provides repository pattern for clean data access.
 """
 from sqlalchemy import Column, String, Numeric, DateTime, Integer, Boolean
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
 from src.storage.db import Base, get_db
@@ -90,6 +90,62 @@ def save_candle(candle: Candle) -> None:
         session.add(candle_model)
 
 
+def save_candles_bulk(candles: List[Candle]) -> int:
+    """
+    Save multiple candles to the database efficiently.
+    Skips duplicates based on timestamp/symbol/timeframe.
+    
+    Args:
+        candles: List of Candle objects
+        
+    Returns:
+        Number of candles inserted
+    """
+    if not candles:
+        return 0
+        
+    db = get_db()
+    with db.get_session() as session:
+        # 1. Identify scope
+        symbol = candles[0].symbol
+        timeframe = candles[0].timeframe
+        min_ts = min(c.timestamp for c in candles)
+        max_ts = max(c.timestamp for c in candles)
+        
+        # 2. Get existing timestamps in this range to avoid duplicates
+        # optimizing to avoid individual checks
+        existing_query = session.query(CandleModel.timestamp).filter(
+            CandleModel.symbol == symbol,
+            CandleModel.timeframe == timeframe,
+            CandleModel.timestamp >= min_ts,
+            CandleModel.timestamp <= max_ts
+        ).all()
+        
+        existing_timestamps = {r[0] for r in existing_query}
+        
+        # 3. Filter out existing
+        new_candles = []
+        for c in candles:
+            if c.timestamp not in existing_timestamps:
+                new_candles.append(CandleModel(
+                    timestamp=c.timestamp,
+                    symbol=c.symbol,
+                    timeframe=c.timeframe,
+                    open=c.open,
+                    high=c.high,
+                    low=c.low,
+                    close=c.close,
+                    volume=c.volume,
+                ))
+        
+        # 4. Bulk insert
+        if new_candles:
+            session.bulk_save_objects(new_candles)
+            
+        return len(new_candles)
+
+
+
 def get_candles(
     symbol: str,
     timeframe: str,
@@ -131,7 +187,7 @@ def get_candles(
         
         return [
             Candle(
-                timestamp=cm.timestamp,
+                timestamp=cm.timestamp.replace(tzinfo=timezone.utc),
                 symbol=cm.symbol,
                 timeframe=cm.timeframe,
                 open=Decimal(str(cm.open)),

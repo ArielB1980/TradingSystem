@@ -29,7 +29,10 @@ risk:
   basis_max_post_pct: 0.0075  # Post-entry divergence limit (same as entry)
   
   # Cost-aware validation
-  max_fee_funding_rr_distortion_pct: 0.10  # Reject if fees+funding distort R:R > 10%
+  # Cost-aware validation
+  max_fee_funding_rr_distortion_pct: 0.20  # Hard cap (allows 20% for tight stops)
+  rr_distortion_strict_limit_pct: 0.10  # Strict cap for normal stops (>1.5%)
+  tight_stop_threshold_pct: 0.015  # Definition of "tight stop" (1.5%)
   funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
 
 ## Strategy Parameters
@@ -109,6 +112,9 @@ monitoring:
 
 ## Backtesting
 backtest:
+  # Starting capital
+  starting_equity: 10000  # $10,000 starting capital
+  
   # Fill assumptions
   assume_maker_fills: true  # Assume limit orders fill at maker fee
   slippage_bps: 2  # 2 basis points average slippage

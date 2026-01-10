@@ -37,6 +37,8 @@ class RiskConfig(BaseSettings):
     
     # Cost-aware validation
     max_fee_funding_rr_distortion_pct: float = Field(default=0.10, ge=0.05, le=0.30)
+    rr_distortion_strict_limit_pct: float = Field(default=0.10, ge=0.05, le=0.30)
+    tight_stop_threshold_pct: float = Field(default=0.015, ge=0.005, le=0.05)
     funding_cost_threshold_pct: float | None = Field(default=0.02, ge=0.0, le=0.10)
 
     @field_validator('max_leverage')
@@ -120,6 +122,9 @@ class MonitoringConfig(BaseSettings):
 
 class BacktestConfig(BaseSettings):
     """Backtesting configuration."""
+    # Starting capital
+    starting_equity: float = Field(default=10000.0, ge=1000.0, le=1000000.0)
+    
     # Fill assumptions
     assume_maker_fills: bool = True
     slippage_bps: float = Field(default=2.0, ge=0.0, le=10.0)
@@ -153,7 +158,7 @@ class Config(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
-        extra="forbid",
+        extra="ignore",
     )
     
     exchange: ExchangeConfig
@@ -177,6 +182,10 @@ class Config(BaseSettings):
         
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
+            
+        import os
+        if "ENVIRONMENT" in os.environ:
+            config_dict["environment"] = os.environ["ENVIRONMENT"]
         
         return cls(**config_dict)
 

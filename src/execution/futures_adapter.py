@@ -102,29 +102,81 @@ class FuturesAdapter:
         # Generate client order ID
         client_order_id = f"order_{uuid.uuid4().hex[:16]}"
         
-        # TODO: Implement actual Kraken Futures API call
-        # This requires futures-specific authentication and API
-        logger.warning(
-            "Futures order placement not yet implemented",
-            symbol=symbol,
-            side=side.value,
-            size_notional=str(size_notional),
-            leverage=str(leverage),
-            reduce_only=reduce_only,
-        )
+        # Map order type to Kraken format
+        kraken_order_type_map = {
+            OrderType.LIMIT: "lmt",
+            OrderType.MARKET: "mkt",
+            OrderType.STOP_LOSS: "stp",
+            OrderType.TAKE_PROFIT: "take_profit",
+        }
+        kraken_order_type = kraken_order_type_map.get(order_type, "lmt")
         
-        # Return mock order for now
-        order = Order(
-            order_id=f"mock_{uuid.uuid4().hex[:16]}",
-            client_order_id=client_order_id,
-            timestamp=datetime.now(timezone.utc),
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            size=size_notional / Decimal("50000"),  # Mock size in contracts
-            price=price,
-            status=OrderStatus.PENDING,
-            reduce_only=reduce_only,
-        )
+        # Map side to Kraken format
+        kraken_side = "buy" if side == Side.LONG else "sell"
         
-        return order
+        # Convert USD notional to contract size
+        # For BTC perpetual, contract size is typically $1 per contract
+        # For real implementation, fetch contract specs from exchange
+        # Simplified assumption: 1 contract = $1 USD notional
+        contract_size = size_notional
+        
+        try:
+            # Place order via Kraken Futures API
+            response = await self.kraken_client.place_futures_order(
+                symbol=symbol,
+                side=kraken_side,
+                order_type=kraken_order_type,
+                size=contract_size,
+                price=price,
+                stop_price=price if order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT] else None,
+                reduce_only=reduce_only,
+                leverage=leverage,
+                client_order_id=client_order_id,
+            )
+            
+            # Extract order details from response
+            send_status = response.get("sendStatus", {})
+            order_id = send_status.get("order_id", f"unknown_{uuid.uuid4().hex[:16]}")
+            status_str = send_status.get("status", "placed")
+            
+            # Map status to our OrderStatus enum
+            status_map = {
+                "placed": OrderStatus.SUBMITTED,
+                "cancelled": OrderStatus.CANCELLED,
+                "filled": OrderStatus.FILLED,
+            }
+            status = status_map.get(status_str, OrderStatus.SUBMITTED)
+            
+            # Create Order object
+            order = Order(
+                order_id=order_id,
+                client_order_id=client_order_id,
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                size=contract_size,
+                price=price,
+                status=status,
+                reduce_only=reduce_only,
+            )
+            
+            logger.info(
+                "Futures order placed successfully",
+                symbol=symbol,
+                order_id=order_id,
+                side=side.value,
+                size=str(contract_size),
+                leverage=str(leverage),
+            )
+            
+            return order
+            
+        except Exception as e:
+            logger.error(
+                "Failed to place futures order",
+                symbol=symbol,
+                error=str(e),
+            )
+            raise
+

@@ -6,6 +6,7 @@ Provides commands for backtest, paper, live, status, and kill-switch.
 import typer
 from pathlib import Path
 from datetime import datetime
+from decimal import Decimal
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
 from src.storage.db import init_db
@@ -38,12 +39,56 @@ def backtest(
     logger.info("Starting backtest", start=start, end=end)
     
     # Parse dates
-    start_date = datetime.strptime(start, "%Y-%m-%d")
-    end_date = datetime.strptime(end, "%Y-%m-%d")
+    from datetime import timezone
+    start_date = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_date = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     
-    # TODO: Initialize backtest engine
-    typer.echo(f"Backtest from {start_date} to {end_date}")
-    typer.echo("⚠️  Backtest engine not yet implemented")
+    # Initialize components
+    logger.info("Initializing backtest components...")
+    
+    # Imports here to avoid circular dependencies at top level if any
+    import asyncio
+    from src.data.kraken_client import KrakenClient
+    from src.backtest.backtest_engine import BacktestEngine
+    
+    async def run_backtest():
+        # Initialize client (testnet=False for backtest data usually, or True if strict)
+        # Using real API for data execution
+        client = KrakenClient(
+            api_key=config.exchange.api_key if hasattr(config.exchange, "api_key") else "",
+            api_secret=config.exchange.api_secret if hasattr(config.exchange, "api_secret") else "",
+            use_testnet=False # Data comes from mainnet usually
+        )
+        
+        try:
+            # Create engine
+            engine = BacktestEngine(config, client)
+            
+            # Run simulation
+            metrics = await engine.run("BTC/USD", start_date, end_date)
+            
+            # Calculate final metrics
+            end_equity = metrics.equity_curve[-1] if metrics.equity_curve else Decimal(str(config.backtest.starting_equity))
+            total_return_pct = (metrics.total_pnl / Decimal(str(config.backtest.starting_equity))) * 100
+            
+            # Output results
+            typer.echo("\n" + "="*60)
+            typer.echo("BACKTEST RESULTS")
+            typer.echo("="*60)
+            typer.echo(f"Period:        {start_date.date()} to {end_date.date()}")
+            typer.echo(f"Start Equity:  ${config.backtest.starting_equity:,.2f}")
+            typer.echo(f"End Equity:    ${end_equity:,.2f}")
+            typer.echo(f"PnL:           ${metrics.total_pnl:,.2f} ({total_return_pct:.2f}%)")
+            typer.echo(f"Max Drawdown:  {metrics.max_drawdown:.2%}")
+            typer.echo(f"Trades:        {metrics.total_trades} ({metrics.winning_trades}W-{metrics.losing_trades}L)")
+            typer.echo(f"Win Rate:      {metrics.win_rate:.1f}%")
+            typer.echo("="*60 + "\n")
+            
+        finally:
+            await client.close()
+
+    # Run async loop
+    asyncio.run(run_backtest())
     
     logger.info("Backtest completed")
 
@@ -70,11 +115,20 @@ def paper(
     
     logger.info("Starting paper trading")
     
-    # TODO: Initialize paper trading engine
-    typer.echo("Paper trading mode")
-    typer.echo("⚠️  Paper trading engine not yet implemented")
+    import asyncio
+    from src.paper.paper_trading import PaperTrading
     
-    logger.info("Paper trading stopped")
+    async def run_paper():
+        engine = PaperTrading(config)
+        await engine.run()
+        
+    try:
+        asyncio.run(run_paper())
+    except KeyboardInterrupt:
+        logger.info("Paper trading stopped by user")
+    except Exception as e:
+        logger.error("Paper trading failed", error=str(e))
+        raise typer.Exit(1)
 
 
 @app.command()

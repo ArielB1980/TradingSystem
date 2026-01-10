@@ -136,10 +136,18 @@ class RiskManager:
         risk_amount = position_notional * stop_distance_pct
         rr_distortion = estimated_fees_funding / risk_amount if risk_amount > 0 else Decimal("0")
         
-        max_distortion = Decimal(str(self.config.max_fee_funding_rr_distortion_pct))
+        # Determine applicable cap based on stop tightness
+        # If stop is TIGHT (<= 1.5%), allow higher distortion (up to 20%)
+        # If stop is WIDE (> 1.5%), enforce strict limit (10%)
+        tight_threshold = Decimal(str(self.config.tight_stop_threshold_pct))
+        if stop_distance_pct <= tight_threshold:
+            max_distortion = Decimal(str(self.config.max_fee_funding_rr_distortion_pct))
+        else:
+            max_distortion = Decimal(str(self.config.rr_distortion_strict_limit_pct))
+
         if rr_distortion > max_distortion:
             rejection_reasons.append(
-                f"Fees+funding distort R:R by {rr_distortion:.1%} > max {max_distortion:.1%}"
+                f"Fees+funding distort R:R by {rr_distortion:.1%} > max {max_distortion:.1%} (Stop: {stop_distance_pct:.2%})"
             )
         
         # Approve or reject
