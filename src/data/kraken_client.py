@@ -16,6 +16,7 @@ import time
 import asyncio
 import json
 import websockets
+import aiohttp
 from typing import Dict, List, Optional, Callable, Any
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -128,7 +129,7 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(
+            ohlcv = self.exchange.fetch_ohlcv(
                 symbol, timeframe, since=since, limit=limit
             )
             
@@ -163,21 +164,49 @@ class KrakenClient:
     
     async def get_futures_position(self, symbol: str) -> Optional[Dict]:
         """
-        Get current futures position.
+        Get current futures position from Kraken Futures API.
         
         Args:
             symbol: Futures symbol (e.g., "BTCUSD-PERP")
         
         Returns:
-            Position dict or None if no position
+            Position dict with keys: size, entry_price, liquidation_price, unrealized_pnl
         """
         await self.private_limiter.wait_for_token()
         
+        if not self.futures_api_key or not self.futures_api_secret:
+            raise ValueError("Futures API credentials not configured")
+        
         try:
-            # TODO: Implement Kraken Futures API call
-            # This requires futures-specific authentication
-            logger.warning("Futures position fetching not yet implemented", symbol=symbol)
-            return None
+            url = "https://futures.kraken.com/derivatives/api/v3/openpositions"
+            headers = await self._get_futures_auth_headers(url, "GET")
+            
+            import ssl
+            ssl_context = ssl.SSLContext()
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error("Futures API error", status=response.status, error=error_text)
+                        raise Exception(f"Futures API error: {error_text}")
+                    
+                    data = await response.json()
+                    
+                    # Find position for this symbol
+                    for position in data.get('openPositions', []):
+                        if position.get('symbol') == symbol:
+                            return {
+                                'size': Decimal(str(position.get('size', 0))),
+                                'entry_price': Decimal(str(position.get('price', 0))),
+                                'liquidation_price': Decimal(str(position.get('liquidationPrice', 0))),
+                                'unrealized_pnl': Decimal(str(position.get('unrealizedPnl', 0))),
+                                'side': 'long' if float(position.get('size', 0)) > 0 else 'short',
+                            }
+                    
+                    # No position found
+                    return None
             
         except Exception as e:
             logger.error("Failed to fetch futures position", symbol=symbol, error=str(e))
@@ -185,13 +214,13 @@ class KrakenClient:
     
     async def get_futures_mark_price(self, symbol: str) -> Decimal:
         """
-        Get current mark price from futures market.
+        Get current mark price from Kraken Futures official feed.
         
         CRITICAL: Mark price MUST be sourced from Kraken Futures mark/index feed,
-        not computed from bid/ask.
+        not computed from bid/ask. This is the official price used for liquidations.
         
         Args:
-            symbol: Futures symbol (e.g., "BTCUSD-PERP")
+            symbol: Futures symbol (e.g., "BTCUSD-PERP", "PI_XBTUSD" for perpetual)
         
         Returns:
             Mark price as Decimal
@@ -199,10 +228,49 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         
         try:
-            # TODO: Implement Kraken Futures mark price API call
-            # Must use official mark/index feed
-            logger.warning("Futures mark price fetching not yet implemented", symbol=symbol)
-            raise NotImplementedError("Futures mark price API not implemented")
+            # Kraken Futures public tickers endpoint
+            url = "https://futures.kraken.com/derivatives/api/v3/tickers"
+            
+            import ssl
+            ssl_context = ssl.SSLContext()
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error("Futures API error", status=response.status, error=error_text)
+                        raise Exception(f"Futures API error: {error_text}")
+                    
+                    data = await response.json()
+                    
+                    # Kraken Futures uses PF_ prefix for perpetuals
+                    # and XBT instead of BTC
+                    search_symbols = [symbol]
+                    if symbol.endswith('-PERP'):
+                        base = symbol.replace('-PERP', '').replace('/', '')
+                        # Kraken uses XBT for Bitcoin
+                        base = base.replace('BTC', 'XBT')
+                        search_symbols.append(f"PF_{base}")
+                        search_symbols.append(f"PI_{base}")  # Legacy format
+                    
+                    # Find ticker for this symbol
+                    for ticker in data.get('tickers', []):
+                        ticker_symbol = ticker.get('symbol')
+                        if ticker_symbol in search_symbols:
+                            mark_price = ticker.get('markPrice')
+                            if mark_price is None:
+                                raise ValueError(f"Mark price not available for {symbol}")
+                            
+                            logger.debug(
+                                "Fetched futures mark price",
+                                symbol=symbol,
+                                ticker_symbol=ticker_symbol,
+                                mark_price=mark_price,
+                            )
+                            return Decimal(str(mark_price))
+                    
+                    raise ValueError(f"Symbol {symbol} not found in tickers. Searched: {search_symbols}")
             
         except Exception as e:
             logger.error("Failed to fetch futures mark price", symbol=symbol, error=str(e))
@@ -218,7 +286,7 @@ class KrakenClient:
         await self.private_limiter.wait_for_token()
         
         try:
-            balance = await self.exchange.fetch_balance()
+            balance = self.exchange.fetch_balance()
             return {
                 currency: Decimal(str(amount))
                 for currency, amount in balance['total'].items()
@@ -228,6 +296,41 @@ class KrakenClient:
         except Exception as e:
             logger.error("Failed to fetch account balance", error=str(e))
             raise
+    
+    async def _get_futures_auth_headers(self, url: str, method: str, postdata: str = "") -> Dict[str, str]:
+        """
+        Generate authentication headers for Kraken Futures API.
+        
+        Args:
+            url: Full API endpoint URL
+            method: HTTP method (GET, POST)
+            postdata: POST data (for POST requests)
+        
+        Returns:
+            Dict of headers including APIKey and Authent
+        """
+        # Extract path from URL
+        path = url.split('.com', 1)[1]
+        
+        # Generate nonce (timestamp in milliseconds)
+        nonce = str(int(time.time() * 1000))
+        
+        # Create signature
+        # authent = sha256(postdata + nonce + path)
+        message = postdata + nonce + path
+        secret_decoded = base64.b64decode(self.futures_api_secret)
+        signature = hmac.new(
+            secret_decoded,
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).digest()
+        authent = base64.b64encode(signature).decode('utf-8')
+        
+        return {
+            'APIKey': self.futures_api_key,
+            'Authent': authent,
+            'Nonce': nonce,
+        }
 
 
 class KrakenWebSocket:

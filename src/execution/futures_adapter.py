@@ -25,10 +25,10 @@ class FuturesAdapter:
     Maps spot tickers to futures contracts and handles order placement.
     """
     
-    # Spot → Futures mapping
+    # Spot → Futures mapping (Kraken uses PF_ prefix for perpetuals)
     TICKER_MAP = {
-        "BTC/USD": "BTCUSD-PERP",
-        "ETH/USD": "ETHUSD-PERP",
+        "BTC/USD": "PF_XBTUSD",  # Kraken Futures BTC perpetual
+        "ETH/USD": "PF_ETHUSD",   # Kraken Futures ETH perpetual
     }
     
     def __init__(self, kraken_client: KrakenClient, max_leverage: float = 10.0):
