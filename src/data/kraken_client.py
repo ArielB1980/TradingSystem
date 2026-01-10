@@ -236,11 +236,7 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/openpositions"
             headers = await self._get_futures_auth_headers(url, "GET")
             
-            import ssl
-            ssl_context = ssl.SSLContext()
-            ssl_context.verify_mode = ssl.CERT_NONE
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()

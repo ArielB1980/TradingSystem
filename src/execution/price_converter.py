@@ -86,4 +86,8 @@ class PriceConverter:
             entry_price_spot=entry_price_spot,
             stop_loss_spot=signal.stop_loss,
             take_profit_spot=signal.take_profit,
+            # Converted Futures Prices
+            entry_price_futures=entry_price_futures,
+            stop_loss_futures=stop_loss_futures,
+            take_profit_futures=take_profit_futures
         )

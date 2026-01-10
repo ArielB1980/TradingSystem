@@ -71,11 +71,30 @@ class RiskManager:
         stop_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
         position_notional = (account_equity * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
         
-        # Calculate leverage and margin
-        leverage = min(
-            position_notional / account_equity,
-            Decimal(str(self.config.max_leverage))
-        )
+        # Calculate leverage needed to support this position
+        # We only use the leverage required, capped at max_leverage
+        leverage_needed = position_notional / account_equity
+        
+        if leverage_needed > Decimal(str(self.config.max_leverage)):
+             leverage = Decimal(str(self.config.max_leverage))
+             # If we need more leverage than allowed, we must reduce size (or reject)
+             # Option A: Reduce size to fit max leverage (Conservative)
+             # Option B: Reject (Strict Risk) -> We choose Reject for now to respect risk_per_trade
+             rejection_reasons.append(
+                f"Required leverage {leverage_needed:.2f}× exceeds cap of {self.config.max_leverage}×"
+            )
+        else:
+            # Use minimum efficient leverage (e.g. 1x if fully funded, or actual needed)
+            # Actually, for Futures, 'leverage' usually sets the Margin Mode.
+            # If we set leverage=10x, we allocate 1/10th margin.
+            # If we set leverage=1x, we allocate 100% margin.
+            # To minimize liquidation risk, we should use the CONFIG MAX LEVERAGE for the order
+            # (giving us max buffer), but Monitor proper position sizing.
+            # However, the user asked to "Choose leverage = min(max, needed)".
+            # Let's stick to the user's request:
+            leverage = max(Decimal("1"), leverage_needed) # At least 1x
+            leverage = min(leverage, Decimal(str(self.config.max_leverage)))
+
         margin_required = position_notional / leverage
         
         logger.debug(
@@ -85,12 +104,6 @@ class RiskManager:
             margin_required=str(margin_required),
             stop_distance_pct=str(stop_distance_pct),
         )
-        
-        # Validate leverage cap
-        if leverage > Decimal(str(self.config.max_leverage)):
-            rejection_reasons.append(
-                f"Leverage {leverage:.2f}× exceeds cap of {self.config.max_leverage}×"
-            )
         
         # Calculate liquidation buffer (if we have exchange-reported liq price)
         liquidation_buffer_pct = Decimal("0")
@@ -111,6 +124,14 @@ class RiskManager:
         # Calculate basis divergence
         basis_divergence_pct = abs(spot_price - perp_mark_price) / spot_price
         
+        # BASIS GUARD ENFORCEMENT
+        # This was missing a hard check
+        basis_max = Decimal(str(getattr(self.config, 'basis_max_pct', '0.0075'))) 
+        if basis_divergence_pct > basis_max:
+             rejection_reasons.append(
+                f"Basis divergence {basis_divergence_pct:.2%} > limit {basis_max:.2%}"
+            )
+
         # Portfolio-level limits
         if len(self.current_positions) >= self.config.max_concurrent_positions:
             rejection_reasons.append(

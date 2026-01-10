@@ -307,41 +307,58 @@ class SMCEngine:
         end = len(candles) - lookback - 2
         
         for i in range(start, end, -1):
+            # Potential Order Block candidate
             ob = candles[i]
+            
+            # Look for displacement in subsequent candles
+            # We look at the immediate next candle (i+1) for the impulsive move start
             nxt = candles[i + 1]
             
-            ob_down = ob.close < ob.open
-            ob_up = ob.close > ob.open
-            
-            nxt_up = nxt.close > nxt.open
-            nxt_down = nxt.close < nxt.open
+            # Calculate displacement validation (body size or move magnitude)
+            # Standard OB: The candle BEFORE the big move.
             
             if bias == "bullish":
-                # Bullish OB: Last DOWN candle before impulse UP
-                if ob_down and nxt_up:
-                    displacement = nxt.high - ob.high
-                    if displacement >= min_displacement:
+                # Bullish OB Criteria:
+                # 1. Candidate is a DOWN candle (Red)
+                # 2. Followed by strong rejection/upward move
+                ob_is_down = ob.close < ob.open
+                
+                if ob_is_down:
+                    # Check displacement: price breaks above OB high with conviction
+                    # Simplified: Next candle closes above OB high OR subsequent swing breaks structure.
+                    # Here we check immediate conviction: Next candle is UP and has large body/range
+                    
+                    displacement_move = nxt.close - ob.high
+                    valid_displacement = displacement_move > 0 and (nxt.high - nxt.low) >= min_displacement
+                    
+                    if valid_displacement:
                          return {
                             "type": "bullish",
                             "index": i,
                             "timestamp": ob.timestamp,
                             "low": ob.low,
                             "high": ob.high,
-                            # For backward compat with current _calculate_levels, though we will update it
-                            "price": ob.high # Entry at top of OB (retest)
+                            "price": ob.high # Entry at top of OB
                         }
+                        
             else: # bearish
-                # Bearish OB: Last UP candle before impulse DOWN
-                if ob_up and nxt_down:
-                    displacement = ob.low - nxt.low
-                    if displacement >= min_displacement:
+                # Bearish OB Criteria:
+                # 1. Candidate is an UP candle (Green)
+                # 2. Followed by strong downward move
+                ob_is_up = ob.close > ob.open
+                
+                if ob_is_up:
+                    displacement_move = ob.low - nxt.close
+                    valid_displacement = displacement_move > 0 and (nxt.high - nxt.low) >= min_displacement
+                    
+                    if valid_displacement:
                         return {
                             "type": "bearish",
                             "index": i,
                             "timestamp": ob.timestamp,
                             "low": ob.low,
                             "high": ob.high,
-                            "price": ob.low # Entry at bottom of OB (retest)
+                            "price": ob.low # Entry at bottom of OB
                         }
         
         return None
@@ -408,12 +425,14 @@ class SMCEngine:
                         "bottom": gap_bottom,
                         "top": gap_top,
                         "size": gap,
-                        "price": gap_mid, # Compatibility with dashboard
+                        "price": gap_top, # Entry often at top of gap (retest)
                     }
 
             else:  # bearish
-                gap_bottom = c3.high
+                # Standard Bearish FVG: Low of candle 1 > High of candle 3
+                # Gap is between High[3] and Low[1]
                 gap_top = c1.low
+                gap_bottom = c3.high
                 gap = gap_top - gap_bottom
 
                 if gap <= 0:
@@ -429,16 +448,17 @@ class SMCEngine:
                 mitigated = False
                 for fc in future:
                     if mode == "touched":
-                        if fc.high >= gap_bottom:  # entered gap
+                        if fc.high >= gap_bottom:  # Entered gap from below
                             mitigated = True
                             break
                     elif mode == "partial":
+                        # Retraced at least X% into the gap
                         threshold = gap_bottom + (gap * partial_fill)
                         if fc.high >= threshold:
                             mitigated = True
                             break
                     elif mode == "full":
-                        if fc.high >= gap_top:  # fully filled
+                        if fc.high >= gap_top:  # Fully filled
                             mitigated = True
                             break
 
@@ -450,7 +470,7 @@ class SMCEngine:
                         "bottom": gap_bottom,
                         "top": gap_top,
                         "size": gap,
-                        "price": gap_mid, # Compatibility with dashboard
+                        "price": gap_bottom, # Entry often at bottom of gap (retest)
                     }
 
         return None
