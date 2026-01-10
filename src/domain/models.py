@@ -85,6 +85,7 @@ class Signal:
     adx: Decimal
     atr: Decimal
     ema200_slope: str  # e.g., "up", "down", "flat"
+    tp_candidates: list[Decimal] = field(default_factory=list)  # Structure-based TP levels
     
     def __post_init__(self):
         """Validate signal."""
@@ -151,6 +152,12 @@ class Position:
     # Associated orders
     stop_loss_order_id: Optional[str] = None
     take_profit_order_id: Optional[str] = None
+    tp_order_ids: list[str] = field(default_factory=list)  # Multi-TP ladder
+    
+    # Execution State
+    trailing_active: bool = False
+    break_even_active: bool = False
+    peak_price: Optional[Decimal] = None  # Highest/Lowest mark price since trail activation
     
     # Metadata
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

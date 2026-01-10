@@ -72,6 +72,18 @@ class PositionModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class SystemEventModel(Base):
+    """ORM model for system events (audit trail)."""
+    __tablename__ = "system_events"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    decision_id = Column(String, nullable=True, index=True)
+    details = Column(String, nullable=False) # JSON string
+
+
 # Repository Functions
 def save_candle(candle: Candle) -> None:
     """Save a candle to the database."""
@@ -273,6 +285,40 @@ def delete_position(symbol: str) -> None:
         session.query(PositionModel).filter(PositionModel.symbol == symbol).delete()
 
 
+def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
+    """
+    Get active position for symbol.
+    
+    Args:
+        symbol: Symbol to check
+        
+    Returns:
+        Position object if exists, else None
+    """
+    db = get_db()
+    with db.get_session() as session:
+        pm = session.query(PositionModel).filter(PositionModel.symbol == symbol).first()
+        
+        if not pm:
+            return None
+            
+        return Position(
+            symbol=pm.symbol,
+            side=Side(pm.side),
+            size=Decimal(str(pm.size)),
+            size_notional=Decimal(str(pm.size_notional)),
+            entry_price=Decimal(str(pm.entry_price)),
+            current_mark_price=Decimal(str(pm.current_mark_price)),
+            liquidation_price=Decimal(str(pm.liquidation_price)),
+            unrealized_pnl=Decimal(str(pm.unrealized_pnl)),
+            leverage=Decimal(str(pm.leverage)),
+            margin_used=Decimal(str(pm.margin_used)),
+            stop_loss_order_id=pm.stop_loss_order_id,
+            take_profit_order_id=pm.take_profit_order_id,
+            opened_at=pm.opened_at.replace(tzinfo=timezone.utc)
+        )
+
+
 def get_all_trades() -> List[Trade]:
     """Retrieve all trades from the database."""
     db = get_db()
@@ -298,4 +344,100 @@ def get_all_trades() -> List[Trade]:
                 exit_reason=tm.exit_reason,
             )
             for tm in trade_models
+        ]
+
+
+import json
+from typing import Optional, Dict
+
+def record_event(
+    event_type: str,
+    symbol: str,
+    details: Dict,
+    decision_id: Optional[str] = None,
+    timestamp: Optional[datetime] = None
+) -> None:
+    """
+    Record a system event for the audit trail.
+    
+    Args:
+        event_type: Type of event (e.g. SIGNAL, DECISION, RISK)
+        symbol: Related symbol
+        details: Dictionary of details (will be JSON serialized)
+        decision_id: Optional ID to link related events
+        timestamp: Optional explicit timestamp
+    """
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+        
+    # Serialize details
+    # Handle Decimals for JSON
+    def decimal_default(obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if hasattr(obj, "value"): # Enum
+            return obj.value
+        raise TypeError
+        
+    try:
+        details_json = json.dumps(details, default=decimal_default)
+    except Exception as e:
+        details_json = json.dumps({"error": str(e), "original_type": str(type(details))})
+    
+    db = get_db()
+    with db.get_session() as session:
+        event = SystemEventModel(
+            timestamp=timestamp,
+            event_type=event_type,
+            symbol=symbol,
+            decision_id=decision_id,
+            details=details_json
+        )
+        session.add(event)
+
+
+def get_recent_events(limit: int = 50, event_type: Optional[str] = None, symbol: Optional[str] = None) -> List[Dict]:
+    """Get recent system events."""
+    db = get_db()
+    with db.get_session() as session:
+        query = session.query(SystemEventModel)
+        
+        if event_type:
+            query = query.filter(SystemEventModel.event_type == event_type)
+        
+        if symbol:
+            query = query.filter(SystemEventModel.symbol == symbol)
+            
+        events = query.order_by(SystemEventModel.timestamp.desc()).limit(limit).all()
+        
+        return [
+            {
+                "id": e.id,
+                "timestamp": e.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+                "type": e.event_type,
+                "symbol": e.symbol,
+                "decision_id": e.decision_id,
+                "details": json.loads(e.details)
+            }
+            for e in events
+        ]
+
+def get_decision_chain(decision_id: str) -> List[Dict]:
+    """Get all events related to a decision ID."""
+    db = get_db()
+    with db.get_session() as session:
+        events = session.query(SystemEventModel).filter(
+            SystemEventModel.decision_id == decision_id
+        ).order_by(SystemEventModel.timestamp.asc()).all()
+        
+        return [
+            {
+                "id": e.id,
+                "timestamp": e.timestamp.replace(tzinfo=timezone.utc).isoformat(),
+                "type": e.event_type,
+                "details": json.loads(e.details)
+            }
+            for e in events
         ]

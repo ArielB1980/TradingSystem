@@ -24,19 +24,20 @@ logger = get_logger(__name__)
 def backtest(
     start: str = typer.Option(..., "--start", help="Start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., "--end", help="End date (YYYY-MM-DD)"),
+    symbol: str = typer.Option("BTC/USD", "--symbol", help="Symbol to backtest"),
     config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
 ):
     """
     Run backtest on historical spot data with futures cost simulation.
     
     Example:
-        python src/cli.py backtest --start 2024-01-01 --end 2024-12-31
+        python src/cli.py backtest --start 2024-01-01 --end 2024-12-31 --symbol ETH/USD
     """
     # Load configuration
     config = load_config(str(config_path))
     setup_logging(config.monitoring.log_level, config.monitoring.log_format)
     
-    logger.info("Starting backtest", start=start, end=end)
+    logger.info("Starting backtest", start=start, end=end, symbol=symbol)
     
     # Parse dates
     from datetime import timezone
@@ -65,7 +66,7 @@ def backtest(
             engine = BacktestEngine(config, client)
             
             # Run simulation
-            metrics = await engine.run("BTC/USD", start_date, end_date)
+            metrics = await engine.run(symbol, start_date, end_date)
             
             # Calculate final metrics
             end_equity = metrics.equity_curve[-1] if metrics.equity_curve else Decimal(str(config.backtest.starting_equity))
@@ -73,7 +74,7 @@ def backtest(
             
             # Output results
             typer.echo("\n" + "="*60)
-            typer.echo("BACKTEST RESULTS")
+            typer.echo(f"BACKTEST RESULTS: {symbol}")
             typer.echo("="*60)
             typer.echo(f"Period:        {start_date.date()} to {end_date.date()}")
             typer.echo(f"Start Equity:  ${config.backtest.starting_equity:,.2f}")
@@ -246,6 +247,30 @@ def kill_switch(
 
 
 @app.command()
+def dashboard(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to"),
+    port: int = typer.Option(8000, "--port", help="Port to bind to"),
+):
+    """
+    Launch the Web Dashboard.
+    
+    Example:
+        python src/cli.py dashboard
+    """
+    import uvicorn
+    import webbrowser
+    from src.dashboard.server import app as dash_app
+    
+    url = f"http://{host}:{port}"
+    typer.secho(f"🚀 Dashboard running at: {url}", fg=typer.colors.GREEN, bold=True)
+    
+    # Auto-open browser
+    webbrowser.open(url)
+    
+    uvicorn.run(dash_app, host=host, port=port)
+
+
+@app.command()
 def status(
     config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
 ):
@@ -268,9 +293,36 @@ def status(
     typer.echo("System Status")
     typer.echo("=" * 50)
     typer.echo(f"Environment: {config.environment}")
-    typer.echo(f"Max Leverage: {config.risk.max_leverage}×")
-    typer.echo(f"Risk per Trade: {config.risk.risk_per_trade_pct * 100}%")
-    typer.echo("\n⚠️  Status monitoring not yet implemented")
+    
+    # 1. Active Position
+    from src.storage.repository import get_active_position, get_all_trades
+    from src.domain.models import Side
+    
+    pos = get_active_position()
+    if pos:
+        pnl_color = typer.colors.GREEN if pos.unrealized_pnl >= 0 else typer.colors.RED
+        typer.secho(f"\n🟢 Active Position: {pos.symbol} ({pos.side.value.upper()})", bold=True)
+        typer.echo(f"  Entry:      ${pos.entry_price:,.2f}")
+        typer.echo(f"  Current:    ${pos.current_mark_price:,.2f}")
+        typer.echo(f"  Size:       ${pos.size_notional:,.2f} ({pos.leverage}x)")
+        typer.echo(f"  Liq Price:  ${pos.liquidation_price:,.2f}")
+        typer.secho(f"  Unrealized: ${pos.unrealized_pnl:,.2f}", fg=pnl_color)
+    else:
+        typer.echo("\n⚪️ No Active Position (Scanning...)")
+        
+    # 2. Recent Trades
+    trades = get_all_trades()
+    if trades:
+        typer.echo(f"\nRecent Trades ({len(trades)} total)")
+        typer.echo("-" * 50)
+        for t in trades[:5]:
+            pnl_color = typer.colors.GREEN if t.net_pnl >= 0 else typer.colors.RED
+            icon = "WIN" if t.net_pnl > 0 else "LOSS"
+            typer.secho(f"  {t.exited_at.strftime('%Y-%m-%d %H:%M')} | {t.side.value.upper()} | ${t.net_pnl:,.2f} ({icon})", fg=pnl_color)
+    else:
+        typer.echo("\nNo trades recorded yet.")
+        
+    typer.echo("\n" + "=" * 50)
 
 
 @app.callback()

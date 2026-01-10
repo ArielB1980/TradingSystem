@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kraken SMC | Observability</title>
+    <!-- Boxicons for icons -->
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+    <style>
+        :root {
+            --bg-dark: #0f111a;
+            --bg-card: #1a1d2d;
+            --bg-hover: #23273a;
+            --text-main: #e0e6ed;
+            --text-muted: #94a3b8;
+            --primary: #6366f1;
+            /* Indigo */
+            --success: #10b981;
+            /* Green */
+            --danger: #ef4444;
+            /* Red */
+            --warning: #f59e0b;
+            /* Amber */
+            --border: #2d3748;
+            --sidebar-width: 240px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: var(--sidebar-width);
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 1.5rem;
+        }
+
+        .brand {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 3rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--primary);
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            color: var(--text-muted);
+            text-decoration: none;
+            border-radius: 0.5rem;
+            margin-bottom: 0.5rem;
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+
+        .nav-item:hover,
+        .nav-item.active {
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--primary);
+        }
+
+        .nav-item i {
+            font-size: 1.25rem;
+        }
+
+        /* Main Content */
+        .main {
+            flex: 1;
+            padding: 2rem;
+            overflow-y: auto;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+        }
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-success {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+        }
+
+        .badge-danger {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+        }
+
+        .badge-warning {
+            background: rgba(245, 158, 11, 0.15);
+            color: var(--warning);
+        }
+
+        .badge-neutral {
+            background: rgba(148, 163, 184, 0.15);
+            color: var(--text-muted);
+        }
+
+        /* Generic Components */
+        .card {
+            background: var(--bg-card);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            border: 1px solid var(--border);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        /* Views */
+        .view-section {
+            display: none;
+        }
+
+        .view-section.active {
+            display: block;
+        }
+
+        /* Decision Trace Detail */
+        .trace-block {
+            border-left: 2px solid var(--border);
+            padding-left: 1rem;
+            margin: 1rem 0;
+        }
+
+        .trace-item {
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .trace-label {
+            color: var(--text-muted);
+            display: inline-block;
+            width: 120px;
+        }
+
+        pre {
+            background: #000;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            color: var(--success);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="sidebar">
+        <div class="brand">
+            <i class='bx bxs-analyse'></i>
+            ANTIGRAVITY
+        </div>
+        <a class="nav-item active" onclick="switchView('fleet')">
+            <i class='bx bxs-dashboard'></i> Fleet Overview
+        </a>
+        <a class="nav-item" onclick="switchView('coin')">
+            <i class='bx bxs-detail'></i> Coin Drilldown
+        </a>
+        <a class="nav-item" onclick="switchView('events')">
+            <i class='bx bx-list-ul'></i> Event Stream
+        </a>
+        <div style="margin-top: auto; color: var(--text-muted); font-size: 0.8rem;">
+            Status: <span id="sys-env" class="text-success">...</span>
+        </div>
+    </nav>
+
+    <main class="main">
+        <!-- FLEET VIEW -->
+        <section id="view-fleet" class="view-section active">
+            <header>
+                <h2>Fleet Overview</h2>
+                <div class="badge badge-neutral" id="last-update">Syncing...</div>
+            </header>
+
+            <div class="card">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Bias</th>
+                            <th>Position</th>
+                            <th>Unrealized PnL</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fleet-table-body">
+                        <!-- Populated via JS -->
+                    </tbody>
+                </table>
+            </div>
+
+            <h3 style="margin: 2rem 0 1rem;">Recent Trades</h3>
+            <div class="card">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Symbol</th>
+                            <th>Side</th>
+                            <th>Result</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent-trades-body"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- COIN VIEW -->
+        <section id="view-coin" class="view-section">
+            <header>
+                <div style="display: flex; align-items: center; gap: 1rem;">
+                    <h2 id="coin-header">BTC/USD</h2>
+                    <span id="coin-pos-badge" class="badge badge-neutral">NO POSITION</span>
+                </div>
+                <select id="coin-select" onchange="loadCoin(this.value)"
+                    style="background: var(--bg-hover); color: white; border: 1px solid var(--border); padding: 0.5rem; border-radius: 0.5rem;">
+                    <option value="BTC_USD">BTC/USD</option>
+                </select>
+            </header>
+
+            <div class="stats-grid">
+                <div class="card">
+                    <div style="color: var(--text-muted); font-size: 0.85rem;">Market Bias</div>
+                    <div style="font-size: 1.5rem; font-weight: 700; margin-top: 0.5rem;" id="coin-bias">--</div>
+                </div>
+                <div class="card">
+                    <div style="color: var(--text-muted); font-size: 0.85rem;">Active PnL</div>
+                    <div style="font-size: 1.5rem; font-weight: 700; margin-top: 0.5rem;" id="coin-pnl">--</div>
+                </div>
+                <div class="card">
+                    <div style="color: var(--text-muted); font-size: 0.85rem;">Entry Price</div>
+                    <div style="font-size: 1.5rem; font-weight: 700; margin-top: 0.5rem;" id="coin-entry">--</div>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1.5rem;">
+                <div class="card">
+                    <h3 style="margin-bottom: 1rem; font-size: 1.1rem;">Decision Trace (Latest)</h3>
+                    <div id="decision-trace-content">
+                        <div style="color: var(--text-muted); text-align: center; padding: 2rem;">No decision data
+                            available</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3 style="margin-bottom: 1rem; font-size: 1.1rem;">Reasoning Log</h3>
+                    <div id="reasoning-list" style="font-size: 0.9rem; line-height: 1.6; color: var(--text-muted);">
+                        <!-- Filled by JS -->
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- EVENTS VIEW -->
+        <section id="view-events" class="view-section">
+            <header>
+                <h2>System Event Stream</h2>
+                <button onclick="loadEvents()"
+                    style="background: var(--bg-hover); color: white; border: none; padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer;">Refresh</button>
+            </header>
+            <div class="card">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Type</th>
+                            <th>Symbol</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody id="events-table-body"></tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        const API = "http://127.0.0.1:8000/api";
+
+        // --- NAVIGATION ---
+        function switchView(viewId) {
+            document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+            document.getElementById('view-' + viewId).classList.add('active');
+
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            // crude implementation
+            if (viewId === 'fleet') document.querySelector('.nav-item:nth-child(2)').classList.add('active');
+            if (viewId === 'coin') document.querySelector('.nav-item:nth-child(3)').classList.add('active');
+            if (viewId === 'events') document.querySelector('.nav-item:nth-child(4)').classList.add('active');
+
+            if (viewId === 'fleet') loadFleet();
+            if (viewId === 'coin') loadCoin('BTC_USD');
+            if (viewId === 'events') loadEvents();
+        }
+
+        // --- LOADERS ---
+        async function loadFleet() {
+            try {
+                const res = await fetch(`${API}/fleet`);
+                const fleet = await res.json();
+                const tbody = document.getElementById('fleet-table-body');
+                tbody.innerHTML = '';
+
+                fleet.forEach(coin => {
+                    const row = document.createElement('tr');
+                    const pnlClass = coin.pnl >= 0 ? 'text-success' : 'text-danger';
+                    const biasColor = coin.bias === 'bullish' ? 'text-success' : coin.bias === 'bearish' ? 'text-danger' : 'text-muted';
+
+                    row.innerHTML = `
+                        <td style="font-weight: 600;">${coin.symbol}</td>
+                        <td class="${biasColor}">${coin.bias.toUpperCase()}</td>
+                        <td>${coin.position}</td>
+                        <td class="${pnlClass}">${coin.pnl ? '$' + coin.pnl.toFixed(2) : '--'}</td>
+                        <td>
+                            <button onclick="switchView('coin'); loadCoin('${coin.symbol.replace('/', '_')}')" style="background: var(--primary); color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer;">Detailed View</button>
+                        </td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                document.getElementById('last-update').innerText = "Last Sync: " + new Date().toLocaleTimeString();
+
+                const tradesRes = await fetch(`${API}/trades`);
+                const trades = await tradesRes.json();
+                const trBody = document.getElementById('recent-trades-body');
+                trBody.innerHTML = '';
+                trades.forEach(t => {
+                    const r = document.createElement('tr');
+                    r.innerHTML = `
+                        <td>${new Date(t.timestamp).toLocaleTimeString()}</td>
+                        <td>${t.symbol}</td>
+                        <td>${t.side}</td>
+                        <td class="${t.status === 'WIN' ? 'text-success' : 'text-danger'}">${t.pnl.toFixed(2)} (${t.status})</td>
+                    `;
+                    trBody.appendChild(r);
+                });
+
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function loadCoin(symbol) {
+            try {
+                const cleanSymbol = symbol.replace('_', '/');
+                document.getElementById('coin-header').innerText = cleanSymbol;
+
+                const res = await fetch(`${API}/coin/${symbol}`);
+                const data = await res.json();
+
+                // Position Header
+                const posEl = document.getElementById('coin-pos-badge');
+                if (data.position) {
+                    posEl.innerText = `${data.position.side.toUpperCase()} ($${data.position.pnl.toFixed(2)})`;
+                    posEl.className = data.position.pnl >= 0 ? "badge badge-success" : "badge badge-danger";
+
+                    document.getElementById('coin-pnl').innerText = `$${data.position.pnl.toFixed(2)}`;
+                    document.getElementById('coin-entry').innerText = `$${data.position.entry.toFixed(2)}`;
+                } else {
+                    posEl.innerText = "NO POSITION";
+                    posEl.className = "badge badge-neutral";
+
+                    document.getElementById('coin-pnl').innerText = "--";
+                    document.getElementById('coin-entry').innerText = "--";
+                }
+
+                // Trace & Bias
+                if (data.latest_trace) {
+                    const details = data.latest_trace.details;
+                    const bias = details.bias || 'unknown';
+                    const biasEl = document.getElementById('coin-bias');
+                    biasEl.innerText = bias.toUpperCase();
+                    biasEl.style.color = bias === 'bullish' ? 'var(--success)' : bias === 'bearish' ? 'var(--danger)' : 'var(--text-muted)';
+
+                    // Reasoning List
+                    const rList = document.getElementById('reasoning-list');
+                    rList.innerHTML = details.reasoning.map(r => `<div>${r}</div>`).join('');
+
+                    // Structured Trace
+                    const tContent = document.getElementById('decision-trace-content');
+                    tContent.innerHTML = `
+                        <div class="trace-block">
+                            <div class="trace-item"><span class="trace-label">Signal Type:</span> <b>${details.signal_type}</b></div>
+                            <div class="trace-item"><span class="trace-label">ADX:</span> ${details.filters.adx.toFixed(2)}</div>
+                            <div class="trace-item"><span class="trace-label">ATR:</span> ${details.filters.atr.toFixed(2)}</div>
+                        </div>
+                    `;
+                    if (details.structure) {
+                        tContent.innerHTML += `
+                            <h4>SMC Structure</h4>
+                            <pre>${JSON.stringify(details.structure, null, 2)}</pre>
+                        `;
+                    }
+                }
+
+            } catch (e) { console.error(e); }
+        }
+
+        async function loadEvents() {
+            try {
+                const res = await fetch(`${API}/events?limit=50`);
+                const events = await res.json();
+                const tbody = document.getElementById('events-table-body');
+                tbody.innerHTML = '';
+
+                events.forEach(e => {
+                    const r = document.createElement('tr');
+                    r.innerHTML = `
+                        <td>${new Date(e.timestamp).toLocaleTimeString()}</td>
+                        <td><span class="badge ${e.type === 'SIGNAL_GENERATED' ? 'badge-success' : 'badge-neutral'}">${e.type}</span></td>
+                        <td>${e.symbol}</td>
+                        <td><pre style="max-height: 60px; overflow-y:auto; margin:0;">${JSON.stringify(e.details)}</pre></td>
+                    `;
+                    tbody.appendChild(r);
+                });
+            } catch (e) { console.error(e); }
+        }
+
+        // Init
+        document.addEventListener('DOMContentLoaded', () => {
+            // Load env & config
+            fetch(`${API}/status`).then(r => r.json()).then(d => {
+                document.getElementById('sys-env').innerText = d.environment.toUpperCase();
+            });
+
+            // Dynamic Coin List
+            fetch(`${API}/config`).then(r => r.json()).then(d => {
+                const select = document.getElementById('coin-select');
+                select.innerHTML = '';
+                d.markets.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.replace('/', '_');
+                    opt.text = m;
+                    select.appendChild(opt);
+                });
+            });
+
+            switchView('fleet');
+
+            // Auto-refresh every 2s
+            setInterval(() => {
+                if (document.getElementById('view-fleet').classList.contains('active')) loadFleet();
+                if (document.getElementById('view-coin').classList.contains('active')) {
+                    const currentSym = document.getElementById('coin-header').innerText.replace('/', '_');
+                    loadCoin(currentSym);
+                }
+            }, 2000);
+        });
+    </script>
+</body>
+
+</html>

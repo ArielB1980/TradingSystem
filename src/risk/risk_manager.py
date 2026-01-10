@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from src.domain.models import Signal, RiskDecision, Position, Side
 from src.config.config import RiskConfig
 from src.monitoring.logger import get_logger
+from src.storage.repository import record_event
 
 logger = get_logger(__name__)
 
@@ -177,6 +178,33 @@ class RiskManager:
                 symbol=signal.symbol,
                 reasons=rejection_reasons,
             )
+            
+        # --- EXPLAINABILITY INSTRUMENTATION ---
+        
+        # Determine strictness tier for logging
+        tight_threshold = Decimal(str(self.config.tight_stop_threshold_pct))
+        strictness_tier = "TIGHT" if stop_distance_pct <= tight_threshold else "NORMAL"
+        
+        validation_data = {
+            "approved": approved,
+            "reasons": rejection_reasons,
+            "metrics": {
+                "position_notional": float(position_notional),
+                "leverage": float(leverage),
+                "margin_required": float(margin_required),
+                "stop_distance_pct": float(stop_distance_pct),
+                "rr_distortion": float(rr_distortion),
+                "liquidation_buffer_pct": float(liquidation_buffer_pct),
+                "basis_divergence_pct": float(basis_divergence_pct),
+            },
+            "limits": {
+                "max_leverage": float(self.config.max_leverage),
+                "max_distortion": float(max_distortion),
+                "strictness_tier": strictness_tier
+            }
+        }
+        
+        record_event("RISK_VALIDATION", signal.symbol, validation_data)
         
         return decision
     

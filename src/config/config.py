@@ -68,16 +68,36 @@ class StrategyConfig(BaseSettings):
     orderblock_lookback: int = Field(default=50, ge=20, le=200)
     fvg_min_size_pct: float = Field(default=0.001, ge=0.0001, le=0.01)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
+    fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"
+    fvg_partial_fill_pct: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class ExecutionConfig(BaseSettings):
     """Execution settings configuration."""
     # Price conversion
-    use_mark_price: bool = True  # Always true for safety
+    use_mark_price: bool = True
     
-    # Order settings
+    # Order Structure
     default_order_type: Literal["market", "limit"] = "limit"
     slippage_tolerance_pct: float = Field(default=0.001, ge=0.0001, le=0.01)
+    
+    # Take Profit Settings
+    tp_mode: Literal["structure_with_rr_fallback"] = "structure_with_rr_fallback"
+    tp_splits: List[float] = [0.35, 0.35, 0.30]
+    rr_fallback_multiples: List[float] = [1.0, 2.0, 3.0]
+    
+    # Dynamic Management
+    break_even_trigger: Literal["tp1_fill"] = "tp1_fill"
+    break_even_offset_ticks: int = 2
+    
+    trailing_enabled: bool = True
+    trailing_trigger: Literal["tp1_fill"] = "tp1_fill"
+    trailing_type: Literal["atr"] = "atr"
+    trailing_atr_period: int = 14
+    trailing_atr_mult: float = 2.0
+    trailing_update_min_ticks: int = 2
+    trail_tighten_after_tp2: bool = False
+    trail_atr_mult_after_tp2: float = 1.6
     order_timeout_seconds: int = Field(default=30, ge=10, le=120)
     max_retries: int = Field(default=3, ge=1, le=10)
     retry_backoff_seconds: int = Field(default=2, ge=1, le=10)

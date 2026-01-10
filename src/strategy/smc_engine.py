@@ -12,6 +12,8 @@ from src.domain.models import Candle, Signal, SignalType
 from src.strategy.indicators import Indicators
 from src.config.config import StrategyConfig
 from src.monitoring.logger import get_logger
+from src.storage.repository import record_event
+import uuid
 
 logger = get_logger(__name__)
 
@@ -49,82 +51,147 @@ class SMCEngine:
     ) -> Signal:
         """
         Generate trading signal from spot market data.
-        
-        Args:
-            symbol: Spot symbol (e.g., "BTC/USD")
-            bias_candles_4h: 4H spot candles for bias
-            bias_candles_1d: 1D spot candles for bias
-            exec_candles_15m: 15m spot candles for execution
-            exec_candles_1h: 1H spot candles for execution
-        
-        Returns:
-            Signal object with full reasoning
         """
+        # Context Variables for Trace
+        decision_id = str(uuid.uuid4())
         reasoning_parts = []
+        bias = "neutral"
+        structure_signal = None
+        adx_value = 0.0
+        atr_value = 0.0
+        tp_candidates = []
         
-        # Step 1: Higher-timeframe bias (4H/1D)
-        bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
+        # Logic Flow
+        signal = None
         
-        if bias == "neutral":
-            return self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+        # Step 1: Higher-timeframe bias
+        if signal is None:
+            bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
+            if bias == "neutral":
+                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+
+        # Step 2: Execution timeframe structure
+        if signal is None:
+            structure_signal = self._detect_structure(
+                exec_candles_15m,
+                exec_candles_1h,
+                bias,
+                reasoning_parts,
+            )
+            if structure_signal is None:
+                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+
+        # Step 3: Filters
+        if signal is None:
+            # ADX
+            adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
+            if not adx_df.empty:
+                adx_value = float(adx_df['ADX_14'].iloc[-1])
+            
+            # ATR
+            atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+            if not atr_df.empty:
+                atr_value = Decimal(str(atr_df.iloc[-1])) # Convert to Decimal
+
+            if not self._apply_filters(exec_candles_1h, reasoning_parts):
+                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+
+            # Step 4: Calculate Levels (If passed all checks)
+            if signal is None:
+                signal_type, entry_price, stop_loss, take_profit, tp_candidates = self._calculate_levels(
+                    structure_signal,
+                    exec_candles_1h,
+                    bias,
+                    reasoning_parts,
+                )
+                
+                # Step 5: RSI Divergence
+                if self.config.rsi_divergence_enabled:
+                    self._check_rsi_divergence(exec_candles_1h, reasoning_parts)
+                
+                # Metadata
+                current_candle = exec_candles_1h[-1]
+                ema_values = self.indicators.calculate_ema(bias_candles_1d, self.config.ema_period)
+                
+                timestamp = current_candle.timestamp
+                ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
+
+                if signal_type != SignalType.NO_SIGNAL:
+                    signal = Signal(
+                        timestamp=timestamp,
+                        symbol=symbol,
+                        signal_type=signal_type,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        reasoning="\n".join(reasoning_parts),
+                        higher_tf_bias=bias,
+                        adx=adx_value,
+                        atr=atr_value,
+                        ema200_slope=ema200_slope,
+                        tp_candidates=tp_candidates
+                    )
+                else:
+                    signal = Signal(
+                        timestamp=timestamp,
+                        symbol=symbol,
+                        signal_type=SignalType.NO_SIGNAL,
+                        entry_price=Decimal("0"),
+                        stop_loss=Decimal("0"),
+                        take_profit=None,
+                        reasoning="\n".join(reasoning_parts),
+                        higher_tf_bias=bias,
+                        adx=adx_value,
+                        atr=atr_value,
+                        ema200_slope=ema200_slope,
+                        tp_candidates=[]
+                    )
+                    
+                    
+        # If signal is still None after all steps (e.g., if _calculate_levels returned None for signal_type)
+        if signal is None:
+            current_candle = exec_candles_1h[-1] if exec_candles_1h else None
+            timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
+            signal = self._no_signal(symbol, reasoning_parts, current_candle)
+
+
+        # --- EXPLAINABILITY INSTRUMENTATION ---
+        trace_data = {
+            "bias": bias,
+            "structure": structure_signal,
+            "filters": {
+                "adx": float(adx_value),
+                "atr": float(atr_value),
+            },
+            "reasoning": reasoning_parts,
+            "signal_type": signal.signal_type.value,
+            "tp_candidates": [float(tp) for tp in tp_candidates]
+        }
         
-        # Step 2: Execution timeframe structure (15m/1H)
-        structure_signal = self._detect_structure(
-            exec_candles_15m,
-            exec_candles_1h,
-            bias,
-            reasoning_parts,
-        )
+        # Record generic decision trace
+        record_event("DECISION_TRACE", symbol, trace_data, decision_id=decision_id)
         
-        if structure_signal is None:
-            return self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
-        
-        # Step 3: Filters (ADX, ATR)
-        if not self._apply_filters(exec_candles_1h, reasoning_parts):
-            return self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
-        
-        # Step 4: Calculate entry, stop-loss, take-profit
-        signal_type, entry_price, stop_loss, take_profit = self._calculate_levels(
-            structure_signal,
-            exec_candles_1h,
-            bias,
-            reasoning_parts,
-        )
-        
-        # Step 5: Optional RSI divergence confirmation
-        if self.config.rsi_divergence_enabled:
-            self._check_rsi_divergence(exec_candles_1h, reasoning_parts)
-        
-        # Get current candle for metadata
-        current_candle = exec_candles_1h[-1]
-        
-        # Calculate indicators for metadata
-        ema_values = self.indicators.calculate_ema(bias_candles_1d, self.config.ema_period)
-        adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
-        atr_values = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
-        
-        signal = Signal(
-            timestamp=current_candle.timestamp,
-            symbol=symbol,
-            signal_type=signal_type,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            reasoning="\n".join(reasoning_parts),
-            higher_tf_bias=bias,
-            adx=Decimal(str(adx_df['ADX_14'].iloc[-1])) if not adx_df.empty else Decimal("0"),
-            atr=Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0"),
-            ema200_slope=self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat",
-        )
-        
-        logger.info(
-            "Signal generated",
-            symbol=symbol,
-            signal_type=signal_type.value,
-            entry=str(entry_price),
-            stop=str(stop_loss),
-            tp=str(take_profit) if take_profit else "None",
-        )
+        if signal.signal_type != SignalType.NO_SIGNAL:
+            logger.info(
+                "Signal generated",
+                symbol=symbol,
+                signal_type=signal.signal_type.value,
+                entry=str(signal.entry_price),
+                stop=str(signal.stop_loss),
+            )
+            # Record explicit signal event
+            record_event(
+                "SIGNAL_GENERATED", 
+                symbol, 
+                {
+                    "type": signal.signal_type.value,
+                    "entry": float(signal.entry_price),
+                    "stop": float(signal.stop_loss),
+                    "tp": float(signal.take_profit) if signal.take_profit else None,
+                    "tp_candidates": [float(tp) for tp in signal.tp_candidates]
+                },
+                decision_id=decision_id
+            )
         
         return signal
     
@@ -210,55 +277,182 @@ class SMCEngine:
         }
     
     def _find_order_block(self, candles: List[Candle], bias: str) -> Optional[dict]:
-        """Find order block (last bullish/bearish candle before move)."""
-        lookback = min(self.config.orderblock_lookback, len(candles) - 1)
+        """
+        Find SMC-style Order Block:
+        - Bullish OB: last DOWN candle before an impulsive UP move
+        - Bearish OB: last UP candle before an impulsive DOWN move
         
-        for i in range(len(candles) - 1, len(candles) - lookback - 1, -1):
-            candle = candles[i]
+        Returns a zone: {'type', 'index', 'low', 'high', 'timestamp', 'price'}
+        """
+        if len(candles) < 3:
+            return None
+            
+        lookback = min(self.config.orderblock_lookback, len(candles) - 2)
+        
+        # Proxy for "typical move" (median of recent ranges) to check displacement
+        start_idx = max(0, len(candles) - lookback - 10)
+        recent = candles[start_idx:]
+        ranges = sorted([(c.high - c.low) for c in recent if c.high > c.low])
+        
+        if not ranges:
+            return None
+            
+        typical_range = ranges[len(ranges) // 2]
+        
+        # Configurable displacement multiple (hardcoded to 2.0 for now as per user suggestion, or read from config if added)
+        # Using 1.5 as 2.0 might be too strict for this timeframe
+        min_displacement = typical_range * Decimal("1.5")
+        
+        start = len(candles) - 2
+        end = len(candles) - lookback - 2
+        
+        for i in range(start, end, -1):
+            ob = candles[i]
+            nxt = candles[i + 1]
+            
+            ob_down = ob.close < ob.open
+            ob_up = ob.close > ob.open
+            
+            nxt_up = nxt.close > nxt.open
+            nxt_down = nxt.close < nxt.open
             
             if bias == "bullish":
-                # Look for bullish order block (green candle)
-                if candle.close > candle.open:
-                    return {
-                        'type': 'bullish',
-                        'price': candle.low,  # Entry at low of order block
-                        'index': i,
-                    }
-            else:  # bearish
-                # Look for bearish order block (red candle)
-                if candle.close < candle.open:
-                    return {
-                        'type': 'bearish',
-                        'price': candle.high,  # Entry at high of order block
-                        'index': i,
-                    }
+                # Bullish OB: Last DOWN candle before impulse UP
+                if ob_down and nxt_up:
+                    displacement = nxt.high - ob.high
+                    if displacement >= min_displacement:
+                         return {
+                            "type": "bullish",
+                            "index": i,
+                            "timestamp": ob.timestamp,
+                            "low": ob.low,
+                            "high": ob.high,
+                            # For backward compat with current _calculate_levels, though we will update it
+                            "price": ob.high # Entry at top of OB (retest)
+                        }
+            else: # bearish
+                # Bearish OB: Last UP candle before impulse DOWN
+                if ob_up and nxt_down:
+                    displacement = ob.low - nxt.low
+                    if displacement >= min_displacement:
+                        return {
+                            "type": "bearish",
+                            "index": i,
+                            "timestamp": ob.timestamp,
+                            "low": ob.low,
+                            "high": ob.high,
+                            "price": ob.low # Entry at bottom of OB (retest)
+                        }
         
         return None
     
     def _find_fair_value_gap(self, candles: List[Candle], bias: str) -> Optional[dict]:
-        """Find fair value gap (imbalance in price action)."""
-        for i in range(len(candles) - 3, 0, -1):
-            c1 = candles[i]
-            c2 = candles[i + 1]
-            c3 = candles[i + 2]
-            
+        """
+        Find most recent FVG (3-candle).
+        Bullish FVG if c1.high < c3.low, gap zone = [c1.high, c3.low]
+        Bearish FVG if c1.low  > c3.high, gap zone = [c3.high, c1.low]
+
+        Mitigation modes:
+        - touched: any re-entry into the gap
+        - partial: re-entry >= X% of gap depth
+        - full: price crosses the far boundary (gap fully filled)
+        """
+        if len(candles) < 3:
+            return None
+
+        mode = getattr(self.config, "fvg_mitigation_mode", "touched")
+        partial_fill = Decimal(str(getattr(self.config, "fvg_partial_fill_pct", 0.5)))
+
+        for i in range(len(candles) - 3, -1, -1):
+            c1, c2, c3 = candles[i], candles[i + 1], candles[i + 2]
+            future = candles[i + 3:]
+
             if bias == "bullish":
-                # Bullish FVG: gap between c1.high and c3.low
-                gap = c3.low - c1.high
-                if gap / c3.low > self.config.fvg_min_size_pct:
+                gap_bottom = c1.high
+                gap_top = c3.low
+                gap = gap_top - gap_bottom
+
+                if gap <= 0:
+                    continue
+
+                gap_mid = (gap_top + gap_bottom) / Decimal("2")
+                if gap_mid <= 0:
+                    continue
+
+                if (gap / gap_mid) <= Decimal(str(self.config.fvg_min_size_pct)):
+                    continue
+
+                # Mitigation check
+                mitigated = False
+                for fc in future:
+                    if mode == "touched":
+                        if fc.low <= gap_top:  # entered gap
+                            mitigated = True
+                            break
+                    elif mode == "partial":
+                        # entered at least X% into gap from top
+                        threshold = gap_top - (gap * partial_fill)
+                        if fc.low <= threshold:
+                            mitigated = True
+                            break
+                    elif mode == "full":
+                        if fc.low <= gap_bottom:  # fully filled
+                            mitigated = True
+                            break
+
+                if not mitigated:
                     return {
-                        'price': (c1.high + c3.low) / 2,  # Midpoint
-                        'size_pct': float(gap / c3.low),
+                        "type": "bullish",
+                        "index": i,
+                        "timestamp": c2.timestamp,
+                        "bottom": gap_bottom,
+                        "top": gap_top,
+                        "size": gap,
+                        "price": gap_mid, # Compatibility with dashboard
                     }
+
             else:  # bearish
-                # Bearish FVG: gap between c3.high and c1.low
-                gap = c1.low - c3.high
-                if gap / c1.low > self.config.fvg_min_size_pct:
+                gap_bottom = c3.high
+                gap_top = c1.low
+                gap = gap_top - gap_bottom
+
+                if gap <= 0:
+                    continue
+
+                gap_mid = (gap_top + gap_bottom) / Decimal("2")
+                if gap_mid <= 0:
+                    continue
+
+                if (gap / gap_mid) <= Decimal(str(self.config.fvg_min_size_pct)):
+                    continue
+
+                mitigated = False
+                for fc in future:
+                    if mode == "touched":
+                        if fc.high >= gap_bottom:  # entered gap
+                            mitigated = True
+                            break
+                    elif mode == "partial":
+                        threshold = gap_bottom + (gap * partial_fill)
+                        if fc.high >= threshold:
+                            mitigated = True
+                            break
+                    elif mode == "full":
+                        if fc.high >= gap_top:  # fully filled
+                            mitigated = True
+                            break
+
+                if not mitigated:
                     return {
-                        'price': (c3.high + c1.low) / 2,  # Midpoint
-                        'size_pct': float(gap / c1.low),
+                        "type": "bearish",
+                        "index": i,
+                        "timestamp": c2.timestamp,
+                        "bottom": gap_bottom,
+                        "top": gap_top,
+                        "size": gap,
+                        "price": gap_mid, # Compatibility with dashboard
                     }
-        
+
         return None
     
     def _detect_break_of_structure(self, candles: List[Candle], bias: str) -> bool:
@@ -314,37 +508,79 @@ class SMCEngine:
         candles: List[Candle],
         bias: str,
         reasoning: List[str],
-    ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal]]:
-        """Calculate entry, stop-loss, and take-profit levels."""
-        current_price = candles[-1].close
+    ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal], List[Decimal]]:
+        """Calculate entry, stop-loss, and take-profit levels with candidates."""
         order_block = structure['order_block']
         
-        # Entry at order block price
-        entry_price = order_block['price']
-        
-        # Calculate ATR for stop sizing
+        # Calculate ATR for stop buffering
         atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
-        atr = Decimal(str(atr_values.iloc[-1]))
+        atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
         
-        # Stop-loss: ATR-based buffer from invalidation level
+        tp_candidates = []
+        
         if bias == "bullish":
             signal_type = SignalType.LONG
-            # Stop below order block with ATR buffer
-            stop_loss = entry_price - (atr * Decimal(str(self.config.atr_multiplier_stop)))
-            # Take-profit at next resistance (simplified: 2× risk)
-            take_profit = entry_price + (entry_price - stop_loss) * 2
+            # Entry: Top of Bullish OB (retest entry)
+            entry_price = order_block['high']
+            
+            # Stop-loss: Below Bottom of OB + buffer
+            invalidation_level = order_block['low']
+            stop_loss = invalidation_level - (atr * Decimal(str(self.config.atr_multiplier_stop)))
+            
+            # Take-profit Candidates
+            # 1. Recent Swing Highs (Liquidity)
+            # Scan last 50 candles for local maxima > entry
+            lookback = 50
+            for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
+                c = candles[i]
+                # Simple swing high check: High > surrounding highs
+                if (c.high > candles[i-1].high and c.high > candles[i+1].high):
+                    if c.high > entry_price:
+                         tp_candidates.append(c.high)
+            
+            # Sort nearest to farthest
+            tp_candidates = sorted(list(set(tp_candidates)))[:5]
+            
+            # Default TP (2R) if no structure found
+            risk = entry_price - stop_loss
+            take_profit = entry_price + (risk * 2)
+            if not tp_candidates:
+                tp_candidates.append(take_profit)
+            
         else:  # bearish
             signal_type = SignalType.SHORT
-            # Stop above order block with ATR buffer
-            stop_loss = entry_price + (atr * Decimal(str(self.config.atr_multiplier_stop)))
-            # Take-profit at next support (simplified: 2× risk)
-            take_profit = entry_price - (stop_loss - entry_price) * 2
+            # Entry: Bottom of Bearish OB (retest entry)
+            entry_price = order_block['low']
+            
+            # Stop-loss: Above Top of OB + buffer
+            invalidation_level = order_block['high']
+            stop_loss = invalidation_level + (atr * Decimal(str(self.config.atr_multiplier_stop)))
+            
+            # Take-profit Candidates
+            # 1. Recent Swing Lows (Liquidity)
+            lookback = 50
+            for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
+                c = candles[i]
+                if (c.low < candles[i-1].low and c.low < candles[i+1].low):
+                    if c.low < entry_price:
+                        tp_candidates.append(c.low)
+                        
+            # Sort nearest to farthest (descending for shorts)
+            tp_candidates = sorted(list(set(tp_candidates)), reverse=True)[:5]
+
+            # Default TP (2R)
+            risk = stop_loss - entry_price
+            take_profit = entry_price - (risk * 2)
+            if not tp_candidates:
+                tp_candidates.append(take_profit)
         
         reasoning.append(
             f"✓ Levels: Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}, ATR ${atr}"
         )
+        if tp_candidates:
+             reasoning.append(f"✓ Found {len(tp_candidates)} TP candidates from structure")
         
-        return signal_type, entry_price, stop_loss, take_profit
+        return signal_type, entry_price, stop_loss, take_profit, tp_candidates
     
     def _check_rsi_divergence(self, candles: List[Candle], reasoning: List[str]):
         """Optional RSI divergence confirmation."""

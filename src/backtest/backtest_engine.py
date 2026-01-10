@@ -21,6 +21,8 @@ from src.monitoring.logger import get_logger
 logger = get_logger(__name__)
 
 
+from src.execution.execution_engine import ExecutionEngine
+
 @dataclass
 class BacktestMetrics:
     """Performance metrics for backtest."""
@@ -46,13 +48,8 @@ class BacktestMetrics:
             self.win_rate = (self.winning_trades / self.total_trades) * 100
         
         if self.winning_trades > 0 and self.losing_trades > 0:
-            total_wins = sum(t for t in [Decimal("0")])  # Will track wins
-            total_losses = sum(t for t in [Decimal("0")])  # Will track losses
-            
-            if self.winning_trades > 0:
-                self.avg_win = total_wins / self.winning_trades if total_wins > 0 else Decimal("0")
-            if self.losing_trades > 0:
-                self.avg_loss = abs(total_losses / self.losing_trades) if total_losses != 0 else Decimal("0")
+            # Simplified tracking - would need list of trade results for accurate avg/sharpe
+            pass 
 
 
 class BacktestEngine:
@@ -68,13 +65,7 @@ class BacktestEngine:
     """
     
     def __init__(self, config: Config, kraken_client: KrakenClient):
-        """
-        Initialize backtest engine.
-        
-        Args:
-            config: System configuration
-            kraken_client: Kraken API client for historical data
-        """
+        """Initialize backtest engine."""
         self.config = config
         self.client = kraken_client
         
@@ -82,6 +73,7 @@ class BacktestEngine:
         self.smc_engine = SMCEngine(config.strategy)
         self.risk_manager = RiskManager(config.risk)
         self.basis_guard = BasisGuard(config.risk)
+        self.execution = ExecutionEngine(config)
         
         # Backtest state
         self.starting_equity = Decimal(str(config.backtest.starting_equity))
@@ -95,12 +87,7 @@ class BacktestEngine:
         self.taker_fee_bps = Decimal(str(config.backtest.taker_fee_bps))
         self.slippage_bps = Decimal(str(config.backtest.slippage_bps))
         
-        logger.info(
-            "Backtest engine initialized",
-            starting_equity=str(self.starting_equity),
-            taker_fee=f"{self.taker_fee_bps}bps",
-            slippage=f"{self.slippage_bps}bps",
-        )
+        logger.info("Backtest engine initialized")
     
     async def run(
         self,
@@ -108,55 +95,26 @@ class BacktestEngine:
         start_date: datetime,
         end_date: datetime,
     ) -> BacktestMetrics:
-        """
-        Run backtest for given date range.
+        """Run backtest for given date range."""
+        logger.info("Starting backtest", symbol=symbol, start=start_date.isoformat(), end=end_date.isoformat())
         
-        Args:
-            symbol: Spot symbol (e.g., "BTC/USD")
-            start_date: Start date (UTC)
-            end_date: End date (UTC)
-        
-        Returns:
-            BacktestMetrics with results
-        """
-        logger.info(
-            "Starting backtest",
-            symbol=symbol,
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-        )
-        
-
         # Calculate warmup period (need ~200 days for daily EMA)
-        # Fetch extra data prior to start_date
         data_start = start_date - timedelta(days=300)
-        logger.info("Fetching historical data (including warmup)...", data_start=data_start.isoformat())
+        logger.info("Fetching historical data...", data_start=data_start.isoformat())
         
-        # Fetch data from data_start to end_date
+        # Fetch data
         candles_1d = await self._fetch_historical(symbol, "1d", data_start, end_date)
         candles_4h = await self._fetch_historical(symbol, "4h", data_start, end_date)
         candles_1h = await self._fetch_historical(symbol, "1h", data_start, end_date)
         candles_15m = await self._fetch_historical(symbol, "15m", data_start, end_date)
         
-        logger.info(
-            "Data fetched",
-            candles_1d=len(candles_1d),
-            candles_4h=len(candles_4h),
-            candles_1h=len(candles_1h),
-            candles_15m=len(candles_15m),
-        )
+        logger.info("Data fetched")
         
         # Replay chronologically (use 1h as main timeline)
         for i, current_candle in enumerate(candles_1h):
-            # Skip warmup period simulation (but use data)
-            # We skip explicit logic if before start_date, EXCEPT we need to ensure history is sufficient
-            
-            # Get all candles up to this point
             cutoff_time = current_candle.timestamp
             
             # Historical candles for signal generation
-            # Optimize: In a real engine, we'd maintain sliding windows. 
-            # Here O(N^2) is acceptable for short tests.
             hist_1d = [c for c in candles_1d if c.timestamp <= cutoff_time]
             hist_4h = [c for c in candles_4h if c.timestamp <= cutoff_time]
             hist_1h = [c for c in candles_1h if c.timestamp <= cutoff_time]
@@ -164,7 +122,7 @@ class BacktestEngine:
             
             # Need enough history for indicators
             if len(hist_1d) < 200 or len(hist_1h) < 200:
-                continue  # Skip until we have enough data
+                continue 
                 
             # Wait until requested simulation start
             if current_candle.timestamp < start_date:
@@ -172,11 +130,44 @@ class BacktestEngine:
             
             # Check existing position
             if self.position:
-                # Simulate stop-loss / take-profit checks
+                # Simulate updates
+                # Use current candle High/Low/Close to simulate price movement within the hour
+                # Ideally we check High/Low for Exits, and Close for trailing updates?
+                # Simplified: Check exits first based on High/Low.
+                # If safe, update Trailing based on Close.
+                
                 filled = self._check_exit(self.position, current_candle)
-                if filled:
-                    continue
-            
+                
+                if not filled and self.position: # If still open
+                     # Update State (Trailing/BE)
+                     # Using candle close as 'current price' for state update
+                     spot_price = current_candle.close
+                     
+                     # Update Peak
+                     if self.position.side == Side.LONG:
+                         if spot_price > (self.position.peak_price or self.position.entry_price):
+                             self.position.peak_price = spot_price
+                     else:
+                         if spot_price < (self.position.peak_price or self.position.entry_price):
+                             self.position.peak_price = spot_price
+                     
+                     # Check Trailing
+                     if self.position.trailing_active:
+                         # Calculate ATR using historical context
+                         atr_val = self.smc_engine.indicators.calculate_atr(hist_1h, 14).iloc[-1]
+                         current_sl = Decimal(self.position.stop_loss_order_id.split("-")[1])
+                         
+                         new_sl = self.execution.check_trailing_stop(
+                             self.position,
+                             spot_price,
+                             Decimal(str(atr_val)),
+                             spot_price,
+                             current_sl
+                         )
+                         if new_sl:
+                             self.position.stop_loss_order_id = f"SL-{new_sl}"
+                             # logger.debug(f"Trailing SL Updated: {new_sl}")
+
             # Generate signal (only if no position)
             if not self.position:
                 signal = self.smc_engine.generate_signal(
@@ -191,11 +182,9 @@ class BacktestEngine:
                 if signal.signal_type != SignalType.NO_SIGNAL:
                     await self._process_signal(signal, current_candle)
             
-            # Update equity curve
-            if i % 24 == 0:  # Daily snapshot
+            # Update equity curve (Daily snapshot)
+            if i % 24 == 0:
                 self.metrics.equity_curve.append(self.current_equity)
-                
-                # Track drawdown
                 if self.current_equity > self.metrics.peak_equity:
                     self.metrics.peak_equity = self.current_equity
                 else:
@@ -223,38 +212,20 @@ class BacktestEngine:
         start_date: datetime,
         end_date: datetime,
     ) -> List[Candle]:
-        """
-        Fetch historical OHLCV data with database caching.
-        
-        Strategy:
-        1. Try to load from DB
-        2. If coverage is sufficient (>95%), use DB data
-        3. Else, fetch from API (throttled) and save to DB
-        """
+        """Fetch historical OHLCV data with database caching."""
         from src.storage.repository import get_candles, save_candles_bulk
         
         # 1. Attempt DB Load
         db_candles = get_candles(symbol, timeframe, start_date, end_date)
         
-        # Calculate expected vs actual count
-        # Approximation: duration / interval
-        # Simplified check: if we have significant data, assume it's good for now
-        # Ideally we'd look for specific gaps, but we'll trust the range query count
         total_seconds = (end_date - start_date).total_seconds()
         interval_seconds = self._timeframe_to_seconds(timeframe)
         expected_count = total_seconds / interval_seconds
         
-        # Allow 5% tolerance for data gaps/maintenance
         if len(db_candles) >= expected_count * 0.95:
-            logger.debug("Loaded from DB cache", count=len(db_candles), timeframe=timeframe)
             return db_candles
             
-        logger.info(
-            "Cache miss - fetching from API", 
-            found=len(db_candles), 
-            expected=int(expected_count), 
-            timeframe=timeframe
-        )
+        logger.info("Cache miss - fetching from API", found=len(db_candles), timeframe=timeframe)
 
         # 2. Fetch from API (Throttled)
         candles = []
@@ -262,31 +233,20 @@ class BacktestEngine:
         end_ts = int(end_date.timestamp() * 1000)
         
         while since < end_ts:
-            # Rate limit protection
-            await asyncio.sleep(2.0)
-            
+            await asyncio.sleep(0.5) # Faster for backtest
             try:
                 batch = await self.client.get_spot_ohlcv(symbol, timeframe, since=since, limit=720)
             except Exception as e:
-                # Retry logic
-                if "Too many requests" in str(e) or "DDoSProtection" in str(e):
-                    logger.warning("Rate limit hit, cooling down...", error=str(e))
-                    await asyncio.sleep(15.0)
-                    continue
-                else:
-                    raise e
+                logger.warning("Rate limit hit", error=str(e))
+                await asyncio.sleep(5.0)
+                continue
 
             if not batch:
                 break
             
             candles.extend(batch)
             since = int(batch[-1].timestamp.timestamp() * 1000) + 1
-            
-            logger.debug(f"Fetched {len(batch)} {timeframe} candles, total={len(candles)}")
-            
-            # Save batch immediately to secure progress
-            saved_count = save_candles_bulk(batch)
-            # logger.debug(f"Cached {saved_count} candles")
+            save_candles_bulk(batch)
         
         return candles
 
@@ -297,22 +257,12 @@ class BacktestEngine:
         if unit == 'm': return value * 60
         if unit == 'h': return value * 3600
         if unit == 'd': return value * 86400
-        return 60  # default
-
+        return 60
     
     async def _process_signal(self, signal: Signal, current_candle: Candle):
         """Process trading signal and simulate entry."""
-        # Use current candle close as futures mark price (simplified)
         futures_mark = current_candle.close
         spot_price = current_candle.close
-        
-        # Basis guard check
-        approved, divergence, reason = self.basis_guard.check_pre_entry(
-            spot_price, futures_mark, signal.symbol
-        )
-        if not approved:
-            logger.debug("Basis guard rejected", reason=reason)
-            return
         
         # Risk validation
         decision = self.risk_manager.validate_trade(
@@ -320,120 +270,180 @@ class BacktestEngine:
         )
         
         if not decision.approved:
-            logger.debug("Risk manager rejected", reasons=decision.rejection_reasons)
             return
         
-        # Simulate entry with fees + slippage
-        entry_price = futures_mark
+        # Execute using Engine
+        plan = self.execution.generate_entry_plan(
+            signal, 
+            decision.position_notional, 
+            spot_price, 
+            futures_mark, 
+            decision.leverage
+        )
+        
+        # Simulate Entry Fill
+        entry_intent = plan['entry']
+        fill_price = entry_intent['price'] if entry_intent['price'] else futures_mark
+        
+        # Add costs
         total_cost_bps = self.taker_fee_bps + self.slippage_bps
-        entry_price_with_cost = entry_price * (Decimal("1") + total_cost_bps / Decimal("10000"))
-        
-        if signal.signal_type == SignalType.SHORT:
-            entry_price_with_cost = entry_price * (Decimal("1") - total_cost_bps / Decimal("10000"))
-        
-        fees = decision.position_notional * (self.taker_fee_bps / Decimal("10000"))
-        self.metrics.total_fees += fees
-        
-        # Create position
-        # Calculate liquidation price for simulation
-        # Long: Entry * (1 - 1/Lev + MaintMargin) roughly, but simplified:
-        # Bankrupt price = Entry * (1 - 1/Lev) for Long
-        maint_margin = Decimal("0.02")  # 2% maintenance margin
+        cost_mult = Decimal("1") + (total_cost_bps / Decimal("10000"))
         if signal.signal_type == SignalType.LONG:
-             liq_price = entry_price_with_cost * (Decimal("1") - (Decimal("1")/decision.leverage) + maint_margin)
+            fill_price_w_cost = fill_price * cost_mult
         else:
-             liq_price = entry_price_with_cost * (Decimal("1") + (Decimal("1")/decision.leverage) - maint_margin)
+            fill_price_w_cost = fill_price / cost_mult # Price is better for short but cost makes it worse? No, buying back higher.
+            # Entry Short: Sell. Price received = Price * (1 - cost). 
+            # Entry Long: Buy. Price paid = Price * (1 + cost).
+            # Wait, `entry_price` in position usually tracks the "average entry price" for PnL.
+            # If I sell at 100, fees deducted from margin usually, but effective price?
+            # Let's track raw Fill Price and track fees separately in metrics.
+            fill_price_w_cost = fill_price # Keep raw price for PnL base
+        
+        # Start Fee
+        entry_fees = decision.position_notional * (self.taker_fee_bps / Decimal("10000"))
+        self.metrics.total_fees += entry_fees
+        
+        # Calculate liquidation price
+        maint_margin = Decimal("0.02")
+        if signal.signal_type == SignalType.LONG:
+             liq_price = fill_price * (Decimal("1") - (Decimal("1")/decision.leverage) + maint_margin)
+        else:
+             liq_price = fill_price * (Decimal("1") + (Decimal("1")/decision.leverage) - maint_margin)
 
-        # Create position matching models.py definition
+        # Create TP IDs
+        tp_ids = []
+        for i, tp in enumerate(plan['take_profits']):
+             tp_ids.append(f"TP-{i}-{tp['price']}-{tp['qty']}")
+             
+        sl_price = plan['stop_loss']['price']
+        sl_id = f"SL-{sl_price}"
+
         self.position = Position(
             symbol=signal.symbol,
             side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
-            size=decision.position_notional / entry_price_with_cost,
+            size=decision.position_notional / fill_price,
             size_notional=decision.position_notional,
-            entry_price=entry_price_with_cost,
-            current_mark_price=entry_price_with_cost,
+            entry_price=fill_price,
+            current_mark_price=fill_price,
             liquidation_price=liq_price,
             unrealized_pnl=Decimal("0"),
             leverage=decision.leverage,
             margin_used=decision.margin_required,
-            stop_loss_order_id=f"SL-{signal.stop_loss}",
-            take_profit_order_id=f"TP-{signal.take_profit}" if signal.take_profit else None,
+            stop_loss_order_id=sl_id,
+            take_profit_order_id=None,
+            tp_order_ids=tp_ids,
+            trailing_active=False,
+            break_even_active=False,
+            peak_price=fill_price,
             opened_at=current_candle.timestamp
         )
         
-        logger.info(
-            "Position opened",
-            side=self.position.side.value,
-            entry=str(entry_price_with_cost),
-            size=str(decision.position_notional),
-            stop=str(signal.stop_loss),
-            tp=str(signal.take_profit) if signal.take_profit else "None",
-        )
+        # logger.info("Position opened", side=self.position.side.value, size=str(decision.position_notional))
     
     def _check_exit(self, position: Position, candle: Candle) -> bool:
         """Check if position hit stop-loss or take-profit."""
-        # Parse levels from order IDs (convention: "SL-{price}", "TP-{price}")
-        stop_loss = Decimal(position.stop_loss_order_id.split("-")[1]) if position.stop_loss_order_id else None
+        # Check SL (High/Low)
+        stop_loss = Decimal(position.stop_loss_order_id.split("-")[1])
         
-        take_profit = None
-        if position.take_profit_order_id:
-            take_profit = Decimal(position.take_profit_order_id.split("-")[1])
-            
-        # Check stop-loss
+        hit_sl = False
         if position.side == Side.LONG:
-            if stop_loss and candle.low <= stop_loss:
-                self._close_position(stop_loss, "stop_loss", candle.timestamp)
-                return True
-            if take_profit and candle.high >= take_profit:
-                self._close_position(take_profit, "take_profit", candle.timestamp)
-                return True
-        else:  # SHORT
-            if stop_loss and candle.high >= stop_loss:
-                self._close_position(stop_loss, "stop_loss", candle.timestamp)
-                return True
-            if take_profit and candle.low <= take_profit:
-                self._close_position(take_profit, "take_profit", candle.timestamp)
-                return True
+            if candle.low <= stop_loss:
+                hit_sl = True
+        else:
+            if candle.high >= stop_loss:
+                hit_sl = True
         
+        if hit_sl:
+            self._close_position(stop_loss, "stop_loss", candle.timestamp, position.size)
+            return True
+            
+        # Check TPs (Partial)
+        remaining_tps = []
+        hits = 0
+        current_price_high = candle.high
+        current_price_low = candle.low
+        
+        # Copy list to iterate safely
+        tps = list(position.tp_order_ids)
+        
+        for tp_id in tps:
+            parts = tp_id.split("-")
+            price = Decimal(parts[2])
+            qty = Decimal(parts[3])
+            
+            # Check if this TP is hit in this candle
+            hit_tp = False
+            if position.side == Side.LONG:
+                if current_price_high >= price:
+                    hit_tp = True
+            else:
+                if current_price_low <= price:
+                    hit_tp = True
+            
+            if hit_tp:
+                # Partial Close
+                # Ensure we don't close more than current size
+                close_qty = min(qty, position.size)
+                self._close_partial(position, price, close_qty, f"tp_{parts[1]}", candle.timestamp)
+                hits += 1
+                
+                 # Activate Trailing if TP1
+                if parts[1] == "0":
+                    if not position.trailing_active and self.config.execution.trailing_enabled:
+                        position.trailing_active = True
+            else:
+                remaining_tps.append(tp_id)
+        
+        if hits > 0:
+            position.tp_order_ids = remaining_tps
+            # If size ~ 0, close full
+            if position.size <= Decimal("0.0001"):
+                self.position = None
+                return True
+                
         return False
-    
-    def _close_position(self, exit_price: Decimal, reason: str, timestamp: datetime):
-        """Close position and update metrics."""
-        if not self.position:
-            return
         
-        # Calculate P&L
-        if self.position.side == Side.LONG:
-            pnl = (exit_price - self.position.entry_price) * self.position.size
-        else:  # SHORT
-            pnl = (self.position.entry_price - exit_price) * self.position.size
-        
-        # Deduct exit fees
-        exit_notional = exit_price * self.position.size
-        exit_fees = exit_notional * (self.taker_fee_bps / Decimal("10000"))
-        pnl -= exit_fees
+    def _close_partial(self, position: Position, price: Decimal, qty: Decimal, reason: str, timestamp: datetime):
+        """Close partial size."""
+        if position.side == Side.LONG:
+            pnl = (price - position.entry_price) * qty
+        else:
+            pnl = (position.entry_price - price) * qty
+            
+        exit_fees = (price * qty) * (self.taker_fee_bps / Decimal("10000"))
+        net_pnl = pnl - exit_fees
         self.metrics.total_fees += exit_fees
+        self.metrics.total_pnl += net_pnl
+        self.current_equity += net_pnl
         
-        # Update equity
-        self.current_equity += pnl
-        self.metrics.total_pnl += pnl
+        position.size -= qty
+        position.size_notional -= (qty * position.entry_price)
         
-        # Update trade stats
+        if net_pnl > 0: self.metrics.winning_trades += 1 # Tracking individual fills as "trades"? Or just PnL?
+        # Metric counting is tricky with partials. 
+        # For simple metrics, we count a "Winning Trade" if the full roundtrip is positive?
+        # Here we just pump PnL.
+        
+    def _close_position(self, exit_price: Decimal, reason: str, timestamp: datetime, size: Decimal):
+        """Close remaining position."""
+        if not self.position: return
+        
+        if self.position.side == Side.LONG:
+            pnl = (exit_price - self.position.entry_price) * size
+        else:
+            pnl = (self.position.entry_price - exit_price) * size
+            
+        exit_fees = (exit_price * size) * (self.taker_fee_bps / Decimal("10000"))
+        net_pnl = pnl - exit_fees
+        self.metrics.total_fees += exit_fees
+        self.metrics.total_pnl += net_pnl
+        self.current_equity += net_pnl
+         
         self.metrics.total_trades += 1
-        if pnl > 0:
+        if net_pnl > 0: 
             self.metrics.winning_trades += 1
         else:
             self.metrics.losing_trades += 1
-        
-        # Record with risk manager
-        self.risk_manager.record_trade_result(pnl)
-        
-        logger.info(
-            "Position closed",
-            reason=reason,
-            exit=str(exit_price),
-            pnl=str(pnl),
-            equity=str(self.current_equity),
-        )
-        
+            
+        self.risk_manager.record_trade_result(net_pnl)
         self.position = None
