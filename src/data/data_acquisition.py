@@ -232,6 +232,49 @@ class DataAcquisition:
         """Check if data feed is healthy."""
         return self.data_feed_healthy
     
+    # ===== Multi-Asset Support (NEW) =====
+    
+    async def fetch_candles_for_all(self, symbols: List[str], timeframes: List[str] = None):
+        """
+        Fetch candles for multiple symbols in parallel.
+        
+        Args:
+            symbols: List of spot symbols
+            timeframes: List of timeframes (default: from config)
+        
+        Returns:
+            Dict[symbol][timeframe] -> List[Candle]
+        """
+        if timeframes is None:
+            timeframes = ["15m", "1h", "4h", "1d"]
+        
+        tasks = []
+        for symbol in symbols:
+            for tf in timeframes:
+                tasks.append(self.fetch_spot_historical(
+                    symbol, tf,
+                    datetime.now(timezone.utc) - timedelta(days=365),
+                    datetime.now(timezone.utc)
+                ))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Organize results
+        candle_buffers = {}
+        idx = 0
+        for symbol in symbols:
+            candle_buffers[symbol] = {}
+            for tf in timeframes:
+                result = results[idx]
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to fetch {symbol} {tf}", error=str(result))
+                    candle_buffers[symbol][tf] = []
+                else:
+                    candle_buffers[symbol][tf] = result
+                idx += 1
+        
+        return candle_buffers
+    
     @staticmethod
     def _timeframe_to_minutes(timeframe: str) -> int:
         """Convert timeframe string to minutes."""
