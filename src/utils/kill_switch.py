@@ -29,16 +29,26 @@ class KillSwitch:
     Prevents oscillation.
     """
     
-    def __init__(self):
-        """Initialize kill switch."""
+    def __init__(self, client=None):
+        """
+        Initialize kill switch.
+        
+        Args:
+            client: KrakenClient instance (optional, for executing actions)
+        """
         self.active = False
         self.latched = False
         self.reason: Optional[KillSwitchReason] = None
         self.activated_at: Optional[datetime] = None
+        self.client = client
         
         logger.info("Kill Switch initialized")
     
-    def activate(self, reason: KillSwitchReason, emergency: bool = False):
+    def set_client(self, client):
+        """Set the KrakenClient instance."""
+        self.client = client
+
+    async def activate(self, reason: KillSwitchReason, emergency: bool = False):
         """
         Activate kill switch.
         
@@ -59,11 +69,27 @@ class KillSwitch:
                 timestamp=self.activated_at.isoformat(),
             )
             
-            # TODO: Implement actual actions:
-            # 1. Cancel all open orders
-            # 2. If emergency: flatten all positions (market orders)
-            # 3. Halt all trading loops
-            
+            if self.client:
+                try:
+                    # 1. Cancel all open orders
+                    await self.client.cancel_all_orders()
+                    logger.info("Kill switch: All orders cancelled")
+                    
+                    # 2. If emergency: flatten all positions
+                    if emergency:
+                         positions = await self.client.get_all_futures_positions()
+                         for pos in positions:
+                             symbol = pos['symbol']
+                             try:
+                                 await self.client.close_position(symbol)
+                                 logger.warning(f"Kill switch: Emergency closed position for {symbol}")
+                             except Exception as e:
+                                 logger.error(f"Kill switch: Failed to close {symbol}", error=str(e))
+                except Exception as e:
+                    logger.critical("Kill switch action failed", error=str(e))
+            else:
+                 logger.critical("Kill switch: No client attached, cannot execute actions")
+
             logger.critical(
                 "Manual acknowledgment required to restart trading"
             )

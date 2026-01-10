@@ -71,29 +71,23 @@ class RiskManager:
         stop_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
         position_notional = (account_equity * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
         
-        # Calculate leverage needed to support this position
-        # We only use the leverage required, capped at max_leverage
-        leverage_needed = position_notional / account_equity
+        # Calculate leverage setting (User Request: Use fixed leverage setting to minimize margin usage)
+        # We set the order leverage to the MAX configured leverage (e.g. 10x)
+        # This allocates 10% margin, leaving 90% as buffer.
+        # This is safer than using 1x leverage which locks 100% equity as margin.
+        leverage = Decimal(str(self.config.max_leverage))
+
+        # Check if we have enough equity to cover the margin at this leverage
+        # margin_required = position_notional / leverage
+        # if margin_required > account_equity: reject (Safety check)
         
-        if leverage_needed > Decimal(str(self.config.max_leverage)):
-             leverage = Decimal(str(self.config.max_leverage))
-             # If we need more leverage than allowed, we must reduce size (or reject)
-             # Option A: Reduce size to fit max leverage (Conservative)
-             # Option B: Reject (Strict Risk) -> We choose Reject for now to respect risk_per_trade
+        # Determine Effective Leverage for monitoring
+        effective_leverage = position_notional / account_equity
+        if effective_leverage > leverage:
+             # This should be caught by the margin check, but explicit check:
              rejection_reasons.append(
-                f"Required leverage {leverage_needed:.2f}× exceeds cap of {self.config.max_leverage}×"
+                f"Effective leverage {effective_leverage:.2f}× exceeds max {leverage}×"
             )
-        else:
-            # Use minimum efficient leverage (e.g. 1x if fully funded, or actual needed)
-            # Actually, for Futures, 'leverage' usually sets the Margin Mode.
-            # If we set leverage=10x, we allocate 1/10th margin.
-            # If we set leverage=1x, we allocate 100% margin.
-            # To minimize liquidation risk, we should use the CONFIG MAX LEVERAGE for the order
-            # (giving us max buffer), but Monitor proper position sizing.
-            # However, the user asked to "Choose leverage = min(max, needed)".
-            # Let's stick to the user's request:
-            leverage = max(Decimal("1"), leverage_needed) # At least 1x
-            leverage = min(leverage, Decimal(str(self.config.max_leverage)))
 
         margin_required = position_notional / leverage
         

@@ -109,6 +109,11 @@ class OrderIntent:
     stop_loss_spot: Decimal
     take_profit_spot: Optional[Decimal]
 
+    # Futures execution levels (converted)
+    entry_price_futures: Optional[Decimal] = None
+    stop_loss_futures: Optional[Decimal] = None
+    take_profit_futures: Optional[Decimal] = None
+
 
 @dataclass
 class Order:

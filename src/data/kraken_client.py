@@ -227,6 +227,19 @@ class KrakenClient:
         Returns:
             Position dict with keys: size, entry_price, liquidation_price, unrealized_pnl
         """
+        all_positions = await self.get_all_futures_positions()
+        for pos in all_positions:
+            if pos['symbol'] == symbol:
+                return pos
+        return None
+
+    async def get_all_futures_positions(self) -> List[Dict]:
+        """
+        Get all open futures positions from Kraken Futures API.
+        
+        Returns:
+            List of position dicts
+        """
         await self.private_limiter.wait_for_token()
         
         if not self.futures_api_key or not self.futures_api_secret:
@@ -240,27 +253,25 @@ class KrakenClient:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        logger.error("Futures API error", status=response.status, error=error_text)
                         raise Exception(f"Futures API error: {error_text}")
                     
                     data = await response.json()
                     
-                    # Find position for this symbol
-                    for position in data.get('openPositions', []):
-                        if position.get('symbol') == symbol:
-                            return {
-                                'size': Decimal(str(position.get('size', 0))),
-                                'entry_price': Decimal(str(position.get('price', 0))),
-                                'liquidation_price': Decimal(str(position.get('liquidationPrice', 0))),
-                                'unrealized_pnl': Decimal(str(position.get('unrealizedPnl', 0))),
-                                'side': 'long' if float(position.get('size', 0)) > 0 else 'short',
-                            }
+                    positions = []
+                    for pos in data.get('openPositions', []):
+                        positions.append({
+                            'symbol': pos.get('symbol'),
+                            'size': Decimal(str(pos.get('size', 0))),
+                            'entry_price': Decimal(str(pos.get('price', 0))),
+                            'liquidation_price': Decimal(str(pos.get('liquidationPrice', 0))),
+                            'unrealized_pnl': Decimal(str(pos.get('unrealizedPnl', 0))),
+                            'side': 'long' if float(pos.get('size', 0)) > 0 else 'short',
+                        })
                     
-                    # No position found
-                    return None
+                    return positions
             
         except Exception as e:
-            logger.error("Failed to fetch futures position", symbol=symbol, error=str(e))
+            logger.error("Failed to fetch all futures positions", error=str(e))
             raise
     
     async def get_futures_mark_price(self, symbol: str) -> Decimal:
@@ -494,6 +505,77 @@ class KrakenClient:
         except Exception as e:
             logger.error("Failed to cancel futures order", order_id=order_id, error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
+
+    async def cancel_all_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Cancel all open futures orders.
+        
+        Args:
+            symbol: Optional symbol to filter cancellations
+            
+        Returns:
+            List of cancellation responses
+        """
+        if not self.futures_exchange:
+            raise ValueError("Futures credentials not configured")
+            
+        try:
+            if symbol:
+                # CCXT cancelAllOrders often supports symbol
+                await self.futures_exchange.cancel_all_orders(symbol)
+                logger.info("All futures orders cancelled", symbol=symbol)
+                return [{"result": "success", "symbol": symbol}]
+            else:
+                # Iterate all open orders if global cancel not supported or to be safe
+                open_orders = await self.get_futures_open_orders()
+                results = []
+                for order in open_orders:
+                    try:
+                        await self.cancel_futures_order(order['id'], order['symbol'])
+                        results.append({"id": order['id'], "status": "cancelled"})
+                    except Exception as e:
+                        results.append({"id": order['id'], "status": "failed", "error": str(e)})
+                return results
+                
+        except Exception as e:
+            logger.error("Failed to cancel all orders", error=str(e))
+            raise
+
+    async def close_position(self, symbol: str) -> Dict[str, Any]:
+        """
+        Close an entire position at market price.
+        
+        Args:
+            symbol: Futures symbol
+            
+        Returns:
+            Order result for the closing trade
+        """
+        position = await self.get_futures_position(symbol)
+        if not position or position['size'] == 0:
+            logger.info("No position to close", symbol=symbol)
+            return {"status": "no_position"}
+            
+        # Determine opposite side
+        size = position['size'] # Decimal
+        current_side = position['side']  # 'long' or 'short'
+        close_side = 'sell' if current_side == 'long' else 'buy'
+        
+        logger.warning(
+            "Closing position (Market)",
+            symbol=symbol,
+            size=str(size),
+            side=close_side
+        )
+        
+        # Place reduce-only market order
+        return await self.place_futures_order(
+            symbol=symbol,
+            side=close_side,
+            order_type='market',
+            size=size,
+            reduce_only=True
+        )
 
     async def close(self):
         """Cleanup resources."""

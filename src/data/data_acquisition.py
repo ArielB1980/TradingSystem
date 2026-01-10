@@ -12,7 +12,7 @@ import asyncio
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from src.data.kraken_client import Kraken Client, KrakenWebSocket
+from src.data.kraken_client import KrakenClient, KrakenWebSocket
 from src.data.orderbook import OrderBook
 from src.domain.models import Candle
 from src.storage.repository import save_candle
