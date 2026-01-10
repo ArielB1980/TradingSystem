@@ -1,0 +1,139 @@
+# Configuration
+
+## Exchange Settings
+exchange:
+  name: "kraken"
+  spot_markets:
+    - "BTC/USD"
+    - "ETH/USD"
+  futures_markets:
+    - "BTCUSD-PERP"
+    - "ETHUSD-PERP"
+
+## Risk Management
+risk:
+  # Position sizing
+  risk_per_trade_pct: 0.005  # 0.5% of account equity per trade
+  max_leverage: 10.0  # Hard cap (actual leverage determined by stop distance)
+  
+  # Liquidation safety
+  min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
+  
+  # Portfolio limits
+  max_concurrent_positions: 2
+  daily_loss_limit_pct: 0.02  # 2% of equity
+  loss_streak_cooldown: 3  # Halt after 3 consecutive losses
+  
+  # Basis guards
+  basis_max_pct: 0.0075  # 0.75% max spot-perp divergence for entry
+  basis_max_post_pct: 0.0075  # Post-entry divergence limit (same as entry)
+  
+  # Cost-aware validation
+  max_fee_funding_rr_distortion_pct: 0.10  # Reject if fees+funding distort R:R > 10%
+  funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
+
+## Strategy Parameters
+strategy:
+  # Timeframes
+  bias_timeframes:
+    - "4h"
+    - "1d"
+  execution_timeframes:
+    - "15m"
+    - "1h"
+  
+  # Indicators
+  ema_period: 200
+  adx_period: 14
+  adx_threshold: 25.0  # Minimum ADX for trend strength
+  atr_period: 14
+  atr_multiplier_stop: 1.5  # ATR multiplier for stop-loss buffer
+  rsi_period: 14
+  rsi_divergence_enabled: false  # Optional confirmation only
+  
+  # SMC Parameters
+  orderblock_lookback: 50
+  fvg_min_size_pct: 0.001  # 0.1% minimum gap size
+  bos_confirmation_candles: 3
+
+## Execution Settings
+execution:
+  # Price conversion
+  use_mark_price: true  # Always true for safety-critical operations
+  
+  # Order settings
+  default_order_type: "limit"
+  slippage_tolerance_pct: 0.001  # 0.1%
+  order_timeout_seconds: 30
+  max_retries: 3
+  retry_backoff_seconds: 2
+  
+  # Pyramiding
+  pyramiding_enabled: false  # Default: no adding to positions
+
+## Data Acquisition
+data:
+  # WebSocket settings
+  ws_reconnect_max_retries: 10
+  ws_reconnect_backoff_seconds: 5
+  
+  # Data validation
+  max_gap_seconds: 60  # Alert if data gap > 1 minute
+  
+  # Storage
+  database_url: "${DATABASE_URL}"  # From environment variable
+  
+## Reconciliation
+reconciliation:
+  # Event-driven: immediate on fills, order updates, margin updates
+  periodic_interval_seconds: 15
+  
+## Monitoring
+monitoring:
+  # Logging
+  log_level: "INFO"  # DEBUG/INFO/WARNING/ERROR/CRITICAL
+  log_format: "json"
+  
+  # Alerts
+  alert_margin_usage_threshold_pct: 0.70  # 70%
+  alert_liquidation_buffer_threshold_pct: 0.35  # Alert if < 35%
+  alert_repeated_rejections_count: 3
+  alert_repeated_rejections_window_seconds: 300
+  
+  # Alert delivery (configure as needed)
+  alert_methods:
+    - "log"  # Always log alerts
+    # - "email"
+    # - "telegram"
+    # - "slack"
+
+## Backtesting
+backtest:
+  # Fill assumptions
+  assume_maker_fills: true  # Assume limit orders fill at maker fee
+  slippage_bps: 2  # 2 basis points average slippage
+  
+  # Cost modeling
+  maker_fee_bps: 2  # Kraken Futures maker fee (check current rates)
+  taker_fee_bps: 5  # Kraken Futures taker fee
+  
+  # Basis modeling
+  basis_model: "static"  # static / stochastic
+  static_basis_bps: 5  # 5 basis points static basis assumption
+
+## Paper Trading
+paper:
+  # Simulation settings
+  simulate_realistic_slippage: true
+  simulate_fill_delays_ms: 100
+
+## Live Trading
+live:
+  # Safety gates
+  require_paper_success: true
+  min_paper_days: 30
+  min_paper_trades: 50
+  max_paper_drawdown_pct: 0.15  # Paper must stay within 15% DD
+
+## Environment
+environment: "dev"  # dev / paper / prod

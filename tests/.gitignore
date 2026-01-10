@@ -1,0 +1,3 @@
+# Test placeholder files
+*.pyc
+__pycache__/
