@@ -130,6 +130,35 @@ class BacktestEngine:
             
             # Check existing position
             if self.position:
+                # Accrue funding costs (simulated every hour, applied 3x daily in reality)
+                # Funding typically charged every 8 hours
+                hours_since_open = (current_candle.timestamp - self.position.opened_at).total_seconds() / 3600
+                funding_intervals = int(hours_since_open / 8)  # Every 8 hours
+                
+                if not hasattr(self.position, '_last_funding_interval'):
+                    self.position._last_funding_interval = 0
+                
+                # Apply funding if we crossed a new 8-hour interval
+                if funding_intervals > self.position._last_funding_interval:
+                    intervals_to_charge = funding_intervals - self.position._last_funding_interval
+                    
+                    # Funding rate per 8h interval = daily_bps / 3
+                    funding_rate_per_interval = Decimal(str(self.config.risk.funding_rate_daily_bps)) / Decimal("3") / Decimal("10000")
+                    funding_cost = self.position.size_notional * funding_rate_per_interval * intervals_to_charge
+                    
+                    # Deduct from equity
+                    self.current_equity -= funding_cost
+                    self.metrics.total_fees += funding_cost  # Track as fee
+                    
+                    self.position._last_funding_interval = funding_intervals
+                    
+                    logger.debug(
+                        "Funding cost applied",
+                        intervals=intervals_to_charge,
+                        cost=str(funding_cost),
+                        total_fees=str(self.metrics.total_fees)
+                    )
+                
                 # Simulate updates
                 # Use current candle High/Low/Close to simulate price movement within the hour
                 # Ideally we check High/Low for Exits, and Close for trailing updates?

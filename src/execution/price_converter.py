@@ -49,8 +49,16 @@ class PriceConverter:
         # Entry at current mark (or slightly better if using limit orders)
         entry_price_futures = futures_mark_price
         
+        # Validate signal type (only accept entry signals)
+        if signal.signal_type.value not in ["long", "short"]:
+            raise ValueError(
+                f"PriceConverter only handles entry signals (LONG/SHORT). "
+                f"Received: {signal.signal_type.value}. "
+                f"Exit signals should be handled by executor directly."
+            )
+        
         # Determine side
-        if signal.signal_type.value in ["long", "exit_short"]:
+        if signal.signal_type.value == "long":
             side = Side.LONG
             # Stop below entry
             stop_loss_futures = futures_mark_price * (Decimal("1") - stop_distance_pct)
@@ -59,7 +67,7 @@ class PriceConverter:
                 take_profit_futures = futures_mark_price * (Decimal("1") + tp_distance_pct)
             else:
                 take_profit_futures = None
-        else:  # short or exit_long
+        else:  # short
             side = Side.SHORT
             # Stop above entry
             stop_loss_futures = futures_mark_price * (Decimal("1") + stop_distance_pct)
