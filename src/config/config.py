@@ -13,6 +13,12 @@ from pathlib import Path
 class ExchangeConfig(BaseSettings):
     """Exchange configuration."""
     name: str = "kraken"
+    
+    # Market Discovery (for multi-asset expansion)
+    use_market_discovery: bool = True
+    discovery_refresh_hours: int = 24
+    
+    # Legacy: Hardcoded markets (used if use_market_discovery=False)
     spot_markets: List[str] = ["BTC/USD", "ETH/USD"]
     futures_markets: List[str] = ["BTCUSD-PERP", "ETHUSD-PERP"]
 
@@ -79,6 +85,28 @@ class StrategyConfig(BaseSettings):
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"
     fvg_partial_fill_pct: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class AssetConfig(BaseSettings):
+    """Asset selection and filtering configuration."""
+    mode: Literal["auto", "whitelist", "blacklist"] = Field(default="auto")
+    whitelist: List[str] = Field(default_factory=list)  # e.g., ["BTC/USD", "ETH/USD"]
+    blacklist: List[str] = Field(default_factory=list)  # e.g., ["DOGE/USD"]
+    
+    @field_validator('mode')
+    @classmethod
+    def validate_mode(cls, v):
+        if v not in ["auto", "whitelist", "blacklist"]:
+            raise ValueError(f"Invalid mode: {v}. Must be auto, whitelist, or blacklist")
+        return v
+
+
+class LiquidityFilters(BaseSettings):
+    """Market eligibility filters."""
+    min_spot_volume_usd_24h: Decimal = Field(default=Decimal("5000000"))  # $5M minimum
+    min_futures_open_interest: Optional[Decimal] = None
+    max_spread_pct: Decimal = Field(default=Decimal("0.0005"))  # 0.05%
+    min_price_usd: Decimal = Field(default=Decimal("0.01"))  # Avoid dust coins
 
 
 class ExecutionConfig(BaseSettings):
@@ -193,6 +221,8 @@ class Config(BaseSettings):
     exchange: ExchangeConfig
     risk: RiskConfig
     strategy: StrategyConfig
+    assets: AssetConfig = Field(default_factory=AssetConfig)  # NEW
+    liquidity_filters: LiquidityFilters = Field(default_factory=LiquidityFilters)  # NEW
     execution: ExecutionConfig
     data: DataConfig
     reconciliation: ReconciliationConfig
