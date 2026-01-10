@@ -51,6 +51,8 @@ class RiskManager:
         spot_price: Decimal,
         perp_mark_price: Decimal,
         exchange_liquidation_price: Optional[Decimal] = None,
+        futures_entry_price: Optional[Decimal] = None,
+        futures_stop_loss: Optional[Decimal] = None,
     ) -> RiskDecision:
         """
         Validate proposed trade against all risk limits.
@@ -61,14 +63,24 @@ class RiskManager:
             spot_price: Current spot price
             perp_mark_price: Current perpetual mark price
             exchange_liquidation_price: Exchange-reported liquidation price (if position exists)
+            futures_entry_price: Converted futures entry price (for accurate risk calc)
+            futures_stop_loss: Converted futures stop price (for accurate risk calc)
         
         Returns:
             RiskDecision with approval status and details
         """
         rejection_reasons = []
         
-        # Calculate position size (CORRECT FORMULA - leverage independent)
-        stop_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
+        # Calculate position size using FUTURES prices if available (more accurate)
+        # Otherwise fall back to spot prices
+        if futures_entry_price and futures_stop_loss:
+            entry_for_risk = futures_entry_price
+            stop_for_risk = futures_stop_loss
+        else:
+            entry_for_risk = signal.entry_price
+            stop_for_risk = signal.stop_loss
+        
+        stop_distance_pct = abs(entry_for_risk - stop_for_risk) / entry_for_risk
         position_notional = (account_equity * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
         
         # Calculate leverage setting (Fixed target as per PRD)
@@ -92,6 +104,7 @@ class RiskManager:
             leverage=str(leverage),
             margin_required=str(margin_required),
             stop_distance_pct=str(stop_distance_pct),
+            using_futures_prices=bool(futures_entry_price),
         )
         
         # Calculate liquidation buffer (if we have exchange-reported liq price)
