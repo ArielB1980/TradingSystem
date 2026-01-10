@@ -71,25 +71,20 @@ class RiskManager:
         stop_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
         position_notional = (account_equity * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
         
-        # Calculate leverage setting (User Request: Use fixed leverage setting to minimize margin usage)
-        # We set the order leverage to the MAX configured leverage (e.g. 10x)
-        # This allocates 10% margin, leaving 90% as buffer.
-        # This is safer than using 1x leverage which locks 100% equity as margin.
-        leverage = Decimal(str(self.config.max_leverage))
+        # Calculate leverage setting (Fixed target as per PRD)
+        # We set the order leverage to the configured target (e.g. 10x)
+        # This allocates margin based on the SETTING, leaving rest as buffer.
+        requested_leverage = Decimal(str(self.config.max_leverage))
 
-        # Check if we have enough equity to cover the margin at this leverage
-        # margin_required = position_notional / leverage
-        # if margin_required > account_equity: reject (Safety check)
-        
-        # Determine Effective Leverage for monitoring
+        # Determine Effective Leverage for monitoring ONLY
         effective_leverage = position_notional / account_equity
-        if effective_leverage > leverage:
-             # This should be caught by the margin check, but explicit check:
+        if effective_leverage > requested_leverage:
              rejection_reasons.append(
-                f"Effective leverage {effective_leverage:.2f}× exceeds max {leverage}×"
+                f"Effective leverage {effective_leverage:.2f}× exceeds max {requested_leverage}×"
             )
 
-        margin_required = position_notional / leverage
+        margin_required = position_notional / requested_leverage
+        leverage = requested_leverage
         
         logger.debug(
             "Position sizing calculated",

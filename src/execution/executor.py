@@ -197,7 +197,14 @@ class Executor:
                     tp_order_id=tp_order.order_id,
                     price=str(take_profit_price),
                 )
+        except Exception as e:
+            logger.error(
+                "Failed to place protective orders",
+                entry_order_id=entry_order.order_id,
+                error=str(e)
+            )
             
+        return sl_order, tp_order
     async def update_protective_orders(
         self,
         symbol: str,

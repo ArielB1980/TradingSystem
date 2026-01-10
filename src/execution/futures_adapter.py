@@ -114,11 +114,29 @@ class FuturesAdapter:
         # Map side to Kraken format
         kraken_side = "buy" if side == Side.LONG else "sell"
         
-        # Convert USD notional to contract size
-        # For BTC perpetual, contract size is typically $1 per contract
-        # For real implementation, fetch contract specs from exchange
-        # Simplified assumption: 1 contract = $1 USD notional
-        contract_size = size_notional
+        # 1. Fetch instrument metadata to get contract size
+        instruments = await self.kraken_client.get_futures_instruments()
+        instr = next((i for i in instruments if i['symbol'].upper() == symbol.upper()), None)
+        
+        if not instr:
+            raise ValueError(f"Instrument specs for {symbol} not found")
+        
+        contract_size = Decimal(str(instr.get('contractSize', 1)))
+        
+        # 2. Convert USD notional to contract count
+        # Formula: size_contracts = Position Notional / (Entry Price * Contract Multiplier)
+        size_contracts = (size_notional / (price * contract_size)).quantize(
+            Decimal("0.0001"), rounding="ROUND_DOWN"
+        )
+        
+        logger.info(
+            "Converting notional to contracts",
+            symbol=symbol,
+            notional=float(size_notional),
+            price=float(price),
+            multiplier=float(contract_size),
+            contracts=float(size_contracts)
+        )
         
         try:
             # Place order via Kraken Futures API
@@ -126,7 +144,7 @@ class FuturesAdapter:
                 symbol=symbol,
                 side=kraken_side,
                 order_type=kraken_order_type,
-                size=contract_size,
+                size=float(size_contracts),
                 price=price,
                 stop_price=price if order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT] else None,
                 reduce_only=reduce_only,

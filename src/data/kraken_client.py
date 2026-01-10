@@ -274,6 +274,24 @@ class KrakenClient:
             logger.error("Failed to fetch all futures positions", error=str(e))
             raise
     
+    async def get_futures_instruments(self) -> List[Dict]:
+        """
+        Fetch all futures instruments and their specifications.
+        Required to get contractSize for conversion.
+        """
+        await self.public_limiter.wait_for_token()
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise Exception(f"Futures API error: {await response.text()}")
+                    data = await response.json()
+                    return data.get('instruments', [])
+        except Exception as e:
+            logger.error("Failed to fetch futures instruments", error=str(e))
+            raise
+
     async def get_futures_mark_price(self, symbol: str) -> Decimal:
         """
         Get current mark price from Kraken Futures official feed.
@@ -294,8 +312,7 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             
             import ssl
-            ssl_context = ssl.SSLContext()
-            ssl_context.verify_mode = ssl.CERT_NONE
+            ssl_context = ssl.create_default_context()
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url) as response:

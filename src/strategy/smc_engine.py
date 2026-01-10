@@ -279,200 +279,100 @@ class SMCEngine:
     def _find_order_block(self, candles: List[Candle], bias: str) -> Optional[dict]:
         """
         Find SMC-style Order Block:
-        - Bullish OB: last DOWN candle before an impulsive UP move
-        - Bearish OB: last UP candle before an impulsive DOWN move
+        - Bullish OB: last DOWN candle before an impulsive UP move (displacement)
+        - Bearish OB: last UP candle before an impulsive DOWN move (displacement)
         
         Returns a zone: {'type', 'index', 'low', 'high', 'timestamp', 'price'}
         """
         if len(candles) < 3:
             return None
             
-        lookback = min(self.config.orderblock_lookback, len(candles) - 2)
+        lookback = min(self.config.orderblock_lookback, len(candles) - 3)
         
-        # Proxy for "typical move" (median of recent ranges) to check displacement
-        start_idx = max(0, len(candles) - lookback - 10)
-        recent = candles[start_idx:]
-        ranges = sorted([(c.high - c.low) for c in recent if c.high > c.low])
-        
-        if not ranges:
-            return None
-            
-        typical_range = ranges[len(ranges) // 2]
-        
-        # Configurable displacement multiple (hardcoded to 2.0 for now as per user suggestion, or read from config if added)
-        # Using 1.5 as 2.0 might be too strict for this timeframe
+        # Calculate volatility-adjusted displacement threshold
+        recent_ranges = [abs(c.high - c.low) for c in candles[-20:]]
+        typical_range = sorted(recent_ranges)[len(recent_ranges)//2]
         min_displacement = typical_range * Decimal("1.5")
         
-        start = len(candles) - 2
-        end = len(candles) - lookback - 2
-        
-        for i in range(start, end, -1):
-            # Potential Order Block candidate
-            ob = candles[i]
-            
-            # Look for displacement in subsequent candles
-            # We look at the immediate next candle (i+1) for the impulsive move start
+        # Iterate backwards to find the most recent valid OB
+        for i in range(len(candles) - 2, len(candles) - lookback - 2, -1):
+            cand = candles[i]
             nxt = candles[i + 1]
             
-            # Calculate displacement validation (body size or move magnitude)
-            # Standard OB: The candle BEFORE the big move.
-            
             if bias == "bullish":
-                # Bullish OB Criteria:
-                # 1. Candidate is a DOWN candle (Red)
-                # 2. Followed by strong rejection/upward move
-                ob_is_down = ob.close < ob.open
-                
-                if ob_is_down:
-                    # Check displacement: price breaks above OB high with conviction
-                    # Simplified: Next candle closes above OB high OR subsequent swing breaks structure.
-                    # Here we check immediate conviction: Next candle is UP and has large body/range
-                    
-                    displacement_move = nxt.close - ob.high
-                    valid_displacement = displacement_move > 0 and (nxt.high - nxt.low) >= min_displacement
-                    
-                    if valid_displacement:
-                         return {
+                # 1. Origin must be a bearish candle
+                if cand.close < cand.open:
+                    # 2. Must be followed by an impulsive move up (displacement)
+                    # The displacement must break the high of the OB candle
+                    move = nxt.close - cand.high
+                    if move > 0 and (nxt.high - nxt.low) >= min_displacement:
+                        return {
                             "type": "bullish",
                             "index": i,
-                            "timestamp": ob.timestamp,
-                            "low": ob.low,
-                            "high": ob.high,
-                            "price": ob.high # Entry at top of OB
+                            "timestamp": cand.timestamp,
+                            "low": cand.low,
+                            "high": cand.high,
+                            "price": cand.high # Entry at OB high
                         }
-                        
             else: # bearish
-                # Bearish OB Criteria:
-                # 1. Candidate is an UP candle (Green)
-                # 2. Followed by strong downward move
-                ob_is_up = ob.close > ob.open
-                
-                if ob_is_up:
-                    displacement_move = ob.low - nxt.close
-                    valid_displacement = displacement_move > 0 and (nxt.high - nxt.low) >= min_displacement
-                    
-                    if valid_displacement:
+                # 1. Origin must be a bullish candle
+                if cand.close > cand.open:
+                    # 2. Must be followed by an impulsive move down
+                    move = cand.low - nxt.close
+                    if move > 0 and (nxt.high - nxt.low) >= min_displacement:
                         return {
                             "type": "bearish",
                             "index": i,
-                            "timestamp": ob.timestamp,
-                            "low": ob.low,
-                            "high": ob.high,
-                            "price": ob.low # Entry at bottom of OB
+                            "timestamp": cand.timestamp,
+                            "low": cand.low,
+                            "high": cand.high,
+                            "price": cand.low # Entry at OB low
                         }
-        
         return None
     
     def _find_fair_value_gap(self, candles: List[Candle], bias: str) -> Optional[dict]:
         """
-        Find most recent FVG (3-candle).
-        Bullish FVG if c1.high < c3.low, gap zone = [c1.high, c3.low]
-        Bearish FVG if c1.low  > c3.high, gap zone = [c3.high, c1.low]
-
-        Mitigation modes:
-        - touched: any re-entry into the gap
-        - partial: re-entry >= X% of gap depth
-        - full: price crosses the far boundary (gap fully filled)
+        Find most recent UNMITIGATED FVG.
         """
         if len(candles) < 3:
             return None
 
-        mode = getattr(self.config, "fvg_mitigation_mode", "touched")
-        partial_fill = Decimal(str(getattr(self.config, "fvg_partial_fill_pct", 0.5)))
-
+        # Iterate backwards from current candle
         for i in range(len(candles) - 3, -1, -1):
-            c1, c2, c3 = candles[i], candles[i + 1], candles[i + 2]
-            future = candles[i + 3:]
-
-            if bias == "bullish":
-                gap_bottom = c1.high
-                gap_top = c3.low
-                gap = gap_top - gap_bottom
-
-                if gap <= 0:
-                    continue
-
-                gap_mid = (gap_top + gap_bottom) / Decimal("2")
-                if gap_mid <= 0:
-                    continue
-
-                if (gap / gap_mid) <= Decimal(str(self.config.fvg_min_size_pct)):
-                    continue
-
-                # Mitigation check
+            c1, c2, c3 = candles[i], candles[i+1], candles[i+2]
+            
+            # Check for gap formation
+            gap_zone = None
+            if bias == "bullish" and c3.low > c1.high:
+                gap_zone = (c1.high, c3.low)
+            elif bias == "bearish" and c1.low > c3.high:
+                gap_zone = (c3.high, c1.low)
+                
+            if gap_zone:
+                # Check for mitigation by any candle AFTER the gap formation (from i+3 to end)
+                # If any candle's wick enters the gap, it is mitigated.
                 mitigated = False
-                for fc in future:
-                    if mode == "touched":
-                        if fc.low <= gap_top:  # entered gap
+                for j in range(i + 3, len(candles)):
+                    fc = candles[j]
+                    if bias == "bullish":
+                        if fc.low <= gap_zone[1]: # Price returned to or below gap top
                             mitigated = True
                             break
-                    elif mode == "partial":
-                        # entered at least X% into gap from top
-                        threshold = gap_top - (gap * partial_fill)
-                        if fc.low <= threshold:
+                    else:
+                        if fc.high >= gap_zone[0]: # Price returned to or above gap bottom
                             mitigated = True
                             break
-                    elif mode == "full":
-                        if fc.low <= gap_bottom:  # fully filled
-                            mitigated = True
-                            break
-
+                
                 if not mitigated:
                     return {
-                        "type": "bullish",
+                        "type": "bullish" if bias == "bullish" else "bearish",
                         "index": i,
                         "timestamp": c2.timestamp,
-                        "bottom": gap_bottom,
-                        "top": gap_top,
-                        "size": gap,
-                        "price": gap_top, # Entry often at top of gap (retest)
+                        "bottom": gap_zone[0],
+                        "top": gap_zone[1],
+                        "size": gap_zone[1] - gap_zone[0],
+                        "price": gap_zone[1] if bias == "bullish" else gap_zone[0]
                     }
-
-            else:  # bearish
-                # Standard Bearish FVG: Low of candle 1 > High of candle 3
-                # Gap is between High[3] and Low[1]
-                gap_top = c1.low
-                gap_bottom = c3.high
-                gap = gap_top - gap_bottom
-
-                if gap <= 0:
-                    continue
-
-                gap_mid = (gap_top + gap_bottom) / Decimal("2")
-                if gap_mid <= 0:
-                    continue
-
-                if (gap / gap_mid) <= Decimal(str(self.config.fvg_min_size_pct)):
-                    continue
-
-                mitigated = False
-                for fc in future:
-                    if mode == "touched":
-                        if fc.high >= gap_bottom:  # Entered gap from below
-                            mitigated = True
-                            break
-                    elif mode == "partial":
-                        # Retraced at least X% into the gap
-                        threshold = gap_bottom + (gap * partial_fill)
-                        if fc.high >= threshold:
-                            mitigated = True
-                            break
-                    elif mode == "full":
-                        if fc.high >= gap_top:  # Fully filled
-                            mitigated = True
-                            break
-
-                if not mitigated:
-                    return {
-                        "type": "bearish",
-                        "index": i,
-                        "timestamp": c2.timestamp,
-                        "bottom": gap_bottom,
-                        "top": gap_top,
-                        "size": gap,
-                        "price": gap_bottom, # Entry often at bottom of gap (retest)
-                    }
-
         return None
     
     def _detect_break_of_structure(self, candles: List[Candle], bias: str) -> bool:

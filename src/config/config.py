@@ -36,7 +36,7 @@ class RiskConfig(BaseSettings):
     basis_max_post_pct: float = Field(default=0.0075, ge=0.001, le=0.02)
     
     # Cost-aware validation
-    max_fee_funding_rr_distortion_pct: float = Field(default=0.10, ge=0.05, le=0.30)
+    max_fee_funding_rr_distortion_pct: float = Field(default=0.20, ge=0.05, le=0.30)
     rr_distortion_strict_limit_pct: float = Field(default=0.10, ge=0.05, le=0.30)
     tight_stop_threshold_pct: float = Field(default=0.015, ge=0.005, le=0.05)
     funding_cost_threshold_pct: float | None = Field(default=0.02, ge=0.0, le=0.10)
