@@ -36,7 +36,11 @@ class RiskConfig(BaseSettings):
     # Portfolio limits
     max_concurrent_positions: int = Field(default=2, ge=1, le=5)
     daily_loss_limit_pct: float = Field(default=0.02, ge=0.01, le=0.10)
-    loss_streak_cooldown: int = Field(default=3, ge=2, le=10)
+    
+    # Loss streak protection (time-based, not permanent block)
+    loss_streak_cooldown: int = Field(default=3, ge=2, le=10)  # Trigger threshold
+    loss_streak_pause_minutes: int = Field(default=240, ge=60, le=720)  # Pause duration (4h default)
+    loss_streak_min_loss_bps: float = Field(default=20.0, ge=5.0, le=100.0)  # Only count losses > X bps
     
     # Basis guards
     basis_max_pct: float = Field(default=0.0075, ge=0.001, le=0.02)

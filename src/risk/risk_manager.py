@@ -35,12 +35,17 @@ class RiskManager:
             config: Risk configuration
         """
         self.config = config
+        self.basis_guard = BasisGuard(
+            basis_max_pct=config.basis_max_pct,
+            basis_max_post_pct=config.basis_max_post_pct,
+        )
         
         # Portfolio state tracking
         self.current_positions: List[Position] = []
         self.daily_pnl = Decimal("0")
         self.consecutive_losses = 0
         self.daily_start_equity = Decimal("0")
+        self.cooldown_until: Optional[datetime] = None  # Time-based cooldown (NEW)
         
         logger.info("Risk Manager initialized", config=config.model_dump())
     
@@ -163,10 +168,14 @@ class RiskManager:
                 f"Daily loss limit exceeded: {daily_loss_pct:.1%} > {self.config.daily_loss_limit_pct:.1%}"
             )
         
-        # Loss streak cooldown
-        if self.consecutive_losses >= self.config.loss_streak_cooldown:
+        # Time-based loss streak cooldown (NEW - prevents deadlock)
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        
+        if self.cooldown_until and now < self.cooldown_until:
+            remaining_minutes = int((self.cooldown_until - now).total_seconds() / 60)
             rejection_reasons.append(
-                f"Loss streak cooldown: {self.consecutive_losses} consecutive losses"
+                f"Loss streak cooldown active: {remaining_minutes} minutes remaining until {self.cooldown_until.strftime('%H:%M UTC')}"
             )
         
         # **REGIME-SPECIFIC VALIDATION** (NEW)
@@ -406,25 +415,66 @@ class RiskManager:
         """Update current positions for portfolio tracking."""
         self.current_positions = positions
     
-    def record_trade_result(self, net_pnl: Decimal):
+    def record_trade_result(self, net_pnl: Decimal, account_equity: Decimal):
         """
         Record trade result for daily P&L and streak tracking.
         
+        CRITICAL CHANGE: Time-based cooldown instead of permanent block.
+        - Only count "meaningful" losses (> X bps of equity)
+        - On streak trigger: pause for X minutes, then AUTO-RESUME
+        - Reset consecutive_losses on pause (prevents deadlock)
+        
         Args:
-            net_pnl: Net P&L from closed trade
+            net_pnl: Net P&L from the trade (including fees/funding)
+            account_equity: Current account equity for meaningful loss check
         """
+        from datetime import datetime, timezone, timedelta
+        
         self.daily_pnl += net_pnl
         
-        if net_pnl < 0:
+        # Only count MEANINGFUL losses toward streak
+        # Prevents noise from shutting down the system
+        loss_bps = abs(net_pnl) / account_equity * Decimal("10000") if account_equity > 0 else Decimal("0")
+        min_loss_bps = Decimal(str(self.config.loss_streak_min_loss_bps))
+        
+        if net_pnl < 0 and loss_bps >= min_loss_bps:
+            # This is a meaningful loss
             self.consecutive_losses += 1
-        else:
+            
+            # Check if we hit the streak threshold
+            if self.consecutive_losses >= self.config.loss_streak_cooldown:
+                # Activate time-based pause
+                pause_duration = timedelta(minutes=self.config.loss_streak_pause_minutes)
+                self.cooldown_until = datetime.now(timezone.utc) + pause_duration
+                
+                logger.warning(
+                    "Loss streak threshold reached - activating cooldown",
+                    consecutive_losses=self.consecutive_losses,
+                    cooldown_until=self.cooldown_until.isoformat(),
+                    pause_minutes=self.config.loss_streak_pause_minutes,
+                )
+                
+                # CRITICAL: Reset consecutive_losses to prevent deadlock
+                # System will auto-resume after pause expires
+                self.consecutive_losses = 0
+        
+        elif net_pnl > 0:
+            # Win - reset streak
             self.consecutive_losses = 0
+            
+            # Also clear any active cooldown on a win
+            if self.cooldown_until:
+                logger.info("Win recorded - clearing active cooldown early")
+                self.cooldown_until = None
+        
+        # else: Small loss (< threshold) - don't count toward streak
         
         logger.info(
             "Trade result recorded",
             net_pnl=str(net_pnl),
             daily_pnl=str(self.daily_pnl),
             consecutive_losses=self.consecutive_losses,
+            cooldown_active=bool(self.cooldown_until),
         )
     
     def reset_daily_metrics(self, starting_equity: Decimal):
