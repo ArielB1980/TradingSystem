@@ -97,8 +97,6 @@ def run_v2_backtest_validation():
     print("  3. Check Fibonacci confluence correlation")
     print("  4. Extend test period to 180+ days")
     print("  5. User review and approval before production")
-    
-    return results
 
 
 if __name__ == "__main__":
