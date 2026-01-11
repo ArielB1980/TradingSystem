@@ -3,11 +3,12 @@ Configuration models for the Kraken Futures SMC Trading System.
 
 Uses Pydantic for validation and type safety.
 """
-from typing import List, Literal
+from typing import List, Literal, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 from pathlib import Path
+from decimal import Decimal
 
 
 class ExchangeConfig(BaseSettings):
