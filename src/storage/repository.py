@@ -84,6 +84,19 @@ class SystemEventModel(Base):
     details = Column(String, nullable=False) # JSON string
 
 
+class AccountStateModel(Base):
+    """ORM model for account balance tracking."""
+    __tablename__ = "account_state"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    equity = Column(Numeric(precision=20, scale=2), nullable=False)
+    balance = Column(Numeric(precision=20, scale=2), nullable=False)
+    margin_used = Column(Numeric(precision=20, scale=2), nullable=False)
+    available_margin = Column(Numeric(precision=20, scale=2), nullable=False)
+    unrealized_pnl = Column(Numeric(precision=20, scale=2), nullable=False)
+
+
 # Repository Functions
 def save_candle(candle: Candle) -> None:
     """Save a candle to the database."""
@@ -441,3 +454,45 @@ def get_decision_chain(decision_id: str) -> List[Dict]:
             }
             for e in events
         ]
+
+
+def save_account_state(
+    equity: Decimal,
+    balance: Decimal,
+    margin_used: Decimal,
+    available_margin: Decimal,
+    unrealized_pnl: Decimal
+) -> None:
+    """Save account snapshot."""
+    db = get_db()
+    with db.get_session() as session:
+        state = AccountStateModel(
+            timestamp=datetime.now(timezone.utc),
+            equity=equity,
+            balance=balance,
+            margin_used=margin_used,
+            available_margin=available_margin,
+            unrealized_pnl=unrealized_pnl
+        )
+        session.add(state)
+
+
+def get_latest_account_state() -> Optional[Dict[str, Decimal]]:
+    """Get latest account snapshot."""
+    db = get_db()
+    with db.get_session() as session:
+        state = session.query(AccountStateModel).order_by(
+            AccountStateModel.timestamp.desc()
+        ).first()
+        
+        if not state:
+            return None
+            
+        return {
+            "timestamp": state.timestamp.replace(tzinfo=timezone.utc),
+            "equity": Decimal(str(state.equity)),
+            "balance": Decimal(str(state.balance)),
+            "margin_used": Decimal(str(state.margin_used)),
+            "available_margin": Decimal(str(state.available_margin)),
+            "unrealized_pnl": Decimal(str(state.unrealized_pnl))
+        }

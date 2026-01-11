@@ -243,7 +243,10 @@ class PaperTrading:
             trailing_active=False,
             break_even_active=False,
             peak_price=fill_price,
-            opened_at=datetime.now(timezone.utc)
+            peak_price=fill_price,
+            opened_at=datetime.now(timezone.utc),
+            setup_type=signal.setup_type.value if hasattr(signal.setup_type, 'value') else signal.setup_type,
+            regime=signal.regime
         )
         
         save_position(new_position)
@@ -381,7 +384,11 @@ class PaperTrading:
         net_pnl = pnl - fees
         
         self.current_equity += net_pnl
-        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
+        self.risk_manager.record_trade_result(
+            net_pnl, 
+            self.current_equity,
+            setup_type=position.setup_type
+        )
         
         # Update Position Size
         position.size -= qty
@@ -402,7 +409,11 @@ class PaperTrading:
         net_pnl = pnl - fees
         
         self.current_equity += net_pnl
-        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
+        self.risk_manager.record_trade_result(
+            net_pnl, 
+            self.current_equity, 
+            setup_type=position.setup_type
+        )
         
         logger.info("Virtual Position Closed", symbol=position.symbol, reason=reason, pnl=str(net_pnl), equity=str(self.current_equity))
         
@@ -422,7 +433,9 @@ class PaperTrading:
             entered_at=position.opened_at,
             exited_at=datetime.now(timezone.utc),
             holding_period_hours=Decimal("0"), # TODO
-            exit_reason=reason
+            exit_reason=reason,
+            setup_type=position.setup_type,
+            regime=position.regime
         )
         save_trade(trade)
         delete_position(position.symbol)

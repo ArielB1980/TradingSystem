@@ -46,6 +46,10 @@ class SMCEngine:
         from src.strategy.fibonacci_engine import FibonacciEngine
         self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
         
+        # V2.1: Signal Scorer
+        from src.strategy.signal_scorer import SignalScorer
+        self.signal_scorer = SignalScorer(config)
+        
         logger.info("SMC Engine initialized", config=config.model_dump())
     
     def generate_signal(
@@ -74,7 +78,9 @@ class SMCEngine:
         # Step 1: Higher-timeframe bias
         if signal is None:
             bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
-            if bias == "neutral":
+            # V2.1: Neutral bias DOES NOT block immediately - waits for Score Gate
+            # unless bias determination failed completely (e.g. insufficient data)
+            if "Insufficient candles" in reasoning_parts[-1]:
                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
 
         # Step 2: Execution timeframe structure
@@ -108,36 +114,62 @@ class SMCEngine:
 
             # Step 4: Calculate Levels (If passed all checks)
             if signal is None:
-                signal_type, entry_price, stop_loss, take_profit, tp_candidates = self._calculate_levels(
+                signal_type, entry_price, stop_loss, take_profit, tp_candidates, classification_info = self._calculate_levels(
                     structure_signal,
                     exec_candles_1h,
                     bias,
                     reasoning_parts,
                 )
                 
-                # Step 5: RSI Divergence
-                if self.config.rsi_divergence_enabled:
-                    self._check_rsi_divergence(exec_candles_1h, reasoning_parts)
+                # Step 5: Fib Validation (Gate for tight_smc)
+                fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
+                fib_valid = True
                 
-                # Metadata
-                current_candle = exec_candles_1h[-1]
-                ema_values = self.indicators.calculate_ema(bias_candles_1d, self.config.ema_period)
+                setup_type = classification_info['setup_type']
+                regime = classification_info['regime']
                 
-                timestamp = current_candle.timestamp
-                ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
-
-                if signal_type != SignalType.NO_SIGNAL:
-                    # Classify setup for regime determination
-                    setup_type, regime = self._classify_setup(structures, signal_type)
+                if regime == "tight_smc":
+                    # HARD REQUIREMENT: Must be in OTE or near key level
+                    if fib_levels:
+                        # Check OTE
+                        in_ote = self.fibonacci_engine.is_in_ote_zone(entry_price, fib_levels)
+                        # Check specific levels
+                        is_near, _ = self.fibonacci_engine.check_confluence(
+                            entry_price, 
+                            fib_levels, 
+                            tolerance_pct=self.config.fib_proximity_bps/10000
+                        )
+                        
+                        if not (in_ote or is_near):
+                            reasoning_parts.append(f"❌ Rejected: tight_smc entry not in OTE/Key Fib (Gate)")
+                            fib_valid = False
+                        else:
+                            reasoning_parts.append(f"✓ Fib requirement passed for tight_smc")
+                    else:
+                        # If no fib levels found, default to rejection for tight_smc safety
+                        reasoning_parts.append(f"❌ Rejected: No Fib structure found for tight_smc")
+                        fib_valid = False
+                
+                if not fib_valid:
+                     signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
+                
+                # Step 6: Scoring & Final Validation
+                if signal is None and signal_type != SignalType.NO_SIGNAL:
+                    # Metadata
+                    current_candle = exec_candles_1h[-1]
+                    timestamp = current_candle.timestamp
+                    ema_values = self.indicators.calculate_ema(bias_candles_1d, self.config.ema_period)
+                    ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
                     
-                    signal = Signal(
+                    # Create TEMP signal for scoring
+                    temp_signal = Signal(
                         timestamp=timestamp,
                         symbol=symbol,
                         signal_type=signal_type,
                         entry_price=entry_price,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
-                        reasoning="\n".join(reasoning_parts),
+                        reasoning="",
                         setup_type=setup_type,
                         regime=regime,
                         higher_tf_bias=bias,
@@ -146,29 +178,62 @@ class SMCEngine:
                         ema200_slope=ema200_slope,
                         tp_candidates=tp_candidates
                     )
-                else:
-                    # No signal - default to TREND/wide_structure
-                    from src.domain.models import SetupType
                     
-                    signal = Signal(
-                        timestamp=timestamp,
-                        symbol=symbol,
-                        signal_type=SignalType.NO_SIGNAL,
-                        entry_price=Decimal("0"),
-                        stop_loss=Decimal("0"),
-                        take_profit=None,
-                        reasoning="\n".join(reasoning_parts),
-                        setup_type=SetupType.TREND,  # Default for no signal
-                        regime="wide_structure",
-                        higher_tf_bias=bias,
-                        adx=adx_value,
-                        atr=atr_value,
-                        ema200_slope=ema200_slope,
-                        tp_candidates=[]
+                    # Estimate cost (rough bps)
+                    cost_bps = Decimal("15.0") # Baseline assumption
+                    
+                    # Score
+                    score_obj = self.signal_scorer.score_signal(
+                        temp_signal,
+                        structure_signal,
+                        fib_levels,
+                        adx_value,
+                        cost_bps,
+                        bias
                     )
                     
+                    # GATE: Check score
+                    passed, threshold = self.signal_scorer.check_score_gate(score_obj.total_score, setup_type, bias)
                     
-        # If signal is still None after all steps (e.g., if _calculate_levels returned None for signal_type)
+                    if not passed:
+                        reasoning_parts.append(f"❌ Score {score_obj.total_score:.1f} < Threshold {threshold} (Grade: {score_obj.get_grade()})")
+                        signal = self._no_signal(symbol, reasoning_parts, current_candle)
+                        
+                        # LOG REJECTION (Mandatory)
+                        logger.info(
+                            "Signal Rejected (Score)",
+                            symbol=symbol,
+                            reason=f"Score {score_obj.total_score} < {threshold}",
+                            setup=setup_type.value,
+                            bias=bias,
+                            adx=adx_value,
+                            fib_confluence=fib_valid
+                        )
+                    else:
+                        reasoning_parts.append(f"✓ Score Passed: {score_obj.total_score:.1f} >= {threshold}")
+                        
+                        # Create FINAL signal
+                        signal = Signal(
+                            timestamp=timestamp,
+                            symbol=symbol,
+                            signal_type=signal_type,
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            reasoning="\n".join(reasoning_parts),
+                            setup_type=setup_type,
+                            regime=regime,
+                            higher_tf_bias=bias,
+                            adx=adx_value,
+                            atr=atr_value,
+                            ema200_slope=ema200_slope,
+                            tp_candidates=tp_candidates
+                        )
+                elif signal is None:
+                     # Calculate levels returned None (should be handled by signal_type check but safe fallback)
+                     signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
+
+        # If signal is still None after all steps
         if signal is None:
             current_candle = exec_candles_1h[-1] if exec_candles_1h else None
             timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
@@ -253,7 +318,15 @@ class SMCEngine:
         candles_1d: List[Candle],
         reasoning: List[str],
     ) -> str:
-        """Determine higher-timeframe bias (bullish/bearish/neutral)."""
+        """
+        Determine higher-timeframe bias (bullish/bearish/neutral).
+        
+        V2.1 Rules:
+        - Price > EMA200 -> Bullish
+        - Price < EMA200 -> Bearish
+        - abs(Price - EMA200) < configurable bps -> Neutral
+        - EMA Slope: CONTRIBUTES TO SCORE ONLY (Does not block bias)
+        """
         if not candles_4h or not candles_1d:
             reasoning.append("❌ Insufficient candles for bias determination")
             return "neutral"
@@ -267,18 +340,22 @@ class SMCEngine:
         
         current_price = candles_1d[-1].close
         ema_value = Decimal(str(ema_1d.iloc[-1]))
-        slope = self.indicators.get_ema_slope(ema_1d)
         
-        # Simple bias: price above/below EMA 200 with slope confirmation
-        if current_price > ema_value and slope == "up":
-            reasoning.append(f"✓ Bullish bias: Price ${current_price} above EMA200 ${ema_value}, slope {slope}")
-            return "bullish"
-        elif current_price < ema_value and slope == "down":
-            reasoning.append(f"✓ Bearish bias: Price ${current_price} below EMA200 ${ema_value}, slope {slope}")
-            return "bearish"
-        else:
-            reasoning.append(f"○ Neutral bias: Price ${current_price}, EMA200 ${ema_value}, slope {slope}")
+        # Check Neutral Zone
+        dist_bps = abs(current_price - ema_value) / ema_value * Decimal("10000")
+        neutral_zone = Decimal(str(self.config.ema_neutral_zone_bps))
+        
+        if dist_bps < neutral_zone:
+            reasoning.append(f"○ Bias Neutral: Price vs EMA dist {dist_bps:.1f} bps < {neutral_zone}")
             return "neutral"
+        
+        # Direction
+        if current_price > ema_value:
+             reasoning.append(f"✓ Bias Bullish: Price ${current_price} > EMA ${ema_value}")
+             return "bullish"
+        else:
+             reasoning.append(f"✓ Bias Bearish: Price ${current_price} < EMA ${ema_value}")
+             return "bearish"
     
     def _detect_structure(
         self,
@@ -487,22 +564,12 @@ class SMCEngine:
         
         adx_value = adx_df['ADX_14'].iloc[-1]
         
-        if adx_value < self.config.adx_threshold:
-            reasoning.append(f"❌ ADX too low: {adx_value:.1f} < {self.config.adx_threshold}")
-            return False
-        
-        reasoning.append(f"✓ ADX filter passed: {adx_value:.1f} > {self.config.adx_threshold}")
-        
         # ATR check (ensure volatility is measurable)
         atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
-        
         if atr_values.empty:
             reasoning.append("❌ ATR not available")
             return False
-        
-        atr_value = atr_values.iloc[-1]
-        reasoning.append(f"✓ ATR available: {atr_value:.2f}")
-        
+            
         return True
     
     def _calculate_levels(
@@ -511,79 +578,156 @@ class SMCEngine:
         candles: List[Candle],
         bias: str,
         reasoning: List[str],
-    ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal], List[Decimal]]:
-        """Calculate entry, stop-loss, and take-profit levels with candidates."""
-        order_block = structure['order_block']
+    ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal], List[Decimal], Dict]:
+        """
+        Calculate Levels: Entry, Stop, TP.
         
-        # Calculate ATR for stop buffering
+        V2.1 Regime:
+        - tight_smc: Stop = Invalid + 0.3-0.6 ATR, TP = 2.0R min
+        - wide_structure: Stop = Invalid + 1.0-1.2 ATR, TP = 1.5R min
+        """
+        from src.domain.models import SetupType
+        
+        order_block = structure['order_block']
+        fvg = structure['fvg']
+        bos = structure['bos']
+        
+        # 1. Classify Setup Type & Regime First
+        setup_type = SetupType.TREND
+        regime = "wide_structure"
+        
+        if order_block:
+            setup_type = SetupType.OB
+            regime = "tight_smc"
+        elif fvg:
+            setup_type = SetupType.FVG
+            regime = "tight_smc"
+        elif bos:
+            setup_type = SetupType.BOS
+            regime = "wide_structure"
+            
+        # 2. Get ATR
         atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
         atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
         
+        # 3. Determine Stop Multiplier based on Regime
+        if regime == "tight_smc":
+            # Randomize or fixed? Use average or min for now to be safe.
+            # Config has ranges: low/high. Let's use AVG of range for standard execution
+            stop_mult = Decimal(str((self.config.tight_smc_atr_stop_min + self.config.tight_smc_atr_stop_max) / 2))
+        else:
+            stop_mult = Decimal(str((self.config.wide_structure_atr_stop_min + self.config.wide_structure_atr_stop_max) / 2))
+            
         tp_candidates = []
+        entry_price = Decimal("0")
+        invalid_level = Decimal("0")
+        signal_type = SignalType.NO_SIGNAL
         
+        # 4. Calculate Entry & Stop Base
         if bias == "bullish":
             signal_type = SignalType.LONG
-            # Entry: Top of Bullish OB (retest entry)
-            entry_price = order_block['high']
+            if setup_type == SetupType.OB:
+                entry_price = order_block['high']
+                invalid_level = order_block['low']
+            elif setup_type == SetupType.FVG:
+                entry_price = fvg['top']
+                invalid_level = fvg['bottom']
+            else: # BOS/Trend
+                entry_price = candles[-1].close # Market entry if confirmed? Or waiting for retrace?
+                # For V2, BOS typically implies awaiting retrace, but if no OB/FVG found...
+                # Current logic implies we only get here if valid.
+                # Let's assume retrace to recent low if BOS?
+                # Fallback: Entry at close, stop at recent swing low.
+                entry_price = candles[-1].close
+                invalid_level = min(c.low for c in candles[-20:])
+                
+            stop_loss = invalid_level - (atr * stop_mult)
             
-            # Stop-loss: Below Bottom of OB + buffer
-            invalidation_level = order_block['low']
-            stop_loss = invalidation_level - (atr * Decimal(str(self.config.atr_multiplier_stop)))
-            
-            # Take-profit Candidates
-            # 1. Recent Swing Highs (Liquidity)
-            # Scan last 50 candles for local maxima > entry
-            lookback = 50
-            for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
-                c = candles[i]
-                # Simple swing high check: High > surrounding highs
-                if (c.high > candles[i-1].high and c.high > candles[i+1].high):
-                    if c.high > entry_price:
-                         tp_candidates.append(c.high)
-            
-            # Sort nearest to farthest
-            tp_candidates = sorted(list(set(tp_candidates)))[:5]
-            
-            # Default TP (2R) if no structure found
-            risk = entry_price - stop_loss
-            take_profit = entry_price + (risk * 2)
-            if not tp_candidates:
-                tp_candidates.append(take_profit)
-            
-        else:  # bearish
+        elif bias == "bearish":  # bearish
             signal_type = SignalType.SHORT
-            # Entry: Bottom of Bearish OB (retest entry)
-            entry_price = order_block['low']
+            if setup_type == SetupType.OB:
+                entry_price = order_block['low']
+                invalid_level = order_block['high']
+            elif setup_type == SetupType.FVG:
+                entry_price = fvg['bottom']
+                invalid_level = fvg['top']
+            else: # BOS/Trend
+                entry_price = candles[-1].close
+                invalid_level = max(c.high for c in candles[-20:])
+                
+            stop_loss = invalid_level + (atr * stop_mult)
             
-            # Stop-loss: Above Top of OB + buffer
-            invalidation_level = order_block['high']
-            stop_loss = invalidation_level + (atr * Decimal(str(self.config.atr_multiplier_stop)))
-            
-            # Take-profit Candidates
-            # 1. Recent Swing Lows (Liquidity)
-            lookback = 50
-            for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
+        else:
+             # Neutral bias - generally no trade unless counter-trend enabled?
+             # For V2.1, neutral can trade if score is high.
+             # Assume logic mirrors bullish/bearish based on structure type
+             if structure.get('order_block'):
+                 ob = structure['order_block']
+                 if ob['type'] == 'bullish':
+                     signal_type = SignalType.LONG
+                     entry_price = ob['high']
+                     invalid_level = ob['low']
+                     stop_loss = invalid_level - (atr * stop_mult)
+                 else:
+                     signal_type = SignalType.SHORT
+                     entry_price = ob['low']
+                     invalid_level = ob['high']
+                     stop_loss = invalid_level + (atr * stop_mult)
+             else:
+                 return SignalType.NO_SIGNAL, Decimal("0"), Decimal("0"), None, [], {}
+                 
+        # 5. TP Logic
+        # Scan for swing points
+        lookback = 50
+        risk = abs(entry_price - stop_loss)
+        if risk == 0: risk = Decimal("1") # Avoid div/0
+        
+        if signal_type == SignalType.LONG:
+             for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
+                c = candles[i]
+                if (c.high > candles[i-1].high and c.high > candles[i+1].high):
+                    if c.high > entry_price: tp_candidates.append(c.high)
+             tp_candidates = sorted(list(set(tp_candidates)))[:5]
+             
+             # Min RR
+             min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
+             min_tp_dist = risk * Decimal(str(min_rr))
+             
+             # Filter TPs < Min RR
+             valid_tps = [tp for tp in tp_candidates if (tp - entry_price) >= min_tp_dist]
+             
+             if valid_tps:
+                 take_profit = valid_tps[0] # Nearest valid
+             else:
+                 take_profit = entry_price + min_tp_dist # Force Min RR
+                 
+        else: # SHORT
+             for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
                 c = candles[i]
                 if (c.low < candles[i-1].low and c.low < candles[i+1].low):
-                    if c.low < entry_price:
-                        tp_candidates.append(c.low)
-                        
-            # Sort nearest to farthest (descending for shorts)
-            tp_candidates = sorted(list(set(tp_candidates)), reverse=True)[:5]
+                    if c.low < entry_price: tp_candidates.append(c.low)
+             tp_candidates = sorted(list(set(tp_candidates)), reverse=True)[:5]
+             
+             min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
+             min_tp_dist = risk * Decimal(str(min_rr))
+             
+             valid_tps = [tp for tp in tp_candidates if (entry_price - tp) >= min_tp_dist]
+             
+             if valid_tps:
+                 take_profit = valid_tps[0]
+             else:
+                 take_profit = entry_price - min_tp_dist
 
-            # Default TP (2R)
-            risk = stop_loss - entry_price
-            take_profit = entry_price - (risk * 2)
-            if not tp_candidates:
-                tp_candidates.append(take_profit)
-        
         reasoning.append(
-            f"✓ Levels: Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}, ATR ${atr}"
+            f"✓ V2.1 Levels ({regime}): Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}"
         )
-        if tp_candidates:
-             reasoning.append(f"✓ Found {len(tp_candidates)} TP candidates from structure")
         
-        return signal_type, entry_price, stop_loss, take_profit, tp_candidates
+        class_info = {
+            "setup_type": setup_type,
+            "regime": regime
+        }
+        
+        return signal_type, entry_price, stop_loss, take_profit, tp_candidates, class_info
     
     def _check_rsi_divergence(self, candles: List[Candle], reasoning: List[str]):
         """Optional RSI divergence confirmation."""

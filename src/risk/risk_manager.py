@@ -3,14 +3,14 @@ Risk management for position sizing, leverage control, and safety limits.
 """
 from typing import List, Optional
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
 from src.domain.models import Signal, RiskDecision, Position, Side
 from src.config.config import RiskConfig
 from src.monitoring.logger import get_logger
 from src.storage.repository import record_event
-from src.risk.basis_guard import BasisGuard  # NEW import
+from src.risk.basis_guard import BasisGuard
 
 logger = get_logger(__name__)
 
@@ -35,9 +35,13 @@ class RiskManager:
         # Portfolio state tracking
         self.current_positions: List[Position] = []
         self.daily_pnl = Decimal("0")
-        self.consecutive_losses = 0
         self.daily_start_equity = Decimal("0")
-        self.cooldown_until: Optional[datetime] = None  # Time-based cooldown (NEW)
+        
+        # V2.1: Regime-specific streak tracking
+        self.consecutive_losses_tight = 0
+        self.consecutive_losses_wide = 0
+        
+        self.cooldown_until: Optional[datetime] = None  # Time-based cooldown
         
         logger.info("Risk Manager initialized", config=config.model_dump())
     
@@ -161,7 +165,6 @@ class RiskManager:
             )
         
         # Time-based loss streak cooldown (NEW - prevents deadlock)
-        from datetime import timezone
         now = datetime.now(timezone.utc)
         
         if self.cooldown_until and now < self.cooldown_until:
@@ -289,18 +292,6 @@ class RiskManager:
     ) -> Decimal:
         """
         Calculate directional liquidation distance.
-        
-        Formula (directional):
-        - Long: (mark_price - liq_price) / mark_price
-        - Short: (liq_price - mark_price) / mark_price
-        
-        Args:
-            mark_price: Current mark price
-            liq_price: Exchange-reported liquidation price
-            side: "long" or "short"
-        
-        Returns:
-            Liquidation distance as percentage (positive = safe)
         """
         if side == "long":
             distance = (mark_price - liq_price) / mark_price
@@ -309,43 +300,9 @@ class RiskManager:
         
         return distance
     
-    def _estimate_costs(self, position_notional: Decimal) -> Decimal:
-        """
-        Estimate total fees and funding costs using configurable parameters.
-        
-        Args:
-            position_notional: Position size in USD notional
-        
-        Returns:
-            Estimated total cost
-        """
-        # Use configurable fee assumptions
-        taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
-        funding_rate_daily = Decimal(str(self.config.funding_rate_daily_bps))
-        
-        entry_fee = position_notional * (taker_fee_bps / Decimal("10000"))
-        exit_fee = position_notional * (taker_fee_bps / Decimal("10000"))
-        funding = position_notional * (funding_rate_daily / Decimal("10000"))
-        
-        total = entry_fee + exit_fee + funding
-        
-        return total
-    
     def _estimate_costs_tight_smc(self, position_notional: Decimal, stop_distance_pct: Decimal) -> Decimal:
         """
         Estimate costs for TIGHT-STOP SMC trades (OB/FVG).
-        
-        Key difference: Probabilistic funding model.
-        - Average hold time: ~6 hours (configurable)
-        - Funding hits every 8 hours
-        - Most tight-stop trades exit before paying funding
-        
-        Args:
-            position_notional: Position size in USD notional
-            stop_distance_pct: Stop distance as decimal (for context)
-        
-        Returns:
-            Estimated total cost (entry + exit fees + probabilistic funding)
         """
         taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
         
@@ -371,17 +328,6 @@ class RiskManager:
     def _estimate_costs_wide_structure(self, position_notional: Decimal, stop_distance_pct: Decimal) -> Decimal:
         """
         Estimate costs for WIDE-STOP structure trades (BOS/TREND).
-        
-        Key difference: Model 1-2 funding intervals.
-        - Average hold time: ~36 hours (configurable)  
-        - Likely to pay 1-2 funding intervals
-        
-        Args:
-            position_notional: Position size in USD notional
-            stop_distance_pct: Stop distance as decimal (for context)
-        
-        Returns:
-            Estimated total cost (entry + exit fees + multi-interval funding)
         """
         taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
         
@@ -392,7 +338,7 @@ class RiskManager:
         avg_hold_hours = Decimal(str(self.config.wide_structure_avg_hold_hours))  # e.g., 36 hours
         funding_interval_hours = Decimal("8")
         
-        funding_intervals = avg_hold_hours / funding_interval_hours  # e.g., 36/8 = 4.5 intervals
+        funding_intervals = avg_hold_hours / funding_interval_hours
         
         daily_funding_bps = Decimal(str(self.config.funding_rate_daily_bps))
         one_interval_funding = position_notional * (daily_funding_bps / Decimal("10000")) / Decimal("3")
@@ -407,65 +353,81 @@ class RiskManager:
         """Update current positions for portfolio tracking."""
         self.current_positions = positions
     
-    def record_trade_result(self, net_pnl: Decimal, account_equity: Decimal):
+    def record_trade_result(self, net_pnl: Decimal, account_equity: Decimal, setup_type: Optional[str] = None):
         """
         Record trade result for daily P&L and streak tracking.
         
-        CRITICAL CHANGE: Time-based cooldown instead of permanent block.
-        - Only count "meaningful" losses (> X bps of equity)
-        - On streak trigger: pause for X minutes, then AUTO-RESUME
-        - Reset consecutive_losses on pause (prevents deadlock)
+        CRITICAL CHANGE: Regime-aware loss streaks.
+        - tight_smc: shorter tolerance (3 losses), longer pause (120m)
+        - wide_structure: longer tolerance (4-5 losses), shorter pause (90m)
         
         Args:
-            net_pnl: Net P&L from the trade (including fees/funding)
-            account_equity: Current account equity for meaningful loss check
+            net_pnl: Net P&L from the trade
+            account_equity: Current account equity
+            setup_type: str "ob"/"fvg" (tight) or "bos"/"trend" (wide)
         """
-        from datetime import datetime, timezone, timedelta
+        from src.domain.models import SetupType
         
         self.daily_pnl += net_pnl
         
-        # Only count MEANINGFUL losses toward streak
-        # Prevents noise from shutting down the system
+        # Determine regime
+        is_tight = setup_type in [SetupType.OB, SetupType.FVG] if setup_type else False
+        
+        # Only count MEANINGFUL losses (> X bps of equity)
         loss_bps = abs(net_pnl) / account_equity * Decimal("10000") if account_equity > 0 else Decimal("0")
         min_loss_bps = Decimal(str(self.config.loss_streak_min_loss_bps))
         
         if net_pnl < 0 and loss_bps >= min_loss_bps:
-            # This is a meaningful loss
-            self.consecutive_losses += 1
+            # Loss Logic
+            if is_tight:
+                self.consecutive_losses_tight += 1
+                limit = self.config.loss_streak_cooldown_tight
+                pause_min = self.config.loss_streak_pause_minutes_tight
+                msg_prefix = "Tight SMC"
+            else:
+                self.consecutive_losses_wide += 1
+                limit = self.config.loss_streak_cooldown_wide
+                pause_min = self.config.loss_streak_pause_minutes_wide
+                msg_prefix = "Wide Structure"
             
-            # Check if we hit the streak threshold
-            if self.consecutive_losses >= self.config.loss_streak_cooldown:
-                # Activate time-based pause
-                pause_duration = timedelta(minutes=self.config.loss_streak_pause_minutes)
+            # Check Threshold
+            current_streak = self.consecutive_losses_tight if is_tight else self.consecutive_losses_wide
+            
+            if current_streak >= limit:
+                # Activate Pause
+                pause_duration = timedelta(minutes=pause_min)
                 self.cooldown_until = datetime.now(timezone.utc) + pause_duration
                 
                 logger.warning(
-                    "Loss streak threshold reached - activating cooldown",
-                    consecutive_losses=self.consecutive_losses,
-                    cooldown_until=self.cooldown_until.isoformat(),
-                    pause_minutes=self.config.loss_streak_pause_minutes,
+                    f"{msg_prefix} Streak Limit Reached - COOLDOWN ACTIVATED",
+                    streak=current_streak,
+                    limit=limit,
+                    pause_min=pause_min,
+                    cooldown_until=self.cooldown_until.isoformat()
                 )
                 
-                # CRITICAL: Reset consecutive_losses to prevent deadlock
-                # System will auto-resume after pause expires
-                self.consecutive_losses = 0
+                # Reset ALL streaks on cooldown activation to prevent immediate re-trigger
+                self.consecutive_losses_tight = 0
+                self.consecutive_losses_wide = 0
         
         elif net_pnl > 0:
-            # Win - reset streak
-            self.consecutive_losses = 0
+            # Win Logic - Reset ALL streaks
+            # A win restores confidence in the system overall
+            self.consecutive_losses_tight = 0
+            self.consecutive_losses_wide = 0
             
-            # Also clear any active cooldown on a win
             if self.cooldown_until:
                 logger.info("Win recorded - clearing active cooldown early")
                 self.cooldown_until = None
-        
-        # else: Small loss (< threshold) - don't count toward streak
         
         logger.info(
             "Trade result recorded",
             net_pnl=str(net_pnl),
             daily_pnl=str(self.daily_pnl),
-            consecutive_losses=self.consecutive_losses,
+            streaks={
+                "tight": self.consecutive_losses_tight,
+                "wide": self.consecutive_losses_wide
+            },
             cooldown_active=bool(self.cooldown_until),
         )
     
@@ -473,4 +435,6 @@ class RiskManager:
         """Reset daily metrics at start of new trading day."""
         self.daily_pnl = Decimal("0")
         self.daily_start_equity = starting_equity
+        self.consecutive_losses_tight = 0
+        self.consecutive_losses_wide = 0
         logger.info("Daily metrics reset", starting_equity=str(starting_equity))

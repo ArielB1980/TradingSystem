@@ -45,13 +45,21 @@ class SignalScorer:
     
     Philosophy:
     - High scores = better confluence, structure, and efficiency
-    - Does NOT block trades (risk manager does that)
+    - HARD GATE: Signals below threshold are rejected (V2.1)
     - Used for prioritization and dashboard display
     """
     
-    def __init__(self):
-        """Initialize signal scorer."""
-        logger.info("SignalScorer initialized")
+    def __init__(self, config: "StrategyConfig"):
+        """
+        Initialize signal scorer.
+        
+        Args:
+            config: Strategy configuration for thresholds
+        """
+        self.config = config
+        logger.info("SignalScorer initialized", 
+                    tight_aligned=config.min_score_tight_smc_aligned,
+                    wide_aligned=config.min_score_wide_structure_aligned)
     
     def score_signal(
         self,
@@ -59,7 +67,8 @@ class SignalScorer:
         structures: Dict,
         fib_levels: Optional[FibonacciLevels],
         adx: float,
-        cost_bps: Decimal
+        cost_bps: Decimal,
+        bias: str
     ) -> SignalScore:
         """
         Calculate composite quality score for a signal.
@@ -70,6 +79,7 @@ class SignalScorer:
             fib_levels: Fibonacci levels (if available)
             adx: ADX value for trend strength
             cost_bps: Estimated cost in basis points
+            bias: HTF bias (bullish/bearish/neutral)
         
         Returns:
             SignalScore with total and component scores
@@ -77,7 +87,7 @@ class SignalScorer:
         # Score each component
         smc_score = self._score_smc_quality(structures)
         fib_score = self._score_fib_confluence(signal, fib_levels)
-        htf_score = self._score_htf_alignment(signal)
+        htf_score = self._score_htf_alignment(signal, bias)
         adx_score = self._score_adx_strength(adx)
         cost_score = self._score_cost_efficiency(signal, cost_bps)
         
@@ -108,6 +118,32 @@ class SignalScorer:
         
         return score
     
+    def check_score_gate(self, score: float, setup_type: str, bias: str) -> Tuple[bool, float]:
+        """
+        Check if signal score passes the hard gate.
+        
+        Returns:
+            (passed: bool, threshold: float)
+        """
+        from src.domain.models import SetupType
+        
+        # Determine strictness based on regime/bias
+        is_tight = setup_type in [SetupType.OB, SetupType.FVG]
+        is_aligned = bias != "neutral"
+        
+        if is_tight:
+            if is_aligned:
+                threshold = self.config.min_score_tight_smc_aligned
+            else:
+                threshold = self.config.min_score_tight_smc_neutral
+        else: # wide_structure (BOS/TREND)
+            if is_aligned:
+                threshold = self.config.min_score_wide_structure_aligned
+            else:
+                threshold = self.config.min_score_wide_structure_neutral
+        
+        return score >= threshold, threshold
+
     def _score_smc_quality(self, structures: Dict) -> float:
         """
         Score SMC structure quality (0-25 points).
@@ -141,7 +177,7 @@ class SignalScorer:
         
         Scoring:
         - In OTE zone: +15
-        - Near any fib level (0.382, 0.618, etc): +10
+        - Near any fib level: +10
         - Near extension: +5
         - No fib data: 0
         """
@@ -180,39 +216,38 @@ class SignalScorer:
         
         return score
     
-    def _score_htf_alignment(self, signal: Signal) -> float:
+    def _score_htf_alignment(self, signal: Signal, bias: str) -> float:
         """
         Score HTF alignment (0-20 points).
         
-        Placeholder: In full implementation, would check:
-        - 4H trend direction
-        - 1D trend direction
-        - Alignment with signal direction
-        
-        For now: award points based on signal type presence
+        V2.1 Logic:
+        - Direction aligned with Bias: +20
+        - Bias Neutral: +10
+        - Counter-trend: 0
         """
-        # Simple scoring based on setup type
-        if hasattr(signal, 'setup_type'):
-            from src.domain.models import SetupType
-            if signal.setup_type in [SetupType.OB, SetupType.FVG]:
-                return 15.0  # Tight-stop setups get bonus
-            elif signal.setup_type == SetupType.BOS:
-                return 20.0  # BOS implies strong HTF alignment
-            else:
-                return 10.0  # TREND
+        from src.domain.models import SignalType
         
-        return 10.0  # Default moderate score
+        if bias == "neutral":
+            return 10.0
+            
+        is_bullish = bias == "bullish"
+        is_long = signal.signal_type == SignalType.LONG
+        
+        if (is_bullish and is_long) or (not is_bullish and not is_long):
+            return 20.0
+            
+        return 0.0
     
     def _score_adx_strength(self, adx: float) -> float:
         """
         Score ADX trend strength (0-15 points).
         
-        Scoring:
-        - ADX >= 40: 15 (very strong trend)
+        Scoring (V2.1 lower thresholds):
+        - ADX >= 40: 15
         - ADX >= 30: 12
         - ADX >= 25: 10
         - ADX >= 20: 7
-        - ADX < 20: 3 (weak trend)
+        - ADX < 20: 0
         """
         if adx >= 40:
             return 15.0
@@ -223,20 +258,13 @@ class SignalScorer:
         elif adx >= 20:
             return 7.0
         else:
-            return 3.0
+            return 0.0
     
     def _score_cost_efficiency(self, signal: Signal, cost_bps: Decimal) -> float:
         """
         Score cost efficiency (0-20 points).
         
         Lower cost relative to potential reward = higher score.
-        
-        Scoring:
-        - Cost <= 10 bps: 20
-        - Cost <= 20 bps: 15
-        - Cost <= 30 bps: 10
-        - Cost <= 50 bps: 5
-        - Cost > 50 bps: 0
         """
         if cost_bps <= Decimal("10"):
             return 20.0

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
 
 
 class Side(str, Enum):
@@ -183,6 +183,10 @@ class Position:
     # Metadata
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
+    # V2.1 Metadata
+    setup_type: Optional[str] = None # e.g. "ob", "fvg"
+    regime: Optional[str] = None # "tight_smc" or "wide_structure"
+    
     def liquidation_distance_pct(self) -> Decimal:
         """
         Calculate liquidation distance as percentage.
@@ -243,3 +247,7 @@ class Trade:
     
     # Exit reason
     exit_reason: str  # "stop_loss", "take_profit", "manual", "kill_switch"
+    
+    # V2.1 Metadata
+    setup_type: Optional[str] = None
+    regime: Optional[str] = None

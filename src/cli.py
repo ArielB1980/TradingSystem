@@ -193,9 +193,21 @@ def live(
     
     logger.warning("Live trading started - REAL CAPITAL AT RISK")
     
-    # TODO: Initialize live trading engine
-    typer.echo("Live trading mode")
-    typer.echo("⚠️  Live trading engine not yet implemented")
+    # Initialize live trading engine
+    import asyncio
+    from src.live.live_trading import LiveTrading
+    
+    async def run_live():
+        engine = LiveTrading(config)
+        await engine.run()
+        
+    try:
+        asyncio.run(run_live())
+    except KeyboardInterrupt:
+        logger.info("Live trading stopped by user")
+    except Exception as e:
+        logger.critical("Live trading failed with error", error=str(e))
+        raise typer.Exit(1)
 
 
 @app.command(name="kill-switch")
@@ -258,9 +270,11 @@ def dashboard(
     Example:
         python src/cli.py dashboard
     """
-    import uvicorn
+    import subprocess
+    import sys
     import webbrowser
-    from src.dashboard.server import app as dash_app
+    
+    app_path = Path("src/dashboard/streamlit_app.py").resolve()
     
     url = f"http://{host}:{port}"
     typer.secho(f"🚀 Dashboard running at: {url}", fg=typer.colors.GREEN, bold=True)
@@ -268,7 +282,13 @@ def dashboard(
     # Auto-open browser
     webbrowser.open(url)
     
-    uvicorn.run(dash_app, host=host, port=port)
+    # Run Streamlit
+    subprocess.run([
+        sys.executable, "-m", "streamlit", "run", str(app_path),
+        "--server.port", str(port),
+        "--server.address", host,
+        "--theme.base", "dark"
+    ])
 
 
 @app.command()

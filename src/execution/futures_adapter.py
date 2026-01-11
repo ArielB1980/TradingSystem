@@ -29,6 +29,10 @@ class FuturesAdapter:
     TICKER_MAP = {
         "BTC/USD": "PF_XBTUSD",  # Kraken Futures BTC perpetual
         "ETH/USD": "PF_ETHUSD",   # Kraken Futures ETH perpetual
+        "SOL/USD": "PF_SOLUSD",
+        "LINK/USD": "PF_LINKUSD",
+        "AVAX/USD": "PF_AVAXUSD",
+        "MATIC/USD": "PF_MATICUSD",
     }
     
     def __init__(self, kraken_client: KrakenClient, max_leverage: float = 10.0):

@@ -3,7 +3,7 @@ Configuration models for the Kraken Futures SMC Trading System.
 
 Uses Pydantic for validation and type safety.
 """
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
@@ -22,6 +22,13 @@ class ExchangeConfig(BaseSettings):
     # Legacy: Hardcoded markets (used if use_market_discovery=False)
     spot_markets: List[str] = ["BTC/USD", "ETH/USD"]
     futures_markets: List[str] = ["BTCUSD-PERP", "ETHUSD-PERP"]
+    
+    # Credentials (loaded from env or yaml)
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    futures_api_key: Optional[str] = None
+    futures_api_secret: Optional[str] = None
+    use_testnet: bool = False
 
 
 class RiskConfig(BaseSettings):
@@ -68,6 +75,13 @@ class RiskConfig(BaseSettings):
     wide_structure_max_distortion_pct: float = Field(default=0.15, ge=0.10, le=0.25)  # R:R distortion
     wide_structure_avg_hold_hours: float = Field(default=36.0, ge=12.0, le=72.0)  # For funding calc
 
+    # Loss streak cooldown (Regime-Aware)
+    loss_streak_cooldown_tight: int = Field(default=3, ge=2, le=10)
+    loss_streak_cooldown_wide: int = Field(default=5, ge=2, le=10) # 4-5 losses
+    loss_streak_pause_minutes_tight: int = Field(default=120, ge=30, le=300) # 120 minutes
+    loss_streak_pause_minutes_wide: int = Field(default=90, ge=30, le=300) # 90 minutes
+
+
     @field_validator('max_leverage')
     @classmethod
     def validate_leverage(cls, v):
@@ -85,10 +99,22 @@ class StrategyConfig(BaseSettings):
     # Indicators
     ema_period: int = Field(default=200, ge=50, le=300)
     adx_period: int = Field(default=14, ge=7, le=30)
-    adx_threshold: float = Field(default=25.0, ge=15.0, le=40.0)
+    adx_threshold: float = Field(default=20.0, ge=10.0, le=40.0)
     atr_period: int = Field(default=14, ge=7, le=30)
+    
+    # Stop buffering (Regime specific ranges)
+    # tight_smc: 0.3-0.6 ATR
+    # wide_structure: 1.0-1.2 ATR
+    tight_smc_atr_stop_min: float = Field(default=0.3, ge=0.1, le=1.0)
+    tight_smc_atr_stop_max: float = Field(default=0.6, ge=0.1, le=1.0)
+    wide_structure_atr_stop_min: float = Field(default=1.0, ge=0.5, le=2.0)
+    wide_structure_atr_stop_max: float = Field(default=1.2, ge=0.5, le=2.0)
+    
+    # Legacy fallbacks
     atr_multiplier_stop: float = Field(default=1.5, ge=1.0, le=3.0)
+    
     rsi_period: int = Field(default=14, ge=7, le=30)
+
     rsi_divergence_enabled: bool = False
     
     # SMC Parameters
@@ -100,6 +126,19 @@ class StrategyConfig(BaseSettings):
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"
     fvg_partial_fill_pct: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    # Bias Logic
+    ema_neutral_zone_bps: float = Field(default=10.0, ge=0.0, le=100.0)
+    
+    # Scoring Gates
+    min_score_tight_smc_aligned: float = Field(default=75.0, ge=0.0, le=100.0)
+    min_score_tight_smc_neutral: float = Field(default=80.0, ge=0.0, le=100.0)
+    min_score_wide_structure_aligned: float = Field(default=70.0, ge=0.0, le=100.0)
+    min_score_wide_structure_neutral: float = Field(default=75.0, ge=0.0, le=100.0)
+    
+    # Fib Enforcement
+    fib_proximity_bps: float = Field(default=20.0, ge=0.0, le=100.0) # 0.2%
+
 
 
 class AssetConfig(BaseSettings):
@@ -115,6 +154,13 @@ class AssetConfig(BaseSettings):
             raise ValueError(f"Invalid mode: {v}. Must be auto, whitelist, or blacklist")
         return v
 
+
+class CoinUniverseConfig(BaseSettings):
+    """Coin universe configuration (V2)."""
+    enabled: bool = True
+    min_spot_volume_24h: Decimal = Field(default=Decimal("5000000"))
+    liquidity_tiers: Dict[str, List[str]] = Field(default_factory=lambda: {"A": ["BTC/USD"], "B": [], "C": []})
+    tier_max_leverage: Dict[str, float] = Field(default_factory=lambda: {"A": 10.0, "B": 5.0, "C": 2.0}) # Global cap still applies
 
 class LiquidityFilters(BaseSettings):
     """Market eligibility filters."""
@@ -237,6 +283,7 @@ class Config(BaseSettings):
     risk: RiskConfig
     strategy: StrategyConfig
     assets: AssetConfig = Field(default_factory=AssetConfig)  # NEW
+    coin_universe: CoinUniverseConfig = Field(default_factory=CoinUniverseConfig) # NEW
     liquidity_filters: LiquidityFilters = Field(default_factory=LiquidityFilters)  # NEW
     execution: ExecutionConfig
     data: DataConfig
@@ -245,7 +292,7 @@ class Config(BaseSettings):
     backtest: BacktestConfig
     paper: PaperConfig
     live: LiveConfig
-    environment: Literal["dev", "paper", "prod"] = "dev"
+    environment: Literal["dev", "paper", "prod"] = "prod"
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "Config":

@@ -9,6 +9,13 @@ exchange:
   futures_markets:
     - "BTCUSD-PERP"
     - "ETHUSD-PERP"
+    
+  # Credentials
+  api_key: "${KRAKEN_API_KEY}"
+  api_secret: "${KRAKEN_API_SECRET}"
+  futures_api_key: "${KRAKEN_FUTURES_API_KEY}"
+  futures_api_secret: "${KRAKEN_FUTURES_API_SECRET}"
+  use_testnet: false
 
 ## Risk Management
 risk:
@@ -35,6 +42,19 @@ risk:
   tight_stop_threshold_pct: 0.015  # Definition of "tight stop" (1.5%)
   funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
 
+  # V2.1 Regime Risk
+  tight_smc_cost_cap_bps: 25.0
+  tight_smc_min_rr_multiple: 2.0
+  tight_smc_avg_hold_hours: 6.0
+  wide_structure_max_distortion_pct: 0.15
+  wide_structure_avg_hold_hours: 36.0
+  
+  loss_streak_cooldown_tight: 3
+  loss_streak_cooldown_wide: 5
+  loss_streak_pause_minutes_tight: 120
+  loss_streak_pause_minutes_wide: 90
+  loss_streak_min_loss_bps: 20.0
+
 ## Strategy Parameters
 strategy:
   # Timeframes
@@ -58,6 +78,20 @@ strategy:
   orderblock_lookback: 50
   fvg_min_size_pct: 0.001  # 0.1% minimum gap size
   bos_confirmation_candles: 3
+
+  # V2.1 Scoring & Regimes
+  ema_neutral_zone_bps: 10.0
+  min_score_tight_smc_aligned: 70.0
+  min_score_tight_smc_neutral: 75.0
+  min_score_wide_structure_aligned: 65.0
+  min_score_wide_structure_neutral: 70.0
+  fib_proximity_bps: 20.0
+  
+  # Regime-specific stops
+  tight_smc_atr_stop_min: 0.3
+  tight_smc_atr_stop_max: 0.6
+  wide_structure_atr_stop_min: 1.0
+  wide_structure_atr_stop_max: 1.2
 
 ## Execution Settings
 execution:

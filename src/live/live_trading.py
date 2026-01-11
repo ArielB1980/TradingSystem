@@ -14,7 +14,7 @@ from src.execution.futures_adapter import FuturesAdapter
 from src.execution.execution_engine import ExecutionEngine
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, get_active_position
+from src.storage.repository import save_candle, get_active_position, save_account_state
 
 logger = get_logger(__name__)
 
@@ -54,10 +54,27 @@ class LiveTrading:
         
         # State
         self.active = False
-        self.candles_15m: Dict[str, List[Candle]] = {}
-        self.candles_1h: Dict[str, List[Candle]] = {}
-        self.candles_4h: Dict[str, List[Candle]] = {}
         self.candles_1d: Dict[str, List[Candle]] = {}
+        self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
+        
+        # Market Expansion (Coin Universe)
+        self.markets = config.exchange.spot_markets
+        if config.assets.mode == "whitelist":
+             self.markets = config.assets.whitelist
+        elif config.coin_universe and config.coin_universe.enabled:
+             # Expand from Tiers
+             expanded = []
+             for tier, coins in config.coin_universe.liquidity_tiers.items():
+                 expanded.extend(coins)
+             self.markets = list(set(expanded)) # Deduplicate
+             logger.info("Coin Universe Enabled", markets=self.markets)
+             
+        # Update Data Acquisition with full list
+        self.data_acq = DataAcquisition(
+            self.client,
+            spot_symbols=self.markets,
+            futures_symbols=config.exchange.futures_markets # This needs expansion too ideally, but for now focus on spot scanning
+        )
         
         logger.info("Live Trading initialized", markets=config.exchange.futures_markets)
     
@@ -109,7 +126,7 @@ class LiveTrading:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=200) # Required for SMC indicators
         
-        for symbol in self.config.exchange.spot_markets:
+        for symbol in self.markets:
             logger.info(f"Fetching history for {symbol}")
             self.candles_1d[symbol] = await self.data_acq.fetch_spot_historical(symbol, "1d", start, end)
             self.candles_4h[symbol] = await self.data_acq.fetch_spot_historical(symbol, "4h", start, end)
@@ -125,7 +142,7 @@ class LiveTrading:
             logger.error("Data acquisition unhealthy")
             return
 
-        for spot_symbol in self.config.exchange.spot_markets:
+        for spot_symbol in self.markets:
             try:
                 # 2. Get Futures Context
                 futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
@@ -158,6 +175,50 @@ class LiveTrading:
                          
             except Exception as e:
                 logger.error(f"Error ticking {spot_symbol}", error=str(e))
+        
+        # 6. Sync Account State (Throttled 15s)
+        now = datetime.now(timezone.utc)
+        if (now - self.last_account_sync).total_seconds() > 15:
+            await self._sync_account_state()
+            self.last_account_sync = now
+
+    async def _sync_account_state(self):
+        """Fetch and persist real-time account state."""
+        try:
+            # 1. Get Balances
+            balance = await self.client.get_futures_balance()
+            if not balance:
+                return
+
+            base_currency = getattr(self.config.exchange, "base_currency", "USD")
+            total = balance.get('total', {})
+            free = balance.get('free', {})
+            used = balance.get('used', {})
+            
+            equity = Decimal(str(total.get(base_currency, 0)))
+            avail_margin = Decimal(str(free.get(base_currency, 0)))
+            margin_used_val = Decimal(str(used.get(base_currency, 0)))
+            
+            # 2. Get Unrealized PnL from positions
+            # Note: get_futures_balance often includes UPNL in equity, but let's be explicit if possible.
+            # Client.get_futures_balance usually returns equity = balance + upnl.
+            # Let's assume 'total' is equity.
+            
+            # Simple assumption for now:
+            cash_balance = equity - 0 # If total is equity
+            
+            # 3. Persist
+            save_account_state(
+                equity=equity,
+                balance=cash_balance, # Simplified
+                margin_used=margin_used_val,
+                available_margin=avail_margin,
+                unrealized_pnl=Decimal("0.0") # Hard to calculate exactly without sum of positions
+            )
+            logger.debug("Account state synced", equity=str(equity))
+            
+        except Exception as e:
+            logger.error("Failed to sync account state", error=str(e))
 
     async def _handle_signal(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
         """Process signal through risk and executor."""

@@ -12,18 +12,28 @@ from src.config.config import load_config
 from src.storage.repository import (
     get_active_position,
     get_all_trades,
-    get_recent_events
+    get_recent_events,
+    get_latest_account_state
 )
 from src.domain.models import Position, Side
 from src.domain.events import CoinStateSnapshot, REASON_CODES
 
 
+def _get_monitored_symbols(config) -> List[str]:
+    """Helper to get full list of monitored symbols respecting Coin Universe."""
+    if hasattr(config, "coin_universe") and config.coin_universe.enabled:
+        expanded = []
+        for tier, coins in config.coin_universe.liquidity_tiers.items():
+            expanded.extend(coins)
+        return list(set(expanded))
+    return config.exchange.spot_markets
+
 def get_portfolio_metrics() -> Dict[str, Any]:
     """Get portfolio-level metrics."""
     config = load_config()
     
-    # Get all configured symbols
-    symbols = config.exchange.spot_markets
+    # Get all configured symbols dynamically
+    symbols = _get_monitored_symbols(config)
     
     # Calculate metrics
     active_positions = 0
@@ -37,12 +47,20 @@ def get_portfolio_metrics() -> Dict[str, Any]:
             total_unrealized_pnl += float(pos.unrealized_pnl)
             total_margin_used += float(pos.margin_used)
     
-    # TODO: Get actual equity from account state
-    equity = 10000.0
+    # Get actual equity from account state
+    account_state = get_latest_account_state()
+    if account_state:
+        equity = float(account_state['equity'])
+        balance = float(account_state['balance'])
+    else:
+        # Fallback if no sync yet
+        equity = 10000.0
+        balance = 10000.0
     
     return {
         "equity": equity,
-        "margin_used": total_margin_used,
+        "balance": balance,
+        "margin_used": total_margin_used, 
         "margin_available": equity - total_margin_used,
         "unrealized_pnl": total_unrealized_pnl,
         "daily_pnl": total_unrealized_pnl,  # TODO: Calculate from realized + unrealized today
@@ -55,7 +73,7 @@ def get_portfolio_metrics() -> Dict[str, Any]:
 def get_all_positions() -> List[Dict[str, Any]]:
     """Get all active positions with risk metrics."""
     config = load_config()
-    symbols = config.exchange.spot_markets
+    symbols = _get_monitored_symbols(config)
     
     positions = []
     for symbol in symbols:
@@ -100,7 +118,7 @@ def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
     For now, build from available data.
     """
     config = load_config()
-    symbols = config.exchange.spot_markets
+    symbols = _get_monitored_symbols(config)
     
     snapshots = {}
     for symbol in symbols:
@@ -139,6 +157,7 @@ def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
             # Decision
             signal=latest['details'].get('signal', 'HOLD') if latest else 'HOLD',
             setup_quality=float(latest['details'].get('setup_quality', 0)) if latest else 0.0,
+            score_breakdown=latest['details'].get('score_breakdown', {}) if latest else {},
             next_action="WAIT",  # TODO: Calculate from state
             block_reason_codes=[r['details'].get('rejection_reasons', ['UNKNOWN'])[0] for r in rejections[:1]],
         )

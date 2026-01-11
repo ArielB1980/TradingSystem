@@ -396,7 +396,9 @@ class BacktestEngine:
             trailing_active=False,
             break_even_active=False,
             peak_price=fill_price,
-            opened_at=current_candle.timestamp
+            opened_at=current_candle.timestamp,
+            setup_type=signal.setup_type.value if hasattr(signal.setup_type, 'value') else signal.setup_type,
+            regime=signal.regime
         )
         
         # logger.info("Position opened", side=self.position.side.value, size=str(decision.position_notional))
@@ -510,6 +512,10 @@ class BacktestEngine:
         else:
             self.metrics.losing_trades += 1
             
-        self.risk_manager.record_trade_result(self.position_realized_pnl, self.current_equity)
+        self.risk_manager.record_trade_result(
+            self.position_realized_pnl, 
+            self.current_equity,
+            setup_type=self.position.setup_type if hasattr(self.position, 'setup_type') else None
+        )
         self.position = None
         self.position_realized_pnl = Decimal("0")

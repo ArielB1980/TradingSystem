@@ -70,6 +70,7 @@ class CoinStateSnapshot:
     signal: str = "HOLD"  # "LONG", "SHORT", "HOLD"
     setup_quality: float = 0.0  # 0-100
     next_action: str = ActionType.WAIT.value
+    score_breakdown: Dict[str, float] = field(default_factory=dict)
     block_reason_codes: List[str] = field(default_factory=list)
     
     # Risk flags
