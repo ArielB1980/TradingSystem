@@ -106,7 +106,20 @@ class BacktestEngine:
         self.taker_fee_bps = Decimal(str(config.backtest.taker_fee_bps))
         self.slippage_bps = Decimal(str(config.backtest.slippage_bps))
         
-        logger.info("Backtest engine initialized")
+        logger.info(
+            "BacktestEngine initialized",
+            symbol=self.symbol,
+            starting_equity=str(self.starting_equity)
+        )
+    
+    def set_client(self, client):
+        """
+        Set Kraken client for data fetching.
+        
+        Args:
+            client: KrakenClient instance
+        """
+        self.client = client
     
     async def run(
         self,
