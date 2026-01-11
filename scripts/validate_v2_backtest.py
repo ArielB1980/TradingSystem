@@ -72,7 +72,7 @@ def run_v2_backtest_validation():
             
             # Initialize Kraken client for data fetching (read-only, no trades)
             from src.data.kraken_client import KrakenClient
-            client = KrakenClient(config.exchange, api_key="", api_secret="")  # Empty creds for backtest
+            client = KrakenClient(api_key="", api_secret="", use_testnet=False)  # Empty creds for backtest
             
             # Initialize engine with specific symbol
             engine = BacktestEngine(config, symbol=symbol, starting_equity=starting_equity)
