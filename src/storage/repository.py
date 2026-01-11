@@ -4,7 +4,7 @@ Persistence functions for storing and retrieving trading data.
 Provides repository pattern for clean data access.
 """
 from sqlalchemy import Column, String, Numeric, DateTime, Integer, Boolean
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Optional
 from src.storage.db import Base, get_db
@@ -224,6 +224,61 @@ def get_candles(
             for cm in candle_models
         ]
 
+
+def load_candles_map(
+    symbols: List[str],
+    timeframe: str,
+    days: int = 30
+) -> dict:
+    """
+    Bulk load candles for multiple symbols into a map.
+    Optimized for startup hydration.
+    
+    Args:
+        symbols: List of symbols to load
+        timeframe: Timeframe string (e.g. "15m")
+        days: Number of days of history to load
+        
+    Returns:
+        Dict[symbol, List[Candle]]
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    db = get_db()
+    results = {}
+    
+    # Pre-initialize dict
+    for s in symbols:
+        results[s] = []
+        
+    with db.get_session() as session:
+        # Query efficient: Get all candles for these symbols/tf since cutoff
+        # Chunking symbols to prevent query overflow if list is huge
+        chunk_size = 50
+        
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i:i + chunk_size]
+            
+            models = session.query(CandleModel).filter(
+                CandleModel.symbol.in_(chunk),
+                CandleModel.timeframe == timeframe,
+                CandleModel.timestamp >= cutoff
+            ).order_by(CandleModel.timestamp.asc()).all()
+            
+            for cm in models:
+                c = Candle(
+                    timestamp=cm.timestamp.replace(tzinfo=timezone.utc),
+                    symbol=cm.symbol,
+                    timeframe=cm.timeframe,
+                    open=Decimal(str(cm.open)),
+                    high=Decimal(str(cm.high)),
+                    low=Decimal(str(cm.low)),
+                    close=Decimal(str(cm.close)),
+                    volume=Decimal(str(cm.volume)),
+                )
+                if c.symbol in results:
+                    results[c.symbol].append(c)
+                    
+    return results
 
 def save_trade(trade: Trade) -> None:
     """Save a completed trade to the database."""

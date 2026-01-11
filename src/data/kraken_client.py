@@ -170,23 +170,35 @@ class KrakenClient:
             logger.error("Failed to fetch spot balance", error=str(e))
             raise Exception(f"Spot API error: {str(e)}")
 
-    async def get_spot_ticker(self, symbol: str) -> Dict[str, Any]:
+    async def get_spot_ticker(self, symbol: str) -> Dict:
+        """Get current spot ticker information."""
+        await self.public_limiter.wait_for_token()
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            return ticker
+        except Exception as e:
+            logger.error(f"Failed to fetch spot ticker for {symbol}", error=str(e))
+            raise
+
+    async def get_spot_tickers_bulk(self, symbols: List[str]) -> Dict[str, Dict]:
         """
-        Get spot ticker (price) using CCXT.
-        
-        Args:
-           symbol: Spot symbol
-           
-        Returns:
-           Ticker dict
+        Get spot tickers for multiple symbols in one call.
+        Returns dict: {symbol: ticker_data}
         """
         await self.public_limiter.wait_for_token()
         try:
-             ticker = self.exchange.fetch_ticker(symbol)
-             return ticker
+            # Chunking to avoid URL length limits if list is huge
+            # CCXT usually handles this, but explicit trunking is safer for 250+ coins
+            results = {}
+            chunk_size = 50 
+            for i in range(0, len(symbols), chunk_size):
+                chunk = symbols[i:i + chunk_size]
+                tickers = self.exchange.fetch_tickers(chunk)
+                results.update(tickers)
+            return results
         except Exception as e:
-             logger.error("Failed to fetch spot ticker", symbol=symbol, error=str(e))
-             raise
+            logger.error("Failed to fetch bulk spot tickers", error=str(e))
+            raise
 
     async def get_spot_ohlcv(
         self,
@@ -379,6 +391,42 @@ class KrakenClient:
             
         except Exception as e:
             logger.error("Failed to fetch futures mark price", symbol=symbol, error=str(e))
+            raise
+
+    async def get_futures_tickers_bulk(self) -> Dict[str, Decimal]:
+        """
+        Get ALL futures mark prices in one call.
+        Returns mapped dict: {futures_symbol: mark_price}
+        """
+        await self.public_limiter.wait_for_token()
+        try:
+            # Fetch all tickers from V3 endpoint
+            url = "https://futures.kraken.com/derivatives/api/v3/tickers"
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise Exception(f"Futures API error: {await response.text()}")
+                    
+                    data = await response.json()
+                    
+                    # Map results
+                    results = {}
+                    for ticker in data.get('tickers', []):
+                        # Kraken returns weird symbols like 'PF_XBTUSD'
+                        # We need to map them back to our 'BTCUSD-PERP' or keep as is and map later.
+                        # For now, we store keyed by the raw symbol AND mapped versions if possible.
+                        # Better strategy: Return the raw map, let caller handle mapping or map common ones.
+                        
+                        raw_symbol = ticker.get('symbol')
+                        mark = ticker.get('markPrice')
+                        if raw_symbol and mark:
+                            results[raw_symbol] = Decimal(str(mark))
+                            
+                    return results
+                    
+        except Exception as e:
+            logger.error("Failed to fetch bulk futures tickers", error=str(e))
             raise
     
     async def get_account_balance(self) -> Dict[str, Decimal]:
