@@ -62,11 +62,12 @@ def backtest(
         )
         
         try:
-            # Create engine
-            engine = BacktestEngine(config, client)
+            # Create engine with symbol
+            engine = BacktestEngine(config, symbol=symbol)
+            engine.set_client(client)
             
             # Run simulation
-            metrics = await engine.run(symbol, start_date, end_date)
+            metrics = await engine.run(start_date, end_date)
             
             # Calculate final metrics
             end_equity = metrics.equity_curve[-1] if metrics.equity_curve else Decimal(str(config.backtest.starting_equity))
