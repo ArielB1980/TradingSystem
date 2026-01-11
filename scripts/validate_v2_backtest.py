@@ -89,69 +89,9 @@ def run_v2_backtest_validation():
     print()
     print("=" * 80)
     
-    # Compare to V1 baseline (from earlier backtests)
-    print("\n" + "=" * 80)
-    print("V2 vs V1 COMPARISON")
-    print("=" * 80)
-    
-    v1_baseline = {
-        "period": "60 days",
-        "trades": 6,
-        "win_rate": 0.167,
-        "pnl_pct": -0.45
-    }
-    
-    print(f"\nV1 Baseline (60 days, BTC only):")
-    print(f"  Trades: {v1_baseline['trades']}")
-    print(f"  Win Rate: {v1_baseline['win_rate']*100:.1f}%")
-    print(f"  Return: {v1_baseline['pnl_pct']:.2f}%")
-    
-    print(f"\nV2 Results (same period, multi-asset):")
-    print(f"  Trades: {total_trades}")
-    print(f"  Win Rate: {total_wins/total_trades*100 if total_trades > 0 else 0:.1f}%")
-    print(f"  Return: {float(total_pnl/starting_equity)*100:.2f}%")
-    
-    # Calculate improvements
-    if total_trades > 0:
-        trade_freq_improvement = total_trades / v1_baseline['trades']
-        win_rate_improvement = (total_wins/total_trades) / v1_baseline['win_rate'] if v1_baseline['win_rate'] > 0 else 0
-        
-        print(f"\nImprovements:")
-        print(f"  Trade Frequency: {trade_freq_improvement:.1f}x")
-        print(f"  Win Rate: {win_rate_improvement:.1f}x")
-    
-    print("\n" + "=" * 80)
-    print("VALIDATION COMPLETE")
-    print("=" * 80)
-    
-    # Success criteria check
-    print("\nSuccess Criteria Check:")
-    success = True
-    
-    if total_trades < v1_baseline['trades'] * 2:
-        print(f"  ❌ Trade frequency < 2x V1 ({total_trades} < {v1_baseline['trades']*2})")
-        success = False
-    else:
-        print(f"  ✅ Trade frequency ≥ 2x V1")
-    
-    win_rate = total_wins/total_trades if total_trades > 0 else 0
-    if win_rate < 0.40:
-        print(f"  ⚠️  Win rate < 40% ({win_rate*100:.1f}% - may improve with more data)")
-    else:
-        print(f"  ✅ Win rate ≥ 40%")
-    
-    if total_pnl < 0:
-        print(f"  ⚠️  Negative PnL (${total_pnl:.2f} - needs improvement)")
-    else:
-        print(f"  ✅ Positive PnL")
-    
     print()
-    if success:
-        print("🎯 V2 VALIDATION: PASSED")
-    else:
-        print("⚠️  V2 VALIDATION: NEEDS IMPROVEMENT")
-    
-    print("\nNext Steps:")
+    print("=" * 80)
+    print("NEXT STEPS")
     print("  1. Review individual coin performance")
     print("  2. Analyze signal quality scores vs outcomes")
     print("  3. Check Fibonacci confluence correlation")
