@@ -141,5 +141,28 @@ live:
   min_paper_trades: 50
   max_paper_drawdown_pct: 0.15  # Paper must stay within 15% DD
 
+## Coin Universe (V2 Multi-Asset)
+coin_universe:
+  enabled: true
+  min_spot_volume_24h: 5000000  # $5M minimum
+  
+  # Liquidity tiers (A = highest, C = lowest)
+  liquidity_tiers:
+    A:
+      - "BTC/USD"
+      - "ETH/USD"
+      - "SOL/USD"
+    B:
+      - "LINK/USD"
+      - "AVAX/USD"
+      - "MATIC/USD"
+    C: []  # Optional lower tier
+  
+  # Max leverage per tier (respects global 10x cap)
+  tier_max_leverage:
+    A: 10.0
+    B: 7.0
+    C: 5.0
+
 ## Environment
 environment: "prod"  # LIVE TRADING MODE - REAL CAPITAL AT RISK
