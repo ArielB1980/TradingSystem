@@ -38,12 +38,12 @@ def run_v2_backtest_validation():
     # Load V2 config
     config = load_config('src/config/config.yaml')
     
-    # Backtest parameters
-    start_date = "2025-08-01"  # 5+ months of data
+    # Backtest parameters - EXTENDED 180 DAYS
+    start_date = "2025-07-14"  # 180 days before Jan 10, 2026
     end_date = "2026-01-10"
     starting_equity = Decimal("10000")
     
-    print(f"Period: {start_date} to {end_date}")
+    print(f"Period: {start_date} to {end_date} (180 days)")
     print(f"Starting Equity: ${starting_equity}")
     print()
     
