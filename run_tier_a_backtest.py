@@ -67,7 +67,7 @@ async def run_tier_a_backtest():
         
         if result['success']:
             metrics = result['metrics']
-            print(f"✓ {metrics.total_trades} trades, PnL: ${float(metrics.net_pnl):,.2f}")
+            print(f"✓ {metrics.total_trades} trades, PnL: ${float(metrics.total_pnl):,.2f}")
         else:
             print(f"✗ Failed: {result['error'][:50]}")
     
@@ -99,12 +99,12 @@ async def run_tier_a_backtest():
         total_trades += metrics.total_trades
         winning_trades += metrics.winning_trades
         losing_trades += metrics.losing_trades
-        total_pnl += metrics.net_pnl
+        total_pnl += metrics.total_pnl
         
         coin_performance.append({
             'symbol': result['symbol'],
             'trades': metrics.total_trades,
-            'pnl': float(metrics.net_pnl),
+            'pnl': float(metrics.total_pnl),
             'win_rate': metrics.win_rate if metrics.total_trades > 0 else 0,
             'return_pct': float(metrics.total_return_pct),
             'max_dd': float(metrics.max_drawdown_pct)

@@ -12,6 +12,7 @@ from src.risk.risk_manager import RiskManager
 from src.execution.executor import Executor
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.execution_engine import ExecutionEngine
+from src.execution.position_manager import PositionManager, ActionType
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
 from src.storage.repository import save_candle, get_active_position, save_account_state
@@ -50,9 +51,11 @@ class LiveTrading:
         self.futures_adapter = FuturesAdapter(self.client)
         self.executor = Executor(config.execution, self.futures_adapter)
         self.execution_engine = ExecutionEngine(config)
+        self.position_manager = PositionManager()
         self.kill_switch = KillSwitch(self.client)
         
         # State
+        self.managed_positions: Dict[str, Position] = {}  # V3 State Tracking
         self.active = False
         self.candles_1d: Dict[str, List[Candle]] = {}
         self.candles_4h: Dict[str, List[Candle]] = {}
@@ -132,12 +135,31 @@ class LiveTrading:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=200) # Required for SMC indicators
         
-        for symbol in self.markets:
-            logger.info(f"Fetching history for {symbol}")
-            self.candles_1d[symbol] = await self.data_acq.fetch_spot_historical(symbol, "1d", start, end)
-            self.candles_4h[symbol] = await self.data_acq.fetch_spot_historical(symbol, "4h", start, end)
-            self.candles_1h[symbol] = await self.data_acq.fetch_spot_historical(symbol, "1h", start, end)
-            self.candles_15m[symbol] = await self.data_acq.fetch_spot_historical(symbol, "15m", start, end)
+        # Limit concurrency to avoid hitting rate limits too hard
+        semaphore = asyncio.Semaphore(10)
+        
+        async def fetch_symbol_data(symbol):
+            async with semaphore:
+                try:
+                    logger.info(f"Fetching history for {symbol}")
+                    # Fetch all timeframes for this symbol in parallel
+                    timeframes = ["1d", "4h", "1h", "15m"]
+                    results = await asyncio.gather(*[
+                        self.data_acq.fetch_spot_historical(symbol, tf, start, end)
+                        for tf in timeframes
+                    ])
+                    
+                    self.candles_1d[symbol] = results[0]
+                    self.candles_4h[symbol] = results[1]
+                    self.candles_1h[symbol] = results[2]
+                    self.candles_15m[symbol] = results[3]
+                    
+                except Exception as e:
+                    logger.error(f"Failed to warmup {symbol}, skipping...", error=str(e))
+
+        # Run all symbols
+        tasks = [fetch_symbol_data(s) for s in self.markets]
+        await asyncio.gather(*tasks)
             
         logger.info("Indicators warmed up")
 
@@ -191,9 +213,29 @@ class LiveTrading:
                 position_data = await self.client.get_futures_position(futures_symbol)
                 
                 if position_data:
-                    # Logic for Trailing/BE/Emergency Close
-                    # For now: Log and let protective orders handle it
-                    logger.info(f"Active position in {futures_symbol}", side=position_data['side'], size=str(position_data['size']))
+                    # V3 Active Management
+                    symbol = position_data['symbol']
+                    
+                    # Ensure tracked
+                    if symbol not in self.managed_positions:
+                         # Only occurs on restart or untracked entry. 
+                         # We init with basic data, missing V3 immutable params (limitations of restart without DB persistance of state)
+                         self.managed_positions[symbol] = self._init_managed_position(position_data, mark_price)
+                    
+                    managed_pos = self.managed_positions[symbol]
+                    # Update dynamic data
+                    managed_pos.current_mark_price = mark_price
+                    managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealizedPnl', 0)))
+                    managed_pos.size = Decimal(str(position_data['size']))
+                    
+                    # Evaluate Rules 1-12
+                    actions = self.position_manager.evaluate(managed_pos, mark_price)
+                    
+                    # Execute Actions
+                    if actions:
+                        await self._execute_management_actions(symbol, actions, managed_pos)
+                        
+                    logger.info(f"Active (V3 Managed) {futures_symbol}", side=position_data['side'], pnl=str(managed_pos.unrealized_pnl))
                 else:
                     # 5. Generate Signals (Spot Analysis)
                     signal = self.smc_engine.generate_signal(
@@ -323,16 +365,68 @@ class LiveTrading:
         entry_order = await self.executor.execute_signal(intent_model, mark_price, [])
         
         if entry_order:
-             # Protective orders are placed after fill usually, 
-             # but for now we place them immediately or on next tick detection.
-             # Executor.execute_signal returns the entry order.
-             # In a real system, we'd wait for fill event.
-             # For simpler loop, we can try to place protective orders on next tick if fill confirmed.
              logger.info("Entry order placed", order_id=entry_order.order_id)
              
-             # Note: Trade records are only saved when positions are CLOSED (entry → exit).
-             # Open positions are tracked via exchange API and synced in _sync_positions().
-             # Trade persistence will happen in the position management/exit logic.
+             # 5. Place Protective Orders (Immediate Safety)
+             # We place SL immediately to prevent naked positions.
+             tps = order_intent.get('take_profits', [])
+             tp1 = tps[0]['price'] if len(tps) > 0 else None
+             tp2 = tps[1]['price'] if len(tps) > 1 else None
+             
+             sl_order, tp_order = await self.executor.place_protective_orders(
+                 entry_order,
+                 intent_model.stop_loss_futures,
+                 take_profit_price=tp1 # Primary TP on exchange
+             )
+             
+             sl_id = sl_order.order_id if sl_order else None
+             if sl_id:
+                 logger.info("Protective SL placed", order_id=sl_id)
+             else:
+                 logger.critical("FAILED TO PLACE STOP LOSS", symbol=signal.symbol)
+             
+             tp_ids = []
+             if tp_order:
+                 tp_ids.append(tp_order.order_id)
+             
+             # V3: Initialize Active Trade Management State
+             # We optimisticly track the position with its immutable intents
+             futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
+             tps = order_intent['take_profits']
+             tp1 = tps[0]['price'] if len(tps) > 0 else None
+             tp2 = tps[1]['price'] if len(tps) > 1 else None
+             
+             v3_pos = Position(
+                 symbol=futures_symbol,
+                 side=intent_model.side,
+                 size=Decimal("0"), # Pending Fill
+                 size_notional=intent_model.size_notional,
+                 entry_price=mark_price, # Est
+                 current_mark_price=mark_price,
+                 liquidation_price=Decimal("0"),
+                 unrealized_pnl=Decimal("0"),
+                 leverage=intent_model.leverage,
+                 margin_used=Decimal("0"),
+                 opened_at=datetime.now(timezone.utc),
+                 updated_at=datetime.now(timezone.utc),
+                 
+                 # V3 Immutable Parameters
+                 initial_stop_price=intent_model.stop_loss_futures,
+                 trade_type=signal.regime,
+                 tp1_price=tp1,
+                 tp2_price=tp2,
+                 partial_close_pct=Decimal("0.5"), # Default config
+                 
+                 # ID Linking
+                 stop_loss_order_id=sl_id, 
+                 tp_order_ids=tp_ids
+             )
+             
+             self.managed_positions[futures_symbol] = v3_pos
+             logger.info("V3 Position State initialized", symbol=futures_symbol)
+             
+             # Trade persistence happens on exit defined in Rules 11
+
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition."""
@@ -361,3 +455,77 @@ class LiveTrading:
         await fetch_tf("1h", self.candles_1h)
         await fetch_tf("4h", self.candles_4h)
         await fetch_tf("1d", self.candles_1d)
+
+    def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
+        """Hydrate Position object from exchange data (for recovery)."""
+        logger.warning(f"Hydrating position for {exchange_data['symbol']} without V3 params (Recovery)")
+        return Position(
+            symbol=exchange_data['symbol'],
+            side=Side.LONG if exchange_data['side'] == 'long' else Side.SHORT,
+            size=Decimal(str(exchange_data['size'])),
+            size_notional=Decimal("0"), # Unknown without calc
+            entry_price=Decimal(str(exchange_data['price'])),
+            current_mark_price=mark_price,
+            liquidation_price=Decimal(str(exchange_data.get('liquidationPrice', 0))),
+            unrealized_pnl=Decimal(str(exchange_data.get('unrealizedPnl', 0))),
+            leverage=Decimal("1"), # Approx
+            margin_used=Decimal("0"),
+            opened_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            
+            # Init V3 defaults (safe fallback)
+            initial_stop_price=None,
+            tp1_price=None,
+            tp2_price=None,
+            final_target_price=None,
+            partial_close_pct=Decimal("0.5"),
+            original_size=Decimal(str(exchange_data['size'])),
+            current_mark_price=mark_price
+        )
+
+    async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):
+        """Execute logic actions decided by PositionManager."""
+        for action in actions:
+            logger.info(f"V3 Action: {action.type.value}", symbol=symbol, reason=action.reason)
+            
+            try:
+                if action.type == ActionType.CLOSE_POSITION:
+                    # Market Close
+                    await self.client.close_position(symbol)
+                    # State update handled on next tick (position gone)
+                    
+                elif action.type == ActionType.PARTIAL_CLOSE:
+                    # Place market reduce-only order
+                    # Invert side
+                    exit_side = 'sell' if position.side == Side.LONG else 'buy'
+                    await self.client.place_futures_order(
+                         symbol=symbol,
+                         side=exit_side,
+                         order_type='market',
+                         size=float(action.quantity),
+                         reduce_only=True
+                    )
+                    # Update internal state (flags)
+                    if "TP1" in action.reason:
+                        position.tp1_hit = True
+                    if "TP2" in action.reason:
+                        position.tp2_hit = True
+
+                elif action.type == ActionType.UPDATE_STATE:
+                    if "Intent Confirmed" in action.reason:
+                        position.intent_confirmed = True
+                        
+                elif action.type == ActionType.UPDATE_STOP:
+                    # Requires Order Management
+                    # If we track SL order ID:
+                    if position.stop_loss_order_id:
+                        await self.client.edit_futures_order(
+                            order_id=position.stop_loss_order_id,
+                            symbol=symbol,
+                            stop_price=float(action.price)
+                        )
+                    else:
+                        logger.warning("Cannot update stop - no SL Order ID tracked", symbol=symbol)
+                        
+            except Exception as e:
+                logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))

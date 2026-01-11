@@ -1,5 +1,10 @@
 # Configuration
 
+## System
+system:
+  name: "Trading System V3"
+  version: "3.0.0"
+
 ## Exchange Settings
 exchange:
   name: "kraken"
@@ -29,7 +34,7 @@ risk:
   # Portfolio limits (CONSERVATIVE for live start)
   # Portfolio limits (Scaled for Multi-Asset)
   max_concurrent_positions: 5  # Allow up to 5 parallel trades
-  daily_loss_limit_pct: 0.01  # 1% daily loss limit (strict)
+  daily_loss_limit_pct: 0.05  # 5% daily loss limit (Accommodates 10x active sizing)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
   # Basis guards
@@ -198,7 +203,7 @@ coin_universe:
   liquidity_tiers:
     # Tier A: Top 20 major coins (20 coins)
     A:
-      - "XBT/USD"
+      - "BTC/USD"  # Bitcoin (Spot uses BTC, Futures uses XBT)
       - "ETH/USD"
       - "SOL/USD"
       - "BNB/USD"
@@ -359,7 +364,7 @@ coin_universe:
       - "LQTY/USD"
       - "LRC/USD"
       - "LSK/USD"
-      - "LUNA2/USD"
+      - "LUNA/USD"
       - "ME/USD"
       - "MELANIA/USD"
       - "METIS/USD"

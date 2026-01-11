@@ -180,6 +180,23 @@ class Position:
     break_even_active: bool = False
     peak_price: Optional[Decimal] = None  # Highest/Lowest mark price since trail activation
     
+    # V3 Active Trade Management
+    # Immutable Parameters (Set at Entry)
+    initial_stop_price: Optional[Decimal] = None
+    max_loss_amount: Optional[Decimal] = None
+    trade_type: Optional[str] = None  # "tight" or "wide"
+    tp1_price: Optional[Decimal] = None
+    tp2_price: Optional[Decimal] = None
+    final_target_price: Optional[Decimal] = None
+    partial_close_pct: Optional[Decimal] = None
+    original_size: Optional[Decimal] = None
+
+    # State Flags
+    intent_confirmed: bool = False
+    premise_invalidated: bool = False
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    
     # Metadata
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
