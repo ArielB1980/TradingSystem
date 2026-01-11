@@ -343,8 +343,7 @@ class LiveTrading:
                  entry_price=Decimal(str(order_intent['metadata']['fut_entry'])),
                  size_notional=decision.position_notional,
                  leverage=decision.leverage,
-                 entered_at=datetime.now(timezone.utc),
-                 entry_time=datetime.now(timezone.utc) # Backwards compat
+                 entered_at=datetime.now(timezone.utc)
              )
              save_trade(trade)
              logger.info("Trade persisted to DB", trade_id=trade.trade_id)
