@@ -42,6 +42,10 @@ class SMCEngine:
         # V2: Per-symbol caching for multi-asset support
         self.indicator_cache: Dict[str, Dict] = {}  # symbol -> cached indicators
         
+        # V2: Fibonacci engine for confluence scoring
+        from src.strategy.fibonacci_engine import FibonacciEngine
+        self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
+        
         logger.info("SMC Engine initialized", config=config.model_dump())
     
     def generate_signal(
