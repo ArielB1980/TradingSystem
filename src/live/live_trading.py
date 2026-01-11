@@ -330,23 +330,9 @@ class LiveTrading:
              # For simpler loop, we can try to place protective orders on next tick if fill confirmed.
              logger.info("Entry order placed", order_id=entry_order.order_id)
              
-             # 5. Persist Trade (CRITICAL FIX)
-             from src.storage.repository import save_trade
-             from src.domain.models import Trade
-             
-             # Create Trade record (approximate, since it's just submitted)
-             # In a real system, we'd wait for execution report.
-             trade = Trade(
-                 trade_id=entry_order.order_id,
-                 symbol=signal.symbol,
-                 side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
-                 entry_price=Decimal(str(order_intent['metadata']['fut_entry'])),
-                 size_notional=decision.position_notional,
-                 leverage=decision.leverage,
-                 entered_at=datetime.now(timezone.utc)
-             )
-             save_trade(trade)
-             logger.info("Trade persisted to DB", trade_id=trade.trade_id)
+             # Note: Trade records are only saved when positions are CLOSED (entry → exit).
+             # Open positions are tracked via exchange API and synced in _sync_positions().
+             # Trade persistence will happen in the position management/exit logic.
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition."""
