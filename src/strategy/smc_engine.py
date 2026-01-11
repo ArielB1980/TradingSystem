@@ -4,7 +4,7 @@ SMC (Smart Money Concepts) signal generation engine.
 Design lock enforced: Operates on spot market data ONLY.
 No futures prices, funding data, or order book data may be accessed.
 """
-from typing import List, Optional, Tuple
+from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime
 import pandas as pd
@@ -38,6 +38,9 @@ class SMCEngine:
         """
         self.config = config
         self.indicators = Indicators()
+        
+        # V2: Per-symbol caching for multi-asset support
+        self.indicator_cache: Dict[str, Dict] = {}  # symbol -> cached indicators
         
         logger.info("SMC Engine initialized", config=config.model_dump())
     
