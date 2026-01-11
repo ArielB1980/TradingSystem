@@ -74,6 +74,18 @@ execution:
   # Pyramiding
   pyramiding_enabled: false  # Default: no adding to positions
 
+## Multi-TP Configuration (V2)
+multi_tp:
+  enabled: true
+  tp1_r_multiple: 1.0   # Close 40% at 1R
+  tp1_close_pct: 0.40
+  tp2_r_multiple: 2.5   # Close 40% at 2.5R
+  tp2_close_pct: 0.40
+  runner_pct: 0.20      # Keep 20% as runner
+  move_sl_to_be_after_tp1: true  # Auto move to breakeven after TP1
+  trailing_stop_enabled: true    # Enable trailing for runner
+  trailing_stop_atr_multiplier: 1.5
+
 ## Data Acquisition
 data:
   # WebSocket settings
