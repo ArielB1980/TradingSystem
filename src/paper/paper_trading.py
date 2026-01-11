@@ -381,7 +381,7 @@ class PaperTrading:
         net_pnl = pnl - fees
         
         self.current_equity += net_pnl
-        self.risk_manager.record_trade_result(net_pnl)
+        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
         
         # Update Position Size
         position.size -= qty
@@ -402,7 +402,7 @@ class PaperTrading:
         net_pnl = pnl - fees
         
         self.current_equity += net_pnl
-        self.risk_manager.record_trade_result(net_pnl)
+        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
         
         logger.info("Virtual Position Closed", symbol=position.symbol, reason=reason, pnl=str(net_pnl), equity=str(self.current_equity))
         
