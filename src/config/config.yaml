@@ -12,16 +12,16 @@ exchange:
 
 ## Risk Management
 risk:
-  # Position sizing
-  risk_per_trade_pct: 0.005  # 0.5% of account equity per trade
-  max_leverage: 10.0  # Hard cap (actual leverage determined by stop distance)
+  # Position sizing (ULTRA-CONSERVATIVE for live start)
+  risk_per_trade_pct: 0.003  # 0.3% of account equity per trade
+  max_leverage: 5.0  # Conservative 5x max (half of system capability)
   
   # Liquidation safety
   min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
   
-  # Portfolio limits
-  max_concurrent_positions: 2
-  daily_loss_limit_pct: 0.02  # 2% of equity
+  # Portfolio limits (CONSERVATIVE for live start)
+  max_concurrent_positions: 1  # ONE position only for first week
+  daily_loss_limit_pct: 0.01  # 1% daily loss limit (strict)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
   # Basis guards
@@ -142,4 +142,4 @@ live:
   max_paper_drawdown_pct: 0.15  # Paper must stay within 15% DD
 
 ## Environment
-environment: "dev"  # dev / paper / prod
+environment: "prod"  # LIVE TRADING MODE - REAL CAPITAL AT RISK
