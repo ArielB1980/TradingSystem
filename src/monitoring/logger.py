@@ -51,10 +51,17 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
     
     # Add file handler if specified
     if log_file:
+        from logging.handlers import RotatingFileHandler
+        
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         
-        file_handler = logging.FileHandler(log_path)
+        # Rotating File Handler (10MB limit, 5 backups)
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=10 * 1024 * 1024, # 10MB
+            backupCount=5
+        )
         file_handler.setLevel(getattr(logging, log_level.upper()))
         logging.root.addHandler(file_handler)
 

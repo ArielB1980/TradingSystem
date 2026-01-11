@@ -197,7 +197,18 @@ class SMCEngine:
                     
                     if not passed:
                         reasoning_parts.append(f"❌ Score {score_obj.total_score:.1f} < Threshold {threshold} (Grade: {score_obj.get_grade()})")
-                        signal = self._no_signal(symbol, reasoning_parts, current_candle)
+                        signal = self._no_signal(
+                            symbol, 
+                            reasoning_parts, 
+                            current_candle, 
+                            score_breakdown={
+                                "smc": score_obj.smc_quality,
+                                "fib": score_obj.fib_confluence,
+                                "htf": score_obj.htf_alignment,
+                                "adx": score_obj.adx_strength,
+                                "cost": score_obj.cost_efficiency
+                            }
+                        )
                         
                         # LOG REJECTION (Mandatory)
                         logger.info(
@@ -227,7 +238,14 @@ class SMCEngine:
                             adx=adx_value,
                             atr=atr_value,
                             ema200_slope=ema200_slope,
-                            tp_candidates=tp_candidates
+                            tp_candidates=tp_candidates,
+                            score_breakdown={
+                                "smc": score_obj.smc_quality,
+                                "fib": score_obj.fib_confluence,
+                                "htf": score_obj.htf_alignment,
+                                "adx": score_obj.adx_strength,
+                                "cost": score_obj.cost_efficiency
+                            }
                         )
                 elif signal is None:
                      # Calculate levels returned None (should be handled by signal_type check but safe fallback)
@@ -749,10 +767,11 @@ class SMCEngine:
         symbol: str,
         reasoning: List[str],
         current_candle: Optional[Candle],
+        score_breakdown: Optional[Dict] = None
     ) -> Signal:
         """Create a NO_SIGNAL signal."""
         from src.domain.models import SetupType
-        timestamp = current_candle.timestamp if current_candle else datetime.now()
+        timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
         
         return Signal(
             timestamp=timestamp,
@@ -768,4 +787,5 @@ class SMCEngine:
             adx=Decimal("0"),
             atr=Decimal("0"),
             ema200_slope="flat",
+            score_breakdown=score_breakdown or {}
         )

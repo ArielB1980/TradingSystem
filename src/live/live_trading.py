@@ -15,7 +15,8 @@ from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_manager import PositionManager, ActionType
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, get_active_position, save_account_state
+from src.storage.repository import save_candle, get_active_position, save_account_state, sync_active_positions, record_event
+from src.storage.maintenance import DatabasePruner
 
 logger = get_logger(__name__)
 
@@ -60,8 +61,13 @@ class LiveTrading:
         self.candles_1d: Dict[str, List[Candle]] = {}
         self.candles_4h: Dict[str, List[Candle]] = {}
         self.candles_1h: Dict[str, List[Candle]] = {}
+        self.candles_1h: Dict[str, List[Candle]] = {}
         self.candles_15m: Dict[str, List[Candle]] = {}
+        self.last_candle_update: Dict[str, Dict[str, datetime]] = {} # Cache tracking
+        self.last_trace_log: Dict[str, datetime] = {} # Dashboard update throttling
         self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
+        self.db_pruner = DatabasePruner()
         
         # Market Expansion (Coin Universe)
         self.markets = config.exchange.spot_markets
@@ -92,6 +98,10 @@ class LiveTrading:
         try:
             # 1. Initial Account Sync (Provide immediate feedback to dashboard)
             await self._sync_account_state()
+            try:
+                await self._sync_positions()
+            except Exception as e:
+                logger.warning("Initial position sync failed", error=str(e))
             
             # 2. Warmup
             await self._warmup()
@@ -163,26 +173,79 @@ class LiveTrading:
             
         logger.info("Indicators warmed up")
 
+    def _convert_to_position(self, data: Dict) -> Position:
+        """Convert raw exchange position dict to Position domain object."""
+        # Handle key variations (CCXT vs Raw vs Internal)
+        symbol = data.get('symbol')
+        
+        # Parse Side
+        side_raw = data.get('side', 'long').lower()
+        side = Side.LONG if side_raw in ['long', 'buy'] else Side.SHORT
+        
+        # Parse Numerics
+        size = Decimal(str(data.get('size', 0)))
+        entry_price = Decimal(str(data.get('entryPrice', data.get('entry_price', 0))))
+        mark_price = Decimal(str(data.get('markPrice', data.get('mark_price', 0))))
+        liq_price = Decimal(str(data.get('liquidationPrice', data.get('liquidation_price', 0))))
+        unrealized_pnl = Decimal(str(data.get('unrealizedPnl', data.get('unrealized_pnl', 0))))
+        leverage = Decimal(str(data.get('leverage', 1)))
+        margin_used = Decimal(str(data.get('initialMargin', data.get('margin_used', 0))))
+        
+        if mark_price == 0:
+            # Fallback for mark price if missing
+             mark_price = entry_price
+             
+        # Calculate Notional
+        size_notional = size * mark_price
+        
+        return Position(
+            symbol=symbol,
+            side=side,
+            size=size,
+            size_notional=size_notional,
+            entry_price=entry_price,
+            current_mark_price=mark_price,
+            liquidation_price=liq_price,
+            unrealized_pnl=unrealized_pnl,
+            leverage=leverage,
+            margin_used=margin_used,
+            opened_at=datetime.now(timezone.utc) # Approximate if missing
+        )
+
     async def _sync_positions(self) -> List[Dict]:
         """
         Sync active positions from exchange and update RiskManager.
         
         Returns:
-            List of active positions
-            
-        Raises:
-            Exception: If position sync fails (caller should handle)
+            List of active positions (dicts)
         """
-        active_positions = await self.client.get_all_futures_positions()
+        raw_positions = await self.client.get_all_futures_positions()
+        
+        # Convert to Domain Objects
+        active_positions = []
+        for p in raw_positions:
+            try:
+                pos_obj = self._convert_to_position(p)
+                active_positions.append(pos_obj)
+            except Exception as e:
+                logger.error("Failed to convert position object", data=str(p), error=str(e))
+        
+        # Update Risk Manager
         self.risk_manager.update_position_list(active_positions)
         
-        if active_positions:
-            logger.info(
-                f"Active Portfolio: {len(active_positions)} positions", 
-                symbols=[p['symbol'] for p in active_positions]
-            )
+        # Persist to DB for Dashboard
+        try:
+             sync_active_positions(self.risk_manager.current_positions)
+        except Exception as e:
+             logger.error("Failed to sync positions to DB", error=str(e))
         
-        return active_positions
+        # ALWAYS log position count for debugging
+        logger.info(
+            f"Active Portfolio: {len(active_positions)} positions", 
+            symbols=[p.symbol for p in active_positions]
+        )
+        
+        return raw_positions
 
     async def _tick(self):
         """Single iteration of live trading logic."""
@@ -248,6 +311,37 @@ class LiveTrading:
                     
                     if signal.signal_type != SignalType.NO_SIGNAL:
                          await self._handle_signal(signal, spot_price, mark_price)
+                    
+                    # DASHBOARD UPDATE: Record decision trace even if NO signal
+                    # Throttle to once every 5 minutes per coin to avoid DB spam
+                    now = datetime.now(timezone.utc)
+                    last_trace = self.last_trace_log.get(spot_symbol, datetime.min.replace(tzinfo=timezone.utc))
+                    
+                    if (now - last_trace).total_seconds() > 300: # 5 minutes
+                        try:
+                            # Extract useful metrics from signal object (even if NO_SIGNAL)
+                            trace_details = {
+                                "signal": signal.signal_type.value,
+                                "regime": signal.regime,
+                                "bias": signal.higher_tf_bias,
+                                "adx": float(signal.adx) if signal.adx else 0.0,
+                                "atr": float(signal.atr) if signal.atr else 0.0,
+                                "ema200_slope": signal.ema200_slope,
+                                "spot_price": float(spot_price),
+                                "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
+                                "score_breakdown": signal.score_breakdown or {}
+                            }
+                            
+                            record_event(
+                                event_type="DECISION_TRACE",
+                                symbol=spot_symbol,
+                                details=trace_details,
+                                timestamp=now
+                            )
+                            self.last_trace_log[spot_symbol] = now
+                            # No log spam, just DB record
+                        except Exception as e:
+                            logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e))
                          
             except Exception as e:
                 logger.error(f"Error ticking {spot_symbol}", error=str(e))
@@ -257,6 +351,15 @@ class LiveTrading:
         if (now - self.last_account_sync).total_seconds() > 15:
             await self._sync_account_state()
             self.last_account_sync = now
+            
+        # 7. Operational Maintenance (Daily)
+        if (now - self.last_maintenance_run).total_seconds() > 86400: # 24 hours
+            try:
+                results = self.db_pruner.run_maintenance()
+                logger.info("Daily database maintenance complete", results=results)
+                self.last_maintenance_run = now
+            except Exception as e:
+                logger.error("Daily maintenance failed", error=str(e))
 
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
@@ -332,14 +435,39 @@ class LiveTrading:
             logger.warning("Trade rejected by Risk Manager", reasons=decision.rejection_reasons)
             return
             
-        # 3. Execution Planning (Spot -> Futures)
-        order_intent = self.execution_engine.generate_entry_plan(
-            signal, 
-            decision.position_notional,
-            spot_price,
-            mark_price,
-            decision.leverage
-        )
+        if decision.approved:
+            # OPPORTUNITY COST REPLACEMENT
+            if decision.should_close_existing and decision.close_symbol:
+                logger.warning(
+                    "Executing Opportunity Cost Replacement",
+                    closing=decision.close_symbol,
+                    opening=signal.symbol
+                )
+                try:
+                    await self.client.close_position(decision.close_symbol)
+                    # Force remove from local state to clear slot immediately
+                    if decision.close_symbol in self.managed_positions:
+                        del self.managed_positions[decision.close_symbol]
+                    # Also update RiskManager immediately
+                    self.risk_manager.current_positions = [
+                        p for p in self.risk_manager.current_positions 
+                        if p.symbol != decision.close_symbol
+                    ]
+                except Exception as e:
+                    logger.error("Failed to execute replacement close", symbol=decision.close_symbol, error=str(e))
+                    # Proceed anyway? Or abort? 
+                    # If close failed, we might exceed limits. Better to abort.
+                    logger.error("Aborting new position entry due to failed replacement")
+                    return
+
+            # Execute Entry
+            order_intent = self.execution_engine.generate_entry_plan( # Reverted to original method name and args
+                signal, 
+                decision.position_notional,
+                spot_price,
+                mark_price,
+                decision.leverage
+            )
         
         # 4. Final Order Intent (with futures prices)
         # Note: In my Executor update I refined OrderIntent, but here 
@@ -429,32 +557,51 @@ class LiveTrading:
 
 
     async def _update_candles(self, symbol: str):
-        """Update local candle caches from acquisition."""
-        # Simplified: fetch latest from data acquisition or client
-        # To be truly efficient, this should link to data_acq buffers.
-        # Using simple fetch for now.
-        async def fetch_tf(tf: str, buffer: Dict[str, List[Candle]]):
+        """Update local candle caches from acquisition with throttling."""
+        
+        now = datetime.now(timezone.utc)
+        if symbol not in self.last_candle_update:
+            self.last_candle_update[symbol] = {}
+            
+        async def fetch_tf(tf: str, buffer: Dict[str, List[Candle]], interval_min: int):
+            # Check cache
+            last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
+            if (now - last_update).total_seconds() < (interval_min * 60):
+                return # Cache hit
+                
             candles = await self.client.get_spot_ohlcv(symbol, tf, limit=10)
             if not candles: return
             
+            # Update Cache
+            self.last_candle_update[symbol][tf] = now
+            
             existing = buffer.get(symbol, [])
-            last_ts = existing[-1].timestamp if existing else datetime.min.replace(tzinfo=timezone.utc)
-            
-            new_ones = [c for c in candles if c.timestamp > last_ts]
-            for c in new_ones:
-                save_candle(c)
-                existing.append(c)
-            
-            # Trim
-            if len(existing) > 500:
-                buffer[symbol] = existing[-500:]
+            # ... (rest of merge logic would be here, but we just replace or append)
+            # For simplicity/robustness in live, we can just replace usage with latest snippet
+            # BUT we need history. 
+            # Smart merge:
+            if not existing:
+                buffer[symbol] = candles
             else:
-                buffer[symbol] = existing
+                 # Append new ones
+                 last_ts = existing[-1].timestamp
+                 new_candles = [c for c in candles if c.timestamp > last_ts]
+                 buffer[symbol].extend(new_candles)
+                 # Limit buffer size
+                 if len(buffer[symbol]) > 500:
+                     buffer[symbol] = buffer[symbol][-500:]
 
-        await fetch_tf("15m", self.candles_15m)
-        await fetch_tf("1h", self.candles_1h)
-        await fetch_tf("4h", self.candles_4h)
-        await fetch_tf("1d", self.candles_1d)
+        # Parallel fetch with thresholds
+        # 15m -> 1 min update
+        # 1h -> 5 min update 
+        # 4h -> 15 min update
+        # 1d -> 60 min update
+        await asyncio.gather(
+            fetch_tf("15m", self.candles_15m, 1),
+            fetch_tf("1h", self.candles_1h, 5),
+            fetch_tf("4h", self.candles_4h, 15),
+            fetch_tf("1d", self.candles_1d, 60)
+        )
 
     def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
         """Hydrate Position object from exchange data (for recovery)."""
@@ -480,7 +627,6 @@ class LiveTrading:
             final_target_price=None,
             partial_close_pct=Decimal("0.5"),
             original_size=Decimal(str(exchange_data['size'])),
-            current_mark_price=mark_price
         )
 
     async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):

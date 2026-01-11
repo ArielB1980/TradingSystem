@@ -97,6 +97,13 @@ class RiskManager:
         # Risk amount = buying_power × risk_pct
         # Position size = risk_amount / stop_distance_pct
         position_notional = (buying_power * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
+        
+        logger.debug(
+            f"Validating trade: {len(self.current_positions)} active positions",
+            symbol=signal.symbol,
+            equity=str(account_equity),
+            buying_power=str(buying_power)
+        )
 
         # Determine Effective Leverage for monitoring ONLY
         effective_leverage = position_notional / account_equity
@@ -161,10 +168,53 @@ class RiskManager:
             )
 
         # Portfolio-level limits
+        should_close_existing = False
+        close_symbol = None
+        
         if len(self.current_positions) >= self.config.max_concurrent_positions:
-            rejection_reasons.append(
-                f"Max concurrent positions ({self.config.max_concurrent_positions}) reached"
-            )
+            # OPPORTUNITY COST LOGIC (Phase 7)
+            # Check if this new trade is significantly better (>2x R:R) than the weakest existing position
+            
+            # 1. Calculate New Trade R:R
+            if signal.take_profit:
+                new_reward = abs(signal.take_profit - signal.entry_price)
+                new_risk = abs(signal.entry_price - signal.stop_loss)
+                new_rr = new_reward / new_risk if new_risk > 0 else Decimal("0")
+            else:
+                new_rr = Decimal("0")
+                
+            # 2. Find Weakest Existing Position
+            weakest_pos = None
+            lowest_rr = Decimal("9999")
+            
+            for pos in self.current_positions:
+                # Calculate existing R:R based on initial params (if available)
+                if pos.final_target_price and pos.initial_stop_price and pos.entry_price:
+                    curr_reward = abs(pos.final_target_price - pos.entry_price)
+                    curr_risk = abs(pos.entry_price - pos.initial_stop_price)
+                    curr_rr = curr_reward / curr_risk if curr_risk > 0 else Decimal("0")
+                    
+                    if curr_rr < lowest_rr:
+                        lowest_rr = curr_rr
+                        weakest_pos = pos
+            
+            # 3. Compare
+            # Threshold: New potential must be > 2.0x existing potential
+            if weakest_pos and new_rr > (lowest_rr * Decimal("2.0")):
+                should_close_existing = True
+                close_symbol = weakest_pos.symbol
+                logger.info(
+                    "Opportunity Cost Override Triggered",
+                    new_symbol=signal.symbol,
+                    new_rr=float(new_rr),
+                    weakest_symbol=weakest_pos.symbol,
+                    weakest_rr=float(lowest_rr),
+                    multiplier=float(new_rr/lowest_rr if lowest_rr > 0 else 0)
+                )
+            else:
+                rejection_reasons.append(
+                    f"Max concurrent positions ({self.config.max_concurrent_positions}) reached"
+                )
         
         # Daily loss limit
         daily_loss_pct = abs(self.daily_pnl) / self.daily_start_equity if self.daily_start_equity > 0 else Decimal("0")
@@ -248,6 +298,8 @@ class RiskManager:
             basis_divergence_pct=basis_divergence_pct,
             estimated_fees_funding=estimated_fees_funding,
             rejection_reasons=rejection_reasons,
+            should_close_existing=should_close_existing,
+            close_symbol=close_symbol
         )
         
         if approved:
@@ -360,7 +412,10 @@ class RiskManager:
     
     def update_position_list(self, positions: List[Position]):
         """Update current positions for portfolio tracking."""
+        prev_count = len(self.current_positions)
         self.current_positions = positions
+        if len(positions) != prev_count:
+            logger.info(f"RiskManager position count updated: {prev_count} -> {len(positions)}")
     
     def record_trade_result(self, net_pnl: Decimal, account_equity: Decimal, setup_type: Optional[str] = None):
         """

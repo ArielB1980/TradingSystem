@@ -298,6 +298,62 @@ def delete_position(symbol: str) -> None:
         session.query(PositionModel).filter(PositionModel.symbol == symbol).delete()
 
 
+def sync_active_positions(positions: List[Position]) -> None:
+    """
+    Sync database with current active positions.
+    Updates existing, creates new, and removes closed (missing) positions.
+    """
+    db = get_db()
+    with db.get_session() as session:
+        # 1. Get all DB positions
+        db_positions = session.query(PositionModel).all()
+        db_symbols = {p.symbol for p in db_positions}
+        active_symbols = {p.symbol for p in positions}
+        
+        # 2. Identify positions to remove (in DB but not in active list)
+        to_remove = db_symbols - active_symbols
+        if to_remove:
+            session.query(PositionModel).filter(PositionModel.symbol.in_(to_remove)).delete(synchronize_session=False)
+            
+        # 3. Update/Create active positions
+        for pos in positions:
+            # We can reuse save_position logic but optimized within this session
+            pm = session.query(PositionModel).filter(PositionModel.symbol == pos.symbol).first()
+            
+            if pm:
+                # Update
+                pm.side = pos.side.value
+                pm.size = pos.size
+                pm.size_notional = pos.size_notional
+                pm.entry_price = pos.entry_price
+                pm.current_mark_price = pos.current_mark_price
+                pm.liquidation_price = pos.liquidation_price
+                pm.unrealized_pnl = pos.unrealized_pnl
+                pm.leverage = pos.leverage
+                pm.margin_used = pos.margin_used
+                pm.stop_loss_order_id = pos.stop_loss_order_id
+                pm.take_profit_order_id = pos.take_profit_order_id
+                pm.updated_at = datetime.utcnow()
+            else:
+                # Create
+                pm = PositionModel(
+                    symbol=pos.symbol,
+                    side=pos.side.value,
+                    size=pos.size,
+                    size_notional=pos.size_notional,
+                    entry_price=pos.entry_price,
+                    current_mark_price=pos.current_mark_price,
+                    liquidation_price=pos.liquidation_price,
+                    unrealized_pnl=pos.unrealized_pnl,
+                    leverage=pos.leverage,
+                    margin_used=pos.margin_used,
+                    stop_loss_order_id=pos.stop_loss_order_id,
+                    take_profit_order_id=pos.take_profit_order_id,
+                    opened_at=pos.opened_at,
+                )
+                session.add(pm)
+
+
 def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
     """
     Get active position for symbol.

@@ -102,6 +102,7 @@ class Signal:
     atr: Decimal
     ema200_slope: str  # e.g., "up", "down", "flat"
     tp_candidates: list[Decimal] = field(default_factory=list)  # Structure-based TP levels
+    score_breakdown: dict = field(default_factory=dict)  # Detailed score components (SMC, Fib, Cost, etc.)
     
     def __post_init__(self):
         """Validate signal."""
@@ -230,6 +231,10 @@ class RiskDecision:
     liquidation_buffer_pct: Decimal
     basis_divergence_pct: Decimal
     estimated_fees_funding: Decimal
+    
+    # Opportunity Cost Replacement
+    should_close_existing: bool = False
+    close_symbol: Optional[str] = None
     
     # Rejection reasons
     rejection_reasons: list[str] = field(default_factory=list)

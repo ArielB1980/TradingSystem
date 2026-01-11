@@ -98,6 +98,11 @@ def get_all_positions() -> List[Dict[str, Any]]:
                 "current_price": float(pos.current_mark_price),
                 "unrealized_pnl": float(pos.unrealized_pnl),
                 "liq_price": float(pos.liquidation_price) if pos.liquidation_price else 0.0,
+                
+                # V3 Active Management Fields
+                "stop_loss": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,
+                "tp1": float(pos.tp1_price) if pos.tp1_price else 0.0,
+                "status": "CONFIRMED" if pos.intent_confirmed else ("TP1 HIT" if pos.tp1_hit else "OPEN"),
                 "liq_distance_pct": liq_dist * 100 if pos.liquidation_price else 0.0,
                 "stop_price": 0.0,  # TODO: Parse from stop_loss_order_id
                 "stop_distance_pct": 0.0,
@@ -223,7 +228,10 @@ def _format_event_message(event: Dict) -> str:
             return "✅ Trade approved"
         else:
             reasons = details.get('rejection_reasons', [])
-            return f"❌ Rejected: {reasons[0] if reasons else 'Unknown'}"
+            main_reason = reasons[0] if reasons else 'Unknown'
+            if "Max concurrent positions" in main_reason:
+                return "❌ Rejected: Max Positions"
+            return f"❌ Rejected: {main_reason}"
     
     elif event_type == "DECISION_TRACE":
         bias = details.get('bias', 'neutral')

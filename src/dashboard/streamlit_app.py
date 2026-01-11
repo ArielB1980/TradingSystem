@@ -212,9 +212,9 @@ if page == "Portfolio Overview":
                 "Current": f"${p['current_price']:,.2f}",
                 "PnL": f"${p['unrealized_pnl']:,.2f}",
                 "Liq Price": f"${p['liq_price']:,.2f}" if p['liq_price'] > 0 else "N/A",
-                "Liq Dist %": f"{p['liq_distance_pct']:.1f}%" if p['liq_distance_pct'] > 0 else "N/A",
-                "Stop": f"${p['stop_price']:,.2f}" if p['stop_price'] > 0 else "N/A",
-                "TPs": p["tp_status"],
+                "Status": p["status"],
+                "Stop": f"${p['stop_loss']:,.2f}" if p['stop_loss'] > 0 else "N/A",
+                "TP1": f"${p['tp1']:,.2f}" if p['tp1'] > 0 else "N/A",
                 "Trailing": "✅" if p["trailing_active"] else "❌",
                 "Flags": ", ".join(p["risk_flags"]) if p["risk_flags"] else "None",
             }
