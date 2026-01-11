@@ -279,11 +279,11 @@ class KrakenClient:
                     for pos in data.get('openPositions', []):
                         positions.append({
                             'symbol': pos.get('symbol'),
-                            'size': Decimal(str(pos.get('size', 0))),
+                            'size': abs(Decimal(str(pos.get('size', 0)))),  # Always positive
                             'entry_price': Decimal(str(pos.get('price', 0))),
                             'liquidation_price': Decimal(str(pos.get('liquidationPrice', 0))),
                             'unrealized_pnl': Decimal(str(pos.get('unrealizedPnl', 0))),
-                            'side': 'long' if float(pos.get('size', 0)) > 0 else 'short',
+                            'side': pos.get('side', 'long'),  # Use API's side field directly
                         })
                     
                     return positions
