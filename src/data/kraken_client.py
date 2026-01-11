@@ -273,6 +273,7 @@ class KrakenClient:
                         raise Exception(f"Futures API error: {error_text}")
                     
                     data = await response.json()
+                    logger.debug("Raw Positions Response", keys=list(data.keys()), count=len(data.get('openPositions', [])))
                     
                     positions = []
                     for pos in data.get('openPositions', []):
@@ -631,6 +632,10 @@ class KrakenClient:
         """
         # Extract path from URL
         path = url.split('.com', 1)[1]
+        
+        # CRITICAL FIX: Signature uses path WITHOUT /derivatives prefix
+        if path.startswith('/derivatives'):
+            path = path[len('/derivatives'):]
         
         # Generate nonce (timestamp in milliseconds)
         nonce = str(int(time.time() * 1000))

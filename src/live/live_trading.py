@@ -148,6 +148,20 @@ class LiveTrading:
             logger.error("Data acquisition unhealthy")
             return
 
+        # 1.5 Sync Active Positions (CRITICAL FIX)
+        # We must update RiskManager with ALL current positions before generating new signals
+        try:
+            active_positions = await self.client.get_all_futures_positions()
+            self.risk_manager.update_position_list(active_positions)
+            
+            # Log for debugging
+            if active_positions:
+                logger.info(f"Active Portfolio: {len(active_positions)} positions", 
+                           symbols=[p['symbol'] for p in active_positions])
+        except Exception as e:
+             logger.error("Failed to sync positions", error=str(e))
+             return # Safety: Don't trade if we can't see positions
+
         for spot_symbol in self.markets:
             try:
                 # 2. Get Futures Context
@@ -301,6 +315,25 @@ class LiveTrading:
              # In a real system, we'd wait for fill event.
              # For simpler loop, we can try to place protective orders on next tick if fill confirmed.
              logger.info("Entry order placed", order_id=entry_order.order_id)
+             
+             # 5. Persist Trade (CRITICAL FIX)
+             from src.storage.repository import save_trade
+             from src.domain.models import Trade
+             
+             # Create Trade record (approximate, since it's just submitted)
+             # In a real system, we'd wait for execution report.
+             trade = Trade(
+                 trade_id=entry_order.order_id,
+                 symbol=signal.symbol,
+                 side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
+                 entry_price=Decimal(str(order_intent['metadata']['fut_entry'])),
+                 size_notional=decision.position_notional,
+                 leverage=decision.leverage,
+                 entered_at=datetime.now(timezone.utc),
+                 entry_time=datetime.now(timezone.utc) # Backwards compat
+             )
+             save_trade(trade)
+             logger.info("Trade persisted to DB", trade_id=trade.trade_id)
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition."""
