@@ -64,24 +64,43 @@ class BacktestEngine:
     5. Track performance
     """
     
-    def __init__(self, config: Config, kraken_client: KrakenClient):
-        """Initialize backtest engine."""
-        self.config = config
-        self.client = kraken_client
+    def __init__(self, config: Config, symbol: Optional[str] = None, starting_equity: Optional[Decimal] = None):
+        """
+        Initialize backtest engine.
         
-        # Initialize components
+        Args:
+            config: System configuration
+            symbol: Trading symbol (e.g., "BTC/USD", "ETH/USD"). If None, uses first spot market.
+            starting_equity: Starting capital. If None, uses config value.
+        """
+        self.config = config
+        
+        # V2: Multi-asset support - use specified symbol or default to first spot market
+        self.symbol = symbol if symbol else config.exchange.spot_markets[0]
+        
+        # Starting capital
+        if starting_equity:
+            self.starting_equity = starting_equity
+        else:
+            self.starting_equity = Decimal(str(config.backtest.starting_equity))
+        
+        self.current_equity = self.starting_equity
+        self.metrics = BacktestMetrics()
+        self.metrics.equity_curve.append(self.starting_equity)
+        self.metrics.peak_equity = self.starting_equity
+        
+        # Kraken client (must be passed in - not created here due to API credentials)
+        # This will be set by caller
+        self.client: Optional[KrakenClient] = None
+        
+        # Strategy and risk components
         self.smc_engine = SMCEngine(config.strategy)
         self.risk_manager = RiskManager(config.risk)
         self.basis_guard = BasisGuard(config.risk)
         self.execution = ExecutionEngine(config)
         
         # Backtest state
-        self.starting_equity = Decimal(str(config.backtest.starting_equity))
-        self.current_equity = self.starting_equity
         self.position: Optional[Position] = None
-        self.metrics = BacktestMetrics()
-        self.metrics.equity_curve.append(self.starting_equity)
-        self.metrics.peak_equity = self.starting_equity
         
         # Cost assumptions
         self.taker_fee_bps = Decimal(str(config.backtest.taker_fee_bps))
@@ -91,24 +110,23 @@ class BacktestEngine:
     
     async def run(
         self,
-        symbol: str,
         start_date: datetime,
         end_date: datetime,
     ) -> BacktestMetrics:
         """Run backtest for given date range."""
-        logger.info("Starting backtest", symbol=symbol, start=start_date.isoformat(), end=end_date.isoformat())
+        logger.info("Starting backtest", start=start_date, end=end_date, symbol=self.symbol)
         
         # Calculate warmup period (need ~200 days for daily EMA)
         data_start = start_date - timedelta(days=300)
-        logger.info("Fetching historical data...", data_start=data_start.isoformat())
+        logger.info("Fetching historical data...", data_start=data_start.isoformat(), symbol=self.symbol)
         
-        # Fetch data
-        candles_1d = await self._fetch_historical(symbol, "1d", data_start, end_date)
-        candles_4h = await self._fetch_historical(symbol, "4h", data_start, end_date)
-        candles_1h = await self._fetch_historical(symbol, "1h", data_start, end_date)
-        candles_15m = await self._fetch_historical(symbol, "15m", data_start, end_date)
+        # Fetch data for the configured symbol
+        candles_1d = await self._fetch_historical(self.symbol, "1d", data_start, end_date)
+        candles_4h = await self._fetch_historical(self.symbol, "4h", data_start, end_date)
+        candles_1h = await self._fetch_historical(self.symbol, "1h", data_start, end_date)
+        candles_15m = await self._fetch_historical(self.symbol, "15m", data_start, end_date)
         
-        logger.info("Data fetched")
+        logger.info("Data fetched", symbol=self.symbol)
         
         # Replay chronologically (use 1h as main timeline)
         for i, current_candle in enumerate(candles_1h):
@@ -200,7 +218,7 @@ class BacktestEngine:
             # Generate signal (only if no position)
             if not self.position:
                 signal = self.smc_engine.generate_signal(
-                    symbol,
+                    symbol=self.symbol,  # V2: Use configured symbol
                     bias_candles_4h=hist_4h,
                     bias_candles_1d=hist_1d,
                     exec_candles_15m=hist_15m,
