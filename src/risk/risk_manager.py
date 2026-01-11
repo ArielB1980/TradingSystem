@@ -169,26 +169,59 @@ class RiskManager:
                 f"Loss streak cooldown: {self.consecutive_losses} consecutive losses"
             )
         
-        # Estimate fees and funding
-        estimated_fees_funding = self._estimate_costs(position_notional)
+        # **REGIME-SPECIFIC VALIDATION** (NEW)
+        # Different cost models for tight-stop SMC vs wide-stop structure
+        regime = signal.regime  # "tight_smc" or "wide_structure"
         
-        # Cost-aware validation
-        risk_amount = position_notional * stop_distance_pct
-        rr_distortion = estimated_fees_funding / risk_amount if risk_amount > 0 else Decimal("0")
+        if regime == "tight_smc":
+            # Tight-stop SMC (OB/FVG): 0.4-1.0% stops
+            # DISABLE R:R distortion filter
+            # INSTEAD: Absolute cost cap + minimum R multiple
+            
+            # 1. Calculate expected costs with probabilistic funding
+            estimated_fees_funding = self._estimate_costs_tight_smc(position_notional, stop_distance_pct)
+            
+            # 2. Absolute cost cap (e.g., 25 bps max)
+            cost_cap_decimal = Decimal(str(self.config.tight_smc_cost_cap_bps / 10000))  # bps to decimal
+            if estimated_fees_funding > position_notional * cost_cap_decimal:
+                rejection_reasons.append(
+                    f"Total cost ${estimated_fees_funding:.2f} exceeds {self.config.tight_smc_cost_cap_bps:.0f} bps cap on ${position_notional:.2f} notional"
+                )
+            
+            # 3. Minimum R:R multiple (ensure TP is far enough)
+            if signal.take_profit:
+                tp_distance = abs(signal.take_profit - signal.entry_price)
+                stop_distance = abs(signal.stop_loss - signal.entry_price)
+                rr_multiple = tp_distance / stop_distance if stop_distance > 0 else Decimal("0")
+                
+                min_rr = Decimal(str(self.config.tight_smc_min_rr_multiple))
+                if rr_multiple < min_rr:
+                    rejection_reasons.append(
+                        f"R:R multiple {rr_multiple:.1f} < minimum {min_rr:.1f} for tight-stop SMC"
+                    )
+            
+            # For logging
+            risk_amount = position_notional * stop_distance_pct
+            rr_distortion = estimated_fees_funding / risk_amount if risk_amount > 0 else Decimal("0")
+            max_distortion = cost_cap_decimal  # For compatibility
         
-        # Determine applicable cap based on stop tightness
-        # If stop is TIGHT (<= 1.5%), allow higher distortion (up to 20%)
-        # If stop is WIDE (> 1.5%), enforce strict limit (10%)
-        tight_threshold = Decimal(str(self.config.tight_stop_threshold_pct))
-        if stop_distance_pct <= tight_threshold:
-            max_distortion = Decimal(str(self.config.max_fee_funding_rr_distortion_pct))
         else:
-            max_distortion = Decimal(str(self.config.rr_distortion_strict_limit_pct))
-
-        if rr_distortion > max_distortion:
-            rejection_reasons.append(
-                f"Fees+funding distort R:R by {rr_distortion:.1%} > max {max_distortion:.1%} (Stop: {stop_distance_pct:.2%})"
-            )
+            # Wide-stop structure (BOS/TREND): 1.5-3.0% stops
+            # KEEP R:R distortion filter (existing logic)
+            
+            estimated_fees_funding = self._estimate_costs_wide_structure(position_notional, stop_distance_pct)
+            
+            # Cost-aware R:R distortion
+            risk_amount = position_notional * stop_distance_pct
+            rr_distortion = estimated_fees_funding / risk_amount if risk_amount > 0 else Decimal("0")
+            
+            # Use regime-specific distortion limit (e.g., 15%)
+            max_distortion = Decimal(str(self.config.wide_structure_max_distortion_pct))
+            
+            if rr_distortion > max_distortion:
+                rejection_reasons.append(
+                    f"Fees+funding distort R:R by {rr_distortion:.1%} > max {max_distortion:.1%} (Stop: {stop_distance_pct:.2%})"
+                )
         
         # Approve or reject
         approved = len(rejection_reasons) == 0
@@ -294,6 +327,78 @@ class RiskManager:
         funding = position_notional * (funding_rate_daily / Decimal("10000"))
         
         total = entry_fee + exit_fee + funding
+        
+        return total
+    
+    def _estimate_costs_tight_smc(self, position_notional: Decimal, stop_distance_pct: Decimal) -> Decimal:
+        """
+        Estimate costs for TIGHT-STOP SMC trades (OB/FVG).
+        
+        Key difference: Probabilistic funding model.
+        - Average hold time: ~6 hours (configurable)
+        - Funding hits every 8 hours
+        - Most tight-stop trades exit before paying funding
+        
+        Args:
+            position_notional: Position size in USD notional
+            stop_distance_pct: Stop distance as decimal (for context)
+        
+        Returns:
+            Estimated total cost (entry + exit fees + probabilistic funding)
+        """
+        taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
+        
+        entry_fee = position_notional * (taker_fee_bps / Decimal("10000"))
+        exit_fee = position_notional * (taker_fee_bps / Decimal("10000"))
+        
+        # Probabilistic funding
+        avg_hold_hours = Decimal(str(self.config.tight_smc_avg_hold_hours))  # e.g., 6 hours
+        funding_interval_hours = Decimal("8")  # Funding every 8 hours
+        
+        # Probability of paying funding = min(avg_hold / 8, 1.0)
+        funding_probability = min(avg_hold_hours / funding_interval_hours, Decimal("1.0"))
+        
+        daily_funding_bps = Decimal(str(self.config.funding_rate_daily_bps))
+        one_interval_funding = position_notional * (daily_funding_bps / Decimal("10000")) / Decimal("3")  # Daily / 3 intervals
+        
+        expected_funding = one_interval_funding * funding_probability
+        
+        total = entry_fee + exit_fee + expected_funding
+        
+        return total
+    
+    def _estimate_costs_wide_structure(self, position_notional: Decimal, stop_distance_pct: Decimal) -> Decimal:
+        """
+        Estimate costs for WIDE-STOP structure trades (BOS/TREND).
+        
+        Key difference: Model 1-2 funding intervals.
+        - Average hold time: ~36 hours (configurable)  
+        - Likely to pay 1-2 funding intervals
+        
+        Args:
+            position_notional: Position size in USD notional
+            stop_distance_pct: Stop distance as decimal (for context)
+        
+        Returns:
+            Estimated total cost (entry + exit fees + multi-interval funding)
+        """
+        taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
+        
+        entry_fee = position_notional * (taker_fee_bps / Decimal("10000"))
+        exit_fee = position_notional * (taker_fee_bps / Decimal("10000"))
+        
+        # Multi-interval funding
+        avg_hold_hours = Decimal(str(self.config.wide_structure_avg_hold_hours))  # e.g., 36 hours
+        funding_interval_hours = Decimal("8")
+        
+        funding_intervals = avg_hold_hours / funding_interval_hours  # e.g., 36/8 = 4.5 intervals
+        
+        daily_funding_bps = Decimal(str(self.config.funding_rate_daily_bps))
+        one_interval_funding = position_notional * (daily_funding_bps / Decimal("10000")) / Decimal("3")
+        
+        expected_funding = one_interval_funding * funding_intervals
+        
+        total = entry_fee + exit_fee + expected_funding
         
         return total
     

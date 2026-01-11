@@ -53,6 +53,16 @@ class RiskConfig(BaseSettings):
     rr_distortion_strict_limit_pct: float = Field(default=0.10, ge=0.05, le=0.30)
     tight_stop_threshold_pct: float = Field(default=0.015, ge=0.005, le=0.05)
     funding_cost_threshold_pct: float | None = Field(default=0.02, ge=0.0, le=0.10)
+    
+    # Regime-specific settings (NEW for dual-regime strategy)
+    # Tight-stop SMC regime (OB/FVG): 0.4-1.0% stops
+    tight_smc_cost_cap_bps: float = Field(default=25.0, ge=10.0, le=50.0)  # Absolute cost cap
+    tight_smc_min_rr_multiple: float = Field(default=3.0, ge=2.0, le=5.0)  # Min R:R required
+    tight_smc_avg_hold_hours: float = Field(default=6.0, ge=1.0, le=24.0)  # For funding calc
+    
+    # Wide-stop structure regime (BOS/TREND): 1.5-3.0% stops
+    wide_structure_max_distortion_pct: float = Field(default=0.15, ge=0.10, le=0.25)  # R:R distortion
+    wide_structure_avg_hold_hours: float = Field(default=36.0, ge=12.0, le=72.0)  # For funding calc
 
     @field_validator('max_leverage')
     @classmethod
