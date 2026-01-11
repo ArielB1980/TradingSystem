@@ -13,7 +13,8 @@ from src.storage.repository import (
     get_active_position,
     get_all_trades,
     get_recent_events,
-    get_latest_account_state
+    get_latest_account_state,
+    get_event_stats,
 )
 from src.domain.models import Position, Side
 from src.domain.events import CoinStateSnapshot, REASON_CODES
@@ -161,6 +162,11 @@ def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
             next_action="WAIT",  # TODO: Calculate from state
             block_reason_codes=[r['details'].get('rejection_reasons', ['UNKNOWN'])[0] for r in rejections[:1]],
         )
+        
+        # Add event stats
+        stats = get_event_stats(symbol)
+        snapshot.event_count = stats.get('count', 0)
+        snapshot.last_event_ts = stats.get('last_event')
         
         snapshots[symbol] = snapshot
     

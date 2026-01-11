@@ -55,6 +55,9 @@ class LiveTrading:
         # State
         self.active = False
         self.candles_1d: Dict[str, List[Candle]] = {}
+        self.candles_4h: Dict[str, List[Candle]] = {}
+        self.candles_1h: Dict[str, List[Candle]] = {}
+        self.candles_15m: Dict[str, List[Candle]] = {}
         self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
         
         # Market Expansion (Coin Universe)
@@ -84,7 +87,10 @@ class LiveTrading:
         logger.critical("🚀 STARTING LIVE TRADING - REAL CAPITAL AT RISK")
         
         try:
-            # 1. Warmup
+            # 1. Initial Account Sync (Provide immediate feedback to dashboard)
+            await self._sync_account_state()
+            
+            # 2. Warmup
             await self._warmup()
             
             # 2. Start Data Acquisition
@@ -190,32 +196,43 @@ class LiveTrading:
             if not balance:
                 return
 
+            # Default to standard CCXT total['USD']
             base_currency = getattr(self.config.exchange, "base_currency", "USD")
             total = balance.get('total', {})
-            free = balance.get('free', {})
-            used = balance.get('used', {})
-            
             equity = Decimal(str(total.get(base_currency, 0)))
-            avail_margin = Decimal(str(free.get(base_currency, 0)))
-            margin_used_val = Decimal(str(used.get(base_currency, 0)))
+            avail_margin = Decimal(str(balance.get('free', {}).get(base_currency, 0)))
+            margin_used_val = Decimal(str(balance.get('used', {}).get(base_currency, 0)))
             
-            # 2. Get Unrealized PnL from positions
-            # Note: get_futures_balance often includes UPNL in equity, but let's be explicit if possible.
-            # Client.get_futures_balance usually returns equity = balance + upnl.
-            # Let's assume 'total' is equity.
-            
-            # Simple assumption for now:
-            cash_balance = equity - 0 # If total is equity
+            # 2. Check for Kraken Futures Multi-Collateral ("flex")
+            # This is critical because 'total' only shows token amounts, not USD value of collateral
+            info = balance.get('info', {})
+            if info and 'accounts' in info and 'flex' in info['accounts']:
+                flex = info['accounts']['flex']
+                # portfolioValue = Total Equity (Balance + Unr. PnL + Collateral Value)
+                # availableMargin = Margin available for new positions
+                # initialMargin = Margin used
+                
+                pv = flex.get('portfolioValue')
+                am = flex.get('availableMargin')
+                im = flex.get('initialMargin')
+                
+                if pv is not None:
+                    equity = Decimal(str(pv))
+                if am is not None:
+                    avail_margin = Decimal(str(am))
+                if im is not None:
+                    margin_used_val = Decimal(str(im))
+                    
+                logger.debug("Synced Multi-Collateral state", equity=str(equity))
             
             # 3. Persist
             save_account_state(
                 equity=equity,
-                balance=cash_balance, # Simplified
+                balance=equity, # For futures margin, equity IS the balance relevant for trading
                 margin_used=margin_used_val,
                 available_margin=avail_margin,
-                unrealized_pnl=Decimal("0.0") # Hard to calculate exactly without sum of positions
+                unrealized_pnl=Decimal("0.0") # Included in portfolioValue usually
             )
-            logger.debug("Account state synced", equity=str(equity))
             
         except Exception as e:
             logger.error("Failed to sync account state", error=str(e))

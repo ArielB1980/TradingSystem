@@ -16,6 +16,7 @@ from src.dashboard.utils import (
     get_system_status,
     get_event_feed,
     format_reason_code,
+    get_all_trades,
 )
 
 # Page config
@@ -92,10 +93,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar - Auto Refresh
+# Sidebar - Manual Refresh
 st.sidebar.title("⚡ SMC Terminal")
-if st.sidebar.checkbox("🔄 Auto Refresh", value=True):
-    time.sleep(2)  # 2s refresh rate
+if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
 
 st.sidebar.markdown("---")
@@ -324,7 +324,10 @@ elif page == "Coin Matrix":
             "FVG": f"${float(snap.fvg_band[0]):,.0f}-${float(snap.fvg_band[1]):,.0f}" if snap.fvg_band else "-",
             "Funding %": f"{float(snap.funding_rate):.3f}",
             "Block Reason": snap.block_reason_codes[0] if snap.block_reason_codes else "-",
+            "Block Reason": snap.block_reason_codes[0] if snap.block_reason_codes else "-",
             "Position": snap.pos_side if snap.pos_side else "-",
+            "Events": f"{snap.event_count}",
+            "Last Update": snap.last_event_ts.strftime('%H:%M:%S') if snap.last_event_ts else "-",
         })
     
     # Display matrix

@@ -17,7 +17,10 @@ import time
 import asyncio
 import json
 import websockets
+import websockets
 import aiohttp
+import certifi
+import ssl
 from typing import Dict, List, Optional, Callable, Any
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -96,10 +99,22 @@ class KrakenClient:
         self.futures_api_key = futures_api_key
         self.futures_api_secret = futures_api_secret
         
+        # Helper to sanitize base64 secrets
+        def sanitize_secret(secret: str) -> str:
+            if not secret: return secret
+            s = secret.strip()
+            # Standardize padding
+            return s + '=' * (-len(s) % 4)
+
+        if self.api_secret:
+            self.api_secret = sanitize_secret(self.api_secret)
+        if self.futures_api_secret:
+            self.futures_api_secret = sanitize_secret(self.futures_api_secret)
+        
         # Initialize CCXT exchange (Spot - Sync)
         self.exchange = ccxt.kraken({
-            'apiKey': api_key,
-            'secret': api_secret,
+            'apiKey': self.api_key,
+            'secret': self.api_secret,
             'enableRateLimit': True,
         })
         
@@ -249,7 +264,9 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/openpositions"
             headers = await self._get_futures_auth_headers(url, "GET")
             
-            async with aiohttp.ClientSession() as session:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -282,7 +299,9 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            async with aiohttp.ClientSession() as session:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         raise Exception(f"Futures API error: {await response.text()}")
@@ -308,11 +327,9 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         
         try:
-            # Kraken Futures public tickers endpoint
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             
-            import ssl
-            ssl_context = ssl.create_default_context()
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url) as response:
@@ -626,7 +643,12 @@ class KrakenClient:
         sha256_hash = hashlib.sha256(message.encode('utf-8')).digest()
         
         # Step 3: Base64-decode the API secret
-        secret_decoded = base64.b64decode(self.futures_api_secret)
+        secret = self.futures_api_secret.strip()
+        padding = len(secret) % 4
+        if padding != 0:
+            secret += '=' * (4 - padding)
+            
+        secret_decoded = base64.b64decode(secret)
         
         # Step 4: HMAC-SHA-512 using the decoded secret and SHA-256 hash
         signature = hmac.new(

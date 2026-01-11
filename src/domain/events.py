@@ -75,6 +75,10 @@ class CoinStateSnapshot:
     
     # Risk flags
     risk_flags: List[str] = field(default_factory=list)  # e.g., ["NEAR_LIQ", "BASIS_HIGH"]
+    
+    # Event Stats
+    event_count: int = 0
+    last_event_ts: Optional[datetime] = None
 
 
 @dataclass

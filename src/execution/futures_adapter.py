@@ -64,8 +64,18 @@ class FuturesAdapter:
         """
         futures_symbol = FuturesAdapter.TICKER_MAP.get(spot_symbol)
         
-        if not futures_symbol:
-            raise ValueError(f"Unsupported spot symbol: {spot_symbol}")
+        if futures_symbol:
+            return futures_symbol
+            
+        # Dynamic Fallback: PF_{BASE}USD
+        # Most V3 tickers follow this pattern (PF_ETHUSD, PF_SOLUSD, etc.)
+        try:
+            base = spot_symbol.split('/')[0]
+            # Handle special cases if any (BTC is handled in TICKER_MAP)
+            dynamic_symbol = f"PF_{base}USD"
+            return dynamic_symbol
+        except IndexError:
+            raise ValueError(f"Invalid spot symbol format: {spot_symbol}")
         
         return futures_symbol
     

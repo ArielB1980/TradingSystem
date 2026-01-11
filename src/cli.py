@@ -188,7 +188,7 @@ def live(
         fg=typer.colors.RED,
     )
     
-    if not typer.confirm("\nDo you want to proceed?"):
+    if not force and not typer.confirm("\nDo you want to proceed?"):
         raise typer.Abort()
     
     logger.warning("Live trading started - REAL CAPITAL AT RISK")

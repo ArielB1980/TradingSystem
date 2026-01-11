@@ -437,6 +437,27 @@ def get_recent_events(limit: int = 50, event_type: Optional[str] = None, symbol:
             for e in events
         ]
 
+def get_event_stats(symbol: str) -> Dict[str, Any]:
+    """Get statistics for system events for a specific symbol."""
+    db = get_db()
+    with db.get_session() as session:
+        from sqlalchemy import func
+        
+        # Count events for this symbol
+        count = session.query(func.count(SystemEventModel.id)).filter(
+            SystemEventModel.symbol == symbol
+        ).scalar() or 0
+        
+        # Get timestamp of the most recent event
+        last_ts = session.query(func.max(SystemEventModel.timestamp)).filter(
+            SystemEventModel.symbol == symbol
+        ).scalar()
+        
+        return {
+            "count": count,
+            "last_event": last_ts.replace(tzinfo=timezone.utc) if last_ts else None
+        }
+
 def get_decision_chain(decision_id: str) -> List[Dict]:
     """Get all events related to a decision ID."""
     db = get_db()

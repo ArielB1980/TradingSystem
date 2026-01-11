@@ -27,7 +27,8 @@ risk:
   min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
   
   # Portfolio limits (CONSERVATIVE for live start)
-  max_concurrent_positions: 1  # ONE position only for first week
+  # Portfolio limits (Scaled for Multi-Asset)
+  max_concurrent_positions: 5  # Allow up to 5 parallel trades
   daily_loss_limit_pct: 0.01  # 1% daily loss limit (strict)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
@@ -198,11 +199,29 @@ coin_universe:
       - "BTC/USD"
       - "ETH/USD"
       - "SOL/USD"
+      - "BNB/USD"
+      - "XRP/USD"
+      - "DOGE/USD"
+      - "ADA/USD"
     B:
       - "LINK/USD"
       - "AVAX/USD"
-      - "MATIC/USD"
-    C: []  # Optional lower tier
+      - "TRX/USD"
+      - "TON/USD"
+      - "DOT/USD"
+      - "LTC/USD"
+      - "NEAR/USD"
+      - "XLM/USD"
+      - "XMR/USD"
+      - "ATOM/USD"
+    C: 
+      - "ZEC/USD"
+      - "FARTCOIN/USD"
+      - "WLFI/USD"
+      - "FET/USD"
+      - "FIL/USD"
+      - "KAS/USD"
+      - "STX/USD"
   
   # Max leverage per tier (respects global 10x cap)
   tier_max_leverage:

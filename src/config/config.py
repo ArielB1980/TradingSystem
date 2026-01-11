@@ -9,6 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 from pathlib import Path
 from decimal import Decimal
+from dotenv import load_dotenv
+
+# Load env immediately
+load_dotenv()
 
 
 class ExchangeConfig(BaseSettings):
@@ -302,7 +306,21 @@ class Config(BaseSettings):
             raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
         
         with open(yaml_path, "r") as f:
-            config_dict = yaml.safe_load(f)
+            raw_content = f.read()
+            
+        # Expand environment variables
+        import os
+        import re
+        
+        # Regex to find ${VAR} or $VAR
+        pattern = re.compile(r'\$\{([^}]+)\}|\$([a-zA-Z_][a-zA-Z0-9_]*)')
+        
+        def replace_match(match):
+            var_name = match.group(1) or match.group(2)
+            return os.environ.get(var_name, match.group(0))  # Return original if not found
+            
+        expanded_content = pattern.sub(replace_match, raw_content)
+        config_dict = yaml.safe_load(expanded_content)
             
         import os
         if "ENVIRONMENT" in os.environ:
