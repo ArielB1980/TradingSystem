@@ -101,6 +101,7 @@ class BacktestEngine:
         
         # Backtest state
         self.position: Optional[Position] = None
+        self.position_realized_pnl: Decimal = Decimal("0")
         
         # Cost assumptions
         self.taker_fee_bps = Decimal(str(config.backtest.taker_fee_bps))
@@ -472,17 +473,17 @@ class BacktestEngine:
             
         exit_fees = (price * qty) * (self.taker_fee_bps / Decimal("10000"))
         net_pnl = pnl - exit_fees
+        
+        # Accumulate metrics
         self.metrics.total_fees += exit_fees
         self.metrics.total_pnl += net_pnl
         self.current_equity += net_pnl
+        self.position_realized_pnl += net_pnl
         
         position.size -= qty
         position.size_notional -= (qty * position.entry_price)
         
-        if net_pnl > 0: self.metrics.winning_trades += 1 # Tracking individual fills as "trades"? Or just PnL?
-        # Metric counting is tricky with partials. 
-        # For simple metrics, we count a "Winning Trade" if the full roundtrip is positive?
-        # Here we just pump PnL.
+        # Note: Do not increment trade counts for partials, only on full close
         
     def _close_position(self, exit_price: Decimal, reason: str, timestamp: datetime, size: Decimal):
         """Close remaining position."""
@@ -495,15 +496,20 @@ class BacktestEngine:
             
         exit_fees = (exit_price * size) * (self.taker_fee_bps / Decimal("10000"))
         net_pnl = pnl - exit_fees
+        
+        # Accumulate metrics
         self.metrics.total_fees += exit_fees
         self.metrics.total_pnl += net_pnl
         self.current_equity += net_pnl
+        self.position_realized_pnl += net_pnl
          
+        # Final trade result based on total position PnL
         self.metrics.total_trades += 1
-        if net_pnl > 0: 
+        if self.position_realized_pnl > 0: 
             self.metrics.winning_trades += 1
         else:
             self.metrics.losing_trades += 1
             
-        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
+        self.risk_manager.record_trade_result(self.position_realized_pnl, self.current_equity)
         self.position = None
+        self.position_realized_pnl = Decimal("0")
