@@ -82,12 +82,21 @@ class RiskManager:
             stop_for_risk = signal.stop_loss
         
         stop_distance_pct = abs(entry_for_risk - stop_for_risk) / entry_for_risk
-        position_notional = (account_equity * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
         
         # Calculate leverage setting (Fixed target as per PRD)
         # We set the order leverage to the configured target (e.g. 10x)
         # This allocates margin based on the SETTING, leaving rest as buffer.
         requested_leverage = Decimal(str(self.config.max_leverage))
+        
+        # FIXED: Calculate buying power (equity × leverage)
+        # This allows position sizing to utilize full leverage capacity
+        # With $389 equity and 10x leverage: buying_power = $3,890
+        buying_power = account_equity * requested_leverage
+        
+        # Position sizing based on buying power, not just equity
+        # Risk amount = buying_power × risk_pct
+        # Position size = risk_amount / stop_distance_pct
+        position_notional = (buying_power * Decimal(str(self.config.risk_per_trade_pct))) / stop_distance_pct
 
         # Determine Effective Leverage for monitoring ONLY
         effective_leverage = position_notional / account_equity

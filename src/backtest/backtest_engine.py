@@ -89,9 +89,14 @@ class BacktestEngine:
         self.metrics.equity_curve.append(self.starting_equity)
         self.metrics.peak_equity = self.starting_equity
         
-        # Kraken client (must be passed in - not created here due to API credentials)
-        # This will be set by caller
-        self.client: Optional[KrakenClient] = None
+        # Kraken client for fetching historical data
+        self.client = KrakenClient(
+            api_key=config.exchange.api_key,
+            api_secret=config.exchange.api_secret,
+            futures_api_key=config.exchange.futures_api_key,
+            futures_api_secret=config.exchange.futures_api_secret,
+            use_testnet=config.exchange.use_testnet
+        )
         
         # Strategy and risk components
         self.smc_engine = SMCEngine(config.strategy)

@@ -1,0 +1,233 @@
+# Configuration
+
+## Exchange Settings
+exchange:
+  name: "kraken"
+  spot_markets:
+    - "BTC/USD"
+    - "ETH/USD"
+  futures_markets:
+    - "BTCUSD-PERP"
+    - "ETHUSD-PERP"
+    
+  # Credentials
+  api_key: "${KRAKEN_API_KEY}"
+  api_secret: "${KRAKEN_API_SECRET}"
+  futures_api_key: "${KRAKEN_FUTURES_API_KEY}"
+  futures_api_secret: "${KRAKEN_FUTURES_API_SECRET}"
+  use_testnet: false
+
+## Risk Management
+risk:
+  # Position sizing (ULTRA-CONSERVATIVE for live start)
+  risk_per_trade_pct: 0.003  # 0.3% of account equity per trade
+  max_leverage: 10.0  # Use full 10x leverage capacity
+  
+  # Liquidation safety
+  min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
+  
+  # Portfolio limits (CONSERVATIVE for live start)
+  # Portfolio limits (Scaled for Multi-Asset)
+  max_concurrent_positions: 5  # Allow up to 5 parallel trades
+  daily_loss_limit_pct: 0.01  # 1% daily loss limit (strict)
+  loss_streak_cooldown: 3  # Halt after 3 consecutive losses
+  
+  # Basis guards
+  basis_max_pct: 0.0075  # 0.75% max spot-perp divergence for entry
+  basis_max_post_pct: 0.0075  # Post-entry divergence limit (same as entry)
+  
+  # Cost-aware validation
+  # Cost-aware validation
+  max_fee_funding_rr_distortion_pct: 0.20  # Hard cap (allows 20% for tight stops)
+  rr_distortion_strict_limit_pct: 0.10  # Strict cap for normal stops (>1.5%)
+  tight_stop_threshold_pct: 0.015  # Definition of "tight stop" (1.5%)
+  funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
+
+  # V2.1 Regime Risk
+  tight_smc_cost_cap_bps: 25.0
+  tight_smc_min_rr_multiple: 2.0
+  tight_smc_avg_hold_hours: 6.0
+  wide_structure_max_distortion_pct: 0.15
+  wide_structure_avg_hold_hours: 36.0
+  
+  loss_streak_cooldown_tight: 3
+  loss_streak_cooldown_wide: 5
+  loss_streak_pause_minutes_tight: 120
+  loss_streak_pause_minutes_wide: 90
+  loss_streak_min_loss_bps: 20.0
+
+## Strategy Parameters
+strategy:
+  # Timeframes
+  bias_timeframes:
+    - "4h"
+    - "1d"
+  execution_timeframes:
+    - "15m"
+    - "1h"
+  
+  # Indicators
+  ema_period: 200
+  adx_period: 14
+  adx_threshold: 25.0  # Minimum ADX for trend strength
+  atr_period: 14
+  atr_multiplier_stop: 1.5  # ATR multiplier for stop-loss buffer
+  rsi_period: 14
+  rsi_divergence_enabled: false  # Optional confirmation only
+  
+  # SMC Parameters
+  orderblock_lookback: 50
+  fvg_min_size_pct: 0.001  # 0.1% minimum gap size
+  bos_confirmation_candles: 3
+
+  # V2.1 Scoring & Regimes
+  ema_neutral_zone_bps: 10.0
+  min_score_tight_smc_aligned: 70.0
+  min_score_tight_smc_neutral: 75.0
+  min_score_wide_structure_aligned: 65.0
+  min_score_wide_structure_neutral: 70.0
+  fib_proximity_bps: 20.0
+  
+  # Regime-specific stops
+  tight_smc_atr_stop_min: 0.3
+  tight_smc_atr_stop_max: 0.6
+  wide_structure_atr_stop_min: 1.0
+  wide_structure_atr_stop_max: 1.2
+
+## Execution Settings
+execution:
+  # Price conversion
+  use_mark_price: true  # Always true for safety-critical operations
+  
+  # Order settings
+  default_order_type: "limit"
+  slippage_tolerance_pct: 0.001  # 0.1%
+  order_timeout_seconds: 30
+  max_retries: 3
+  retry_backoff_seconds: 2
+  
+  # Pyramiding
+  pyramiding_enabled: false  # Default: no adding to positions
+
+## Multi-TP Configuration (V2)
+multi_tp:
+  enabled: true
+  tp1_r_multiple: 1.0   # Close 40% at 1R
+  tp1_close_pct: 0.40
+  tp2_r_multiple: 2.5   # Close 40% at 2.5R
+  tp2_close_pct: 0.40
+  runner_pct: 0.20      # Keep 20% as runner
+  move_sl_to_be_after_tp1: true  # Auto move to breakeven after TP1
+  trailing_stop_enabled: true    # Enable trailing for runner
+  trailing_stop_atr_multiplier: 1.5
+
+## Data Acquisition
+data:
+  # WebSocket settings
+  ws_reconnect_max_retries: 10
+  ws_reconnect_backoff_seconds: 5
+  
+  # Data validation
+  max_gap_seconds: 60  # Alert if data gap > 1 minute
+  
+  # Storage
+  database_url: "${DATABASE_URL}"  # From environment variable
+  
+## Reconciliation
+reconciliation:
+  # Event-driven: immediate on fills, order updates, margin updates
+  periodic_interval_seconds: 15
+  
+## Monitoring
+monitoring:
+  # Logging
+  log_level: "INFO"  # DEBUG/INFO/WARNING/ERROR/CRITICAL
+  log_format: "json"
+  
+  # Alerts
+  alert_margin_usage_threshold_pct: 0.70  # 70%
+  alert_liquidation_buffer_threshold_pct: 0.35  # Alert if < 35%
+  alert_repeated_rejections_count: 3
+  alert_repeated_rejections_window_seconds: 300
+  
+  # Alert delivery (configure as needed)
+  alert_methods:
+    - "log"  # Always log alerts
+    # - "email"
+    # - "telegram"
+    # - "slack"
+
+## Backtesting
+backtest:
+  # Starting capital
+  starting_equity: 10000  # $10,000 starting capital
+  
+  # Fill assumptions
+  assume_maker_fills: true  # Assume limit orders fill at maker fee
+  slippage_bps: 2  # 2 basis points average slippage
+  
+  # Cost modeling
+  maker_fee_bps: 2  # Kraken Futures maker fee (check current rates)
+  taker_fee_bps: 5  # Kraken Futures taker fee
+  
+  # Basis modeling
+  basis_model: "static"  # static / stochastic
+  static_basis_bps: 5  # 5 basis points static basis assumption
+
+## Paper Trading
+paper:
+  # Simulation settings
+  simulate_realistic_slippage: true
+  simulate_fill_delays_ms: 100
+
+## Live Trading
+live:
+  # Safety gates
+  require_paper_success: true
+  min_paper_days: 30
+  min_paper_trades: 50
+  max_paper_drawdown_pct: 0.15  # Paper must stay within 15% DD
+
+## Coin Universe (V2 Multi-Asset)
+coin_universe:
+  enabled: true
+  min_spot_volume_24h: 5000000  # $5M minimum
+  
+  # Liquidity tiers (A = highest, C = lowest)
+  liquidity_tiers:
+    A:
+      - "BTC/USD"
+      - "ETH/USD"
+      - "SOL/USD"
+      - "BNB/USD"
+      - "XRP/USD"
+      - "DOGE/USD"
+      - "ADA/USD"
+    B:
+      - "LINK/USD"
+      - "AVAX/USD"
+      - "TRX/USD"
+      - "TON/USD"
+      - "DOT/USD"
+      - "LTC/USD"
+      - "NEAR/USD"
+      - "XLM/USD"
+      - "XMR/USD"
+      - "ATOM/USD"
+    C: 
+      - "ZEC/USD"
+      - "FARTCOIN/USD"
+      - "WLFI/USD"
+      - "FET/USD"
+      - "FIL/USD"
+      - "KAS/USD"
+      - "STX/USD"
+  
+  # Max leverage per tier (respects global 10x cap)
+  tier_max_leverage:
+    A: 10.0
+    B: 7.0
+    C: 5.0
+
+## Environment
+environment: "prod"  # LIVE TRADING MODE - REAL CAPITAL AT RISK
