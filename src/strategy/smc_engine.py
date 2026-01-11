@@ -71,6 +71,7 @@ class SMCEngine:
                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
 
         # Step 2: Execution timeframe structure
+        structures = {}  # Store for regime classification
         if signal is None:
             structure_signal = self._detect_structure(
                 exec_candles_15m,
@@ -80,6 +81,8 @@ class SMCEngine:
             )
             if structure_signal is None:
                  signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+            else:
+                structures = structure_signal  # Save for classification
 
         # Step 3: Filters
         if signal is None:
@@ -117,6 +120,9 @@ class SMCEngine:
                 ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
 
                 if signal_type != SignalType.NO_SIGNAL:
+                    # Classify setup for regime determination
+                    setup_type, regime = self._classify_setup(structures, signal_type)
+                    
                     signal = Signal(
                         timestamp=timestamp,
                         symbol=symbol,
@@ -125,6 +131,8 @@ class SMCEngine:
                         stop_loss=stop_loss,
                         take_profit=take_profit,
                         reasoning="\n".join(reasoning_parts),
+                        setup_type=setup_type,
+                        regime=regime,
                         higher_tf_bias=bias,
                         adx=adx_value,
                         atr=atr_value,
@@ -132,6 +140,9 @@ class SMCEngine:
                         tp_candidates=tp_candidates
                     )
                 else:
+                    # No signal - default to TREND/wide_structure
+                    from src.domain.models import SetupType
+                    
                     signal = Signal(
                         timestamp=timestamp,
                         symbol=symbol,
@@ -140,6 +151,8 @@ class SMCEngine:
                         stop_loss=Decimal("0"),
                         take_profit=None,
                         reasoning="\n".join(reasoning_parts),
+                        setup_type=SetupType.TREND,  # Default for no signal
+                        regime="wide_structure",
                         higher_tf_bias=bias,
                         adx=adx_value,
                         atr=atr_value,
@@ -194,6 +207,38 @@ class SMCEngine:
             )
         
         return signal
+    
+    def _classify_setup(
+        self,
+        structures: dict,
+        signal_type: SignalType,
+    ) -> tuple[str, str]:
+        """
+        Classify setup type for regime determination.
+        
+        Returns:
+            (setup_type, regime) tuple
+            
+        Priority (highest first):
+        1. If Order Block present → ("ob", "tight_smc")
+        2. If Fair Value Gap present → ("fvg", "tight_smc")
+        3. If Break of Structure confirmed → ("bos", "wide_structure")
+        4. Else (HTF trend only) → ("trend", "wide_structure")
+        """
+        from src.domain.models import SetupType
+        
+        if structures.get("orderblock"):
+            return (SetupType.OB, "tight_smc")
+        
+        elif structures.get("fvg"):
+            return (SetupType.FVG, "tight_smc")
+        
+        elif structures.get("bos_confirmed"):
+            return (SetupType.BOS, "wide_structure")
+        
+        else:
+            # HTF trend following only
+            return (SetupType.TREND, "wide_structure")
     
     def _determine_bias(
         self,
@@ -555,6 +600,7 @@ class SMCEngine:
         current_candle: Optional[Candle],
     ) -> Signal:
         """Create a NO_SIGNAL signal."""
+        from src.domain.models import SetupType
         timestamp = current_candle.timestamp if current_candle else datetime.now()
         
         return Signal(
@@ -565,6 +611,8 @@ class SMCEngine:
             stop_loss=Decimal("0"),
             take_profit=None,
             reasoning="\n".join(reasoning),
+            setup_type=SetupType.TREND,  # Default for no signal
+            regime="wide_structure",
             higher_tf_bias="neutral",
             adx=Decimal("0"),
             atr=Decimal("0"),

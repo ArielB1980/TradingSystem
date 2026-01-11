@@ -43,6 +43,18 @@ class SignalType(str, Enum):
     NO_SIGNAL = "no_signal"
 
 
+class SetupType(str, Enum):
+    """
+    Setup type for regime classification.
+    
+    Used to distinguish between tight-stop SMC and wide-stop structure trades.
+    """
+    OB = "ob"           # Order Block (tight-stop regime: 0.4-1.0%)
+    FVG = "fvg"         # Fair Value Gap (tight-stop regime: 0.4-1.0%)
+    BOS = "bos"         # Break of Structure (wide-stop regime: 1.5-3.0%)
+    TREND = "trend"     # HTF Trend following (wide-stop regime: 1.5-3.0%)
+
+
 @dataclass(frozen=True)
 class Candle:
     """
@@ -79,6 +91,10 @@ class Signal:
     stop_loss: Decimal  # From spot analysis (SMC invalidation level)
     take_profit: Optional[Decimal]  # From spot analysis (next SMC level)
     reasoning: str  # Full reasoning for signal
+    
+    # Regime classification (NEW)
+    setup_type: SetupType  # OB/FVG/BOS/TREND
+    regime: str  # "tight_smc" or "wide_structure"
     
     # Metadata
     higher_tf_bias: str  # e.g., "bullish", "bearish", "neutral"
