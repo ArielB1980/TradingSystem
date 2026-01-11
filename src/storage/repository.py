@@ -628,3 +628,44 @@ def get_latest_account_state() -> Optional[Dict[str, Decimal]]:
             "available_margin": Decimal(str(state.available_margin)),
             "unrealized_pnl": Decimal(str(state.unrealized_pnl))
         }
+
+
+def get_latest_traces(limit: int = 300) -> List[Dict]:
+    """
+    Get the latest DECISION_TRACE event for each symbol.
+    
+    Args:
+        limit: Maximum number of symbols to return
+        
+    Returns:
+        List of dicts with symbol, timestamp, and details
+    """
+    db = get_db()
+    with db.get_session() as session:
+        from sqlalchemy import func
+        
+        # Subquery to get latest timestamp per symbol
+        subq = session.query(
+            SystemEventModel.symbol,
+            func.max(SystemEventModel.timestamp).label('max_ts')
+        ).filter(
+            SystemEventModel.event_type == 'DECISION_TRACE'
+        ).group_by(SystemEventModel.symbol).subquery()
+        
+        # Join to get full records
+        events = session.query(SystemEventModel).join(
+            subq,
+            (SystemEventModel.symbol == subq.c.symbol) &
+            (SystemEventModel.timestamp == subq.c.max_ts)
+        ).limit(limit).all()
+        
+        results = []
+        for e in events:
+            results.append({
+                'symbol': e.symbol,
+                'timestamp': e.timestamp.replace(tzinfo=timezone.utc),
+                'details': json.loads(e.details)
+            })
+        
+        return results
+
