@@ -474,5 +474,5 @@ class BacktestEngine:
         else:
             self.metrics.losing_trades += 1
             
-        self.risk_manager.record_trade_result(net_pnl)
+        self.risk_manager.record_trade_result(net_pnl, self.current_equity)
         self.position = None

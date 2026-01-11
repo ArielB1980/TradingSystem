@@ -1,20 +1,16 @@
 """
-Risk management for position sizing and liquidation safety.
-
-Implements:
-- Correct position sizing (leverage-independent)
-- Liquidation distance calculation (directional)
-- Portfolio-level risk limits
-- Cost-aware validation
-- Non-negotiable safety rules
+Risk management for position sizing, leverage control, and safety limits.
 """
+from typing import List, Optional
 from decimal import Decimal
-from typing import Optional, List
 from datetime import datetime, timezone
+from dataclasses import dataclass
+
 from src.domain.models import Signal, RiskDecision, Position, Side
 from src.config.config import RiskConfig
 from src.monitoring.logger import get_logger
 from src.storage.repository import record_event
+from src.risk.basis_guard import BasisGuard  # NEW import
 
 logger = get_logger(__name__)
 
@@ -35,10 +31,6 @@ class RiskManager:
             config: Risk configuration
         """
         self.config = config
-        self.basis_guard = BasisGuard(
-            basis_max_pct=config.basis_max_pct,
-            basis_max_post_pct=config.basis_max_post_pct,
-        )
         
         # Portfolio state tracking
         self.current_positions: List[Position] = []
