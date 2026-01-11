@@ -227,13 +227,13 @@ class SMCEngine:
         """
         from src.domain.models import SetupType
         
-        if structures.get("orderblock"):
+        if structures.get("order_block"):  # Fixed: was "orderblock"
             return (SetupType.OB, "tight_smc")
         
         elif structures.get("fvg"):
             return (SetupType.FVG, "tight_smc")
         
-        elif structures.get("bos_confirmed"):
+        elif structures.get("bos"):  # Fixed: was "bos_confirmed"
             return (SetupType.BOS, "wide_structure")
         
         else:

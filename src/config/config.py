@@ -57,7 +57,7 @@ class RiskConfig(BaseSettings):
     # Regime-specific settings (NEW for dual-regime strategy)
     # Tight-stop SMC regime (OB/FVG): 0.4-1.0% stops
     tight_smc_cost_cap_bps: float = Field(default=25.0, ge=10.0, le=50.0)  # Absolute cost cap
-    tight_smc_min_rr_multiple: float = Field(default=3.0, ge=2.0, le=5.0)  # Min R:R required
+    tight_smc_min_rr_multiple: float = Field(default=2.0, ge=1.5, le=5.0)  # Min R:R required (reduced to 2.0)
     tight_smc_avg_hold_hours: float = Field(default=6.0, ge=1.0, le=24.0)  # For funding calc
     
     # Wide-stop structure regime (BOS/TREND): 1.5-3.0% stops
