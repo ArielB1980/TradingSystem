@@ -141,6 +141,27 @@ class LiveTrading:
             
         logger.info("Indicators warmed up")
 
+    async def _sync_positions(self) -> List[Dict]:
+        """
+        Sync active positions from exchange and update RiskManager.
+        
+        Returns:
+            List of active positions
+            
+        Raises:
+            Exception: If position sync fails (caller should handle)
+        """
+        active_positions = await self.client.get_all_futures_positions()
+        self.risk_manager.update_position_list(active_positions)
+        
+        if active_positions:
+            logger.info(
+                f"Active Portfolio: {len(active_positions)} positions", 
+                symbols=[p['symbol'] for p in active_positions]
+            )
+        
+        return active_positions
+
     async def _tick(self):
         """Single iteration of live trading logic."""
         # 1. Check Data Health
@@ -148,19 +169,12 @@ class LiveTrading:
             logger.error("Data acquisition unhealthy")
             return
 
-        # 1.5 Sync Active Positions (CRITICAL FIX)
-        # We must update RiskManager with ALL current positions before generating new signals
+        # 2. Sync Active Positions (CRITICAL: Must happen before signal generation)
         try:
-            active_positions = await self.client.get_all_futures_positions()
-            self.risk_manager.update_position_list(active_positions)
-            
-            # Log for debugging
-            if active_positions:
-                logger.info(f"Active Portfolio: {len(active_positions)} positions", 
-                           symbols=[p['symbol'] for p in active_positions])
+            await self._sync_positions()
         except Exception as e:
-             logger.error("Failed to sync positions", error=str(e))
-             return # Safety: Don't trade if we can't see positions
+            logger.error("Failed to sync positions", error=str(e))
+            return  # Safety: Don't trade if we can't see positions
 
         for spot_symbol in self.markets:
             try:

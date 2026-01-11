@@ -28,6 +28,14 @@ from collections import deque
 from dataclasses import dataclass
 from src.monitoring.logger import get_logger
 from src.domain.models import Candle
+from src.constants import (
+    PUBLIC_API_CAPACITY,
+    PUBLIC_API_REFILL_RATE,
+    PRIVATE_API_CAPACITY,
+    PRIVATE_API_REFILL_RATE,
+    KRAKEN_FUTURES_BASE_URL,
+)
+from src.exceptions import APIError, AuthenticationError
 
 logger = get_logger(__name__)
 
@@ -132,8 +140,11 @@ class KrakenClient:
             self.futures_exchange = None
         
         # Rate limiters (configurable per endpoint group)
-        self.public_limiter = RateLimiter(capacity=20, refill_rate=1.0)  # 1 req/sec
-        self.private_limiter = RateLimiter(capacity=20, refill_rate=0.33)  # ~20 per minute
+        self.public_limiter = RateLimiter(capacity=PUBLIC_API_CAPACITY, refill_rate=PUBLIC_API_REFILL_RATE)
+        self.private_limiter = RateLimiter(capacity=PRIVATE_API_CAPACITY, refill_rate=PRIVATE_API_REFILL_RATE)
+        
+        # Reusable SSL context
+        self._ssl_context = None
         
         logger.info("Kraken client initialized")
     
@@ -264,8 +275,7 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/openpositions"
             headers = await self._get_futures_auth_headers(url, "GET")
             
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
@@ -300,8 +310,7 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
@@ -330,8 +339,7 @@ class KrakenClient:
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
@@ -617,6 +625,59 @@ class KrakenClient:
         if self.futures_exchange:
             await self.futures_exchange.close()
 
+    def _get_ssl_context(self) -> ssl.SSLContext:
+        """
+        Get or create reusable SSL context with certifi certificates.
+        
+        Returns:
+            SSL context configured with certifi certificates
+        """
+        if self._ssl_context is None:
+            self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+        return self._ssl_context
+    
+    def _generate_futures_signature(self, path: str, postdata: str, nonce: str) -> str:
+        """
+        Generate HMAC-SHA512 signature for Kraken Futures API.
+        
+        Args:
+            path: API endpoint path (without /derivatives prefix)
+            postdata: POST data string
+            nonce: Timestamp nonce
+            
+        Returns:
+            Base64-encoded signature
+            
+        Raises:
+            AuthenticationError: If signature generation fails
+        """
+        try:
+            # Step 1: Concatenate postdata + nonce + path
+            message = postdata + nonce + path
+            
+            # Step 2: SHA-256 hash of the message
+            sha256_hash = hashlib.sha256(message.encode('utf-8')).digest()
+            
+            # Step 3: Base64-decode the API secret
+            secret = self.futures_api_secret.strip()
+            padding = len(secret) % 4
+            if padding != 0:
+                secret += '=' * (4 - padding)
+                
+            secret_decoded = base64.b64decode(secret)
+            
+            # Step 4: HMAC-SHA-512 using the decoded secret and SHA-256 hash
+            signature = hmac.new(
+                secret_decoded,
+                sha256_hash,
+                hashlib.sha512
+            ).digest()
+            
+            # Step 5: Base64-encode the signature
+            return base64.b64encode(signature).decode('utf-8')
+            
+        except Exception as e:
+            raise AuthenticationError(f"Failed to generate signature: {e}")
     
     async def _get_futures_auth_headers(self, url: str, method: str, postdata: str = "") -> Dict[str, str]:
         """
@@ -629,41 +690,25 @@ class KrakenClient:
         
         Returns:
             Dict of headers including APIKey and Authent
+            
+        Raises:
+            AuthenticationError: If credentials are missing or invalid
         """
+        if not self.futures_api_key or not self.futures_api_secret:
+            raise AuthenticationError("Futures API credentials not configured")
+        
         # Extract path from URL
         path = url.split('.com', 1)[1]
         
-        # CRITICAL FIX: Signature uses path WITHOUT /derivatives prefix
+        # CRITICAL: Signature uses path WITHOUT /derivatives prefix
         if path.startswith('/derivatives'):
             path = path[len('/derivatives'):]
         
         # Generate nonce (timestamp in milliseconds)
         nonce = str(int(time.time() * 1000))
         
-        # Create signature (Kraken Futures API v3 method)
-        # Step 1: Concatenate postdata + nonce + path
-        message = postdata + nonce + path
-        
-        # Step 2: SHA-256 hash of the message
-        sha256_hash = hashlib.sha256(message.encode('utf-8')).digest()
-        
-        # Step 3: Base64-decode the API secret
-        secret = self.futures_api_secret.strip()
-        padding = len(secret) % 4
-        if padding != 0:
-            secret += '=' * (4 - padding)
-            
-        secret_decoded = base64.b64decode(secret)
-        
-        # Step 4: HMAC-SHA-512 using the decoded secret and SHA-256 hash
-        signature = hmac.new(
-            secret_decoded,
-            sha256_hash,
-            hashlib.sha512
-        ).digest()
-        
-        # Step 5: Base64-encode the signature
-        authent = base64.b64encode(signature).decode('utf-8')
+        # Generate signature using extracted method
+        authent = self._generate_futures_signature(path, postdata, nonce)
         
         return {
             'APIKey': self.futures_api_key,
