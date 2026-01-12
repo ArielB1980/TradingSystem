@@ -7,10 +7,66 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Optional, Dict
-from src.storage.repository import get_latest_traces
+from src.storage.repository import get_latest_traces, get_candles
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def calculate_signal_strength(details: dict) -> float:
+    """
+    Calculate signal strength from score breakdown.
+    
+    Args:
+        details: Trace details containing score_breakdown
+        
+    Returns:
+        Signal strength (0.0 to 1.0)
+    """
+    score_breakdown = details.get('score_breakdown', {})
+    if not score_breakdown:
+        return 0.0
+    
+    # Sum all score components
+    total_score = sum(float(v) for v in score_breakdown.values())
+    
+    # Normalize to 0-1 range (assuming max score is ~5)
+    return min(total_score / 5.0, 1.0)
+
+
+def calculate_24h_change(symbol: str, current_price: float) -> float:
+    """
+    Calculate 24h price change percentage.
+    
+    Args:
+        symbol: Trading symbol
+        current_price: Current price
+        
+    Returns:
+        24h change percentage
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        
+        # Get candles from 24h ago
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        candles = get_candles(symbol, "1h", limit=25)
+        
+        if not candles or len(candles) < 2:
+            return 0.0
+        
+        # Get price from ~24h ago (oldest candle)
+        price_24h_ago = float(candles[0].close)
+        
+        if price_24h_ago == 0:
+            return 0.0
+        
+        change_pct = ((current_price - price_24h_ago) / price_24h_ago) * 100
+        return change_pct
+        
+    except Exception as e:
+        logger.debug(f"Failed to calculate 24h change for {symbol}", error=str(e))
+        return 0.0
 
 
 @dataclass
@@ -100,11 +156,11 @@ def load_all_coins() -> List[CoinSnapshot]:
             snapshot = CoinSnapshot(
                 symbol=trace.get('symbol', 'UNKNOWN'),
                 price=details.get('spot_price', 0.0),
-                change_24h=0.0,  # TODO: Calculate from historical data
+                change_24h=calculate_24h_change(trace.get('symbol'), details.get('spot_price', 0.0)),
                 regime=details.get('regime', 'unknown'),
                 bias=details.get('bias', 'neutral'),
                 signal=details.get('signal', 'NO_SIGNAL'),
-                quality=details.get('setup_quality', 0.0),
+                quality=calculate_signal_strength(details),
                 adx=details.get('adx', 0.0),
                 atr=details.get('atr', 0.0),
                 ema200_slope=details.get('ema200_slope', 'flat'),

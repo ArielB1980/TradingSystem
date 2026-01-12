@@ -182,16 +182,25 @@ class Position:
     peak_price: Optional[Decimal] = None  # Highest/Lowest mark price since trail activation
     
     # V3 Active Trade Management
-    # Immutable Parameters (Set at Entry)
-    initial_stop_price: Optional[Decimal] = None
-    max_loss_amount: Optional[Decimal] = None
-    trade_type: Optional[str] = None  # "tight" or "wide"
-    tp1_price: Optional[Decimal] = None
-    tp2_price: Optional[Decimal] = None
-    final_target_price: Optional[Decimal] = None
-    partial_close_pct: Optional[Decimal] = None
-    original_size: Optional[Decimal] = None
-
+    # V3 Immutable Parameters (set at entry, never changed)
+    initial_stop_price: Optional[Decimal] = None  # Original stop loss level
+    trade_type: Optional[str] = None  # "breakout", "pullback", "reversal"
+    tp1_price: Optional[Decimal] = None  # First TP target
+    tp2_price: Optional[Decimal] = None  # Second TP target
+    final_target_price: Optional[Decimal] = None  # Final TP target
+    partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1
+    original_size: Optional[Decimal] = None  # Original position size before any closes
+    
+    # Order IDs for tracking
+    stop_loss_order_id: Optional[str] = None
+    tp_order_ids: Optional[list[str]] = None
+    
+    # Basis and Funding Tracking
+    basis_at_entry: Optional[Decimal] = None  # Futures - Spot at entry (bps)
+    basis_current: Optional[Decimal] = None  # Current basis (bps)
+    funding_rate: Optional[Decimal] = None  # Current funding rate
+    cumulative_funding: Decimal = Decimal("0")  # Total funding paid/received
+    
     # State Flags
     intent_confirmed: bool = False
     premise_invalidated: bool = False

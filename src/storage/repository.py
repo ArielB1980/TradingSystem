@@ -443,31 +443,6 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
         )
 
 
-def get_all_trades() -> List[Trade]:
-    """Retrieve all trades from the database."""
-    db = get_db()
-    with db.get_session() as session:
-        trade_models = session.query(TradeModel).order_by(TradeModel.entered_at.desc()).all()
-        
-        return [
-            Trade(
-                trade_id=tm.trade_id,
-                symbol=tm.symbol,
-                side=tm.side,
-                entry_price=Decimal(str(tm.entry_price)),
-                exit_price=Decimal(str(tm.exit_price)),
-                size_notional=Decimal(str(tm.size_notional)),
-                leverage=Decimal(str(tm.leverage)),
-                gross_pnl=Decimal(str(tm.gross_pnl)),
-                fees=Decimal(str(tm.fees)),
-                funding=Decimal(str(tm.funding)),
-                net_pnl=Decimal(str(tm.net_pnl)),
-                entered_at=tm.entered_at,
-                exited_at=tm.exited_at,
-                holding_period_hours=Decimal(str(tm.holding_period_hours)),
-                exit_reason=tm.exit_reason,
-            )
-            for tm in trade_models
         ]
 
 

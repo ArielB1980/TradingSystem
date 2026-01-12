@@ -262,11 +262,56 @@ class Executor:
                 logger.info("SL updated", symbol=symbol, old_id=current_sl_id, new_id=updated_sl_id, price=str(new_sl_price))
             except Exception as e:
                 logger.error("Failed to update SL", symbol=symbol, error=str(e))
-
-        # 2. Update TPs (TODO: Implement ladder replacement)
-        # For now, we focus on SL as it's safety critical.
         
-        return updated_sl_id, []
+        # 2. Update TPs (TP Ladder Replacement)
+        updated_tp_ids = current_tp_ids
+        if new_tp_prices:
+            try:
+                # Cancel existing TP orders
+                for tp_id in current_tp_ids:
+                    try:
+                        await self.futures_adapter.cancel_order(tp_id, symbol)
+                        logger.debug("Cancelled TP order", order_id=tp_id)
+                    except Exception as e:
+                        logger.warning("Failed to cancel TP", order_id=tp_id, error=str(e))
+                
+                # Place new TP ladder
+                new_tp_ids = []
+                # Get position size for proper TP sizing
+                # For simplicity, divide position equally across TPs
+                # In production, you'd want configurable percentages
+                tp_count = len(new_tp_prices)
+                
+                for i, tp_price in enumerate(new_tp_prices):
+                    try:
+                        # Calculate size for this TP level
+                        # Simple equal distribution for now
+                        tp_order = await self.futures_adapter.place_order(
+                            symbol=symbol,
+                            side=protective_side,
+                            size_notional=Decimal("0"),  # Reduce-only handles sizing
+                            leverage=Decimal("1"),
+                            order_type=OrderType.TAKE_PROFIT,
+                            price=tp_price,
+                            reduce_only=True
+                        )
+                        new_tp_ids.append(tp_order.order_id)
+                        logger.info(
+                            f"TP{i+1} placed",
+                            symbol=symbol,
+                            price=str(tp_price),
+                            order_id=tp_order.order_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to place TP{i+1}", symbol=symbol, error=str(e))
+                
+                updated_tp_ids = new_tp_ids
+                logger.info("TP ladder updated", symbol=symbol, tp_count=len(new_tp_ids))
+                
+            except Exception as e:
+                logger.error("Failed to update TP ladder", symbol=symbol, error=str(e))
+        
+        return updated_sl_id, updated_tp_ids
 
     async def close_all_positions(self):
         """Emergency: Close all open positions at market."""

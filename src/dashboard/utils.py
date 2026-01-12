@@ -58,13 +58,20 @@ def get_portfolio_metrics() -> Dict[str, Any]:
         equity = 10000.0
         balance = 10000.0
     
+    # Calculate daily PnL (realized today + unrealized)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    trades_today = get_trades_since(today_start)
+    realized_pnl_today = sum(trade.net_pnl for trade in trades_today)
+    
+    daily_pnl = realized_pnl_today + total_unrealized_pnl
+    
     return {
         "equity": equity,
         "balance": balance,
         "margin_used": total_margin_used, 
         "margin_available": equity - total_margin_used,
         "unrealized_pnl": total_unrealized_pnl,
-        "daily_pnl": total_unrealized_pnl,  # TODO: Calculate from realized + unrealized today
+        "daily_pnl": daily_pnl,
         "active_positions": active_positions,
         "max_positions": config.risk.max_concurrent_positions,
         "effective_leverage": total_margin_used / equity if equity > 0 else 0.0,
