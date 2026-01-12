@@ -386,9 +386,12 @@ class LiveTrading:
                 except Exception as e:
                     logger.error(f"Error processing {spot_symbol}", error=str(e))
 
-        # Run Parallel
-        await asyncio.gather(*[process_coin(sym) for sym in self.markets])
-
+        # Execute parallel processing
+        await asyncio.gather(*[process_coin(s) for s in self.markets], return_exceptions=True)
+        
+        # 4.5 CRITICAL: Validate all positions have stop loss protection
+        await self._validate_position_protection()
+        
         # 5. Account Sync (Throttled)
         now = datetime.now(timezone.utc)
         if (now - self.last_account_sync).total_seconds() > 15:
@@ -452,7 +455,39 @@ class LiveTrading:
             
         except Exception as e:
             logger.error("Failed to sync account state", error=str(e))
-
+    
+    async def _validate_position_protection(self):
+        """CRITICAL: Ensure all open positions have stop loss orders."""
+        try:
+            all_positions = await self.client.get_all_futures_positions()
+            
+            for pos in all_positions:
+                symbol = pos['symbol']
+                
+                # Check if position has protective orders in managed_positions
+                if symbol in self.managed_positions:
+                    managed_pos = self.managed_positions[symbol]
+                    
+                    # CRITICAL CHECK: Stop loss must be set
+                    if not managed_pos.initial_stop_price:
+                        logger.critical(
+                            f"🚨 UNPROTECTED POSITION: {symbol} has NO STOP LOSS!",
+                            size=str(pos['size']),
+                            entry=str(pos['entry_price']),
+                            unrealized_pnl=str(pos.get('unrealized_pnl', 0))
+                        )
+                        # TODO: Emergency stop loss placement could go here
+                        # For now, just alert loudly
+                else:
+                    # Position exists but not in managed_positions - this is also critical
+                    logger.critical(
+                        f"🚨 UNMANAGED POSITION: {symbol} exists but not tracked!",
+                        size=str(pos['size']),
+                        entry=str(pos['entry_price'])
+                    )
+        except Exception as e:
+            logger.error("Failed to validate position protection", error=str(e))
+    
     async def _handle_signal(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
         """Process signal through risk and executor."""
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
@@ -649,12 +684,18 @@ class LiveTrading:
     def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
         """Hydrate Position object from exchange data (for recovery)."""
         logger.warning(f"Hydrating position for {exchange_data['symbol']} without V3 params (Recovery)")
+        
+        # Defensive: Ensure required keys exist
+        if 'entry_price' not in exchange_data:
+            logger.error(f"Missing 'entry_price' in exchange data for {exchange_data.get('symbol', 'UNKNOWN')}", data_keys=list(exchange_data.keys()))
+            raise ValueError(f"Cannot hydrate position: missing entry_price")
+        
         return Position(
             symbol=exchange_data['symbol'],
             side=Side.LONG if exchange_data['side'] == 'long' else Side.SHORT,
             size=Decimal(str(exchange_data['size'])),
             size_notional=Decimal("0"), # Unknown without calc
-            entry_price=Decimal(str(exchange_data['price'])),
+            entry_price=Decimal(str(exchange_data['entry_price'])),  # FIX: was 'price'
             current_mark_price=mark_price,
             liquidation_price=Decimal(str(exchange_data.get('liquidationPrice', 0))),
             unrealized_pnl=Decimal(str(exchange_data.get('unrealizedPnl', 0))),
