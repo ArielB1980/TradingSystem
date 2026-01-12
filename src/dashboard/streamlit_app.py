@@ -54,6 +54,45 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Sidebar - Performance & Status
+with st.sidebar:
+    st.header("📊 System Performance")
+    
+    # Load performance metrics
+    from src.monitoring.performance import calculate_performance_metrics
+    metrics = calculate_performance_metrics(days=30)
+    
+    col_pnl, col_win = st.columns(2)
+    with col_pnl:
+        pnl = metrics.get('total_pnl', 0.0)
+        st.metric("30d PnL", f"${pnl:,.2f}", delta=pnl)
+    with col_win:
+        win_rate = metrics.get('win_rate', 0.0)
+        st.metric("Win Rate", f"{win_rate:.1f}%")
+        
+    st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0.0):.2f}")
+    st.metric("Max Drawdown", f"{metrics.get('max_drawdown', 0.0):.2f}%", delta_color="inverse")
+    
+    st.divider()
+    
+    st.header("⚙️ System Status")
+    
+    # Kill switch status
+    from src.monitoring.kill_switch import get_kill_switch
+    ks = get_kill_switch()
+    ks_status = ks.get_status()
+    
+    if ks_status.get('active'):
+        st.error(f"🚨 KILL SWITCH ACTIVE")
+        st.caption(f"Reason: {ks_status.get('reason')}")
+    else:
+        st.success("✅ System Operational")
+        
+    # Active Alerts (Placeholder)
+    # st.subheader("🔔 Recent Alerts")
+    # ...
+
+
 # Header
 st.markdown('<div class="main-header">🎯 Trading System Monitor</div>', unsafe_allow_html=True)
 
@@ -75,61 +114,32 @@ st.markdown(
 )
 
 # Filters
+# ... (Filters section unchanged) ...
 st.markdown("### Filters")
 col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
-    signal_filter = st.selectbox(
-        "Signal",
-        ["All", "LONG", "SHORT", "NO_SIGNAL"],
-        index=0
-    )
-
+    signal_filter = st.selectbox("Signal", ["All", "LONG", "SHORT", "NO_SIGNAL"], index=0)
 with col2:
-    regime_filter = st.selectbox(
-        "Regime",
-        ["All", "tight_range", "wide_structure", "trending"],
-        index=0
-    )
-
+    regime_filter = st.selectbox("Regime", ["All", "tight_range", "wide_structure", "trending"], index=0)
 with col3:
-    bias_filter = st.selectbox(
-        "Bias",
-        ["All", "bullish", "bearish", "neutral"],
-        index=0
-    )
-
+    bias_filter = st.selectbox("Bias", ["All", "bullish", "bearish", "neutral"], index=0)
 with col4:
-    quality_threshold = st.slider(
-        "Min Quality",
-        min_value=0,
-        max_value=100,
-        value=0,
-        step=5
-    )
-
+    quality_threshold = st.slider("Min Quality", 0, 100, 0, 5)
 with col5:
-    status_filter = st.selectbox(
-        "Status",
-        ["All", "active", "stale", "dead"],
-        index=0
-    )
+    status_filter = st.selectbox("Status", ["All", "active", "stale", "dead"], index=0)
 
 # Apply filters
 filtered_coins = coins
 
 if signal_filter != "All":
     filtered_coins = [c for c in filtered_coins if c.signal == signal_filter]
-
 if regime_filter != "All":
     filtered_coins = [c for c in filtered_coins if c.regime == regime_filter]
-
 if bias_filter != "All":
     filtered_coins = [c for c in filtered_coins if c.bias == bias_filter]
-
 if quality_threshold > 0:
     filtered_coins = [c for c in filtered_coins if c.quality >= quality_threshold]
-
 if status_filter != "All":
     filtered_coins = [c for c in filtered_coins if c.status == status_filter]
 
@@ -148,10 +158,14 @@ if filtered_coins:
         else:
             last_update_str = f"{int(age/3600)}h ago"
         
+        # Color code 24h change
+        change = getattr(coin, 'change_24h', 0.0)
+        
         data.append({
             "Status": coin.status_emoji,
             "Symbol": coin.symbol,
             "Price": f"${coin.price:.4f}",
+            "24h %": f"{change:+.2f}%",
             "Signal": f"{coin.signal_emoji} {coin.signal}",
             "Regime": coin.regime,
             "Bias": coin.bias,
@@ -172,7 +186,13 @@ if filtered_coins:
         df,
         use_container_width=True,
         height=600,
-        hide_index=True
+        hide_index=True,
+        column_config={
+            "24h %": st.column_config.NumberColumn(
+                "24h %",
+                format="%.2f%%",
+            )
+        }
     )
     
     # Expandable detail section
@@ -199,7 +219,13 @@ if filtered_coins:
                 st.write(f"**Signal:** {latest['signal']}")
                 st.write(f"**Quality:** {latest['quality']:.0f}")
                 st.write(f"**Timestamp:** {latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            
+                
+                # Show Basis/Funding if available
+                # (Assuming detail dict might need updates to carry this, or we fetch active position)
+                from src.storage.repository import get_active_positions
+                # This is a bit heavy for UI loop, but okay for single selection
+                # Ideally pass this down from data_loader
+                
             with col2:
                 st.markdown("#### Recent Signals")
                 for sig in detail['recent_signals'][:5]:
