@@ -447,12 +447,12 @@ class LiveTrading:
         # 5. Account Sync (Throttled) - This was moved to step 2.
         # The original code had a 15s throttle here. The new instruction implies a 60s throttle at the start.
         # Keeping this commented out to avoid duplicate sync.
-        # now = datetime.now(timezone.utc)
         # if (now - self.last_account_sync).total_seconds() > 15:
         #     await self._sync_account_state()
         #     self.last_account_sync = now
             
         # 7. Operational Maintenance (Daily)
+        now = datetime.now(timezone.utc)
         if (now - self.last_maintenance_run).total_seconds() > 86400: # 24 hours
             try:
                 results = self.db_pruner.run_maintenance()
