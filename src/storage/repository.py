@@ -6,7 +6,8 @@ Provides repository pattern for clean data access.
 from sqlalchemy import Column, String, Numeric, DateTime, Integer, Boolean
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Dict
+import json
 from src.storage.db import Base, get_db
 from src.domain.models import Candle, Trade, Position
 
@@ -521,9 +522,6 @@ def get_trades_since(since: datetime) -> List[Trade]:
             for tm in trade_models
         ]
 
-
-import json
-from typing import Optional, Dict
 
 def record_event(
     event_type: str,
