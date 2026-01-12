@@ -541,6 +541,7 @@ class KrakenClient:
             logger.error("Futures order placement failed", error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
     
+    @retry_on_transient_errors
     async def get_futures_balance(self) -> Dict[str, Any]:
         """
         Get futures account balance using CCXT.

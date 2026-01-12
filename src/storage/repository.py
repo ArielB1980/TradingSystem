@@ -570,7 +570,7 @@ def record_event(
     timestamp: Optional[datetime] = None
 ) -> None:
     """
-    Record a system event for the audit trail.
+    Record a system event for the audit trail (synchronous version).
     
     Args:
         event_type: Type of event (e.g. SIGNAL, DECISION, RISK)
@@ -608,6 +608,39 @@ def record_event(
             details=details_json
         )
         session.add(event)
+
+
+async def async_record_event(
+    event_type: str,
+    symbol: str,
+    details: Dict,
+    decision_id: Optional[str] = None,
+    timestamp: Optional[datetime] = None
+) -> None:
+    """
+    Record a system event for the audit trail (async version - non-blocking).
+    
+    Offloads the synchronous DB write to a thread pool to prevent blocking
+    the main event loop during live trading.
+    
+    Args:
+        event_type: Type of event (e.g. SIGNAL, DECISION, RISK)
+        symbol: Related symbol
+        details: Dictionary of details (will be JSON serialized)
+        decision_id: Optional ID to link related events
+        timestamp: Optional explicit timestamp
+    """
+    import asyncio
+    
+    # Run the synchronous record_event in a thread pool
+    await asyncio.to_thread(
+        record_event,
+        event_type=event_type,
+        symbol=symbol,
+        details=details,
+        decision_id=decision_id,
+        timestamp=timestamp
+    )
 
 
 def get_recent_events(limit: int = 50, event_type: Optional[str] = None, symbol: Optional[str] = None) -> List[Dict]:

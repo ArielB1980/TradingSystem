@@ -394,6 +394,8 @@ class LiveTrading:
                     
                     if (now - last_trace).total_seconds() > 300: # 5 minutes
                         try:
+                            from src.storage.repository import async_record_event
+                            
                             trace_details = {
                                 "signal": signal.signal_type.value,
                                 "regime": signal.regime,
@@ -406,7 +408,7 @@ class LiveTrading:
                                 "score_breakdown": signal.score_breakdown or {}
                             }
                             
-                            record_event(
+                            await async_record_event(
                                 event_type="DECISION_TRACE",
                                 symbol=spot_symbol,
                                 details=trace_details,

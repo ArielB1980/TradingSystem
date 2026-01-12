@@ -99,16 +99,43 @@ class SMCEngine:
 
         # Step 3: Filters
         if signal is None:
-            # ADX
-            adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
-            if not adx_df.empty:
-                adx_value = float(adx_df['ADX_14'].iloc[-1])
+            # Cache key based on last candle timestamp
+            cache_key = f"{symbol}_{exec_candles_1h[-1].timestamp if exec_candles_1h else 'none'}"
             
-            # ATR
-            atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
-            if not atr_df.empty:
-                atr_value = Decimal(str(atr_df.iloc[-1])) # Convert to Decimal
-
+            # Check cache for indicators
+            cached_indicators = self.indicator_cache.get(cache_key)
+            
+            if cached_indicators:
+                # Use cached values
+                adx_value = cached_indicators['adx']
+                atr_value = cached_indicators['atr']
+                fib_levels = cached_indicators['fib_levels']
+            else:
+                # Calculate fresh
+                adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
+                if not adx_df.empty:
+                    adx_value = float(adx_df['ADX_14'].iloc[-1])
+                else:
+                    adx_value = 0.0
+                
+                # ATR
+                atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+                if not atr_df.empty:
+                    atr_value = Decimal(str(atr_df.iloc[-1]))
+                else:
+                    atr_value = Decimal("0")
+                
+                # Fib Levels (pre-calculate for later use)
+                fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
+                
+                # Store in cache
+                self.indicator_cache[cache_key] = {
+                    'adx': adx_value,
+                    'atr': atr_value,
+                    'fib_levels': fib_levels
+                }
+            
+            # Apply filters
             if not self._apply_filters(exec_candles_1h, reasoning_parts):
                  signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
 
@@ -121,8 +148,7 @@ class SMCEngine:
                     reasoning_parts,
                 )
                 
-                # Step 5: Fib Validation (Gate for tight_smc)
-                fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
+                # Step 5: Fib Validation (Gate for tight_smc) - use cached fib_levels
                 fib_valid = True
                 
                 setup_type = classification_info['setup_type']
