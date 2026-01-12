@@ -248,6 +248,14 @@ class LiveTrading:
         Single iteration of live trading logic.
         Optimized for batch processing (Phase 10).
         """
+        # 0. Order Timeout Monitoring (CRITICAL: Check first)
+        try:
+            cancelled_count = await self.executor.check_order_timeouts()
+            if cancelled_count > 0:
+                logger.warning("Cancelled expired orders", count=cancelled_count)
+        except Exception as e:
+            logger.error("Failed to check order timeouts", error=str(e))
+        
         # 1. Check Data Health
         if not self.data_acq.is_healthy():
             logger.error("Data acquisition unhealthy")
@@ -392,11 +400,13 @@ class LiveTrading:
         # 4.5 CRITICAL: Validate all positions have stop loss protection
         await self._validate_position_protection()
         
-        # 5. Account Sync (Throttled)
-        now = datetime.now(timezone.utc)
-        if (now - self.last_account_sync).total_seconds() > 15:
-            await self._sync_account_state()
-            self.last_account_sync = now
+        # 5. Account Sync (Throttled) - This was moved to step 2.
+        # The original code had a 15s throttle here. The new instruction implies a 60s throttle at the start.
+        # Keeping this commented out to avoid duplicate sync.
+        # now = datetime.now(timezone.utc)
+        # if (now - self.last_account_sync).total_seconds() > 15:
+        #     await self._sync_account_state()
+        #     self.last_account_sync = now
             
         # 7. Operational Maintenance (Daily)
         if (now - self.last_maintenance_run).total_seconds() > 86400: # 24 hours

@@ -51,6 +51,12 @@ class Executor:
         self.submitted_orders: Dict[str, Order] = {}  # client_order_id → Order
         self.order_intents_seen: Set[str] = set()  # intent hash for deduplication
         
+        # Order monitoring for timeout handling
+        from src.execution.order_monitor import OrderMonitor
+        self.order_monitor = OrderMonitor(
+            default_timeout_seconds=config.order_timeout_seconds
+        )
+        
         logger.info("Executor initialized", config=config.model_dump())
     
     async def execute_signal(
@@ -116,6 +122,9 @@ class Executor:
             # Track order
             self.submitted_orders[entry_order.client_order_id] = entry_order
             self.order_intents_seen.add(intent_hash)
+            
+            # Register with order monitor for timeout tracking
+            self.order_monitor.track_order(entry_order)
             
             logger.info(
                 "Entry order submitted",
@@ -304,3 +313,81 @@ class Executor:
             )
         
         return ghost_ids
+    
+    async def check_order_timeouts(self) -> int:
+        """
+        Check for expired orders and cancel them.
+        
+        Returns:
+            Number of orders cancelled
+        """
+        expired_orders = self.order_monitor.get_expired_orders()
+        
+        if not expired_orders:
+            return 0
+        
+        cancelled_count = 0
+        
+        for tracked in expired_orders:
+            order = tracked.order
+            try:
+                logger.warning(
+                    "Order timeout detected, cancelling",
+                    order_id=order.order_id,
+                    symbol=order.symbol,
+                    age_seconds=tracked.age_seconds,
+                    timeout=tracked.timeout_seconds
+                )
+                
+                # Cancel the order
+                await self.futures_adapter.cancel_order(order.order_id, order.symbol)
+                
+                # Mark as cancelled in monitor
+                self.order_monitor.mark_as_cancelled(order.order_id)
+                
+                # Remove from submitted orders
+                if order.client_order_id in self.submitted_orders:
+                    del self.submitted_orders[order.client_order_id]
+                
+                cancelled_count += 1
+                
+                logger.info(
+                    "Expired order cancelled",
+                    order_id=order.order_id,
+                    symbol=order.symbol
+                )
+                
+            except Exception as e:
+                logger.error(
+                    "Failed to cancel expired order",
+                    order_id=order.order_id,
+                    symbol=order.symbol,
+                    error=str(e)
+                )
+        
+        return cancelled_count
+    
+    async def reconcile_orders(self, exchange_orders: list[Order]) -> None:
+        """
+        Reconcile tracked orders with exchange state.
+        
+        Args:
+            exchange_orders: Current orders from exchange
+        """
+        discrepancies = self.order_monitor.reconcile_with_exchange(exchange_orders)
+        
+        if discrepancies:
+            logger.warning(
+                "Order reconciliation found discrepancies",
+                count=len(discrepancies),
+                details=discrepancies
+            )
+    
+    def get_monitoring_stats(self) -> dict:
+        """
+        Get order monitoring statistics.
+        
+        Returns:
+            Dict with monitoring metrics
+        """
+        return self.order_monitor.get_monitoring_stats()
