@@ -248,6 +248,7 @@ coin_universe:
       - "EGLD/USD"
       - "XTZ/USD"
       - "ALGO/USD"
+      - "DOGE/USD"
       - "ETC/USD"
       - "KAS/USD"
       - "FET/USD"

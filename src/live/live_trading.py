@@ -614,7 +614,6 @@ class LiveTrading:
                  leverage=intent_model.leverage,
                  margin_used=Decimal("0"),
                  opened_at=datetime.now(timezone.utc),
-                 updated_at=datetime.now(timezone.utc),
                  
                  # V3 Immutable Parameters
                  initial_stop_price=intent_model.stop_loss_futures,
@@ -702,7 +701,6 @@ class LiveTrading:
             leverage=Decimal("1"), # Approx
             margin_used=Decimal("0"),
             opened_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
             
             # Init V3 defaults (safe fallback)
             initial_stop_price=None,
