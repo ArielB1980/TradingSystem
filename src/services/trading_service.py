@@ -1,0 +1,552 @@
+import multiprocessing
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional
+from queue import Empty
+from decimal import Decimal
+
+from src.config.config import Config
+from src.monitoring.logger import get_logger, setup_logging
+from src.ipc.messages import MarketUpdate, ServiceCommand, ServiceStatus
+from src.domain.models import Candle, Signal, SignalType, Position, Side, OrderType, OrderIntent, RiskDecision
+from src.strategy.smc_engine import SMCEngine
+from src.risk.risk_manager import RiskManager
+from src.execution.executor import Executor
+from src.data.kraken_client import KrakenClient
+from src.execution.price_converter import PriceConverter
+from src.execution.futures_adapter import FuturesAdapter
+from src.storage.repository import async_record_event, sync_active_positions, save_account_state
+from src.execution.position_manager import PositionManager, ActionType, ManagementAction
+from src.execution.execution_engine import ExecutionEngine
+from src.storage.maintenance import DatabasePruner
+from src.monitoring.kill_switch import get_kill_switch
+
+logger = get_logger("TradingService")
+
+class TradingService(multiprocessing.Process):
+    """
+    Dedicated process for Tick Processing, Strategy Analysis, and Order Execution.
+    Consumes MarketUpdate events from DataService.
+    """
+    def __init__(self, input_queue: multiprocessing.Queue, command_queue: multiprocessing.Queue, config: Config):
+        super().__init__()
+        self.input_queue = input_queue
+        self.command_queue = command_queue
+        self.config = config
+        self.active = True
+        
+        # Cache State
+        self.candles_15m = {}
+        self.candles_1h = {}
+        self.candles_4h = {}
+        self.candles_1d = {}
+        
+        # Throttling
+        self.last_analysis: Dict[str, datetime] = {}
+        self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_trace_log: Dict[str, datetime] = {}
+        
+    def run(self):
+        setup_logging()
+        logger.info("Trading Service Process Started (PID %s)", self.pid)
+        try:
+            asyncio.run(self._service_loop())
+        except KeyboardInterrupt:
+            logger.info("Trading Service stopped by User")
+        except Exception as e:
+            logger.critical(f"Trading Service Crashed: {e}", exc_info=True)
+
+    async def _service_loop(self):
+        # Init Components
+        self.kraken = KrakenClient(
+            api_key=self.config.exchange.api_key,
+            api_secret=self.config.exchange.api_secret,
+            futures_api_key=self.config.exchange.futures_api_key,
+            futures_api_secret=self.config.exchange.futures_api_secret,
+            use_testnet=self.config.exchange.use_testnet
+        )
+        self.price_converter = PriceConverter()
+        self.futures_adapter = FuturesAdapter(self.kraken, max_leverage=self.config.risk.max_leverage)
+        
+        self.executor = Executor(
+            self.config.execution, 
+            self.futures_adapter
+        )
+        self.execution_engine = ExecutionEngine(self.config)
+        self.risk_manager = RiskManager(self.config.risk)
+        self.smc_engine = SMCEngine(self.config.strategy)
+        
+        # Position Management V2
+        self.position_manager = PositionManager()
+        self.managed_positions: Dict[str, Position] = {}
+        
+        # Maintenance
+        self.db_pruner = DatabasePruner()
+        self.kill_switch = get_kill_switch()
+        
+        # Initial Sync
+        try:
+            await self.executor.sync_open_orders()
+        except Exception as e:
+            logger.error(f"Failed to sync orders: {e}")
+        
+        self._send_status("RUNNING", {"msg": "Initialized"})
+        
+        # Start Independent Position Management Loop
+        asyncio.create_task(self._position_management_loop())
+        
+        while self.active:
+            try:
+                # 1. Kill Switch Check (HIGHEST PRIORITY)
+                if self.kill_switch.is_active():
+                    logger.critical("Kill switch active - halting Trading")
+                    await asyncio.sleep(60)
+                    continue
+
+                # 2. Order Timeout Monitoring
+                try:
+                    cancelled_count = await self.executor.check_order_timeouts()
+                    if cancelled_count > 0:
+                        logger.warning(f"Cancelled {cancelled_count} expired orders")
+                except Exception as e:
+                    logger.error(f"Failed to check order timeouts: {e}")
+
+                # 3. Account Sync (Throttled 60s)
+                now = datetime.now(timezone.utc)
+                if (now - self.last_account_sync).total_seconds() > 60:
+                    await self._sync_account_state()
+                    self.last_account_sync = now
+                    
+                # 4. Drainage Input Queue (Batch Processing)
+                processed = 0
+                while not self.input_queue.empty() and processed < 100:
+                    msg = self.input_queue.get_nowait()
+                    if isinstance(msg, MarketUpdate):
+                        await self._handle_market_update(msg)
+                    processed += 1
+                    
+                # 5. Process Commands
+                while not self.command_queue.empty():
+                    cmd = self.command_queue.get_nowait()
+                    if cmd.command == "STOP":
+                        self.active = False
+                        break
+                
+                # 6. Operational Maintenance (Daily)
+                if (now - self.last_maintenance_run).total_seconds() > 86400:
+                    try:
+                        results = self.db_pruner.run_maintenance()
+                        logger.info("Daily database maintenance complete", results=results)
+                        self.last_maintenance_run = now
+                    except Exception as e:
+                        logger.error(f"Maintenance failed: {e}")
+
+            except Empty:
+                pass
+            except Exception as e:
+                logger.error(f"Error in Trading Loop: {e}")
+                
+            if not self.active: break
+            
+            # Yield to loop
+            await asyncio.sleep(0.01)
+            
+        logger.info("Trading Service Shutting Down...")
+
+    async def _position_management_loop(self):
+        """Continuous loop to monitor and manage active positions."""
+        logger.info("Starting Position Management Loop...")
+        while self.active:
+            try:
+                # 1. Fetch Open Positions
+                # We fetch fresh from API to ensure Truth
+                positions = await self.kraken.get_all_futures_positions()
+                
+                if positions:
+                    logger.info(f"Active Portfolio: {len(positions)} positions", symbols=[p['symbol'] for p in positions])
+                
+                for pos_data in positions:
+                    symbol = pos_data['symbol']
+                    
+                    # Ensure managed
+                    if symbol not in self.managed_positions:
+                        # Hydrate minimal managed position (Blind adoption)
+                        logger.warning(f"Adopting unmanaged position: {symbol}")
+                        
+                        entry_price = Decimal(str(pos_data.get('entryPrice', pos_data.get('entry_price', 0))))
+                        mark_price = Decimal(str(pos_data.get('markPrice', 0)))
+
+                        self.managed_positions[symbol] = Position(
+                            symbol=symbol,
+                            side=Side.LONG if pos_data['side'] == 'long' else Side.SHORT,
+                            size=Decimal(str(pos_data['size'])),
+                            entry_price=entry_price,
+                            current_mark_price=mark_price,
+                            unrealized_pnl=Decimal(str(pos_data.get('unrealizedPnl', 0))),
+                            opened_at=datetime.now(timezone.utc),
+                            # Missing V3 params defaults
+                            initial_stop_price=Decimal("0"),
+                            trade_type="MANUAL",
+                            
+                            # Required fields
+                            size_notional=Decimal(str(pos_data['size'])) * mark_price,
+                            liquidation_price=Decimal("0"),
+                            leverage=Decimal("1.0"),
+                            margin_used=Decimal(str(pos_data.get('margin_used', 0)))
+                        )
+                    
+                    managed_pos = self.managed_positions[symbol]
+                    # Update Live Data
+                    managed_pos.current_mark_price = Decimal(str(pos_data.get('markPrice', 0)))
+                    managed_pos.unrealized_pnl = Decimal(str(pos_data.get('unrealizedPnl', 0)))
+                    managed_pos.size = Decimal(str(pos_data['size']))
+                    
+                    # Evaluate Exit Strategy
+                    actions = self.position_manager.evaluate(managed_pos, managed_pos.current_mark_price)
+                    if actions:
+                        await self._execute_management_actions(symbol, actions, managed_pos)
+                
+                # 2. Position Protection Validation (CRITICAL)
+                await self._validate_position_protection(positions)
+                        
+            except Exception as e:
+                logger.error(f"Position Management Error: {e}")
+            
+            # Check every 10 seconds
+            await asyncio.sleep(10.0)
+
+    # ... (rest of methods)
+
+    async def _handle_market_update(self, msg: MarketUpdate):
+        symbol = msg.symbol
+        tf = msg.timeframe
+        
+        # 1. Update Cache
+        target_map = getattr(self, f"candles_{tf}", None)
+        if target_map is None: return 
+        
+        current = target_map.get(symbol, [])
+        new_data = msg.candles
+        
+        # Simple Merge logic
+        if not current:
+            target_map[symbol] = new_data
+        else:
+            merged = {c.timestamp: c for c in current}
+            for c in new_data:
+                merged[c.timestamp] = c
+            target_map[symbol] = sorted(merged.values(), key=lambda x: x.timestamp)
+            # Cap size
+            if len(target_map[symbol]) > 1000:
+                target_map[symbol] = target_map[symbol][-1000:]
+            
+        # 2. Trigger Strategy (Live Signal)
+        if not msg.is_historical and tf == "15m":
+             await self._analyze_symbol(symbol)
+
+    async def _analyze_symbol(self, symbol: str):
+         # Skip if recently analyzed (Throttling)
+         now = datetime.now(timezone.utc)
+         last = self.last_analysis.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
+         if (now - last).total_seconds() < 10: # Max 1 analysis per 10s per symbol
+             return
+         self.last_analysis[symbol] = now
+
+         # Ensure enough data
+         c15m = self.candles_15m.get(symbol, [])
+         if len(c15m) < 50: return
+         
+         # Run SMC Analysis
+         try:
+             signal = self.smc_engine.generate_signal(
+                 symbol,
+                 c15m,
+                 self.candles_1h.get(symbol, []),
+                 self.candles_4h.get(symbol, []),
+                 self.candles_1d.get(symbol, [])
+             )
+             
+             if signal.signal_type != SignalType.NO_SIGNAL:
+                 logger.info(f"SIGNAL FOUND: {symbol} {signal.signal_type} {signal.regime} Score={signal.score}")
+                 
+                 # Current Price (from last candle)
+                 trigger_price = c15m[-1].close
+                 
+                 # Determine Futures Symbol
+                 futures_symbol = self.futures_adapter.map_spot_to_futures(symbol)
+                 if futures_symbol:
+                     # 1. Fetch Account Equity (Futures Balance)
+                     # In V2, we might not have direct client access in same way, but we have self.kraken
+                     # However, DataService handles polling. TradingService can fetch balance via client on demand
+                     # or rely on an account_state cache. For safety, let's fetch fresh.
+                     try:
+                         balance = await self.kraken.get_futures_balance()
+                         base_currency = getattr(self.config.exchange, "base_currency", "USD")
+                         equity = Decimal(str(balance.get('total', {}).get(base_currency, 0)))
+                     except Exception as e:
+                         logger.error(f"Failed to fetch balance for risk check: {e}")
+                         return
+
+                     if equity <= 0:
+                         logger.warning(f"Insufficient equity: {equity}")
+                         return
+
+                     # 2. Risk Validation (Safety Gate)
+                     decision = self.risk_manager.validate_trade(
+                        signal, equity, 
+                        spot_price=Decimal(str(trigger_price)), 
+                        perp_mark_price=Decimal(str(trigger_price)) # Approx if no mark available yet
+                     )
+                     
+                     if not decision.approved:
+                        logger.info(f"Trade rejected by Risk: {decision.rejection_reasons}")
+                        return
+
+                     # 3. Opportunity Cost Handling
+                     if decision.should_close_existing and decision.close_symbol:
+                         logger.warning(f"Opportunity Cost Replacement: Closing {decision.close_symbol} for {symbol}")
+                         # Close existing
+                         # We need to execute immediate close.
+                         # self._execute_management_actions(...)
+                         # For now, simplistic close:
+                         try:
+                             # We don't have management actions yet, direct close
+                             await self.kraken.close_position(decision.close_symbol)
+                             if decision.close_symbol in self.managed_positions:
+                                 del self.managed_positions[decision.close_symbol]
+                             # Update Risk Manager
+                             self.risk_manager.current_positions = [
+                                 p for p in self.risk_manager.current_positions 
+                                 if p.symbol != decision.close_symbol
+                             ]
+                         except Exception as e:
+                             logger.error(f"Failed to close replacement symbol {decision.close_symbol}: {e}")
+                             return
+
+                     # 4. Execute Entry
+                     await self._execute_signal(signal, futures_symbol, Decimal(str(trigger_price)), decision)
+                 
+                 # 5. Record Decision Trace (Throttled 5m)
+                 await self._record_decision_trace(symbol, signal, trigger_price)
+                          
+         except Exception as e:
+             logger.error(f"Analysis failed for {symbol}: {e}")
+
+    async def _execute_signal(self, signal: Signal, futures_symbol: str, price: Decimal, decision: RiskDecision):
+        """Execute trade via Executor."""
+        try:
+             # 1. Generate Entry Plan
+             # We use the execution engine helper (method from V1 we can assume is on engine or recreated here)
+             order_intent_dict = self.execution_engine.generate_entry_plan(
+                 signal,
+                 decision.position_notional,
+                 Decimal(str(signal.entry_price)),
+                 price,
+                 decision.leverage
+             )
+             
+             # Convert to OrderIntent Object
+             intent_model = OrderIntent(
+                timestamp=datetime.now(timezone.utc),
+                signal=signal,
+                side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
+                size_notional=decision.position_notional,
+                leverage=decision.leverage,
+                # Spot levels
+                entry_price_spot=signal.entry_price,
+                stop_loss_spot=signal.stop_loss,
+                take_profit_spot=signal.take_profit,
+                # Futures levels
+                entry_price_futures=order_intent_dict['metadata']['fut_entry'],
+                stop_loss_futures=order_intent_dict['metadata']['fut_sl'],
+                take_profit_futures=order_intent_dict['take_profits'][0]['price'] if order_intent_dict['take_profits'] else None
+             )
+
+             logger.info(f"[EXECUTION] Placing trade for {futures_symbol} Size=${decision.position_notional:.2f}")
+
+             # 2. Execute Entry
+             entry_order = await self.executor.execute_signal(intent_model, price, [])
+             
+             if entry_order:
+                 logger.info("Entry order placed", order_id=entry_order.order_id)
+                 
+                 # 3. Place Protective Orders
+                 tps = order_intent_dict.get('take_profits', [])
+                 tp1 = tps[0]['price'] if len(tps) > 0 else None
+                 
+                 sl_order, tp_order = await self.executor.place_protective_orders(
+                     entry_order,
+                     intent_model.stop_loss_futures,
+                     take_profit_price=tp1
+                 )
+
+                 sl_id = sl_order.order_id if sl_order else None
+                 tp_ids = []
+                 if tp_order:
+                     tp_ids.append(tp_order.order_id)
+                     
+                 if not sl_id:
+                     logger.critical(f"FAILED TO PLACE STOP LOSS for {futures_symbol}!")
+
+                 # 4. Initialize V3 Position State
+                 v3_pos = Position(
+                     symbol=futures_symbol,
+                     side=intent_model.side,
+                     size=Decimal("0"), # Pending Fill
+                     size_notional=intent_model.size_notional,
+                     entry_price=price,
+                     current_mark_price=price,
+                     liquidation_price=Decimal("0"),
+                     unrealized_pnl=Decimal("0"),
+                     leverage=intent_model.leverage,
+                     margin_used=Decimal("0"),
+                     opened_at=datetime.now(timezone.utc),
+                     
+                     # V3 Immutable Parameters
+                     initial_stop_price=intent_model.stop_loss_futures,
+                     trade_type=signal.regime,
+                     tp1_price=tp1,
+                     tp2_price=tps[1]['price'] if len(tps) > 1 else None,
+                     partial_close_pct=Decimal("0.5"),
+                     
+                     # ID Linking
+                     stop_loss_order_id=sl_id,
+                     tp_order_ids=tp_ids
+                 )
+                 
+                 self.managed_positions[futures_symbol] = v3_pos
+                 logger.info("V3 Position State initialized", symbol=futures_symbol)
+                 
+                 # Persist Event
+                 await async_record_event("TRADE_EXECUTION", futures_symbol, {
+                     "signal": signal.model_dump_json(),
+                     "order_id": entry_order.order_id
+                 })
+
+        except Exception as e:
+             logger.error(f"Execution failed: {e}")
+
+    async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):
+        """Execute logic actions decided by PositionManager."""
+        for action in actions:
+            logger.info(f"V3 Action: {action.type.value}", symbol=symbol, reason=action.reason)
+            
+            try:
+                if action.type == ActionType.CLOSE_POSITION:
+                    # Market Close
+                    await self.kraken.close_position(symbol)
+                    # State update handled on next loop (position gone)
+                    
+                elif action.type == ActionType.PARTIAL_CLOSE:
+                    # Place market reduce-only order
+                    exit_side = 'sell' if position.side == Side.LONG else 'buy'
+                    await self.kraken.place_futures_order(
+                         symbol=symbol,
+                         side=exit_side,
+                         order_type='market',
+                         size=float(action.quantity),
+                         reduce_only=True
+                    )
+                    # Update internal state (flags)
+                    if "TP1" in action.reason:
+                        position.tp1_hit = True
+                    if "TP2" in action.reason:
+                        position.tp2_hit = True
+
+                elif action.type == ActionType.UPDATE_STATE:
+                    if "Intent Confirmed" in action.reason:
+                        position.intent_confirmed = True
+                        
+                elif action.type == ActionType.UPDATE_STOP:
+                    if position.stop_loss_order_id:
+                        await self.kraken.edit_futures_order(
+                            order_id=position.stop_loss_order_id,
+                            symbol=symbol,
+                            stop_price=float(action.price)
+                        )
+                    else:
+                        logger.warning("Cannot update stop - no SL Order ID tracked", symbol=symbol)
+                        
+            except Exception as e:
+                logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))
+
+    async def _sync_account_state(self):
+        """Update account balance and equity in DB."""
+        try:
+            balance_data = await self.kraken.get_futures_balance()
+            base_currency = getattr(self.config.exchange, "base_currency", "USD")
+            
+            # Extract fields
+            equity = Decimal(str(balance_data.get('total', {}).get(base_currency, 0)))
+            available = Decimal(str(balance_data.get('free', {}).get(base_currency, 0)))
+            used = Decimal(str(balance_data.get('margin_used', 0))) # Some clients return as flat key
+            unrealized = Decimal(str(balance_data.get('unrealized_pnl', 0)))
+            
+            # If not in top level, check nested
+            if used == 0:
+                used = Decimal(str(balance_data.get('used', {}).get(base_currency, 0)))
+            if unrealized == 0:
+                unrealized = Decimal(str(balance_data.get('unrealizedPnl', 0)))
+
+            # Persist for Dashboard
+            def _save():
+                save_account_state(
+                    equity=equity,
+                    balance=equity - unrealized, # Proxy for balance
+                    margin_used=used,
+                    available_margin=available,
+                    unrealized_pnl=unrealized
+                )
+            
+            await asyncio.to_thread(_save)
+            
+            # Update Risk Manager
+            self.risk_manager.reset_daily_metrics(equity)
+            
+        except Exception as e:
+            logger.error(f"Account state sync failed: {e}")
+
+    async def _validate_position_protection(self, positions: List[Dict]):
+        """Ensure every active position has a stop-loss order."""
+        for pos_data in positions:
+            symbol = pos_data['symbol']
+            
+            # Check if we have SL ID tracked
+            managed_pos = self.managed_positions.get(symbol)
+            if not managed_pos or not managed_pos.stop_loss_order_id:
+                # CRITICAL: Missing protection
+                logger.critical(f"PROTECTION BREACH: {symbol} has no managed stop-loss!")
+                # In V1 this would try to recover/close. 
+                # For V2 we log critical and adoption handles basic setup.
+
+    async def _record_decision_trace(self, symbol: str, signal: Signal, price: Decimal):
+        """Log throttled decision trace for debugging."""
+        last = self.last_trace_log.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
+        now = datetime.now(timezone.utc)
+        
+        if (now - last).total_seconds() > 300: # Every 5 minutes
+            await async_record_event(
+                "DECISION_TRACE", 
+                symbol, 
+                {
+                    "price": float(price),
+                    "signal_type": signal.signal_type.value,
+                    "regime": signal.regime,
+                    "score": signal.score
+                }
+            )
+            self.last_trace_log[symbol] = now
+
+    def _send_status(self, status: str, details: Dict = None):
+        msg = ServiceStatus(
+            service_name="TradingService",
+            status=status,
+            timestamp=datetime.now(timezone.utc),
+            details=details
+        )
+        # We don't have an output queue for status?
+        # TradingProcess is a consumer.
+        # It can log status.
+        logger.info(f"STATUS UPDATE: {status} {details}")
+

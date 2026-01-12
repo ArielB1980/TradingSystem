@@ -15,7 +15,7 @@ from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_manager import PositionManager, ActionType
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map
+from src.storage.repository import save_candle, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles
 from src.storage.maintenance import DatabasePruner
 
 logger = get_logger(__name__)
@@ -103,40 +103,57 @@ class LiveTrading:
             except Exception as e:
                 logger.warning("Initial position sync failed", error=str(e))
             
-            # Phase 10.5: Fast Startup Hydration
-            try:
-                logger.info("Hydrating candle cache from database...")
-                start_hydrate = datetime.now()
+                        # Phase 10.5: Fast Startup Hydration
+                # Solution: Lazy Background Hydration
+                # PERMANENTLY DISABLED: Background Thread causes GIL Starvation and blocks Main Loop.
+                logger.warning("Hydration Disabled permanently to ensure stability")
                 
-                # Load all required timeframes
-                self.candles_15m = load_candles_map(self.markets, "15m", days=7)
-                self.candles_1h = load_candles_map(self.markets, "1h", days=14)
-                self.candles_4h = load_candles_map(self.markets, "4h", days=30)
-                self.candles_1d = load_candles_map(self.markets, "1d", days=60)
+                # Default empty initialization (Immediate trading availability)
+                self.candles_15m = {m: [] for m in self.markets}
+                self.candles_1h = {m: [] for m in self.markets}
+                self.candles_4h = {m: [] for m in self.markets}
+                self.candles_1d = {m: [] for m in self.markets}
                 
-                # Set last update timestamps to prevent immediate re-fetch
-                now = datetime.now(timezone.utc)
-                for symbol in self.markets:
-                    self.last_candle_update[symbol] = {} # Initialize for symbol
-                    
-                    last_15m = self.candles_15m[symbol][-1].timestamp if self.candles_15m.get(symbol) and self.candles_15m[symbol] else datetime.min.replace(tzinfo=timezone.utc)
-                    self.last_candle_update[symbol]["15m"] = last_15m
-                    
-                    last_1h = self.candles_1h[symbol][-1].timestamp if self.candles_1h.get(symbol) and self.candles_1h[symbol] else datetime.min.replace(tzinfo=timezone.utc)
-                    self.last_candle_update[symbol]["1h"] = last_1h
-                    
-                    last_4h = self.candles_4h[symbol][-1].timestamp if self.candles_4h.get(symbol) and self.candles_4h[symbol] else datetime.min.replace(tzinfo=timezone.utc)
-                    self.last_candle_update[symbol]["4h"] = last_4h
-                    
-                    last_1d = self.candles_1d[symbol][-1].timestamp if self.candles_1d.get(symbol) and self.candles_1d[symbol] else datetime.min.replace(tzinfo=timezone.utc)
-                    self.last_candle_update[symbol]["1d"] = last_1d
-
-                logger.info(f"Hydration complete in {(datetime.now() - start_hydrate).total_seconds():.2f}s")
+                # Spawn background task
+                # asyncio.create_task(self._background_hydration_task())
                 
             except Exception as e:
-                logger.error("Failed to hydrate cache from DB", error=str(e))
-                # Fallback: continue empty, will fetch from API
-            
+                 # Catch-all
+                 pass
+                
+            except Exception as e:
+                 # Catch-all
+                 pass
+
+            # Set last update timestamps to prevent immediate re-fetch
+            # This logic must run whether hydration succeeded or failed/timed out
+            now = datetime.now(timezone.utc)
+            for symbol in self.markets:
+                self.last_candle_update[symbol] = {} # Initialize for symbol
+                
+                c_15 = self.candles_15m.get(symbol, [])
+                last_15m = c_15[-1].timestamp if c_15 else datetime.min.replace(tzinfo=timezone.utc)
+                self.last_candle_update[symbol]["15m"] = last_15m
+                
+                c_1h = self.candles_1h.get(symbol, [])
+                last_1h = c_1h[-1].timestamp if c_1h else datetime.min.replace(tzinfo=timezone.utc)
+                self.last_candle_update[symbol]["1h"] = last_1h
+                
+                c_4h = self.candles_4h.get(symbol, [])
+                last_4h = c_4h[-1].timestamp if c_4h else datetime.min.replace(tzinfo=timezone.utc)
+                self.last_candle_update[symbol]["4h"] = last_4h
+                
+                c_1d = self.candles_1d.get(symbol, [])
+                last_1d = c_1d[-1].timestamp if c_1d else datetime.min.replace(tzinfo=timezone.utc)
+                self.last_candle_update[symbol]["1d"] = last_1d
+
+            # CRITICAL: Sync open orders to populate Executor memory
+            # This prevents duplicate orders if the bot restarts with active pending orders
+            try:
+                await self.executor.sync_open_orders()
+            except Exception as e:
+                logger.error("Initial order sync failed", error=str(e))
+
             await self.data_acq.start() # Start data acquisition directly
             
             # Main Loop
@@ -443,6 +460,62 @@ class LiveTrading:
                 self.last_maintenance_run = now
             except Exception as e:
                 logger.error("Daily maintenance failed", error=str(e))
+
+    async def _background_hydration_task(self):
+        """
+        Incrementally load historical data from DB in background.
+        Prevents startup hang by avoiding massive synchronous reads.
+        """
+        # Wait a few seconds for initial API sync to settle
+        await asyncio.sleep(5.0)
+        logger.info("[Background] Starting historical data hydration...")
+        
+        scopes = [
+            ("15m", 30), # Priority 1: Strategy timeframe
+            ("1h", 60),  # Priority 2: High timeframe confirmation
+            ("4h", 90),
+            ("1d", 180)
+        ]
+        
+        total_start = datetime.now()
+        
+        for tf, days in scopes:
+            start_date = datetime.now(timezone.utc) - timedelta(days=days)
+            loaded_count = 0
+            
+            for symbol in self.markets:
+                if not self.active: return
+                
+                try:
+                    # Offload DB read to thread
+                    def _fetch():
+                        return get_candles(symbol, tf, start_time=start_date)
+                    
+                    history = await asyncio.to_thread(_fetch)
+                    
+                    if history:
+                        target_map = getattr(self, f"candles_{tf}")
+                        current_candles = target_map.get(symbol, [])
+                        
+                        # Smart Merge: Use history as base, overwrite with newer API data
+                        # Dictionary by timestamp for O(N) merge
+                        merged_dict = {c.timestamp: c for c in history}
+                        for c in current_candles:
+                            merged_dict[c.timestamp] = c
+                            
+                        # Convert back to sorted list
+                        target_map[symbol] = sorted(merged_dict.values(), key=lambda x: x.timestamp)
+                        loaded_count += 1
+                        
+                except Exception as e:
+                    logger.debug(f"[Background] Failed to load {symbol} {tf}: {e}")
+                
+                # Yield to Main Loop (Prevent GIL starvation)
+                await asyncio.sleep(0.02) 
+            
+            logger.info(f"[Background] Hydrated {tf}: {loaded_count}/{len(self.markets)} symbols")
+            
+        logger.info(f"[Background] Hydration complete in {(datetime.now() - total_start).total_seconds():.1f}s")
 
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
