@@ -36,6 +36,7 @@ from src.constants import (
     KRAKEN_FUTURES_BASE_URL,
 )
 from src.exceptions import APIError, AuthenticationError
+from src.utils.retry import retry_on_transient_errors
 
 logger = get_logger(__name__)
 
@@ -271,6 +272,7 @@ class KrakenClient:
                 return pos
         return None
 
+    @retry_on_transient_errors(max_retries=3, base_delay=1.0)
     async def get_all_futures_positions(self) -> List[Dict]:
         """
         Get all open futures positions from Kraken Futures API.
