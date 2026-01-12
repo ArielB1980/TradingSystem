@@ -248,7 +248,30 @@ class LiveTrading:
         Single iteration of live trading logic.
         Optimized for batch processing (Phase 10).
         """
-        # 0. Order Timeout Monitoring (CRITICAL: Check first)
+        # 0. Kill Switch Check (HIGHEST PRIORITY)
+        from src.monitoring.kill_switch import get_kill_switch
+        ks = get_kill_switch()
+        
+        if ks.is_active():
+            logger.critical("Kill switch is active - halting trading")
+            # Cancel all pending orders
+            try:
+                # TODO: Implement cancel_all_orders
+                logger.warning("Cancelling all pending orders...")
+            except Exception as e:
+                logger.error("Failed to cancel orders during kill switch", error=str(e))
+            
+            # Close all positions
+            try:
+                logger.critical("Closing all positions due to kill switch")
+                # TODO: Implement close_all_positions
+            except Exception as e:
+                logger.error("Failed to close positions during kill switch", error=str(e))
+            
+            # Stop processing
+            return
+        
+        # 0.1 Order Timeout Monitoring (CRITICAL: Check first)
         try:
             cancelled_count = await self.executor.check_order_timeouts()
             if cancelled_count > 0:

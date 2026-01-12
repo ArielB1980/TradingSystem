@@ -211,52 +211,55 @@ def live(
 
 
 @app.command(name="kill-switch")
-def kill_switch(
-    emergency: bool = typer.Option(False, "--emergency", help="Emergency stop (cancel all orders + flatten all positions)"),
-    config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
+def kill_switch_cmd(
+    action: str = typer.Argument("status", help="Action: activate, deactivate, or status"),
+    reason: str = typer.Option("Manual activation", help="Reason for activation")
 ):
     """
-    Activate kill switch to halt trading immediately.
+    Emergency kill switch control.
     
-    This will:
-    1. Cancel all open orders
-    2. Flatten all positions (if --emergency is set)
-    3. Latch the system (requires manual restart)
+    Actions:
+    - activate: Stop all trading and close positions
+    - deactivate: Resume normal trading
+    - status: Check kill switch state
     
-    Example:
-        python src/cli.py kill-switch --emergency
+    Examples:
+        python src/cli.py kill-switch activate --reason "Market volatility"
+        python src/cli.py kill-switch deactivate
+        python src/cli.py kill-switch status
     """
-    # Load configuration
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    from rich.console import Console
+    from src.monitoring.kill_switch import get_kill_switch
     
-    typer.secho(
-        "\n🛑 KILL SWITCH ACTIVATED 🛑",
-        fg=typer.colors.RED,
-        bold=True,
-    )
+    console = Console()
+    ks = get_kill_switch()
     
-    logger.critical("Kill switch activated", emergency=emergency)
-    
-    if emergency:
-        typer.echo("Emergency mode:")
-        typer.echo("  1. Cancelling all open orders...")
-        typer.echo("  2. Flattening all positions...")
-        typer.echo("  3. Latching system...")
+    if action == "activate":
+        ks.activate(reason=reason, activated_by="CLI")
+        console.print("[bold red]🚨 KILL SWITCH ACTIVATED[/bold red]")
+        console.print(f"Reason: {reason}")
+        console.print("\nAll trading halted. Positions will be closed on next tick.")
         
-        # TODO: Implement kill switch
-        typer.echo("\n⚠️  Kill switch not yet implemented")
+    elif action == "deactivate":
+        ks.deactivate(deactivated_by="CLI")
+        console.print("[bold green]✅ KILL SWITCH DEACTIVATED[/bold green]")
+        console.print("Trading can resume.")
+        
+    elif action == "status":
+        status = ks.get_status()
+        if status["active"]:
+            console.print("[bold red]🚨 KILL SWITCH: ACTIVE[/bold red]")
+            console.print(f"Activated at: {status['activated_at']}")
+            console.print(f"Activated by: {status['activated_by']}")
+            console.print(f"Reason: {status['reason']}")
+            console.print(f"Duration: {status['duration_seconds']:.0f}s")
+        else:
+            console.print("[bold green]✅ KILL SWITCH: INACTIVE[/bold green]")
+            console.print("Trading is operational.")
     else:
-        typer.echo("  1. Halting new entries...")
-        typer.echo("  2. System latched (manual restart required)")
-        
-        # TODO: Implement kill switch
-        typer.echo("\n⚠️  Kill switch not yet implemented")
-    
-    typer.secho(
-        "\n✓ Kill switch engaged. Manual acknowledgment required to restart.",
-        fg=typer.colors.GREEN,
-    )
+        console.print(f"[bold red]Unknown action: {action}[/bold red]")
+        console.print("Valid actions: activate, deactivate, status")
+        raise typer.Exit(1)
 
 
 @app.command()
