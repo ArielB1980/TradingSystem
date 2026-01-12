@@ -202,6 +202,15 @@ def get_coin_detail(symbol: str) -> Optional[Dict]:
         if not events:
             return None
         
+        # Helper to ensure datetime
+        def to_datetime(ts):
+            if isinstance(ts, str):
+                try:
+                    return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except:
+                    return datetime.now(timezone.utc)
+            return ts or datetime.now(timezone.utc)
+        
         # Get latest event
         latest = events[0]
         details = latest.get('details', {})
@@ -215,11 +224,11 @@ def get_coin_detail(symbol: str) -> Optional[Dict]:
                 'signal': details.get('signal'),
                 'quality': details.get('setup_quality'),
                 'reasoning': details.get('reasoning', 'No reasoning available'),
-                'timestamp': latest.get('timestamp')
+                'timestamp': to_datetime(latest.get('timestamp'))
             },
             'recent_signals': [
                 {
-                    'timestamp': e.get('timestamp'),
+                    'timestamp': to_datetime(e.get('timestamp')),
                     'signal': e.get('details', {}).get('signal'),
                     'quality': e.get('details', {}).get('setup_quality', 0)
                 }
