@@ -457,6 +457,45 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
         )
 
 
+def get_active_positions() -> List[Position]:
+    """Retrieve all active positions."""
+    db = get_db()
+    with db.get_session() as session:
+        position_models = session.query(PositionModel).all()
+        
+        return [
+            Position(
+                symbol=pm.symbol,
+                side=Side(pm.side),
+                size=Decimal(str(pm.size)),
+                size_notional=Decimal(str(pm.size_notional)),
+                entry_price=Decimal(str(pm.entry_price)),
+                current_mark_price=Decimal(str(pm.current_mark_price)),
+                liquidation_price=Decimal(str(pm.liquidation_price)),
+                unrealized_pnl=Decimal(str(pm.unrealized_pnl)),
+                leverage=Decimal(str(pm.leverage)),
+                margin_used=Decimal(str(pm.margin_used)),
+                opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
+                updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
+                # V3 Params
+                initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
+                trade_type=pm.trade_type,
+                tp1_price=Decimal(str(pm.tp1_price)) if pm.tp1_price else None,
+                tp2_price=Decimal(str(pm.tp2_price)) if pm.tp2_price else None,
+                final_target_price=Decimal(str(pm.final_target_price)) if pm.final_target_price else None,
+                partial_close_pct=Decimal(str(pm.partial_close_pct)) if pm.partial_close_pct else Decimal("0.5"),
+                original_size=Decimal(str(pm.original_size)) if pm.original_size else None,
+                stop_loss_order_id=pm.stop_loss_order_id,
+                tp_order_ids=json.loads(pm.tp_order_ids) if pm.tp_order_ids else None,
+                basis_at_entry=Decimal(str(pm.basis_at_entry)) if pm.basis_at_entry else None,
+                basis_current=Decimal(str(pm.basis_current)) if pm.basis_current else None,
+                funding_rate=Decimal(str(pm.funding_rate)) if pm.funding_rate else None,
+                cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0")
+            )
+            for pm in position_models
+        ]
+
+
 def get_all_trades() -> List[Trade]:
     """Retrieve all trades from the database."""
     db = get_db()
