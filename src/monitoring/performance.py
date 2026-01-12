@@ -10,8 +10,10 @@ Calculates key performance indicators:
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List
-from src.storage.repository import get_all_trades, get_trades_since
+from typing import Dict, List
 from src.monitoring.logger import get_logger
+
+logger = get_logger(__name__)
 
 logger = get_logger(__name__)
 
@@ -26,6 +28,8 @@ def calculate_performance_metrics(days: int = 30) -> Dict:
     Returns:
         Dict with performance metrics
     """
+    from src.storage.repository import get_trades_since
+    
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     trades = get_trades_since(cutoff)
     
@@ -156,6 +160,8 @@ def get_trade_statistics() -> Dict:
     Returns:
         Dict with trade stats
     """
+    from src.storage.repository import get_all_trades
+    
     all_trades = get_all_trades()
     
     if not all_trades:
