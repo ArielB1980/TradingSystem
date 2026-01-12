@@ -260,14 +260,21 @@ class SMCEngine:
 
         # --- EXPLAINABILITY INSTRUMENTATION ---
         trace_data = {
-            "bias": bias,
+            "signal": signal.signal_type.value,
+            "regime": signal.regime,
+            "bias": signal.higher_tf_bias,
+            "adx": float(signal.adx) if signal.adx else 0.0,
+            "atr": float(signal.atr) if signal.atr else 0.0,
+            "ema200_slope": signal.ema200_slope,
+            "spot_price": float(exec_candles_1h[-1].close) if exec_candles_1h else 0.0,
+            "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
+            "score_breakdown": signal.score_breakdown or {},
             "structure": structure_signal,
             "filters": {
                 "adx": float(adx_value),
                 "atr": float(atr_value),
             },
             "reasoning": reasoning_parts,
-            "signal_type": signal.signal_type.value,
             "tp_candidates": [float(tp) for tp in tp_candidates]
         }
         
