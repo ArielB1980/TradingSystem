@@ -74,12 +74,8 @@ class DataAcquisition:
         self.running = True
         logger.info("Data acquisition started")
         
-        # Start tasks
-        tasks = [
-            self._monitor_data_gaps(),
-        ]
-        
-        await asyncio.gather(*tasks)
+        # Start background tasks (non-blocking)
+        asyncio.create_task(self._monitor_data_gaps())
     
     async def stop(self):
         """Stop data acquisition."""

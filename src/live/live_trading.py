@@ -138,8 +138,10 @@ class LiveTrading:
                 # Fallback: continue empty, will fetch from API
             
             await self.data_acq.start() # Start data acquisition directly
+            logger.info("✅ Data acquisition started, entering main loop")
             
             # Main Loop
+            logger.info("🔄 Starting main trading loop")
             while self.active:
                 if self.kill_switch.is_active():
                     logger.critical("Kill switch active - pausing loop")
@@ -148,10 +150,12 @@ class LiveTrading:
                 
                 loop_start = datetime.now(timezone.utc)
                 
+                logger.debug(f"Tick {loop_start.strftime('%H:%M:%S')} starting")
                 try:
                     await self._tick()
+                    logger.debug("Tick completed successfully")
                 except Exception as e:
-                    logger.error("Error in live trading tick", error=str(e))
+                    logger.error("Error in live trading tick", error=str(e), exc_info=True)
                     if "API" in str(e):
                          # Potential API failure - check if we should trigger kill switch
                          pass
@@ -253,114 +257,72 @@ class LiveTrading:
             logger.error("Data acquisition unhealthy")
             return
 
-        # 2. Sync Active Positions (Global Sync)
+        # 2. Sync Active Positions (CRITICAL: Must happen before signal generation)
         try:
-            # This updates global state in Repository and internal trackers
-            # We also get the raw list here to use for the tick
-            all_raw_positions = await self.client.get_all_futures_positions()
-            # We still run sync to ensure DB peristence is up to date
             await self._sync_positions()
         except Exception as e:
             logger.error("Failed to sync positions", error=str(e))
-            return
+            return  # Safety: Don't trade if we can't see positions
 
-        # 3. Batch Data Fetching (Optimization)
-        try:
-            # Fetch ALL spot tickers (chunked inside client)
-            map_spot_tickers = await self.client.get_spot_tickers_bulk(self.markets)
-            
-            # Fetch ALL futures mark prices
-            map_futures_tickers = await self.client.get_futures_tickers_bulk()
-            
-            # Map positions by symbol for O(1) loopup
-            map_positions = {p['symbol']: p for p in all_raw_positions}
-            
-        except Exception as e:
-            logger.error("Failed batch data fetch", error=str(e))
-            return
-
-        # 4. Parallel Analysis Loop
-        # Semaphore to control concurrency (e.g. 20 coins at a time for candle fetching)
-        sem = asyncio.Semaphore(20)
-        
-        async def process_coin(spot_symbol: str):
-            async with sem:
-                try:
-                    # Context
-                    futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
+        for spot_symbol in self.markets:
+            try:
+                # 2. Get Futures Context
+                futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
+                mark_price = await self.client.get_futures_mark_price(futures_symbol)
+                spot_price = (await self.client.get_spot_ticker(spot_symbol))['last']
+                spot_price = Decimal(str(spot_price))
+                
+                # 3. Update Sync Data
+                await self._update_candles(spot_symbol)
+                
+                # 4. Check Current Position
+                position_data = await self.client.get_futures_position(futures_symbol)
+                
+                if position_data:
+                    # V3 Active Management
+                    symbol = position_data['symbol']
                     
-                    # Get Data from Bulk Cache
-                    if spot_symbol not in map_spot_tickers:
-                        return # Skip if no data
-                        
-                    spot_ticker = map_spot_tickers[spot_symbol]
-                    spot_price = Decimal(str(spot_ticker['last']))
+                    # Ensure tracked
+                    if symbol not in self.managed_positions:
+                         # Only occurs on restart or untracked entry. 
+                         # We init with basic data, missing V3 immutable params (limitations of restart without DB persistance of state)
+                         self.managed_positions[symbol] = self._init_managed_position(position_data, mark_price)
                     
-                    # Resolve futures mark price
-                    # Try direct match or mapped match
-                    mark_price = None
-                    if futures_symbol in map_futures_tickers:
-                        mark_price = map_futures_tickers[futures_symbol]
-                    else:
-                        # Try logic lookup (e.g. PF_XBTUSD)
-                        # Quick dirty check for specific mapping if known keys differ
-                        # For now rely on exact or adapter map
-                        pass
-                        
-                    if not mark_price:
-                        # Fallback for critical pricing (or skip)
-                        # Logging too much here might spam, so only debug
-                        # logger.debug(f"Missing mark price for {futures_symbol}")
-                        return 
-
-                    # Update Candles (This still does I/O but is parallelized now)
-                    await self._update_candles(spot_symbol)
+                    managed_pos = self.managed_positions[symbol]
+                    # Update dynamic data
+                    managed_pos.current_mark_price = mark_price
+                    managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealizedPnl', 0)))
+                    managed_pos.size = Decimal(str(position_data['size']))
                     
-                    # Position Management
-                    position_data = map_positions.get(futures_symbol)
-                    if position_data:
-                        # Management Logic
-                        symbol = position_data['symbol']
-                         # Ensure tracked
-                        if symbol not in self.managed_positions:
-                             self.managed_positions[symbol] = self._init_managed_position(position_data, mark_price)
+                    # Evaluate Rules 1-12
+                    actions = self.position_manager.evaluate(managed_pos, mark_price)
+                    
+                    # Execute Actions
+                    if actions:
+                        await self._execute_management_actions(symbol, actions, managed_pos)
                         
-                        managed_pos = self.managed_positions[symbol]
-                        managed_pos.current_mark_price = mark_price
-                        managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealized_pnl', 0))) # Key corrected from raw API
-                        managed_pos.size = Decimal(str(position_data['size']))
-                        
-                        actions = self.position_manager.evaluate(managed_pos, mark_price)
-                        if actions:
-                            await self._execute_management_actions(symbol, actions, managed_pos)
-                            
-                    # Signal Generation (SMC)
-                    # Use 15m candles (primary timeframe)
-                    # NOTE: _update_candles ensures self.candles_15m is populated
-                    candles = self.candles_15m.get(spot_symbol, [])
-                    if len(candles) < 50:
-                        return
-
-                    signal = await self.smc_engine.generate_signal(
+                    logger.info(f"Active (V3 Managed) {futures_symbol}", side=position_data['side'], pnl=str(managed_pos.unrealized_pnl))
+                else:
+                    # 5. Generate Signals (Spot Analysis)
+                    signal = self.smc_engine.generate_signal(
                         spot_symbol,
-                        candles,
-                        self.candles_1h.get(spot_symbol, []),
-                        self.candles_4h.get(spot_symbol, []),
-                        self.candles_1d.get(spot_symbol, [])
+                        bias_candles_4h=self.candles_4h.get(spot_symbol, []),
+                        bias_candles_1d=self.candles_1d.get(spot_symbol, []),
+                        exec_candles_15m=self.candles_15m.get(spot_symbol, []),
+                        exec_candles_1h=self.candles_1h.get(spot_symbol, [])
                     )
-                    
-                    # Pass context to signal for execution (mark price for futures)
-                    # Signal is spot-based, execution is futures-based.
                     
                     if signal.signal_type != SignalType.NO_SIGNAL:
                          await self._handle_signal(signal, spot_price, mark_price)
                     
-                    # Trace Logging (Throttled)
+                    # DASHBOARD UPDATE: Record decision trace even if NO signal
+                    # Throttle to once every 5 minutes per coin to avoid DB spam
                     now = datetime.now(timezone.utc)
                     last_trace = self.last_trace_log.get(spot_symbol, datetime.min.replace(tzinfo=timezone.utc))
                     
                     if (now - last_trace).total_seconds() > 300: # 5 minutes
                         try:
+                            # Extract useful metrics from signal object (even if NO_SIGNAL)
                             trace_details = {
                                 "signal": signal.signal_type.value,
                                 "regime": signal.regime,
@@ -380,16 +342,14 @@ class LiveTrading:
                                 timestamp=now
                             )
                             self.last_trace_log[spot_symbol] = now
+                            # No log spam, just DB record
                         except Exception as e:
                             logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e))
-
-                except Exception as e:
-                    logger.error(f"Error processing {spot_symbol}", error=str(e))
-
-        # Run Parallel
-        await asyncio.gather(*[process_coin(sym) for sym in self.markets])
-
-        # 5. Account Sync (Throttled)
+                         
+            except Exception as e:
+                logger.error(f"Error ticking {spot_symbol}", error=str(e))
+        
+        # 6. Sync Account State (Throttled 15s)
         now = datetime.now(timezone.utc)
         if (now - self.last_account_sync).total_seconds() > 15:
             await self._sync_account_state()
