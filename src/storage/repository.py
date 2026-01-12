@@ -437,12 +437,88 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
             unrealized_pnl=Decimal(str(pm.unrealized_pnl)),
             leverage=Decimal(str(pm.leverage)),
             margin_used=Decimal(str(pm.margin_used)),
+            opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
+            updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
+            # V3 Params
+            initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
+            trade_type=pm.trade_type,
+            tp1_price=Decimal(str(pm.tp1_price)) if pm.tp1_price else None,
+            tp2_price=Decimal(str(pm.tp2_price)) if pm.tp2_price else None,
+            final_target_price=Decimal(str(pm.final_target_price)) if pm.final_target_price else None,
+            partial_close_pct=Decimal(str(pm.partial_close_pct)) if pm.partial_close_pct else Decimal("0.5"),
+            original_size=Decimal(str(pm.original_size)) if pm.original_size else None,
             stop_loss_order_id=pm.stop_loss_order_id,
-            take_profit_order_id=pm.take_profit_order_id,
-            opened_at=pm.opened_at.replace(tzinfo=timezone.utc)
+            tp_order_ids=json.loads(pm.tp_order_ids) if pm.tp_order_ids else None,
+            basis_at_entry=Decimal(str(pm.basis_at_entry)) if pm.basis_at_entry else None,
+            basis_current=Decimal(str(pm.basis_current)) if pm.basis_current else None,
+            funding_rate=Decimal(str(pm.funding_rate)) if pm.funding_rate else None,
+            cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0")
         )
 
 
+def get_all_trades() -> List[Trade]:
+    """Retrieve all trades from the database."""
+    db = get_db()
+    with db.get_session() as session:
+        trade_models = session.query(TradeModel).order_by(TradeModel.exited_at.desc()).all()
+        
+        return [
+            Trade(
+                trade_id=tm.trade_id,
+                symbol=tm.symbol,
+                side=Side(tm.side),
+                entry_price=Decimal(str(tm.entry_price)),
+                exit_price=Decimal(str(tm.exit_price)),
+                size_notional=Decimal(str(tm.size_notional)),
+                leverage=Decimal(str(tm.leverage)),
+                gross_pnl=Decimal(str(tm.gross_pnl)),
+                fees=Decimal(str(tm.fees)),
+                funding=Decimal(str(tm.funding)),
+                net_pnl=Decimal(str(tm.net_pnl)),
+                entered_at=tm.entered_at.replace(tzinfo=timezone.utc),
+                exited_at=tm.exited_at.replace(tzinfo=timezone.utc),
+                holding_period_hours=Decimal(str(tm.holding_period_hours)),
+                exit_reason=tm.exit_reason,
+            )
+            for tm in trade_models
+        ]
+
+
+def get_trades_since(since: datetime) -> List[Trade]:
+    """
+    Retrieve trades closed since a specific time.
+    
+    Args:
+        since: Datetime to filter from (inclusive)
+    
+    Returns:
+        List of Trade objects closed since the given time
+    """
+    db = get_db()
+    with db.get_session() as session:
+        trade_models = session.query(TradeModel).filter(
+            TradeModel.exited_at >= since
+        ).order_by(TradeModel.exited_at.desc()).all()
+        
+        return [
+            Trade(
+                trade_id=tm.trade_id,
+                symbol=tm.symbol,
+                side=Side(tm.side),
+                entry_price=Decimal(str(tm.entry_price)),
+                exit_price=Decimal(str(tm.exit_price)),
+                size_notional=Decimal(str(tm.size_notional)),
+                leverage=Decimal(str(tm.leverage)),
+                gross_pnl=Decimal(str(tm.gross_pnl)),
+                fees=Decimal(str(tm.fees)),
+                funding=Decimal(str(tm.funding)),
+                net_pnl=Decimal(str(tm.net_pnl)),
+                entered_at=tm.entered_at.replace(tzinfo=timezone.utc),
+                exited_at=tm.exited_at.replace(tzinfo=timezone.utc),
+                holding_period_hours=Decimal(str(tm.holding_period_hours)),
+                exit_reason=tm.exit_reason,
+            )
+            for tm in trade_models
         ]
 
 
