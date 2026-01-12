@@ -45,7 +45,7 @@ class RiskConfig(BaseSettings):
     min_liquidation_buffer_pct: float = Field(default=0.35, ge=0.30, le=0.50)
     
     # Portfolio limits
-    max_concurrent_positions: int = Field(default=2, ge=1, le=5)
+    max_concurrent_positions: int = Field(default=2, ge=1, le=10)
     daily_loss_limit_pct: float = Field(default=0.02, ge=0.01, le=0.10)
     
     # Loss streak protection (time-based, not permanent block)
