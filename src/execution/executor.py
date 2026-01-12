@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Dict, Optional, Set
 from datetime import datetime, timezone
 import uuid
-from src.domain.models import Order, OrderIntent, OrderType, OrderStatus, Position
+from src.domain.models import Order, OrderIntent, OrderType, OrderStatus, Position, Side
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.price_converter import PriceConverter
 from src.config.config import ExecutionConfig
