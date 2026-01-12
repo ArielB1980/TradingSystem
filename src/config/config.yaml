@@ -33,7 +33,7 @@ risk:
   
   # Portfolio limits (CONSERVATIVE for live start)
   # Portfolio limits (Scaled for Multi-Asset)
-  max_concurrent_positions: 5  # Allow up to 5 parallel trades
+  max_concurrent_positions: 10  # Allow up to 10 parallel trades
   daily_loss_limit_pct: 0.05  # 5% daily loss limit (Accommodates 10x active sizing)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
