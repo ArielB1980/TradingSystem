@@ -86,10 +86,11 @@ class Executor:
             )
             return None
         
+        futures_symbol = FuturesAdapter.map_spot_to_futures(order_intent.signal.symbol)
+        
         # Pyramiding guard
         if self.config.pyramiding_enabled is False:
             # Check if we already have a position in this symbol
-            futures_symbol = FuturesAdapter.map_spot_to_futures(order_intent.signal.symbol)
             has_position = any(p.symbol == futures_symbol for p in current_positions)
             
             if has_position:
@@ -97,6 +98,22 @@ class Executor:
                     "Pyramiding guard REJECTED",
                     symbol=futures_symbol,
                     reason="Pyramiding disabled, position already exists",
+                )
+                return None
+                
+            # Check if we have any pending (open) entry orders for this symbol
+            # We check submitted_orders tracking locally to avoid API latency
+            has_pending = any(
+                o.symbol == futures_symbol and o.status in (OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+                and o.side == order_intent.side # Same side check? Or any side? Generally one order per symbol.
+                for o in self.submitted_orders.values()
+            )
+            
+            if has_pending:
+                logger.warning(
+                    "Duplicate order guard REJECTED",
+                    symbol=futures_symbol,
+                    reason="Pending entry order already exists"
                 )
                 return None
         
