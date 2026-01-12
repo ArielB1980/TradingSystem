@@ -339,10 +339,12 @@ class LiveTrading:
                         pass
                         
                     if not mark_price:
-                        # Fallback for critical pricing (or skip)
-                        # Logging too much here might spam, so only debug
-                        # logger.debug(f"Missing mark price for {futures_symbol}")
-                        return 
+                        # Fallback for analysis-only mode (spot tokens without futures)
+                        # We use spot price as mark price proxy for SMC analysis, but disable execution
+                        mark_price = spot_price
+                        is_tradable = False
+                    else:
+                        is_tradable = True
 
                     # Update Candles (This still does I/O but is parallelized now)
                     await self._update_candles(spot_symbol)
@@ -383,7 +385,7 @@ class LiveTrading:
                     # Pass context to signal for execution (mark price for futures)
                     # Signal is spot-based, execution is futures-based.
                     
-                    if signal.signal_type != SignalType.NO_SIGNAL:
+                    if signal.signal_type != SignalType.NO_SIGNAL and is_tradable:
                          await self._handle_signal(signal, spot_price, mark_price)
                     
                     # Trace Logging (Throttled)
