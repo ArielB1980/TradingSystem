@@ -6,7 +6,7 @@ No futures prices, funding data, or order book data may be accessed.
 """
 from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 from src.domain.models import Candle, Signal, SignalType
 from src.strategy.indicators import Indicators
@@ -39,8 +39,10 @@ class SMCEngine:
         self.config = config
         self.indicators = Indicators()
         
-        # V2: Per-symbol caching for multi-asset support
-        self.indicator_cache: Dict[str, Dict] = {}  # symbol -> cached indicators
+        # V2: Per-symbol caching for multi-asset support (optimized with tuple keys)
+        self.indicator_cache: Dict[Tuple[str, datetime], Dict] = {}
+        self.cache_max_size = 1000  # Prevent unbounded growth
+        self.cache_max_age = timedelta(hours=2)  # Configurable
         
         # V2: Fibonacci engine for confluence scoring
         from src.strategy.fibonacci_engine import FibonacciEngine
@@ -51,6 +53,34 @@ class SMCEngine:
         self.signal_scorer = SignalScorer(config)
         
         logger.info("SMC Engine initialized", config=config.model_dump())
+    
+    def _get_cache_key(self, symbol: str, candles: List[Candle]) -> Tuple[str, datetime]:
+        """Generate cache key from symbol and last candle timestamp."""
+        if not candles:
+            return (symbol, datetime.min.replace(tzinfo=timezone.utc))
+        return (symbol, candles[-1].timestamp)
+    
+    def _clean_cache(self):
+        """Remove stale cache entries."""
+        if len(self.indicator_cache) < self.cache_max_size:
+            return
+            
+        now = datetime.now(timezone.utc)
+        cutoff = now - self.cache_max_age
+        
+        # Remove old entries
+        self.indicator_cache = {
+            k: v for k, v in self.indicator_cache.items()
+            if k[1] > cutoff
+        }
+        
+        # If still too large, remove oldest entries
+        if len(self.indicator_cache) > self.cache_max_size:
+            sorted_keys = sorted(self.indicator_cache.keys(), key=lambda x: x[1], reverse=True)
+            self.indicator_cache = {
+                k: self.indicator_cache[k] 
+                for k in sorted_keys[:self.cache_max_size]
+            }
     
     def generate_signal(
         self,
@@ -99,8 +129,8 @@ class SMCEngine:
 
         # Step 3: Filters
         if signal is None:
-            # Cache key based on last candle timestamp
-            cache_key = f"{symbol}_{exec_candles_1h[-1].timestamp if exec_candles_1h else 'none'}"
+            # Cache key based on symbol and last candle timestamp (optimized)
+            cache_key = self._get_cache_key(symbol, exec_candles_1h)
             
             # Check cache for indicators
             cached_indicators = self.indicator_cache.get(cache_key)
@@ -134,6 +164,10 @@ class SMCEngine:
                     'atr': atr_value,
                     'fib_levels': fib_levels
                 }
+                
+                # Periodic cleanup
+                if len(self.indicator_cache) % 100 == 0:
+                    self._clean_cache()
             
             # Apply filters
             if not self._apply_filters(exec_candles_1h, reasoning_parts):
@@ -146,6 +180,7 @@ class SMCEngine:
                     exec_candles_1h,
                     bias,
                     reasoning_parts,
+                    atr_value=atr_value,  # Pass cached ATR
                 )
                 
                 # Step 5: Fib Validation (Gate for tight_smc) - use cached fib_levels
@@ -629,6 +664,7 @@ class SMCEngine:
         candles: List[Candle],
         bias: str,
         reasoning: List[str],
+        atr_value: Optional[Decimal] = None,
     ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal], List[Decimal], Dict]:
         """
         Calculate Levels: Entry, Stop, TP.
@@ -657,9 +693,12 @@ class SMCEngine:
             setup_type = SetupType.BOS
             regime = "wide_structure"
             
-        # 2. Get ATR
-        atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
-        atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
+        # 2. Get ATR (use cached if available)
+        if atr_value is None:
+            atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
+            atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
+        else:
+            atr = atr_value  # Use cached value
         
         # 3. Determine Stop Multiplier based on Regime
         if regime == "tight_smc":
@@ -728,46 +767,42 @@ class SMCEngine:
                  return SignalType.NO_SIGNAL, Decimal("0"), Decimal("0"), None, [], {}
                  
         # 5. TP Logic
-        # Scan for swing points
+        # Scan for swing points (optimized)
         lookback = 50
         risk = abs(entry_price - stop_loss)
         if risk == 0: risk = Decimal("1") # Avoid div/0
         
         if signal_type == SignalType.LONG:
-             for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
-                c = candles[i]
-                if (c.high > candles[i-1].high and c.high > candles[i+1].high):
-                    if c.high > entry_price: tp_candidates.append(c.high)
-             tp_candidates = sorted(list(set(tp_candidates)))[:5]
-             
-             # Min RR
-             min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
-             min_tp_dist = risk * Decimal(str(min_rr))
-             
-             # Filter TPs < Min RR
-             valid_tps = [tp for tp in tp_candidates if (tp - entry_price) >= min_tp_dist]
-             
-             if valid_tps:
-                 take_profit = valid_tps[0] # Nearest valid
-             else:
-                 take_profit = entry_price + min_tp_dist # Force Min RR
+            # Use optimized vectorized swing point detection
+            swing_highs = self.indicators.find_swing_points(candles, lookback=lookback, find_highs=True)
+            tp_candidates = sorted([h for h in swing_highs if h > entry_price])[:5]
+            
+            # Min RR
+            min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
+            min_tp_dist = risk * Decimal(str(min_rr))
+            
+            # Filter TPs < Min RR
+            valid_tps = [tp for tp in tp_candidates if (tp - entry_price) >= min_tp_dist]
+            
+            if valid_tps:
+                take_profit = valid_tps[0] # Nearest valid
+            else:
+                take_profit = entry_price + min_tp_dist # Force Min RR
                  
         else: # SHORT
-             for i in range(len(candles) - 2, max(0, len(candles) - lookback), -1):
-                c = candles[i]
-                if (c.low < candles[i-1].low and c.low < candles[i+1].low):
-                    if c.low < entry_price: tp_candidates.append(c.low)
-             tp_candidates = sorted(list(set(tp_candidates)), reverse=True)[:5]
-             
-             min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
-             min_tp_dist = risk * Decimal(str(min_rr))
-             
-             valid_tps = [tp for tp in tp_candidates if (entry_price - tp) >= min_tp_dist]
-             
-             if valid_tps:
-                 take_profit = valid_tps[0]
-             else:
-                 take_profit = entry_price - min_tp_dist
+            # Use optimized vectorized swing point detection
+            swing_lows = self.indicators.find_swing_points(candles, lookback=lookback, find_highs=False)
+            tp_candidates = sorted([l for l in swing_lows if l < entry_price], reverse=True)[:5]
+            
+            min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5
+            min_tp_dist = risk * Decimal(str(min_rr))
+            
+            valid_tps = [tp for tp in tp_candidates if (entry_price - tp) >= min_tp_dist]
+            
+            if valid_tps:
+                take_profit = valid_tps[0]
+            else:
+                take_profit = entry_price - min_tp_dist
 
         reasoning.append(
             f"✓ V2.1 Levels ({regime}): Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}"

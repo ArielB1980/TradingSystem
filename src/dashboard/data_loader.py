@@ -126,56 +126,86 @@ def load_all_coins() -> List[CoinSnapshot]:
         List of CoinSnapshot objects, sorted alphabetically by symbol.
     """
     try:
-        # Get latest DECISION_TRACE for each symbol
-        traces = get_latest_traces(limit=300)
+        from src.config.config import load_config
+        from src.dashboard.utils import _get_monitored_symbols
+        
+        # Get all configured symbols (should be 250 coins)
+        config = load_config()
+        all_symbols = _get_monitored_symbols(config)
+        
+        # Get latest DECISION_TRACE for each symbol (creates a dict for quick lookup)
+        traces = get_latest_traces(limit=500)
+        traces_by_symbol = {trace.get('symbol'): trace for trace in traces}
         
         snapshots = []
         now = datetime.now(timezone.utc)
         
-        for trace in traces:
-            # Parse details JSON
-            details = trace.get('details', {})
+        # Process all configured symbols, not just ones with traces
+        for symbol in all_symbols:
+            trace = traces_by_symbol.get(symbol)
             
-            # Calculate status based on last update
-            last_update = trace.get('timestamp')
-            if last_update:
-                age_seconds = (now - last_update).total_seconds()
-                if age_seconds < 600:  # < 10 minutes
-                    status = "active"
-                elif age_seconds < 3600:  # < 1 hour
-                    status = "stale"
+            if trace:
+                # Parse details JSON
+                details = trace.get('details', {})
+                
+                # Calculate status based on last update
+                last_update = trace.get('timestamp')
+                if last_update:
+                    age_seconds = (now - last_update).total_seconds()
+                    if age_seconds < 600:  # < 10 minutes
+                        status = "active"
+                    elif age_seconds < 3600:  # < 1 hour
+                        status = "stale"
+                    else:
+                        status = "dead"
                 else:
                     status = "dead"
+                
+                # Extract score breakdown
+                score_breakdown = details.get('score_breakdown', {})
+                
+                # Create snapshot
+                snapshot = CoinSnapshot(
+                    symbol=symbol,
+                    price=details.get('spot_price', 0.0),
+                    change_24h=calculate_24h_change(symbol, details.get('spot_price', 0.0)),
+                    regime=details.get('regime', 'unknown'),
+                    bias=details.get('bias', 'neutral'),
+                    signal=details.get('signal', 'NO_SIGNAL'),
+                    quality=calculate_signal_strength(details),
+                    adx=details.get('adx', 0.0),
+                    atr=details.get('atr', 0.0),
+                    ema200_slope=details.get('ema200_slope', 'flat'),
+                    score_breakdown=score_breakdown,
+                    last_update=last_update or now,
+                    last_signal=None,  # TODO: Query for last non-NO_SIGNAL
+                    status=status
+                )
             else:
-                status = "dead"
-            
-            # Extract score breakdown
-            score_breakdown = details.get('score_breakdown', {})
-            
-            # Create snapshot
-            snapshot = CoinSnapshot(
-                symbol=trace.get('symbol', 'UNKNOWN'),
-                price=details.get('spot_price', 0.0),
-                change_24h=calculate_24h_change(trace.get('symbol'), details.get('spot_price', 0.0)),
-                regime=details.get('regime', 'unknown'),
-                bias=details.get('bias', 'neutral'),
-                signal=details.get('signal', 'NO_SIGNAL'),
-                quality=calculate_signal_strength(details),
-                adx=details.get('adx', 0.0),
-                atr=details.get('atr', 0.0),
-                ema200_slope=details.get('ema200_slope', 'flat'),
-                score_breakdown=score_breakdown,
-                last_update=last_update or now,
-                last_signal=None,  # TODO: Query for last non-NO_SIGNAL
-                status=status
-            )
+                # No trace yet - create default snapshot
+                snapshot = CoinSnapshot(
+                    symbol=symbol,
+                    price=0.0,
+                    change_24h=0.0,
+                    regime='unknown',
+                    bias='neutral',
+                    signal='NO_SIGNAL',
+                    quality=0.0,
+                    adx=0.0,
+                    atr=0.0,
+                    ema200_slope='flat',
+                    score_breakdown={},
+                    last_update=now,
+                    last_signal=None,
+                    status='dead'  # No data yet
+                )
             
             snapshots.append(snapshot)
         
         # Sort alphabetically by symbol
         snapshots.sort(key=lambda x: x.symbol)
         
-        logger.info(f"Loaded {len(snapshots)} coin snapshots")
+        logger.info(f"Loaded {len(snapshots)} coin snapshots ({len([s for s in snapshots if s.status != 'dead'])} with data)")
         return snapshots
         
     except Exception as e:

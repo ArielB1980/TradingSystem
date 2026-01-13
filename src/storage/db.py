@@ -24,11 +24,23 @@ class Database:
             database_url: Database connection string
         """
         self.database_url = database_url
-        self.engine = create_engine(
-            database_url,
-            echo=False,
-            pool_pre_ping=True,  # Verify connections before using
-        )
+        
+        # Optimize connection pooling
+        pool_kwargs = {
+            "echo": False,
+            "pool_pre_ping": True,  # Verify connections before using
+        }
+        
+        # Add pooling config for non-SQLite databases
+        if not database_url.startswith("sqlite"):
+            pool_kwargs.update({
+                "pool_size": 10,  # Base connections
+                "max_overflow": 20,  # Additional connections under load
+                "pool_recycle": 3600,  # Recycle connections after 1 hour
+                "pool_timeout": 30,  # Wait up to 30s for connection
+            })
+        
+        self.engine = create_engine(database_url, **pool_kwargs)
         
         # Enable foreign key constraints for SQLite
         if database_url.startswith("sqlite"):

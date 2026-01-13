@@ -15,7 +15,7 @@ from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_manager import PositionManager, ActionType
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles
+from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles
 from src.storage.maintenance import DatabasePruner
 
 logger = get_logger(__name__)
@@ -69,6 +69,13 @@ class LiveTrading:
         self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
         self.db_pruner = DatabasePruner()
         
+        # Coin processing tracking
+        self.coin_processing_stats: Dict[str, Dict] = {}  # Track processing stats per coin
+        self.last_status_summary = datetime.min.replace(tzinfo=timezone.utc)
+        
+        # Batched candle storage (Phase 2 optimization)
+        self.pending_candles: List[Candle] = []  # Batch candles before saving
+        
         # Market Expansion (Coin Universe)
         self.markets = config.exchange.spot_markets
         if config.assets.mode == "whitelist":
@@ -103,27 +110,46 @@ class LiveTrading:
             except Exception as e:
                 logger.warning("Initial position sync failed", error=str(e))
             
-                        # Phase 10.5: Fast Startup Hydration
-                # Solution: Lazy Background Hydration
-                # PERMANENTLY DISABLED: Background Thread causes GIL Starvation and blocks Main Loop.
-                logger.warning("Hydration Disabled permanently to ensure stability")
+            # Phase 10.5: Fast Startup - Load candles from database
+            # CRITICAL FIX: Load last 50 candles from database to avoid cold start
+            logger.info("Loading candles from database for fast startup...")
+            try:
+                self.candles_15m = {}
+                self.candles_1h = {}
+                self.candles_4h = {}
+                self.candles_1d = {}
                 
-                # Default empty initialization (Immediate trading availability)
+                # Load candles from database (async-safe, uses thread pool)
+                for symbol in self.markets:
+                    try:
+                        # Load last 50 candles for each timeframe (enough for signal generation)
+                        candles_15m = await asyncio.to_thread(get_candles, symbol, "15m", limit=50)
+                        candles_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=50)
+                        candles_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=50)
+                        candles_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=50)
+                        
+                        self.candles_15m[symbol] = candles_15m if candles_15m else []
+                        self.candles_1h[symbol] = candles_1h if candles_1h else []
+                        self.candles_4h[symbol] = candles_4h if candles_4h else []
+                        self.candles_1d[symbol] = candles_1d if candles_1d else []
+                    except Exception as e:
+                        logger.debug(f"Failed to load candles for {symbol} from DB", error=str(e))
+                        # Initialize empty if DB load fails
+                        self.candles_15m[symbol] = []
+                        self.candles_1h[symbol] = []
+                        self.candles_4h[symbol] = []
+                        self.candles_1d[symbol] = []
+                
+                loaded_count = sum(len(c) for c in self.candles_15m.values())
+                logger.info(f"Loaded {loaded_count} candles from database across {len(self.markets)} symbols")
+                
+            except Exception as e:
+                logger.error("Failed to load candles from database", error=str(e))
+                # Fallback: initialize empty
                 self.candles_15m = {m: [] for m in self.markets}
                 self.candles_1h = {m: [] for m in self.markets}
                 self.candles_4h = {m: [] for m in self.markets}
                 self.candles_1d = {m: [] for m in self.markets}
-                
-                # Spawn background task
-                # asyncio.create_task(self._background_hydration_task())
-                
-            except Exception as e:
-                 # Catch-all
-                 pass
-                
-            except Exception as e:
-                 # Catch-all
-                 pass
 
             # Set last update timestamps to prevent immediate re-fetch
             # This logic must run whether hydration succeeded or failed/timed out
@@ -225,14 +251,19 @@ class LiveTrading:
             opened_at=datetime.now(timezone.utc) # Approximate if missing
         )
 
-    async def _sync_positions(self) -> List[Dict]:
+    async def _sync_positions(self, raw_positions: Optional[List[Dict]] = None) -> List[Dict]:
         """
         Sync active positions from exchange and update RiskManager.
+        
+        Args:
+            raw_positions: Optional pre-fetched positions list (to avoid duplicate API calls)
         
         Returns:
             List of active positions (dicts)
         """
-        raw_positions = await self.client.get_all_futures_positions()
+        # Phase 2 Fix: Accept pre-fetched positions to avoid duplicate API calls
+        if raw_positions is None:
+            raw_positions = await self.client.get_all_futures_positions()
         
         # Convert to Domain Objects
         active_positions = []
@@ -246,9 +277,9 @@ class LiveTrading:
         # Update Risk Manager
         self.risk_manager.update_position_list(active_positions)
         
-        # Persist to DB for Dashboard
+        # Persist to DB for Dashboard (Phase 2: Use async wrapper)
         try:
-             sync_active_positions(self.risk_manager.current_positions)
+             await asyncio.to_thread(sync_active_positions, self.risk_manager.current_positions)
         except Exception as e:
              logger.error("Failed to sync positions to DB", error=str(e))
         
@@ -302,12 +333,12 @@ class LiveTrading:
             return
 
         # 2. Sync Active Positions (Global Sync)
+        # Phase 2 Fix: Pass positions to _sync_positions to avoid duplicate API call
         try:
             # This updates global state in Repository and internal trackers
-            # We also get the raw list here to use for the tick
             all_raw_positions = await self.client.get_all_futures_positions()
-            # We still run sync to ensure DB peristence is up to date
-            await self._sync_positions()
+            # Pass positions to sync to avoid duplicate API call
+            await self._sync_positions(all_raw_positions)
         except Exception as e:
             logger.error("Failed to sync positions", error=str(e))
             return
@@ -388,7 +419,52 @@ class LiveTrading:
                     # Use 15m candles (primary timeframe)
                     # NOTE: _update_candles ensures self.candles_15m is populated
                     candles = self.candles_15m.get(spot_symbol, [])
-                    if len(candles) < 50:
+                    candle_count = len(candles)
+                    
+                    # Update processing stats
+                    if spot_symbol not in self.coin_processing_stats:
+                        self.coin_processing_stats[spot_symbol] = {
+                            "processed_count": 0,
+                            "last_processed": datetime.min.replace(tzinfo=timezone.utc),
+                            "candle_count": 0
+                        }
+                    self.coin_processing_stats[spot_symbol]["processed_count"] += 1
+                    self.coin_processing_stats[spot_symbol]["last_processed"] = datetime.now(timezone.utc)
+                    self.coin_processing_stats[spot_symbol]["candle_count"] = candle_count
+                    
+                    if candle_count < 50:
+                        # Still log trace even if insufficient candles (monitoring status)
+                        now = datetime.now(timezone.utc)
+                        last_trace = self.last_trace_log.get(spot_symbol, datetime.min.replace(tzinfo=timezone.utc))
+                        
+                        if (now - last_trace).total_seconds() > 300: # 5 minutes
+                            try:
+                                from src.storage.repository import async_record_event
+                                
+                                trace_details = {
+                                    "signal": "NO_SIGNAL",
+                                    "regime": "unknown",
+                                    "bias": "neutral",
+                                    "adx": 0.0,
+                                    "atr": 0.0,
+                                    "ema200_slope": "flat",
+                                    "spot_price": float(spot_price),
+                                    "setup_quality": 0.0,
+                                    "score_breakdown": {},
+                                    "status": "monitoring",
+                                    "candle_count": candle_count,
+                                    "reason": "insufficient_candles"
+                                }
+                                
+                                await async_record_event(
+                                    event_type="DECISION_TRACE",
+                                    symbol=spot_symbol,
+                                    details=trace_details,
+                                    timestamp=now
+                                )
+                                self.last_trace_log[spot_symbol] = now
+                            except Exception as e:
+                                logger.error("Failed to record monitoring trace", symbol=spot_symbol, error=str(e))
                         return
 
                     signal = self.smc_engine.generate_signal(
@@ -422,7 +498,9 @@ class LiveTrading:
                                 "ema200_slope": signal.ema200_slope,
                                 "spot_price": float(spot_price),
                                 "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
-                                "score_breakdown": signal.score_breakdown or {}
+                                "score_breakdown": signal.score_breakdown or {},
+                                "status": "active",
+                                "candle_count": candle_count
                             }
                             
                             await async_record_event(
@@ -440,6 +518,55 @@ class LiveTrading:
 
         # Execute parallel processing
         await asyncio.gather(*[process_coin(s) for s in self.markets], return_exceptions=True)
+        
+        # Phase 2: Batch save all collected candles (grouped by symbol/timeframe)
+        if self.pending_candles:
+            try:
+                from collections import defaultdict
+                # Group candles by (symbol, timeframe) since save_candles_bulk requires same symbol/tf
+                grouped = defaultdict(list)
+                for candle in self.pending_candles:
+                    key = (candle.symbol, candle.timeframe)
+                    grouped[key].append(candle)
+                
+                # Save each group in parallel (async-safe)
+                save_tasks = []
+                for (symbol, tf), candle_group in grouped.items():
+                    save_tasks.append(asyncio.to_thread(save_candles_bulk, candle_group))
+                
+                if save_tasks:
+                    await asyncio.gather(*save_tasks, return_exceptions=True)
+                
+                total_saved = len(self.pending_candles)
+                self.pending_candles.clear()
+                logger.debug(f"Batched save complete", candles_saved=total_saved, groups=len(grouped))
+            except Exception as e:
+                logger.error("Failed to batch save candles", error=str(e))
+                self.pending_candles.clear()  # Clear on error to prevent memory leak
+        
+        # Log periodic status summary (every 5 minutes)
+        now = datetime.now(timezone.utc)
+        if (now - self.last_status_summary).total_seconds() > 300:  # 5 minutes
+            try:
+                total_coins = len(self.markets)
+                coins_with_candles = sum(1 for s in self.markets if len(self.candles_15m.get(s, [])) >= 50)
+                coins_processed_recently = sum(
+                    1 for s in self.markets 
+                    if self.coin_processing_stats.get(s, {}).get("last_processed", datetime.min.replace(tzinfo=timezone.utc)) > (now - timedelta(minutes=10))
+                )
+                coins_with_traces = len([s for s in self.markets if s in self.last_trace_log])
+                
+                logger.info(
+                    "Coin processing status summary",
+                    total_coins=total_coins,
+                    coins_with_sufficient_candles=coins_with_candles,
+                    coins_processed_recently=coins_processed_recently,
+                    coins_with_traces=coins_with_traces,
+                    coins_waiting_for_candles=total_coins - coins_with_candles
+                )
+                self.last_status_summary = now
+            except Exception as e:
+                logger.error("Failed to log status summary", error=str(e))
         
         # 4.5 CRITICAL: Validate all positions have stop loss protection
         await self._validate_position_protection()
@@ -756,7 +883,7 @@ class LiveTrading:
             if (now - last_update).total_seconds() < (interval_min * 60):
                 return # Cache hit
                 
-            candles = await self.client.get_spot_ohlcv(symbol, tf, limit=10)
+            candles = await self.client.get_spot_ohlcv(symbol, tf, limit=100)  # Increased from 10 to 100
             if not candles: return
             
             # Update Cache
@@ -777,6 +904,10 @@ class LiveTrading:
                  # Limit buffer size
                  if len(buffer[symbol]) > 500:
                      buffer[symbol] = buffer[symbol][-500:]
+            
+            # Phase 2: Collect candles for batched save (saves at end of tick)
+            if candles:
+                self.pending_candles.extend(candles)
 
         # Parallel fetch with thresholds
         # 15m -> 1 min update
