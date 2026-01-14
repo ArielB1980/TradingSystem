@@ -20,9 +20,24 @@ def main():
     print(f"Connecting to database...")
     
     db = get_db()
+    
+    # Debug Connection
+    url_str = str(db.engine.url)
+    masked_url = url_str.split("@")[-1] if "@" in url_str else url_str
+    print(f"DB Engine: {db.engine.dialect.name}")
+    print(f"DB Host/Info: {masked_url}")
+    
     cutoff = datetime.now(timezone.utc) - timedelta(hours=10)
     
     with db.get_session() as session:
+        # Debug Totals
+        total_events = session.query(SystemEventModel).count()
+        total_trades = session.query(TradeModel).count()
+        print(f"\n--- Total Database State ---")
+        print(f"Total System Events: {total_events}")
+        print(f"Total Trades: {total_trades}")
+
+        # 1. Count Signals
         # 1. Count Signals
         # Assuming event_type for signals is 'SIGNAL' or 'SIGNAL_GENERATED'
         # Let's check distinct types to be sure if count is 0
