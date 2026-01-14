@@ -5,14 +5,14 @@ services:
     github:
       repo: ArielB1980/TradingSystem
       branch: main
-    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath /dashboard
+    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
     routes:
-      - path: /dashboard
+      - path: /
     health_check:
-      path: /dashboard/_stcore/health
+      path: /_stcore/health
     envs:
       - key: DATABASE_URL
         scope: RUN_TIME
@@ -30,7 +30,6 @@ services:
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
-    routes:
     routes:
       - path: /api
     envs:
