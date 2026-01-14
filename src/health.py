@@ -43,14 +43,7 @@ async def ready():
     return {"status": "ready"}
 
 
-@app.get("/dashboard")
-async def dashboard_redirect():
-    """Redirect to dashboard info."""
-    return {
-        "message": "Dashboard is available",
-        "url": "https://tradingbot-2tdzi.ondigitalocean.app:8000",
-        "note": "Dashboard runs on separate component - check App Platform components"
-    }
+
 
 
 @app.get("/quick-test")

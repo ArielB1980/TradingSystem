@@ -62,7 +62,7 @@ services:
     github:
       repo: ArielB1980/TradingSystem
       branch: main
-    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true
+    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath /dashboard
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
