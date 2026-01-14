@@ -43,6 +43,50 @@ async def ready():
     return {"status": "ready"}
 
 
+@app.get("/quick-test")
+async def quick_test():
+    """Quick system connectivity test."""
+    results = {
+        "database": "unknown",
+        "api_keys": "unknown",
+        "environment": os.getenv("ENVIRONMENT", "unknown")
+    }
+    
+    # Check database URL
+    database_url = os.getenv("DATABASE_URL", "")
+    if database_url:
+        results["database"] = "configured"
+        # Try to connect
+        try:
+            from src.storage.db import get_db
+            from sqlalchemy import text
+            db = get_db()
+            with db.get_session() as session:
+                session.execute(text("SELECT 1;"))
+            results["database"] = "connected"
+        except Exception as e:
+            results["database"] = f"error: {str(e)[:50]}"
+    else:
+        results["database"] = "not_configured"
+    
+    # Check API keys
+    has_spot_key = bool(os.getenv("KRAKEN_API_KEY"))
+    has_spot_secret = bool(os.getenv("KRAKEN_API_SECRET"))
+    has_futures_key = bool(os.getenv("KRAKEN_FUTURES_API_KEY"))
+    has_futures_secret = bool(os.getenv("KRAKEN_FUTURES_API_SECRET"))
+    
+    if has_spot_key and has_spot_secret:
+        results["api_keys"] = "spot_configured"
+    if has_futures_key and has_futures_secret:
+        results["api_keys"] = "futures_configured" if results["api_keys"] == "spot_configured" else "futures_only"
+    if not has_spot_key and not has_futures_key:
+        results["api_keys"] = "not_configured"
+    
+    results["status"] = "ok" if results["database"] == "connected" else "issues"
+    
+    return JSONResponse(content=results)
+
+
 @app.get("/test")
 async def test_system():
     """Run system tests (API, data, signals)."""
