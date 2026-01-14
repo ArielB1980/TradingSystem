@@ -58,6 +58,10 @@ def main():
         print(f"Signals Found: {signal_count}")
         print(f"Trades Executed: {trade_count}")
         
+        # 3. Market Coverage
+        unique_symbols = session.query(SystemEventModel.symbol).distinct().count()
+        print(f"Unique Symbols Active: {unique_symbols}")
+        
         if signal_count == 0:
             print("\nDebug: No signals found. Checking recent event types:")
             recent = session.query(SystemEventModel.event_type).distinct().limit(10).all()
