@@ -31,7 +31,8 @@ services:
     instance_count: 1
     instance_size_slug: basic-xxs
     routes:
-      - path: /
+    routes:
+      - path: /api
     envs:
       - key: DATABASE_URL
         scope: RUN_TIME
