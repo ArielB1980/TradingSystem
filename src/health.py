@@ -43,6 +43,36 @@ async def ready():
     return {"status": "ready"}
 
 
+@app.get("/test")
+async def test_system():
+    """Run system tests (API, data, signals)."""
+    import asyncio
+    import concurrent.futures
+    from src.test_system import run_all_tests
+    
+    try:
+        # Run async tests in thread pool (FastAPI already has event loop)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, run_all_tests())
+            result = future.result(timeout=120)  # 2 minute timeout
+        
+        return JSONResponse(content={
+            "status": "success" if result else "failed",
+            "message": "System tests completed",
+            "all_tests_passed": result
+        })
+    except concurrent.futures.TimeoutError:
+        return JSONResponse(
+            content={"status": "timeout", "message": "Tests took too long"},
+            status_code=504
+        )
+    except Exception as e:
+        return JSONResponse(
+            content={"status": "error", "message": str(e)},
+            status_code=500
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))

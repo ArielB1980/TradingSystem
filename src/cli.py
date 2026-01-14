@@ -210,6 +210,28 @@ def live(
         raise typer.Exit(1)
 
 
+@app.command()
+def test(
+    config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
+):
+    """
+    Run system tests to verify API connection, data acquisition, and signal processing.
+    
+    Example:
+        python run.py test
+    """
+    import asyncio
+    from src.test_system import run_all_tests
+    
+    # Load config for logging setup
+    config = load_config(str(config_path))
+    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    
+    success = asyncio.run(run_all_tests())
+    if not success:
+        raise typer.Exit(1)
+
+
 @app.command(name="kill-switch")
 def kill_switch_cmd(
     action: str = typer.Argument("status", help="Action: activate, deactivate, or status"),
