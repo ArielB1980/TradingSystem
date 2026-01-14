@@ -959,8 +959,16 @@ class LiveTrading:
             
             try:
                 if action.type == ActionType.CLOSE_POSITION:
+                    # Get exit price and reason before closing
+                    exit_price = position.current_mark_price
+                    exit_reason = action.reason or "unknown"
+                    
                     # Market Close
                     await self.client.close_position(symbol)
+                    
+                    # Save to trade history
+                    await self._save_trade_history(position, exit_price, exit_reason)
+                    
                     # State update handled on next tick (position gone)
                     
                 elif action.type == ActionType.PARTIAL_CLOSE:
@@ -998,3 +1006,77 @@ class LiveTrading:
                         
             except Exception as e:
                 logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))
+    
+    async def _save_trade_history(self, position: Position, exit_price: Decimal, exit_reason: str):
+        """
+        Save closed position to trade history.
+        
+        Args:
+            position: The position being closed
+            exit_price: Exit price
+            exit_reason: Reason for exit (stop_loss, take_profit, manual, etc.)
+        """
+        try:
+            from src.domain.models import Trade
+            from src.storage.repository import save_trade
+            from datetime import datetime, timezone
+            import uuid
+            
+            # Calculate holding period
+            now = datetime.now(timezone.utc)
+            holding_hours = (now - position.opened_at).total_seconds() / 3600
+            
+            # Calculate PnL
+            if position.side == Side.LONG:
+                gross_pnl = (exit_price - position.entry_price) * position.size
+            else:  # SHORT
+                gross_pnl = (position.entry_price - exit_price) * position.size
+            
+            # Estimate fees (simplified - should use actual fees if available)
+            # Maker: 0.02%, Taker: 0.05% (Kraken Futures)
+            entry_fee = position.size_notional * Decimal("0.0002")  # Assume maker
+            exit_fee = position.size_notional * Decimal("0.0002")
+            fees = entry_fee + exit_fee
+            
+            # Estimate funding (simplified - should use actual funding if available)
+            # Average funding rate ~0.01% per 8 hours
+            funding_periods = holding_hours / 8
+            funding = position.size_notional * Decimal("0.0001") * Decimal(str(funding_periods))
+            
+            net_pnl = gross_pnl - fees - funding
+            
+            # Create Trade object
+            trade = Trade(
+                trade_id=str(uuid.uuid4()),
+                symbol=position.symbol,
+                side=position.side,
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                size_notional=position.size_notional,
+                leverage=position.leverage,
+                gross_pnl=gross_pnl,
+                fees=fees,
+                funding=funding,
+                net_pnl=net_pnl,
+                entered_at=position.opened_at,
+                exited_at=now,
+                holding_period_hours=Decimal(str(holding_hours)),
+                exit_reason=exit_reason
+            )
+            
+            # Save to database
+            await asyncio.to_thread(save_trade, trade)
+            
+            logger.info(
+                "Trade saved to history",
+                symbol=position.symbol,
+                side=position.side.value,
+                entry_price=str(position.entry_price),
+                exit_price=str(exit_price),
+                net_pnl=str(net_pnl),
+                exit_reason=exit_reason,
+                holding_hours=f"{holding_hours:.2f}"
+            )
+            
+        except Exception as e:
+            logger.error("Failed to save trade history", symbol=position.symbol, error=str(e))

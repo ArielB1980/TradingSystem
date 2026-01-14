@@ -52,6 +52,13 @@ class SMCEngine:
         from src.strategy.signal_scorer import SignalScorer
         self.signal_scorer = SignalScorer(config)
         
+        # V3: Market Structure Tracker (confirmation + reconfirmation)
+        from src.strategy.market_structure_tracker import MarketStructureTracker
+        self.ms_tracker = MarketStructureTracker(
+            confirmation_candles=getattr(config, 'ms_confirmation_candles', 3),
+            reconfirmation_candles=getattr(config, 'ms_reconfirmation_candles', 2)
+        )
+        
         logger.info("SMC Engine initialized", config=config.model_dump())
     
     def _get_cache_key(self, symbol: str, candles: List[Candle]) -> Tuple[str, datetime]:
@@ -113,7 +120,62 @@ class SMCEngine:
             if "Insufficient candles" in reasoning_parts[-1]:
                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
 
-        # Step 2: Execution timeframe structure
+        # Step 2: Market Structure Change Detection & Confirmation
+        # V3: Require structure change confirmation + reconfirmation before entry
+        if signal is None:
+            # Update market structure tracking
+            ms_state, ms_change = self.ms_tracker.update_structure(symbol, exec_candles_1h)
+            
+            if ms_change:
+                # Structure change detected - check confirmation
+                confirmed = self.ms_tracker.check_confirmation(symbol, exec_candles_1h, ms_change)
+                
+                if confirmed:
+                    # Check reconfirmation (entry ready)
+                    # Get entry zone from structure detection
+                    structure_signal = self._detect_structure(
+                        exec_candles_15m,
+                        exec_candles_1h,
+                        bias,
+                        reasoning_parts,
+                    )
+                    
+                    entry_zone = None
+                    if structure_signal:
+                        # Extract entry zone (order block or FVG)
+                        if structure_signal.get('order_block'):
+                            ob = structure_signal['order_block']
+                            entry_zone = {'low': ob.get('low'), 'high': ob.get('high')}
+                        elif structure_signal.get('fvg'):
+                            fvg = structure_signal['fvg']
+                            entry_zone = {'bottom': fvg.get('bottom'), 'top': fvg.get('top')}
+                    
+                    reconfirmed = self.ms_tracker.check_reconfirmation(
+                        symbol, exec_candles_15m, exec_candles_1h, ms_change, entry_zone
+                    )
+                    
+                    if not reconfirmed:
+                        reasoning_parts.append(
+                            f"⏳ Structure change confirmed, waiting for reconfirmation (retrace to entry zone)"
+                        )
+                        signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                else:
+                    reasoning_parts.append(
+                        f"⏳ Structure change detected ({ms_change.new_state.value}), waiting for confirmation"
+                    )
+                    signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+            else:
+                # No structure change - check if we're waiting for one
+                if not self.ms_tracker.is_entry_ready(symbol):
+                    # Check if we should require structure change
+                    require_ms_change = getattr(self.config, 'require_ms_change_confirmation', True)
+                    if require_ms_change:
+                        reasoning_parts.append(
+                            f"⏳ No market structure change detected - waiting for structure break"
+                        )
+                        signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+        
+        # Step 2.5: Execution timeframe structure (only if entry ready or MS change not required)
         structures = {}  # Store for regime classification
         if signal is None:
             structure_signal = self._detect_structure(
@@ -126,6 +188,14 @@ class SMCEngine:
                  signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
             else:
                 structures = structure_signal  # Save for classification
+                
+                # V3: If entry ready, verify signal direction matches structure change
+                if self.ms_tracker.is_entry_ready(symbol):
+                    entry_signal = self.ms_tracker.get_entry_signal(symbol)
+                    if entry_signal:
+                        expected_direction, _ = entry_signal
+                        # Verify the structure signal aligns with MS change direction
+                        # This will be checked later when we determine signal_type
 
         # Step 3: Filters
         if signal is None:
@@ -213,6 +283,28 @@ class SMCEngine:
                 
                 if not fib_valid:
                      signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
+                
+                # Step 5.5: V3 - Verify signal direction matches MS change (if entry ready)
+                if signal is None and signal_type != SignalType.NO_SIGNAL:
+                    if self.ms_tracker.is_entry_ready(symbol):
+                        entry_signal = self.ms_tracker.get_entry_signal(symbol)
+                        if entry_signal:
+                            expected_direction, _ = entry_signal
+                            # Verify signal direction matches MS change
+                            if expected_direction == "LONG" and signal_type != SignalType.LONG:
+                                reasoning_parts.append(
+                                    f"❌ Signal direction mismatch: MS change expects LONG but got {signal_type.value}"
+                                )
+                                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                            elif expected_direction == "SHORT" and signal_type != SignalType.SHORT:
+                                reasoning_parts.append(
+                                    f"❌ Signal direction mismatch: MS change expects SHORT but got {signal_type.value}"
+                                )
+                                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                            else:
+                                reasoning_parts.append(
+                                    f"✓ Signal direction matches MS change ({expected_direction})"
+                                )
                 
                 # Step 6: Scoring & Final Validation
                 if signal is None and signal_type != SignalType.NO_SIGNAL:

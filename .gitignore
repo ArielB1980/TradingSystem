@@ -34,6 +34,7 @@ env/
 
 # Environment variables
 .env
+DATABASE_URL.txt
 
 # Database
 *.db
@@ -57,3 +58,9 @@ Thumbs.db
 
 # Project specific
 trading.db
+
+# Market discovery data
+data/discovered_markets.json
+
+# Process management
+.watchdog_live_trading.pid

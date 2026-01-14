@@ -84,6 +84,11 @@ strategy:
   orderblock_lookback: 50
   fvg_min_size_pct: 0.001  # 0.1% minimum gap size
   bos_confirmation_candles: 3
+  
+  # V3: Market Structure Change Confirmation
+  require_ms_change_confirmation: true  # Require MS change before entry
+  ms_confirmation_candles: 3  # Candles price must hold after break
+  ms_reconfirmation_candles: 2  # Candles for reconfirmation (retrace)
 
   # V2.1 Scoring & Regimes
   ema_neutral_zone_bps: 10.0

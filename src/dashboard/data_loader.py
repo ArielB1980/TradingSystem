@@ -43,26 +43,61 @@ def calculate_24h_change(symbol: str, current_price: float) -> float:
         current_price: Current price
         
     Returns:
-        24h change percentage
+        24h change percentage (0.0 if cannot calculate)
     """
     try:
         from datetime import datetime, timezone, timedelta
         
-        # Get candles from 24h ago
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        candles = get_candles(symbol, "1h", limit=25)
-        
-        if not candles or len(candles) < 2:
+        if current_price <= 0:
             return 0.0
         
-        # Get price from ~24h ago (oldest candle)
-        price_24h_ago = float(candles[0].close)
+        # Try multiple timeframes to find 24h price
+        # Priority: 1h candles (most accurate), then 15m, then 4h
+        for timeframe, limit in [("1h", 25), ("15m", 100), ("4h", 7)]:
+            try:
+                candles = get_candles(symbol, timeframe, limit=limit)
+                
+                if not candles or len(candles) < 2:
+                    continue
+                
+                # Find candle closest to 24h ago
+                now = datetime.now(timezone.utc)
+                target_time = now - timedelta(hours=24)
+                
+                # Find closest candle to 24h ago
+                closest_candle = None
+                min_diff = timedelta.max
+                
+                for candle in candles:
+                    diff = abs(candle.timestamp - target_time)
+                    if diff < min_diff:
+                        min_diff = diff
+                        closest_candle = candle
+                
+                # Use closest candle if within 2 hours of target
+                if closest_candle and min_diff < timedelta(hours=2):
+                    price_24h_ago = float(closest_candle.close)
+                    
+                    if price_24h_ago > 0:
+                        change_pct = ((current_price - price_24h_ago) / price_24h_ago) * 100
+                        return change_pct
+                
+                # Fallback: use oldest candle if we have enough history
+                if len(candles) >= 24:  # At least 24 periods
+                    oldest_candle = candles[0]
+                    price_24h_ago = float(oldest_candle.close)
+                    
+                    if price_24h_ago > 0:
+                        change_pct = ((current_price - price_24h_ago) / price_24h_ago) * 100
+                        return change_pct
+                        
+            except Exception as e:
+                logger.debug(f"Failed to get {timeframe} candles for 24h change", symbol=symbol, error=str(e))
+                continue
         
-        if price_24h_ago == 0:
-            return 0.0
-        
-        change_pct = ((current_price - price_24h_ago) / price_24h_ago) * 100
-        return change_pct
+        # If all methods fail, return 0.0 (dashboard will show 0.00%)
+        logger.debug(f"Could not calculate 24h change for {symbol} - no suitable candles")
+        return 0.0
         
     except Exception as e:
         logger.debug(f"Failed to calculate 24h change for {symbol}", error=str(e))
@@ -151,10 +186,22 @@ def load_all_coins() -> List[CoinSnapshot]:
                 # Calculate status based on last update
                 last_update = trace.get('timestamp')
                 if last_update:
+                    # Ensure timezone-aware datetime
+                    if isinstance(last_update, str):
+                        try:
+                            last_update = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+                        except:
+                            last_update = datetime.now(timezone.utc)
+                    elif last_update.tzinfo is None:
+                        # Make timezone-aware if naive
+                        last_update = last_update.replace(tzinfo=timezone.utc)
+                    
                     age_seconds = (now - last_update).total_seconds()
-                    if age_seconds < 600:  # < 10 minutes
+                    # More lenient thresholds: active = 1h, stale = 6h, dead = >6h
+                    # Accounts for batch processing of 250 coins with throttling
+                    if age_seconds < 3600:  # < 1 hour (was 10 minutes)
                         status = "active"
-                    elif age_seconds < 3600:  # < 1 hour
+                    elif age_seconds < 21600:  # < 6 hours (was 1 hour)
                         status = "stale"
                     else:
                         status = "dead"
@@ -164,25 +211,34 @@ def load_all_coins() -> List[CoinSnapshot]:
                 # Extract score breakdown
                 score_breakdown = details.get('score_breakdown', {})
                 
+                # Extract price - ensure it's a valid float
+                spot_price = details.get('spot_price', 0.0)
+                try:
+                    spot_price = float(spot_price) if spot_price else 0.0
+                except (TypeError, ValueError):
+                    spot_price = 0.0
+                
                 # Create snapshot
                 snapshot = CoinSnapshot(
                     symbol=symbol,
-                    price=details.get('spot_price', 0.0),
-                    change_24h=calculate_24h_change(symbol, details.get('spot_price', 0.0)),
+                    price=spot_price,
+                    change_24h=calculate_24h_change(symbol, spot_price) if spot_price > 0 else 0.0,
                     regime=details.get('regime', 'unknown'),
                     bias=details.get('bias', 'neutral'),
                     signal=details.get('signal', 'NO_SIGNAL'),
                     quality=calculate_signal_strength(details),
-                    adx=details.get('adx', 0.0),
-                    atr=details.get('atr', 0.0),
+                    adx=float(details.get('adx', 0.0)) if details.get('adx') is not None else 0.0,
+                    atr=float(details.get('atr', 0.0)) if details.get('atr') is not None else 0.0,
                     ema200_slope=details.get('ema200_slope', 'flat'),
-                    score_breakdown=score_breakdown,
+                    score_breakdown=score_breakdown if isinstance(score_breakdown, dict) else {},
                     last_update=last_update or now,
                     last_signal=None,  # TODO: Query for last non-NO_SIGNAL
                     status=status
                 )
             else:
                 # No trace yet - create default snapshot
+                # Use a very old timestamp to indicate no data
+                no_data_timestamp = datetime.min.replace(tzinfo=timezone.utc)
                 snapshot = CoinSnapshot(
                     symbol=symbol,
                     price=0.0,
@@ -195,7 +251,7 @@ def load_all_coins() -> List[CoinSnapshot]:
                     atr=0.0,
                     ema200_slope='flat',
                     score_breakdown={},
-                    last_update=now,
+                    last_update=no_data_timestamp,
                     last_signal=None,
                     status='dead'  # No data yet
                 )

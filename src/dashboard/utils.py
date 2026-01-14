@@ -21,12 +21,28 @@ from src.domain.events import CoinStateSnapshot, REASON_CODES
 
 
 def _get_monitored_symbols(config) -> List[str]:
-    """Helper to get full list of monitored symbols respecting Coin Universe."""
+    """
+    Helper to get full list of monitored symbols.
+    
+    Priority (same as live trading system):
+    1. Discovered markets (from daily discovery process)
+    2. Coin Universe (if enabled)
+    3. Config markets (fallback)
+    """
+    # Check for discovered markets first (same priority as live trading)
+    from src.utils.market_discovery import load_discovered_markets
+    discovered_markets = load_discovered_markets()
+    if discovered_markets:
+        return discovered_markets
+    
+    # Fallback to Coin Universe if enabled
     if hasattr(config, "coin_universe") and config.coin_universe.enabled:
         expanded = []
         for tier, coins in config.coin_universe.liquidity_tiers.items():
             expanded.extend(coins)
         return list(set(expanded))
+    
+    # Final fallback to config markets
     return config.exchange.spot_markets
 
 def get_portfolio_metrics() -> Dict[str, Any]:
@@ -106,9 +122,13 @@ def get_all_positions() -> List[Dict[str, Any]]:
                 "unrealized_pnl": float(pos.unrealized_pnl),
                 "liq_price": float(pos.liquidation_price) if pos.liquidation_price else 0.0,
                 
-                # V3 Active Management Fields
-                "stop_loss": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,
-                "tp1": float(pos.tp1_price) if pos.tp1_price else 0.0,
+                # V3 Active Management Fields - using correct field names for dashboard
+                "initial_stop_price": float(pos.initial_stop_price) if pos.initial_stop_price else None,
+                "tp1_price": float(pos.tp1_price) if pos.tp1_price else None,
+                "tp2_price": float(pos.tp2_price) if pos.tp2_price else None,
+                "final_target_price": float(pos.final_target_price) if pos.final_target_price else None,
+                "stop_loss": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,  # Keep for backward compat
+                "tp1": float(pos.tp1_price) if pos.tp1_price else 0.0,  # Keep for backward compat
                 "status": "CONFIRMED" if pos.intent_confirmed else ("TP1 HIT" if pos.tp1_hit else "OPEN"),
                 "liq_distance_pct": liq_dist * 100 if pos.liquidation_price else 0.0,
                 "stop_price": 0.0,  # TODO: Parse from stop_loss_order_id

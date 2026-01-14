@@ -137,6 +137,12 @@ class PositionModel(Base):
     stop_loss_order_id = Column(String, nullable=True)
     take_profit_order_id = Column(String, nullable=True)
     
+    # V3 Active Trade Management fields
+    initial_stop_price = Column(Numeric(precision=20, scale=8), nullable=True)
+    tp1_price = Column(Numeric(precision=20, scale=8), nullable=True)
+    tp2_price = Column(Numeric(precision=20, scale=8), nullable=True)
+    final_target_price = Column(Numeric(precision=20, scale=8), nullable=True)
+    
     opened_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -425,6 +431,11 @@ def save_position(position: Position) -> None:
             position_model.margin_used = position.margin_used
             position_model.stop_loss_order_id = position.stop_loss_order_id
             position_model.take_profit_order_id = position.take_profit_order_id
+            # V3 fields
+            position_model.initial_stop_price = position.initial_stop_price
+            position_model.tp1_price = position.tp1_price
+            position_model.tp2_price = position.tp2_price
+            position_model.final_target_price = position.final_target_price
             position_model.updated_at = datetime.utcnow()
         else:
             # Create new
@@ -441,6 +452,11 @@ def save_position(position: Position) -> None:
                 margin_used=position.margin_used,
                 stop_loss_order_id=position.stop_loss_order_id,
                 take_profit_order_id=position.take_profit_order_id,
+                # V3 fields
+                initial_stop_price=position.initial_stop_price,
+                tp1_price=position.tp1_price,
+                tp2_price=position.tp2_price,
+                final_target_price=position.final_target_price,
                 opened_at=position.opened_at,
             )
             session.add(position_model)
@@ -488,6 +504,11 @@ def sync_active_positions(positions: List[Position]) -> None:
                 pm.margin_used = pos.margin_used
                 pm.stop_loss_order_id = pos.stop_loss_order_id
                 pm.take_profit_order_id = pos.take_profit_order_id
+                # V3 fields
+                pm.initial_stop_price = pos.initial_stop_price
+                pm.tp1_price = pos.tp1_price
+                pm.tp2_price = pos.tp2_price
+                pm.final_target_price = pos.final_target_price
                 pm.updated_at = datetime.utcnow()
             else:
                 # Create
@@ -504,6 +525,11 @@ def sync_active_positions(positions: List[Position]) -> None:
                     margin_used=pos.margin_used,
                     stop_loss_order_id=pos.stop_loss_order_id,
                     take_profit_order_id=pos.take_profit_order_id,
+                    # V3 fields
+                    initial_stop_price=pos.initial_stop_price,
+                    tp1_price=pos.tp1_price,
+                    tp2_price=pos.tp2_price,
+                    final_target_price=pos.final_target_price,
                     opened_at=pos.opened_at,
                 )
                 session.add(pm)
