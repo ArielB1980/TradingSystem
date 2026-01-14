@@ -9,6 +9,9 @@ services:
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xxs
+    routes:
+      - path: /
+
     envs:
       - key: DATABASE_URL
         scope: RUN_TIME
