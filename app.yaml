@@ -1,6 +1,27 @@
 name: tradingsystem
 region: nyc
 services:
+  - name: dashboard
+    github:
+      repo: ArielB1980/TradingSystem
+      branch: main
+    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath /dashboard
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    routes:
+      - path: /dashboard
+    health_check:
+      path: /_stcore/health
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: ENVIRONMENT
+        value: prod
+        scope: RUN_TIME
+        type: GENERAL
+
   - name: web
     github:
       repo: ArielB1980/TradingSystem
@@ -11,7 +32,6 @@ services:
     instance_size_slug: basic-xxs
     routes:
       - path: /
-
     envs:
       - key: DATABASE_URL
         scope: RUN_TIME
@@ -54,25 +74,6 @@ services:
         scope: RUN_TIME
         type: SECRET
       - key: KRAKEN_FUTURES_API_SECRET
-        scope: RUN_TIME
-        type: SECRET
-      - key: ENVIRONMENT
-        value: prod
-        scope: RUN_TIME
-        type: GENERAL
-
-  - name: dashboard
-    github:
-      repo: ArielB1980/TradingSystem
-      branch: main
-    run_command: streamlit run src/dashboard/streamlit_app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.baseUrlPath /dashboard
-    http_port: 8080
-    instance_count: 1
-    instance_size_slug: basic-xxs
-    routes:
-      - path: /dashboard
-    envs:
-      - key: DATABASE_URL
         scope: RUN_TIME
         type: SECRET
       - key: ENVIRONMENT
