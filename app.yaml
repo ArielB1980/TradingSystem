@@ -12,7 +12,7 @@ services:
     routes:
       - path: /dashboard
     health_check:
-      path: /_stcore/health
+      path: /dashboard/_stcore/health
     envs:
       - key: DATABASE_URL
         scope: RUN_TIME
