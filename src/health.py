@@ -109,11 +109,15 @@ async def test_system():
             [sys.executable, test_script],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            timeout=120
+            text=True
         )
         
-        stdout, stderr = process.communicate()
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise
         
         # Parse results (simple check for pass/fail indicators)
         results["status"] = "completed"
