@@ -57,6 +57,23 @@ class Executor:
         # Using defaultdict to create locks on demand
         self._symbol_locks = defaultdict(asyncio.Lock)
         
+    def _normalize_symbol(self, symbol: str) -> str:
+        """
+        Normalize symbol for robust comparison.
+        Handles: PF_MONUSD, MON/USD:USD, MONUSD-PERP, etc.
+        Returns: MONUSD (clean uppercase)
+        """
+        if not symbol: return ""
+        s = symbol.upper()
+        # Remove Kraken prefixes
+        s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
+        # Remove CCXT suffixes
+        s = s.split(':')[0]
+        # Remove separators
+        s = s.replace('/', '').replace('-', '').replace('_', '')
+        return s
+
+        
         # Order monitoring for timeout handling
         from src.execution.order_monitor import OrderMonitor
         self.order_monitor = OrderMonitor(
@@ -197,7 +214,7 @@ class Executor:
                 try:
                     exchange_orders = await self.futures_adapter.kraken_client.get_futures_open_orders()
                     exchange_pending = any(
-                        o.get('symbol', '').upper() == futures_symbol.upper() 
+                        self._normalize_symbol(o.get('symbol', '')) == self._normalize_symbol(futures_symbol)
                         and o.get('side', '').lower() == ('buy' if order_intent.side == Side.LONG else 'sell')
                         for o in exchange_orders
                     )
@@ -220,8 +237,10 @@ class Executor:
                     
                 # Check if we have any pending (open) entry orders for this symbol
                 # We check submitted_orders tracking locally to avoid API latency
+                # Check if we have any pending (open) entry orders for this symbol
+                # We check submitted_orders tracking locally to avoid API latency
                 has_pending = any(
-                    o.symbol == futures_symbol and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
+                    self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol) and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
                     and o.side == order_intent.side # Same side check? Or any side? Generally one order per symbol.
                     for o in self.submitted_orders.values()
                 )
