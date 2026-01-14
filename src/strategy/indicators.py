@@ -272,7 +272,11 @@ class Indicators:
         
         # Single pass through candles (6x faster than multiple list comprehensions)
         for i, c in enumerate(candles):
-            timestamps[i] = c.timestamp
+            # Convert timezone-aware datetime to naive for numpy compatibility
+            ts = c.timestamp
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            timestamps[i] = ts
             opens[i] = float(c.open)
             highs[i] = float(c.high)
             lows[i] = float(c.low)

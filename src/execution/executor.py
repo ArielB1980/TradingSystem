@@ -12,6 +12,8 @@ from decimal import Decimal
 from typing import Dict, Optional, Set
 from datetime import datetime, timezone
 import uuid
+import asyncio
+from collections import defaultdict
 from src.domain.models import Order, OrderIntent, OrderType, OrderStatus, Position, Side
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.price_converter import PriceConverter
@@ -51,6 +53,10 @@ class Executor:
         self.submitted_orders: Dict[str, Order] = {}  # client_order_id → Order
         self.order_intents_seen: Set[str] = set()  # intent hash for deduplication
         
+        # Per-symbol locks to prevent race conditions in parallel processing
+        # Using defaultdict to create locks on demand
+        self._symbol_locks = defaultdict(asyncio.Lock)
+        
         # Order monitoring for timeout handling
         from src.execution.order_monitor import OrderMonitor
         self.order_monitor = OrderMonitor(
@@ -77,12 +83,14 @@ class Executor:
                 # Status
                 status_str = order_data.get('status')
                 status_map = {
-                    'open': OrderStatus.OPEN,
+                    'open': OrderStatus.SUBMITTED,  # Open orders are submitted/pending
                     'closed': OrderStatus.FILLED, 
-                    'canceled': OrderStatus.CANCELLED
+                    'canceled': OrderStatus.CANCELLED,
+                    'pending': OrderStatus.PENDING,
+                    'submitted': OrderStatus.SUBMITTED,
                 }
-                # If we are fetching 'open_orders', they are mostly OPEN/PARTIALLY_FILLED
-                status = status_map.get(status_str, OrderStatus.OPEN)
+                # If we are fetching 'open_orders', they are mostly SUBMITTED/PENDING
+                status = status_map.get(status_str, OrderStatus.SUBMITTED)
                 
                 # Side
                 side_str = order_data.get('side', '').lower()
@@ -156,7 +164,7 @@ class Executor:
         Returns:
             Entry order if submitted, None if rejected
         """
-        # Idempotency check
+        # Idempotency check (before lock for performance)
         intent_hash = self._hash_intent(order_intent)
         if intent_hash in self.order_intents_seen:
             logger.warning(
@@ -168,78 +176,114 @@ class Executor:
         
         futures_symbol = FuturesAdapter.map_spot_to_futures(order_intent.signal.symbol)
         
-        # Pyramiding guard
-        if self.config.pyramiding_enabled is False:
-            # Check if we already have a position in this symbol
-            has_position = any(p.symbol == futures_symbol for p in current_positions)
-            
-            if has_position:
-                logger.warning(
-                    "Pyramiding guard REJECTED",
-                    symbol=futures_symbol,
-                    reason="Pyramiding disabled, position already exists",
-                )
-                return None
+        # CRITICAL: Acquire per-symbol lock to prevent race conditions
+        # This ensures only one order can be processed for a symbol at a time
+        async with self._symbol_locks[futures_symbol]:
+            # Pyramiding guard
+            if self.config.pyramiding_enabled is False:
+                # Check if we already have a position in this symbol
+                has_position = any(p.symbol == futures_symbol for p in current_positions)
                 
-            # Check if we have any pending (open) entry orders for this symbol
-            # We check submitted_orders tracking locally to avoid API latency
-            has_pending = any(
-                o.symbol == futures_symbol and o.status in (OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
-                and o.side == order_intent.side # Same side check? Or any side? Generally one order per symbol.
-                for o in self.submitted_orders.values()
-            )
+                if has_position:
+                    logger.warning(
+                        "Pyramiding guard REJECTED",
+                        symbol=futures_symbol,
+                        reason="Pyramiding disabled, position already exists",
+                    )
+                    return None
+                    
+                # CRITICAL: Check exchange for existing open orders BEFORE placing new order
+                # This prevents duplicate orders if sync missed something or order was placed externally
+                try:
+                    exchange_orders = await self.futures_adapter.kraken_client.get_futures_open_orders()
+                    exchange_pending = any(
+                        o.get('symbol', '').upper() == futures_symbol.upper() 
+                        and o.get('side', '').lower() == ('buy' if order_intent.side == Side.LONG else 'sell')
+                        for o in exchange_orders
+                    )
+                    
+                    if exchange_pending:
+                        logger.warning(
+                            "Duplicate order guard REJECTED - Exchange has pending order",
+                            symbol=futures_symbol,
+                            reason="Open order already exists on exchange"
+                        )
+                        # Sync this order to local state
+                        await self.sync_open_orders()
+                        return None
+                except Exception as e:
+                    logger.warning(
+                        "Failed to check exchange orders, proceeding with local check only",
+                        symbol=futures_symbol,
+                        error=str(e)
+                    )
+                    
+                # Check if we have any pending (open) entry orders for this symbol
+                # We check submitted_orders tracking locally to avoid API latency
+                has_pending = any(
+                    o.symbol == futures_symbol and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
+                    and o.side == order_intent.side # Same side check? Or any side? Generally one order per symbol.
+                    for o in self.submitted_orders.values()
+                )
+                
+                if has_pending:
+                    logger.warning(
+                        "Duplicate order guard REJECTED",
+                        symbol=futures_symbol,
+                        reason="Pending entry order already exists in local state"
+                    )
+                    return None
             
-            if has_pending:
-                logger.warning(
-                    "Duplicate order guard REJECTED",
+            # Place entry order
+            try:
+                entry_order = await self.futures_adapter.place_order(
                     symbol=futures_symbol,
-                    reason="Pending entry order already exists"
+                    side=order_intent.side,
+                    size_notional=order_intent.size_notional,
+                    leverage=order_intent.leverage,
+                    order_type=OrderType.LIMIT if self.config.default_order_type == "limit" else OrderType.MARKET,
+                    price=order_intent.entry_price_futures if self.config.default_order_type == "limit" else None,
+                    reduce_only=False,
+                )
+                
+                # Save converted levels for protective orders
+                entry_order.stop_loss_futures = order_intent.stop_loss_futures
+                entry_order.take_profit_futures = order_intent.take_profit_futures
+                entry_order.size_notional_initial = order_intent.size_notional
+
+                # Track order
+                self.submitted_orders[entry_order.client_order_id] = entry_order
+                self.order_intents_seen.add(intent_hash)
+                
+                # Register with order monitor for timeout tracking
+                self.order_monitor.track_order(entry_order)
+                
+                logger.info(
+                    "Entry order submitted",
+                    symbol=futures_symbol,
+                    order_id=entry_order.order_id,
+                    client_order_id=entry_order.client_order_id,
+                    entry_price=str(order_intent.entry_price_futures),
+                )
+                
+                return entry_order
+                
+            except Exception as e:
+                logger.error(
+                    "Failed to submit entry order",
+                    symbol=order_intent.signal.symbol,
+                    error=str(e),
+                )
+                # CRITICAL: Add intent_hash even on failure to prevent immediate retry
+                # This prevents rapid retry loops when order placement fails
+                # The hash will expire naturally as signals change over time
+                self.order_intents_seen.add(intent_hash)
+                logger.debug(
+                    "Added failed intent to seen set to prevent immediate retry",
+                    symbol=order_intent.signal.symbol,
+                    intent_hash=intent_hash
                 )
                 return None
-        
-        # Place entry order
-        try:
-            futures_symbol = FuturesAdapter.map_spot_to_futures(order_intent.signal.symbol)
-            
-            entry_order = await self.futures_adapter.place_order(
-                symbol=futures_symbol,
-                side=order_intent.side,
-                size_notional=order_intent.size_notional,
-                leverage=order_intent.leverage,
-                order_type=OrderType.LIMIT if self.config.default_order_type == "limit" else OrderType.MARKET,
-                price=order_intent.entry_price_futures if self.config.default_order_type == "limit" else None,
-                reduce_only=False,
-            )
-            
-            # Save converted levels for protective orders
-            entry_order.stop_loss_futures = order_intent.stop_loss_futures
-            entry_order.take_profit_futures = order_intent.take_profit_futures
-            entry_order.size_notional_initial = order_intent.size_notional
-
-            # Track order
-            self.submitted_orders[entry_order.client_order_id] = entry_order
-            self.order_intents_seen.add(intent_hash)
-            
-            # Register with order monitor for timeout tracking
-            self.order_monitor.track_order(entry_order)
-            
-            logger.info(
-                "Entry order submitted",
-                symbol=futures_symbol,
-                order_id=entry_order.order_id,
-                client_order_id=entry_order.client_order_id,
-                entry_price=str(order_intent.entry_price_futures),
-            )
-            
-            return entry_order
-            
-        except Exception as e:
-            logger.error(
-                "Failed to submit entry order",
-                symbol=order_intent.signal.symbol,
-                error=str(e),
-            )
-            return None
     
     async def place_protective_orders(
         self,

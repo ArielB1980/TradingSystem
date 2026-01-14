@@ -154,6 +154,78 @@ class TradingService(multiprocessing.Process):
             
         logger.info("Trading Service Shutting Down...")
 
+    async def _fetch_stop_loss_for_position(self, symbol: str, side: Side) -> Optional[Decimal]:
+        """
+        Fetch existing stop loss order price for a position from exchange.
+        
+        Returns:
+            Stop loss price if found, None otherwise
+        """
+        try:
+            open_orders = await self.kraken.get_futures_open_orders()
+            for order in open_orders:
+                if order.get('symbol') == symbol:
+                    # Check if it's a stop loss order (reduce-only, opposite side)
+                    order_side = order.get('side', '').lower()
+                    is_reduce_only = order.get('reduceOnly', order.get('reduce_only', False))
+                    order_type = order.get('type', '').lower()
+                    
+                    # Stop loss should be opposite side and reduce-only
+                    expected_side = 'sell' if side == Side.LONG else 'buy'
+                    if (order_side == expected_side and 
+                        is_reduce_only and 
+                        ('stop' in order_type or 'stop_loss' in order_type or order_type == 'stop')):
+                        price = order.get('price') or order.get('stopPrice') or order.get('triggerPrice')
+                        if price:
+                            return Decimal(str(price))
+        except Exception as e:
+            logger.error(f"Failed to fetch stop loss for {symbol}", error=str(e))
+        return None
+
+    async def _calculate_emergency_stop_loss(
+        self, 
+        symbol: str,
+        side: Side,
+        entry_price: Decimal,
+        current_price: Decimal,
+        liquidation_price: Decimal
+    ) -> Optional[Decimal]:
+        """
+        Calculate a safe emergency stop loss for an unprotected position.
+        
+        Uses risk-per-trade to determine stop distance, ensuring it's far enough
+        from liquidation price.
+        """
+        try:
+            # Calculate risk per trade (0.3% default)
+            risk_pct = Decimal(str(self.config.risk.risk_per_trade_pct))
+            
+            # For LONG: stop below entry, for SHORT: stop above entry
+            if side == Side.LONG:
+                # Stop loss should be risk_pct below entry
+                stop_price = entry_price * (Decimal("1") - risk_pct)
+                
+                # Ensure stop is at least 35% above liquidation (safety buffer)
+                if liquidation_price > Decimal("0"):
+                    min_stop = liquidation_price * Decimal("1.35")
+                    if stop_price < min_stop:
+                        stop_price = min_stop
+                    
+            else:  # SHORT
+                # Stop loss should be risk_pct above entry
+                stop_price = entry_price * (Decimal("1") + risk_pct)
+                
+                # Ensure stop is at least 35% below liquidation (safety buffer)
+                if liquidation_price > Decimal("0"):
+                    max_stop = liquidation_price * Decimal("0.65")
+                    if stop_price > max_stop:
+                        stop_price = max_stop
+            
+            return stop_price
+        except Exception as e:
+            logger.error(f"Failed to calculate emergency stop for {symbol}", error=str(e))
+            return None
+
     async def _position_management_loop(self):
         """Continuous loop to monitor and manage active positions."""
         logger.info("Starting Position Management Loop...")
@@ -176,22 +248,71 @@ class TradingService(multiprocessing.Process):
                         
                         entry_price = Decimal(str(pos_data.get('entryPrice', pos_data.get('entry_price', 0))))
                         mark_price = Decimal(str(pos_data.get('markPrice', 0)))
+                        liquidation_price = Decimal(str(pos_data.get('liquidationPrice', pos_data.get('liquidation_price', 0))))
+                        side = Side.LONG if pos_data['side'] == 'long' else Side.SHORT
+
+                        # CRITICAL FIX: Fetch existing stop loss from exchange
+                        stop_loss_price = await self._fetch_stop_loss_for_position(symbol, side)
+                        
+                        # If no stop loss found, calculate and place emergency stop
+                        if not stop_loss_price or stop_loss_price == Decimal("0"):
+                            logger.critical(
+                                f"🚨 UNPROTECTED POSITION: {symbol} has NO STOP LOSS! Placing emergency stop...",
+                                entry=str(entry_price),
+                                mark=str(mark_price),
+                                liquidation=str(liquidation_price)
+                            )
+                            
+                            # Calculate safe emergency stop
+                            emergency_stop = await self._calculate_emergency_stop_loss(
+                                symbol,
+                                side,
+                                entry_price,
+                                mark_price,
+                                liquidation_price
+                            )
+                            
+                            if emergency_stop:
+                                try:
+                                    # Place emergency stop loss order
+                                    protective_side = 'sell' if side == Side.LONG else 'buy'
+                                    sl_order = await self.kraken.place_futures_order(
+                                        symbol=symbol,
+                                        side=protective_side,
+                                        order_type='stop',
+                                        size=float(pos_data['size']),
+                                        stop_price=float(emergency_stop),
+                                        reduce_only=True
+                                    )
+                                    stop_loss_price = emergency_stop
+                                    logger.info(
+                                        f"✅ Emergency stop loss placed for {symbol}",
+                                        order_id=sl_order.get('id'),
+                                        stop_price=str(emergency_stop)
+                                    )
+                                except Exception as e:
+                                    logger.critical(
+                                        f"❌ FAILED to place emergency stop for {symbol}",
+                                        error=str(e)
+                                    )
+                                    # Still set the price for monitoring even if order failed
+                                    stop_loss_price = emergency_stop
 
                         self.managed_positions[symbol] = Position(
                             symbol=symbol,
-                            side=Side.LONG if pos_data['side'] == 'long' else Side.SHORT,
+                            side=side,
                             size=Decimal(str(pos_data['size'])),
                             entry_price=entry_price,
                             current_mark_price=mark_price,
                             unrealized_pnl=Decimal(str(pos_data.get('unrealizedPnl', 0))),
                             opened_at=datetime.now(timezone.utc),
-                            # Missing V3 params defaults
-                            initial_stop_price=Decimal("0"),
+                            # CRITICAL FIX: Set actual stop loss price, not 0
+                            initial_stop_price=stop_loss_price if stop_loss_price else None,
                             trade_type="MANUAL",
                             
                             # Required fields
                             size_notional=Decimal(str(pos_data['size'])) * mark_price,
-                            liquidation_price=Decimal("0"),
+                            liquidation_price=liquidation_price if liquidation_price > Decimal("0") else None,
                             leverage=Decimal("1.0"),
                             margin_used=Decimal(str(pos_data.get('margin_used', 0)))
                         )
@@ -201,6 +322,11 @@ class TradingService(multiprocessing.Process):
                     managed_pos.current_mark_price = Decimal(str(pos_data.get('markPrice', 0)))
                     managed_pos.unrealized_pnl = Decimal(str(pos_data.get('unrealizedPnl', 0)))
                     managed_pos.size = Decimal(str(pos_data['size']))
+                    
+                    # Update liquidation price if available
+                    liq_price = Decimal(str(pos_data.get('liquidationPrice', pos_data.get('liquidation_price', 0))))
+                    if liq_price > Decimal("0"):
+                        managed_pos.liquidation_price = liq_price
                     
                     # Evaluate Exit Strategy
                     actions = self.position_manager.evaluate(managed_pos, managed_pos.current_mark_price)
@@ -511,14 +637,68 @@ class TradingService(multiprocessing.Process):
         """Ensure every active position has a stop-loss order."""
         for pos_data in positions:
             symbol = pos_data['symbol']
-            
-            # Check if we have SL ID tracked
             managed_pos = self.managed_positions.get(symbol)
-            if not managed_pos or not managed_pos.stop_loss_order_id:
-                # CRITICAL: Missing protection
-                logger.critical(f"PROTECTION BREACH: {symbol} has no managed stop-loss!")
-                # In V1 this would try to recover/close. 
-                # For V2 we log critical and adoption handles basic setup.
+            
+            if not managed_pos:
+                continue  # Will be handled by adoption logic
+            
+            # CRITICAL CHECK: Stop loss price must be set
+            if not managed_pos.initial_stop_price or managed_pos.initial_stop_price == Decimal("0"):
+                logger.critical(
+                    f"🚨 UNPROTECTED POSITION: {symbol} has NO STOP LOSS PRICE!",
+                    size=str(managed_pos.size),
+                    entry=str(managed_pos.entry_price),
+                    mark=str(managed_pos.current_mark_price),
+                    unrealized_pnl=str(managed_pos.unrealized_pnl)
+                )
+                
+                # Try to place emergency stop loss
+                try:
+                    liquidation_price = managed_pos.liquidation_price or Decimal(str(pos_data.get('liquidationPrice', pos_data.get('liquidation_price', 0))))
+                    emergency_stop = await self._calculate_emergency_stop_loss(
+                        symbol,
+                        managed_pos.side,
+                        managed_pos.entry_price,
+                        managed_pos.current_mark_price,
+                        liquidation_price
+                    )
+                    
+                    if emergency_stop:
+                        protective_side = 'sell' if managed_pos.side == Side.LONG else 'buy'
+                        sl_order = await self.kraken.place_futures_order(
+                            symbol=symbol,
+                            side=protective_side,
+                            order_type='stop',
+                            size=float(managed_pos.size),
+                            stop_price=float(emergency_stop),
+                            reduce_only=True
+                        )
+                        managed_pos.initial_stop_price = emergency_stop
+                        managed_pos.stop_loss_order_id = sl_order.get('id')
+                        logger.info(
+                            f"✅ Emergency stop loss placed for {symbol}",
+                            order_id=sl_order.get('id'),
+                            stop_price=str(emergency_stop)
+                        )
+                except Exception as e:
+                    logger.critical(
+                        f"❌ FAILED to place emergency stop for {symbol}",
+                        error=str(e)
+                    )
+            
+            # Also verify stop loss order exists on exchange
+            elif not managed_pos.stop_loss_order_id:
+                # Check if order exists on exchange
+                existing_sl = await self._fetch_stop_loss_for_position(symbol, managed_pos.side)
+                if existing_sl:
+                    # Update our tracking
+                    managed_pos.initial_stop_price = existing_sl
+                    logger.info(f"✅ Found existing stop loss for {symbol}", price=str(existing_sl))
+                else:
+                    logger.warning(
+                        f"⚠️  {symbol} has stop price but no order ID - verifying on exchange",
+                        stop_price=str(managed_pos.initial_stop_price)
+                    )
 
     async def _record_decision_trace(self, symbol: str, signal: Signal, price: Decimal):
         """Log throttled decision trace for debugging."""

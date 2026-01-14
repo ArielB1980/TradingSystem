@@ -178,28 +178,52 @@ class KrakenClient:
             ticker = self.exchange.fetch_ticker(symbol)
             return ticker
         except Exception as e:
-            logger.error(f"Failed to fetch spot ticker for {symbol}", error=str(e))
+            # Don't log errors for invalid symbols - just skip them silently
+            error_msg = str(e).lower()
+            if "does not have market" in error_msg or "invalid symbol" in error_msg:
+                logger.debug(f"Symbol {symbol} not available on exchange, skipping", error=str(e))
+            else:
+                logger.error(f"Failed to fetch spot ticker for {symbol}", error=str(e))
             raise
 
     async def get_spot_tickers_bulk(self, symbols: List[str]) -> Dict[str, Dict]:
         """
         Get spot tickers for multiple symbols in one call.
         Returns dict: {symbol: ticker_data}
+        Handles invalid symbols gracefully by skipping them.
         """
         await self.public_limiter.wait_for_token()
-        try:
-            # Chunking to avoid URL length limits if list is huge
-            # CCXT usually handles this, but explicit trunking is safer for 250+ coins
-            results = {}
-            chunk_size = 50 
-            for i in range(0, len(symbols), chunk_size):
-                chunk = symbols[i:i + chunk_size]
+        results = {}
+        chunk_size = 50 
+        
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i:i + chunk_size]
+            try:
                 tickers = self.exchange.fetch_tickers(chunk)
                 results.update(tickers)
-            return results
-        except Exception as e:
-            logger.error("Failed to fetch bulk spot tickers", error=str(e))
-            raise
+            except Exception as e:
+                # If bulk fetch fails, try individual fetches for the chunk
+                error_msg = str(e).lower()
+                if "does not have market" in error_msg or "invalid symbol" in error_msg:
+                    # Try fetching individually to identify which symbol(s) are invalid
+                    for symbol in chunk:
+                        try:
+                            ticker = await self.get_spot_ticker(symbol)
+                            results[symbol] = ticker
+                        except:
+                            # Skip invalid symbols silently
+                            pass
+                else:
+                    # For other errors, log and continue with partial results
+                    logger.warning(f"Bulk fetch failed for chunk, trying individual fetches", error=str(e))
+                    for symbol in chunk:
+                        try:
+                            ticker = await self.get_spot_ticker(symbol)
+                            results[symbol] = ticker
+                        except:
+                            pass
+        
+        return results
 
     async def get_spot_ohlcv(
         self,
