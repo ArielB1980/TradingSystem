@@ -43,6 +43,18 @@ def main():
     
     logger.info(f"Services Started. Data PID: {data_service.pid}, Trading PID: {trading_service.pid}")
     
+    # Verify DB Persistence
+    try:
+        from src.storage.repository import record_event
+        record_event("SYSTEM_STARTUP", "system", {
+            "version": config.system.version,
+            "data_pid": data_service.pid,
+            "trading_pid": trading_service.pid
+        })
+        logger.info("Startup Event recorded in DB")
+    except Exception as e:
+        logger.error(f"Failed to record startup event: {e}")
+    
     # Signal Handling
     stop_event = multiprocessing.Event()
     
