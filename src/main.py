@@ -14,6 +14,8 @@ multiprocessing.set_start_method("spawn", force=True)
 
 logger = get_logger("Main")
 
+
+def main():
     print("DEBUG: Starting main...")
     setup_logging()
     print("DEBUG: Logging setup complete.")
