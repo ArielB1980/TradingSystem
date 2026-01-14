@@ -43,6 +43,20 @@ async def ready():
     return {"status": "ready"}
 
 
+@app.get("/dashboard")
+async def dashboard_routing_debug():
+    """Debug endpoint to identify routing issues."""
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Routing Error",
+            "message": "You have reached the WEB service, not the DASHBOARD service.",
+            "detail": "DigitalOcean App Platform is currently routing /dashboard to this container (web). Please check app.yaml routes.",
+            "service": "web"
+        }
+    )
+
+
 
 
 
