@@ -9,13 +9,13 @@ import os
 app = FastAPI(title="Trading System Health Check")
 
 
-@app.get("/")
+@app.get("/api")
 async def root():
     """Root endpoint."""
     return {"status": "ok", "service": "trading-system"}
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     """Health check endpoint for App Platform."""
     # Check if critical environment variables are set
@@ -37,30 +37,27 @@ async def health():
     return JSONResponse(content=checks, status_code=status_code)
 
 
-@app.get("/ready")
+@app.get("/api/ready")
 async def ready():
     """Readiness probe endpoint."""
     return {"status": "ready"}
 
 
-@app.get("/dashboard")
+@app.get("/api/dashboard")
 async def dashboard_routing_debug():
     """Debug endpoint to identify routing issues."""
     return JSONResponse(
         status_code=404,
         content={
             "error": "Routing Error",
-            "message": "You have reached the WEB service, not the DASHBOARD service.",
-            "detail": "DigitalOcean App Platform is currently routing /dashboard to this container (web). Please check app.yaml routes.",
+            "message": "You have reached the WEB service (on /api/dashboard), not the DASHBOARD service.",
+            "detail": "If you see this, DigitalOcean App Platform is correctly routing /api to this container, but /dashboard should go to the dashboard service.",
             "service": "web"
         }
     )
 
 
-
-
-
-@app.get("/quick-test")
+@app.get("/api/quick-test")
 async def quick_test():
     """Quick system connectivity test."""
     results = {
@@ -104,7 +101,7 @@ async def quick_test():
     return JSONResponse(content=results)
 
 
-@app.get("/test")
+@app.get("/api/test")
 async def test_system():
     """Run system tests (API, data, signals)."""
     import asyncio
