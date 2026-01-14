@@ -541,7 +541,40 @@ class KrakenClient:
                     await self.futures_exchange.set_leverage(float(leverage), symbol)
                     logger.debug("Leverage set to isolated", leverage=leverage, symbol=symbol)
                 except Exception as lev_err:
-                    logger.warning("Failed to set leverage explicitly", error=str(lev_err))
+                    # Retry with unified symbol if possible
+                    try:
+                        logger.warning(f"set_leverage failed for {symbol}, trying resolution...", error=str(lev_err))
+                        # Load markets if not loaded
+                        if not self.futures_exchange.markets:
+                            await self.futures_exchange.load_markets()
+                        
+                        # Try to find market by ID (e.g. PF_MONUSD) or other common formats
+                        market = None
+                        
+                        # 1. Exact match by ID
+                        for m in self.futures_exchange.markets.values():
+                            if m['id'] == symbol or m['symbol'] == symbol:
+                                market = m
+                                break
+                        
+                        # 2. Case-insensitive check
+                        if not market:
+                             for m in self.futures_exchange.markets.values():
+                                if m['id'].upper() == symbol.upper():
+                                    market = m
+                                    break
+                        
+                        if market:
+                            unified_symbol = market['symbol']
+                            logger.info(f"Resolved {symbol} -> {unified_symbol} for leverage setting")
+                            await self.futures_exchange.set_leverage(float(leverage), unified_symbol)
+                            logger.info("Leverage set successfully with unified symbol", symbol=unified_symbol)
+                        else:
+                            logger.warning(f"Could not resolve symbol {symbol} for leverage retry")
+                            
+                    except Exception as retry_err:
+                        logger.warning("Failed to set leverage explicitly (retry failed)", error=str(retry_err))
+                    
                     # Fallback: hope params['leverage'] works or user setting is already correct
             
             order = await self.futures_exchange.create_order(
