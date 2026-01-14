@@ -29,11 +29,26 @@ async def test_database():
     print("="*60)
     
     try:
+        from sqlalchemy import text
+        import os
         db = get_db()
+        database_url = os.getenv("DATABASE_URL", "")
+        
         with db.get_session() as session:
-            result = session.execute("SELECT version();")
-            version = result.fetchone()[0]
-            print(f"✅ Database connected: {version[:50]}...")
+            # Use database-specific query
+            if database_url.startswith("postgresql"):
+                result = session.execute(text("SELECT version();"))
+                version = result.fetchone()[0]
+                print(f"✅ Database connected: PostgreSQL {version.split(',')[0].split()[-1]}")
+            elif database_url.startswith("sqlite"):
+                result = session.execute(text("SELECT sqlite_version();"))
+                version = result.fetchone()[0]
+                print(f"✅ Database connected: SQLite {version}")
+            else:
+                # Generic test - just try to query
+                result = session.execute(text("SELECT 1;"))
+                result.fetchone()
+                print(f"✅ Database connected: {database_url.split('://')[0] if database_url else 'default'}")
             return True
     except Exception as e:
         print(f"❌ Database connection failed: {e}")

@@ -48,9 +48,12 @@ async def test_system():
     """Run system tests (API, data, signals)."""
     import asyncio
     import concurrent.futures
-    from src.test_system import run_all_tests
+    import traceback
     
     try:
+        # Import here to avoid issues at module level
+        from src.test_system import run_all_tests
+        
         # Run async tests in thread pool (FastAPI already has event loop)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(asyncio.run, run_all_tests())
@@ -63,12 +66,18 @@ async def test_system():
         })
     except concurrent.futures.TimeoutError:
         return JSONResponse(
-            content={"status": "timeout", "message": "Tests took too long"},
+            content={"status": "timeout", "message": "Tests took too long (120s timeout)"},
             status_code=504
         )
     except Exception as e:
+        error_msg = str(e)
+        error_trace = traceback.format_exc()
         return JSONResponse(
-            content={"status": "error", "message": str(e)},
+            content={
+                "status": "error",
+                "message": error_msg,
+                "traceback": error_trace[:500]  # Limit traceback length
+            },
             status_code=500
         )
 
