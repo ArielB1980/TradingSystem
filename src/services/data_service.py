@@ -150,14 +150,14 @@ class DataService(multiprocessing.Process):
                 
                 try:
                     # 1. Primary Polling: 15m (Every loop)
-                    candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=3)
+                    candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=100)
                     if candles_15m:
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                         
                     # 2. Secondary Polling: 1h (Every ~15m loop equivalent or throttled)
                     # For simplicity, we can poll them but at higher sleep or random?
                     # Let's just poll them every time for now as 3 calls is cheap.
-                    candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=2)
+                    candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=100)
                     if candles_1h:
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
 
@@ -165,7 +165,7 @@ class DataService(multiprocessing.Process):
                     # We can use time-based check per symbol if we want to be hyper-optimized.
                     # But 3 requests per symbol is still well within 15/s limit (200 symbols * 3 = 600 total).
                     # Loop takes 60s. 600 calls / 60s = 10 calls/s. Still safe.
-                    candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=2)
+                    candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=100)
                     if candles_4h:
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                         
