@@ -82,10 +82,23 @@ class DataService(multiprocessing.Process):
             
         logger.info("Data Service Shutting Down...")
             
+    def _get_active_markets(self) -> List[str]:
+        """Resolve list of active markets based on config."""
+        if self.config.coin_universe.enabled:
+            # Aggregate all tiers
+            markets = []
+            for tier_list in self.config.coin_universe.liquidity_tiers.values():
+                markets.extend(tier_list)
+            # Dedup and sort
+            return sorted(list(set(markets)))
+        else:
+            return self.config.exchange.spot_markets
+
     async def _perform_background_hydration(self):
         """Crawl DB for history and push updates. Runs once for full history, then periodically for gaps."""
         logger.info("Starting background hydration task...")
-        markets = self.config.exchange.spot_markets
+        markets = self._get_active_markets()
+        logger.info(f"Hydrating {len(markets)} markets")
         
         # 1. INITIAL FULL HYDRATION
         scopes_initial = [
@@ -139,8 +152,8 @@ class DataService(multiprocessing.Process):
 
     async def _perform_live_polling(self):
         """Poll API for latest candles."""
-        logger.info("Starting Live Polling...")
-        markets = self.config.exchange.spot_markets
+        markets = self._get_active_markets()
+        logger.info(f"Starting Live Polling for {len(markets)} markets...")
         
         while self.active:
             loop_start = time.time()
