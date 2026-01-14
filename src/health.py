@@ -47,36 +47,52 @@ async def ready():
 async def test_system():
     """Run system tests (API, data, signals)."""
     import asyncio
-    import concurrent.futures
-    import traceback
+    import subprocess
+    import sys
+    import os
+    
+    results = {
+        "status": "running",
+        "tests": {}
+    }
     
     try:
-        # Import here to avoid issues at module level
-        from src.test_system import run_all_tests
+        # Run test script as subprocess to avoid event loop conflicts
+        test_script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "src", "test_system.py")
         
-        # Run async tests in thread pool (FastAPI already has event loop)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, run_all_tests())
-            result = future.result(timeout=120)  # 2 minute timeout
+        # Use subprocess to run tests in separate process
+        process = subprocess.Popen(
+            [sys.executable, test_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120
+        )
         
-        return JSONResponse(content={
-            "status": "success" if result else "failed",
-            "message": "System tests completed",
-            "all_tests_passed": result
-        })
-    except concurrent.futures.TimeoutError:
+        stdout, stderr = process.communicate()
+        
+        # Parse results (simple check for pass/fail indicators)
+        results["status"] = "completed"
+        results["output"] = stdout[:1000]  # Limit output
+        results["exit_code"] = process.returncode
+        results["all_passed"] = process.returncode == 0
+        
+        if stderr:
+            results["errors"] = stderr[:500]
+        
+        return JSONResponse(content=results)
+        
+    except subprocess.TimeoutExpired:
         return JSONResponse(
             content={"status": "timeout", "message": "Tests took too long (120s timeout)"},
             status_code=504
         )
     except Exception as e:
-        error_msg = str(e)
-        error_trace = traceback.format_exc()
         return JSONResponse(
             content={
                 "status": "error",
-                "message": error_msg,
-                "traceback": error_trace[:500]  # Limit traceback length
+                "message": str(e),
+                "type": type(e).__name__
             },
             status_code=500
         )
