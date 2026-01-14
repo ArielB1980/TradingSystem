@@ -279,6 +279,12 @@ class LiveConfig(BaseSettings):
     max_paper_drawdown_pct: float = Field(default=0.15, ge=0.10, le=0.30)
 
 
+class SystemConfig(BaseSettings):
+    """System metadata."""
+    name: str = "Trading System"
+    version: str = "3.0.0"
+
+
 class Config(BaseSettings):
     """Main configuration class."""
     model_config = SettingsConfigDict(
@@ -288,6 +294,7 @@ class Config(BaseSettings):
         extra="ignore",
     )
     
+    system: SystemConfig = Field(default_factory=SystemConfig)
     exchange: ExchangeConfig
     risk: RiskConfig
     strategy: StrategyConfig
