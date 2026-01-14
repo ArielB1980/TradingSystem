@@ -14,14 +14,18 @@ multiprocessing.set_start_method("spawn", force=True)
 
 logger = get_logger("Main")
 
-def main():
+    print("DEBUG: Starting main...")
     setup_logging()
+    print("DEBUG: Logging setup complete.")
     logger.info("Initializing Architecture v2 (Multiprocessing)...")
     
     # Load Config
     try:
+        print("DEBUG: Loading config...")
         config = load_config()
+        print("DEBUG: Config loaded successfully.")
     except Exception as e:
+        print(f"DEBUG: Config Load Failed: {e}")
         logger.critical(f"Failed to load config: {e}")
         sys.exit(1)
         
