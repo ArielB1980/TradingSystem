@@ -271,9 +271,16 @@ class LiveTrading:
         Returns:
             List of active positions (dicts)
         """
-        # Phase 2 Fix: Accept pre-fetched positions to avoid duplicate API calls
         if raw_positions is None:
-            raw_positions = await self.client.get_all_futures_positions()
+            try:
+                # Add timeout to prevent hanging the main loop
+                raw_positions = await asyncio.wait_for(self.client.get_all_futures_positions(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error("Timeout fetching futures positions during sync")
+                raw_positions = []
+            except Exception as e:
+                logger.error("Failed to fetch futures positions", error=str(e))
+                raw_positions = []
         
         # Convert to Domain Objects
         active_positions = []
