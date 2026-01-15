@@ -123,14 +123,14 @@ class KrakenClient:
         if self.futures_api_secret:
             self.futures_api_secret = sanitize_secret(self.futures_api_secret)
         
-        # Initialize CCXT exchange (Spot - Sync)
-        print(f"DEBUG: KrakenClient Init - CCXT Spot (Sync) Starting...", flush=True)
-        self.exchange = ccxt.kraken({
+        # Initialize CCXT exchange (Spot - ASYNC)
+        print(f"DEBUG: KrakenClient Init - CCXT Spot (ASYNC) Starting...", flush=True)
+        self.exchange = ccxt_async.kraken({
             'apiKey': self.api_key,
             'secret': self.api_secret,
             'enableRateLimit': True,
         })
-        print(f"DEBUG: KrakenClient Init - CCXT Spot (Sync) Done", flush=True)
+        print(f"DEBUG: KrakenClient Init - CCXT Spot (ASYNC) Done", flush=True)
         
         # Initialize CCXT Futures Exchange (Futures - Async)
         if self.futures_api_key and self.futures_api_secret:
@@ -166,12 +166,8 @@ class KrakenClient:
         await self.private_limiter.wait_for_token()
         
         try:
-            # Note: fetch_balance is synchronous in standard ccxt, but here we invoke it 
-            # within an async method. If self.exchange is sync, this blocks the loop briefly.
-            # However, for this check script it's fine. 
-            # Ideally we'd use run_in_executor or async ccxt for spot too, 
-            # but we are careful not to break existing spot code.
-            balance = self.exchange.fetch_balance()
+            # Now fully async
+            balance = await self.exchange.fetch_balance()
             logger.debug("Fetched spot balance")
             return balance
         except Exception as e:
@@ -182,7 +178,7 @@ class KrakenClient:
         """Get current spot ticker information."""
         await self.public_limiter.wait_for_token()
         try:
-            ticker = self.exchange.fetch_ticker(symbol)
+            ticker = await self.exchange.fetch_ticker(symbol)
             return ticker
         except Exception as e:
             # Don't log errors for invalid symbols - just skip them silently
@@ -206,7 +202,7 @@ class KrakenClient:
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i:i + chunk_size]
             try:
-                tickers = self.exchange.fetch_tickers(chunk)
+                tickers = await self.exchange.fetch_tickers(chunk)
                 results.update(tickers)
             except Exception as e:
                 # If bulk fetch fails, try individual fetches for the chunk
@@ -254,7 +250,7 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         
         try:
-            ohlcv = self.exchange.fetch_ohlcv(
+            ohlcv = await self.exchange.fetch_ohlcv(
                 symbol, timeframe, since=since, limit=limit
             )
             
@@ -739,6 +735,8 @@ class KrakenClient:
         """Cleanup resources."""
         if self.futures_exchange:
             await self.futures_exchange.close()
+        if self.exchange:
+            await self.exchange.close()
 
     def _get_ssl_context(self) -> ssl.SSLContext:
         """
