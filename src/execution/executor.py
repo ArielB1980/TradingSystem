@@ -57,6 +57,14 @@ class Executor:
         # Using defaultdict to create locks on demand
         self._symbol_locks = defaultdict(asyncio.Lock)
         
+        # Order monitoring for timeout handling
+        from src.execution.order_monitor import OrderMonitor
+        self.order_monitor = OrderMonitor(
+            default_timeout_seconds=config.order_timeout_seconds
+        )
+        
+        logger.info("Executor initialized", config=config.model_dump())
+        
     def _normalize_symbol(self, symbol: str) -> str:
         """
         Normalize symbol for robust comparison.
