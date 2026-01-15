@@ -86,7 +86,10 @@ class TradingService:
         
         # Initial Sync
         try:
-            await self.executor.sync_open_orders()
+            # Wrap in timeout to prevent startup hang
+            await asyncio.wait_for(self.executor.sync_open_orders(), timeout=45.0)
+        except asyncio.TimeoutError:
+            logger.error("Timeout during initial order sync - proceeding with caution")
         except Exception as e:
             logger.error(f"Failed to sync orders: {e}")
         
@@ -712,7 +715,7 @@ class TradingService:
         
         # Dynamic Throttle
         if signal.signal_type == SignalType.NO_SIGNAL:
-            throttle = 3600 # 1 hour for Heartbeats
+            throttle = 600 # 10 mins for Heartbeats (Revised from 1 hour)
         else:
             throttle = 300 # 5 mins for Active Signals
 

@@ -378,7 +378,8 @@ class KrakenClient:
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         raise Exception(f"Futures API error: {await response.text()}")
