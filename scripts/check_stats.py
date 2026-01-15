@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.append(os.getcwd())
 
 from src.storage.db import get_db, Base
-from src.storage.repository import SystemEventModel, TradeModel
+from src.storage.repository import SystemEventModel, TradeModel, CandleModel
 
 def main():
     db_url = os.getenv("DATABASE_URL")
@@ -38,9 +38,11 @@ def main():
         # Debug Totals
         total_events = session.query(SystemEventModel).count()
         total_trades = session.query(TradeModel).count()
+        total_candles = session.query(CandleModel).count()
         print(f"\n--- Total Database State ---")
         print(f"Total System Events: {total_events}")
         print(f"Total Trades: {total_trades}")
+        print(f"Total Candles Stored: {total_candles}")
         
         print(f"\n--- Statistics for last {args.hours} hours (since {cutoff.strftime('%Y-%m-%d %H:%M:%S UTC')}) ---")
 
