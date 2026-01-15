@@ -81,14 +81,7 @@ class Executor:
         s = s.replace('/', '').replace('-', '').replace('_', '')
         return s
 
-        
-        # Order monitoring for timeout handling
-        from src.execution.order_monitor import OrderMonitor
-        self.order_monitor = OrderMonitor(
-            default_timeout_seconds=config.order_timeout_seconds
-        )
-        
-        logger.info("Executor initialized", config=config.model_dump())
+
         
     async def sync_open_orders(self) -> None:
         """
