@@ -1,8 +1,7 @@
-import multiprocessing
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
-from queue import Empty
+from asyncio import Queue, QueueEmpty
 from decimal import Decimal
 
 from src.config.config import Config
@@ -23,13 +22,12 @@ from src.monitoring.kill_switch import get_kill_switch
 
 logger = get_logger("TradingService")
 
-class TradingService(multiprocessing.Process):
+class TradingService:
     """
-    Dedicated process for Tick Processing, Strategy Analysis, and Order Execution.
-    Consumes MarketUpdate events from DataService.
+    Async Service for Tick Processing, Strategy Analysis, and Order Execution.
+    Runs as a Task within the main event loop.
     """
-    def __init__(self, input_queue: multiprocessing.Queue, command_queue: multiprocessing.Queue, config: Config):
-        super().__init__()
+    def __init__(self, input_queue: Queue, command_queue: Queue, config: Config):
         self.input_queue = input_queue
         self.command_queue = command_queue
         self.config = config
@@ -47,13 +45,12 @@ class TradingService(multiprocessing.Process):
         self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
         self.last_trace_log: Dict[str, datetime] = {}
         
-    def run(self):
-        setup_logging()
-        logger.info("Trading Service Process Started (PID %s)", self.pid)
+    async def start(self):
+        logger.info("Trading Service Task Starting...")
         try:
-            asyncio.run(self._service_loop())
-        except KeyboardInterrupt:
-            logger.info("Trading Service stopped by User")
+            await self._service_loop()
+        except asyncio.CancelledError:
+            logger.info("Trading Service Cancelled")
         except Exception as e:
             logger.critical(f"Trading Service Crashed: {e}", exc_info=True)
 
@@ -144,7 +141,7 @@ class TradingService(multiprocessing.Process):
                     except Exception as e:
                         logger.error(f"Maintenance failed: {e}")
 
-            except Empty:
+            except QueueEmpty:
                 pass
             except Exception as e:
                 logger.error(f"Error in Trading Loop: {e}")

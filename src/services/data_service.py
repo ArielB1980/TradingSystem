@@ -1,9 +1,8 @@
-import multiprocessing
 import asyncio
 import time
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
-from queue import Empty
+from asyncio import Queue, QueueEmpty
 
 from src.config.config import Config
 from src.monitoring.logger import get_logger, setup_logging
@@ -14,35 +13,24 @@ from src.domain.models import Candle
 
 logger = get_logger("DataService")
 
-class DataService(multiprocessing.Process):
+class DataService:
     """
-    Dedicated process for Data Ingestion and Hydration.
-    Runs an asyncio loop isolated from the Trading Engine.
+    Async Service for Data Ingestion and Hydration.
+    Runs as a Task within the main event loop.
     """
-    def __init__(self, output_queue: multiprocessing.Queue, command_queue: multiprocessing.Queue, config: Config):
-        super().__init__()
+    def __init__(self, output_queue: Queue, command_queue: Queue, config: Config):
         self.output_queue = output_queue
         self.command_queue = command_queue
         self.config = config
         self.active = True
         
-    def run(self):
-        """Entry point for the separate process."""
-        import sys
-        import os
-        print(f"DEBUG: DataService Process Starting (PID {self.pid})", flush=True)
-        
-        db_url = os.getenv("DATABASE_URL", "NOT_SET")
-        masked = db_url.split("@")[-1] if "@" in db_url else "LOCAL"
-        print(f"DEBUG: DataService Env DB_URL: {masked}", flush=True)
-
-        setup_logging()
-        logger.info("Data Service Process Started (PID %s)", self.pid)
-        
+    async def start(self):
+        """Entry point for the async task."""
+        logger.info("Data Service Task Starting...")
         try:
-            asyncio.run(self._service_loop())
-        except KeyboardInterrupt:
-            logger.info("Data Service stopped by User")
+            await self._service_loop()
+        except asyncio.CancelledError:
+             logger.info("Data Service Cancelled")
         except Exception as e:
             logger.critical(f"Data Service Crashed: {e}", exc_info=True)
             
@@ -77,20 +65,19 @@ class DataService(multiprocessing.Process):
         
         while self.active:
             # 1. Process Commands
-            try:
-                while not self.command_queue.empty():
-                    try:
-                        cmd = self.command_queue.get_nowait()
-                        if cmd.command == "STOP":
-                            logger.info("Received STOP command")
-                            self.active = False
-                            break
-                        elif cmd.command == "PING":
-                            self._send_status("RUNNING", {"pong": time.time()})
-                    except Empty:
+            while not self.command_queue.empty():
+                try:
+                    cmd = self.command_queue.get_nowait()
+                    if cmd.command == "STOP":
+                        logger.info("Received STOP command")
+                        self.active = False
                         break
-            except Exception as e:
-                logger.error(f"Command processing error: {e}")
+                    elif cmd.command == "PING":
+                        self._send_status("RUNNING", {"pong": time.time()})
+                except QueueEmpty:
+                    break
+        except Exception as e:
+            logger.error(f"Command processing error: {e}")
             
             if not self.active:
                 break
