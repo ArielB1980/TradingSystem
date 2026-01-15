@@ -119,11 +119,11 @@ class DataService:
         # 2. PERIODIC GAP FILLING (Every 10 minutes, check last 24h)
         while self.active:
             await asyncio.sleep(600) # Wait 10 mins
-            logger.info("Starting periodic gap-fill hydration...")
+            logging.info("Starting periodic gap-fill hydration...")
             scopes_periodic = [
-                ("15m", 1),
-                ("1h", 1),
-                ("4h", 1)
+                ("15m", 3), # Increased from 1 to 3 days to cover EMA 200 (~2.1 days)
+                ("1h", 7),  # Increased from 1 to 7 days for safety
+                ("4h", 30)  # Increased from 1 to 30 days
             ]
             await self._run_hydration_cycle(markets, scopes_periodic)
 
@@ -174,9 +174,9 @@ class DataService:
                 async with sem:
                     if not self.active: return
                     
-                    # Determine limit: 100 for first run (Bootstrap), 3 for updates (Incremental)
+                    # Determine limit: 300 for first run (Bootstrap), 3 for updates (Incremental)
                     is_bootstrap = symbol not in bootstrapped_symbols
-                    limit = 100 if is_bootstrap else 3
+                    limit = 300 if is_bootstrap else 3
                     
                     try:
                         # 1. Primary Polling: 15m (Every loop)
