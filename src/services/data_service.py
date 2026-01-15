@@ -148,7 +148,7 @@ class DataService:
                             timeframe=tf, 
                             is_historical=True
                         )
-                        self.output_queue.put(msg)
+                        self.output_queue.put_nowait(msg)
                         
                 except Exception as e:
                     logger.error(f"Hydration error for {symbol}: {e}")
@@ -179,7 +179,7 @@ class DataService:
                     if candles_15m:
                         # Persist to DB
                         await asyncio.to_thread(save_candles_bulk, candles_15m)
-                        self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
+                        self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                         # Mark as bootstrapped if successful
                         if is_bootstrap:
                             bootstrapped_symbols.add(symbol)
@@ -190,7 +190,7 @@ class DataService:
                     candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit)
                     if candles_1h:
                         await asyncio.to_thread(save_candles_bulk, candles_1h)
-                        self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
+                        self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
 
                     # 3. Tertiary Polling: 4h (Occasionally)
                     # We can use time-based check per symbol if we want to be hyper-optimized.
@@ -199,7 +199,7 @@ class DataService:
                     candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit)
                     if candles_4h:
                         await asyncio.to_thread(save_candles_bulk, candles_4h)
-                        self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
+                        self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                         
                 except Exception as e:
                    # CRITICAL DEBUG: Using error level to see why persistence fails
@@ -219,4 +219,4 @@ class DataService:
             timestamp=datetime.now(timezone.utc),
             details=details
         )
-        self.output_queue.put(msg)
+        self.output_queue.put_nowait(msg)
