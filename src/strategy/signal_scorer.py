@@ -4,7 +4,7 @@ Signal quality scoring system for V2.
 Scores each signal on multiple factors to prioritize opportunities.
 Used for dashboard display and future trade selection optimization.
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from decimal import Decimal
 from dataclasses import dataclass
 
