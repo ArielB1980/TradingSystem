@@ -10,9 +10,16 @@ import yaml
 from pathlib import Path
 from decimal import Decimal
 from dotenv import load_dotenv
+import os
 
-# Load env immediately
+# Load .env first (default)
 load_dotenv()
+
+# Load .env.local if it exists (overrides .env)
+env_local_path = Path(__file__).parent.parent.parent / ".env.local"
+if env_local_path.exists():
+    load_dotenv(dotenv_path=env_local_path, override=True)
+
 
 
 class ExchangeConfig(BaseSettings):
@@ -40,6 +47,20 @@ class RiskConfig(BaseSettings):
     # Position sizing
     risk_per_trade_pct: float = Field(default=0.005, ge=0.0001, le=0.05)
     max_leverage: float = Field(default=10.0, ge=1.0, le=10.0)
+
+    # Sizing Method: fixed, kelly, volatility, kelly_volatility
+    sizing_method: Literal["fixed", "kelly", "volatility", "kelly_volatility"] = "fixed"
+    
+    # Kelly Criterion Settings
+    kelly_win_prob: float = Field(default=0.55, ge=0.1, le=0.9)
+    kelly_win_loss_ratio: float = Field(default=2.0, ge=1.0)
+    kelly_max_fraction: float = Field(default=0.25, ge=0.01, le=1.0) # Cap Kelly (Quarter Kelly usually safe)
+    
+    # Volatility Sizing Settings
+    vol_sizing_atr_threshold_high: float = Field(default=1.5, ge=1.0) # Reduce size if ATR > 1.5x Avg
+    vol_sizing_atr_threshold_low: float = Field(default=0.5, le=1.0) # Increase size if ATR < 0.5x Avg
+    vol_sizing_high_vol_penalty: float = Field(default=0.30, le=0.9) # -30% size
+    vol_sizing_low_vol_boost: float = Field(default=0.20, le=0.5) # +20% size
     
     # Liquidation safety
     min_liquidation_buffer_pct: float = Field(default=0.35, ge=0.30, le=0.50)
@@ -143,10 +164,28 @@ class StrategyConfig(BaseSettings):
     # Fib Enforcement
     fib_proximity_bps: float = Field(default=20.0, ge=0.0, le=100.0) # 0.2%
 
+
     # V3: Market Structure Change Confirmation
     require_ms_change_confirmation: bool = Field(default=True)
     ms_confirmation_candles: int = Field(default=3, ge=1, le=10)
     ms_reconfirmation_candles: int = Field(default=2, ge=1, le=10)
+    
+    # V4: Adaptive Strategy Logic
+    adaptive_enabled: bool = True
+    atr_confirmation_threshold_high: float = Field(default=1.5, ge=1.0) # > 1.5x avg ATR -> High Vol
+    atr_confirmation_threshold_low: float = Field(default=0.5, le=1.0) # < 0.5x avg ATR -> Low Vol
+    base_confirmation_candles: int = 3
+    max_confirmation_candles: int = 5
+    min_confirmation_candles: int = 2
+    
+    # RSI Divergence
+    rsi_divergence_check: bool = True
+    rsi_divergence_lookback: int = 20
+
+    # Exits
+    abandon_ship_enabled: bool = True
+    time_based_exit_bars: int = Field(default=20, ge=5) # Bars to hold without TP before exit
+
 
 
 
@@ -283,6 +322,7 @@ class SystemConfig(BaseSettings):
     """System metadata."""
     name: str = "Trading System"
     version: str = "3.0.0"
+    dry_run: bool = False  # If True, no real orders are placed
 
 
 class Config(BaseSettings):
@@ -337,7 +377,25 @@ class Config(BaseSettings):
         import os
         if "ENVIRONMENT" in os.environ:
             config_dict["environment"] = os.environ["ENVIRONMENT"]
-        
+            
+        # Default local DB if not provided and not in prod
+        if config_dict.get("environment") != "prod" and not config_dict.get("data", {}).get("database_url"):
+            # Ensure .local directory exists
+            local_dir = Path("./.local")
+            local_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Set default SQLite URL
+            if "data" not in config_dict:
+                config_dict["data"] = {}
+            config_dict["data"]["database_url"] = "sqlite:///./.local/bot.db"
+            
+        # Force dry_run if not explicitly set in local/dev
+        if config_dict.get("environment") != "prod":
+            if "system" not in config_dict:
+                config_dict["system"] = {}
+            if "dry_run" not in config_dict["system"]:
+                config_dict["system"]["dry_run"] = True
+
         return cls(**config_dict)
 
     def validate_config(self) -> None:

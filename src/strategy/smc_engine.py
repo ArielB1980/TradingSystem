@@ -107,6 +107,7 @@ class SMCEngine:
         structure_signal = None
         adx_value = 0.0
         atr_value = 0.0
+        atr_ratio = None
         tp_candidates = []
         
         # Logic Flow
@@ -126,9 +127,45 @@ class SMCEngine:
             # Update market structure tracking
             ms_state, ms_change = self.ms_tracker.update_structure(symbol, exec_candles_1h)
             
+            # V4: Adaptive Confirmation Logic
+            required_candles = None
+            if self.config.adaptive_enabled:
+                # Dynamic Logic based on Volatility State
+                try:
+                    atr_series = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+                    if not atr_series.empty:
+                        current_atr = atr_series.iloc[-1]
+                        # Use 20-period moving average of ATR as baseline
+                        avg_atr = atr_series.rolling(20).mean().iloc[-1]
+                        
+                        if avg_atr > 0:
+                            # Calculate ratio (float for local logic, Decimal for Signal if needed)
+                            ratio_val = float(current_atr / avg_atr)
+                            atr_ratio = Decimal(str(ratio_val))
+                            
+                            # Store for Signal metadata (Risk Manager needs this)
+                            atr_value = float(current_atr)
+
+                            if ratio_val > self.config.atr_confirmation_threshold_high:
+                                required_candles = self.config.max_confirmation_candles
+                                reasoning_parts.append(f"🌊 High Volatility (ATR Ratio {ratio_val:.2f}) -> Extended Confirmation ({required_candles} candles)")
+                            elif ratio_val < self.config.atr_confirmation_threshold_low:
+                                required_candles = self.config.min_confirmation_candles
+                                # reasoning_parts.append(f"💧 Low Volatility (ATR Ratio {ratio_val:.2f}) -> Reduced Confirmation ({required_candles} candles)")
+
+                except Exception as e:
+                    # Fallback to default if ATR calc fails
+                    logger.warning("Adaptive confirmation failed, using default", error=str(e))
+
+            
             if ms_change:
                 # Structure change detected - check confirmation
-                confirmed = self.ms_tracker.check_confirmation(symbol, exec_candles_1h, ms_change)
+                confirmed = self.ms_tracker.check_confirmation(
+                    symbol, 
+                    exec_candles_1h, 
+                    ms_change,
+                    required_candles=required_candles # Dynamic
+                )
                 
                 if confirmed:
                     # Check reconfirmation (entry ready)
@@ -139,6 +176,24 @@ class SMCEngine:
                         bias,
                         reasoning_parts,
                     )
+                    
+                    # V4: RSI Divergence Check (Gate before Reconfirmation)
+                    if self.config.rsi_divergence_check:
+                         rsi_values = self.indicators.calculate_rsi(exec_candles_1h, self.config.rsi_period)
+                         divergence = self.indicators.detect_rsi_divergence(exec_candles_1h, rsi_values, self.config.rsi_divergence_lookback)
+                         
+                         if divergence != "none":
+                             # If Bias is Bullish but Bearish Divergence -> Weakness
+                             if bias == "bullish" and divergence == "bearish":
+                                 reasoning_parts.append(f"⚠️ Bearish RSI Divergence detected against Bullish bias")
+                                 # We could reject or reduce size. For now, strict:
+                                 # signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1]) 
+                                 # Let's just log it for scoring to penalize
+                             
+                             elif bias == "bearish" and divergence == "bullish":
+                                 reasoning_parts.append(f"⚠️ Bullish RSI Divergence detected against Bearish bias")
+
+
                     
                     entry_zone = None
                     if structure_signal:
@@ -328,6 +383,7 @@ class SMCEngine:
                         higher_tf_bias=bias,
                         adx=adx_value,
                         atr=atr_value,
+                        atr_ratio=atr_ratio,
                         ema200_slope=ema200_slope,
                         tp_candidates=tp_candidates
                     )
@@ -390,6 +446,7 @@ class SMCEngine:
                             higher_tf_bias=bias,
                             adx=adx_value,
                             atr=atr_value,
+                            atr_ratio=atr_ratio,
                             ema200_slope=ema200_slope,
                             tp_candidates=tp_candidates,
                             score_breakdown={

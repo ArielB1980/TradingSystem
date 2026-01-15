@@ -4,6 +4,7 @@ CLI entrypoint for the Kraken Futures SMC Trading System.
 Provides commands for backtest, paper, live, status, and kill-switch.
 """
 import typer
+from typing import Optional
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
@@ -137,6 +138,7 @@ def paper(
 def live(
     config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
     force: bool = typer.Option(False, "--force", help="Force live trading (bypass safety gates)"),
+    log_file: Optional[Path] = typer.Option(None, "--log-file", help="Path to log file"),
 ):
     """
     Run live trading on Kraken Futures (REAL CAPITAL AT RISK).
@@ -148,10 +150,10 @@ def live(
     """
     # Load configuration
     config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    setup_logging(config.monitoring.log_level, config.monitoring.log_format, log_file=str(log_file) if log_file else None)
     
     # Validate environment
-    if config.environment != "prod":
+    if config.environment != "prod" and not force and not config.system.dry_run:
         typer.secho(
             f"❌ Environment is '{config.environment}', not 'prod'. Set environment='prod' in config for live trading.",
             fg=typer.colors.RED,
