@@ -107,6 +107,7 @@ class KrakenClient:
         self.api_secret = api_secret
         self.futures_api_key = futures_api_key
         self.futures_api_secret = futures_api_secret
+        self.use_testnet = use_testnet
         
         # Helper to sanitize base64 secrets
         def sanitize_secret(secret: str) -> str:
@@ -123,29 +124,47 @@ class KrakenClient:
         if self.futures_api_secret:
             self.futures_api_secret = sanitize_secret(self.futures_api_secret)
         
-        # Initialize CCXT exchange (Spot - ASYNC)
-        print(f"DEBUG: KrakenClient Init - CCXT Spot (ASYNC) Starting...", flush=True)
-        self.exchange = ccxt_async.kraken({
-            'apiKey': self.api_key,
-            'secret': self.api_secret,
-            'enableRateLimit': True,
-        })
-        print(f"DEBUG: KrakenClient Init - CCXT Spot (ASYNC) Done", flush=True)
+        self.exchange = None
+        self.futures_exchange = None
         
+        # Rate limiters (configurable per endpoint group)
+        self.public_limiter = RateLimiter(capacity=PUBLIC_API_CAPACITY, refill_rate=PUBLIC_API_REFILL_RATE)
+        self.private_limiter = RateLimiter(capacity=PRIVATE_API_CAPACITY, refill_rate=PRIVATE_API_REFILL_RATE)
+        
+        # Reusable SSL context
+        self._ssl_context = None
+        
+        logger.info("Kraken client configuration loaded")
+    
+    async def initialize(self):
+        """
+        Lazy initialization of CCXT exchanges.
+        MUST be called inside the running event loop of the target process.
+        """
+        print(f"DEBUG: KrakenClient ({id(self)}) Lazy Initializing...", flush=True)
+        
+        # Initialize CCXT exchange (Spot - ASYNC)
+        if not self.exchange:
+            print(f"DEBUG: KrakenClient - Spot Exchange Init", flush=True)
+            self.exchange = ccxt_async.kraken({
+                'apiKey': self.api_key,
+                'secret': self.api_secret,
+                'enableRateLimit': True,
+            })
+
         # Initialize CCXT Futures Exchange (Futures - Async)
-        if self.futures_api_key and self.futures_api_secret:
-            print(f"DEBUG: KrakenClient Init - CCXT Futures (Async) Starting...", flush=True)
+        if self.futures_api_key and self.futures_api_secret and not self.futures_exchange:
+            print(f"DEBUG: KrakenClient - Futures Exchange Init", flush=True)
             self.futures_exchange = ccxt_async.krakenfutures({
                 'apiKey': self.futures_api_key,
                 'secret': self.futures_api_secret,
                 'enableRateLimit': True,
                 'options': {'defaultType': 'future'},
             })
-            if use_testnet:
-                self.futures_exchange.set_sandbox_mode(True)
-            print(f"DEBUG: KrakenClient Init - CCXT Futures (Async) Done", flush=True)
-        else:
-            self.futures_exchange = None
+            if self.futures_exchange and self.use_testnet:
+                 self.futures_exchange.set_sandbox_mode(True)
+        
+        print(f"DEBUG: KrakenClient Initialization Data Complete", flush=True)
         
         # Rate limiters (configurable per endpoint group)
         self.public_limiter = RateLimiter(capacity=PUBLIC_API_CAPACITY, refill_rate=PUBLIC_API_REFILL_RATE)

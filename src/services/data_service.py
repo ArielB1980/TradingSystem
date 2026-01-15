@@ -65,6 +65,9 @@ class DataService(multiprocessing.Process):
         
         # Report Status
         self._send_status("RUNNING", {"msg": "Service Initialization Complete"})
+
+        # Initialize Client Lazy
+        await self.kraken.initialize()
         
         # Start Background Hydration as a Task
         asyncio.create_task(self._perform_background_hydration())

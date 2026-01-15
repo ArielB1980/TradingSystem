@@ -67,6 +67,8 @@ class TradingService(multiprocessing.Process):
             futures_api_secret=self.config.exchange.futures_api_secret,
             use_testnet=self.config.exchange.use_testnet
         )
+        await self.kraken.initialize()
+        
         print(f"DEBUG: TradingService ({self.pid}) Init: PriceConverter", flush=True)
         self.price_converter = PriceConverter()
         
