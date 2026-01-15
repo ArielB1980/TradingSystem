@@ -9,8 +9,8 @@ from src.services.data_service import DataService
 from src.services.trading_service import TradingService
 from src.ipc.messages import ServiceCommand
 
-# Force 'spawn' method for macOS compatibility
-multiprocessing.set_start_method("spawn", force=True)
+# Force 'spawn' method for macOS compatibility - try default for Linux container
+# multiprocessing.set_start_method("spawn", force=True)
 
 logger = get_logger("Main")
 
