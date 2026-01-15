@@ -103,6 +103,9 @@ class LiveTrading:
         logger.critical("🚀 STARTING LIVE TRADING - REAL CAPITAL AT RISK")
         
         try:
+            # 0. Initialize Client (CRITICAL FIX: Must happen before any API calls)
+            await self.client.initialize()
+
             # 1. Initial Account Sync (Provide immediate feedback to dashboard)
             await self._sync_account_state()
             try:
