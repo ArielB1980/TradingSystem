@@ -9,7 +9,7 @@ from src.config.config import Config
 from src.monitoring.logger import get_logger, setup_logging
 from src.data.kraken_client import KrakenClient
 from src.ipc.messages import MarketUpdate, ServiceCommand, ServiceStatus
-from src.storage.repository import get_candles, save_candle
+from src.storage.repository import get_candles, save_candle, save_candles_bulk
 from src.domain.models import Candle
 
 logger = get_logger("DataService")
@@ -172,6 +172,8 @@ class DataService(multiprocessing.Process):
                     # 1. Primary Polling: 15m (Every loop)
                     candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=limit)
                     if candles_15m:
+                        # Persist to DB
+                        await asyncio.to_thread(save_candles_bulk, candles_15m)
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                         # Mark as bootstrapped if successful
                         if is_bootstrap:
@@ -182,6 +184,7 @@ class DataService(multiprocessing.Process):
                     # Let's just poll them every time for now as 3 calls is cheap.
                     candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit)
                     if candles_1h:
+                        await asyncio.to_thread(save_candles_bulk, candles_1h)
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
 
                     # 3. Tertiary Polling: 4h (Occasionally)
@@ -190,6 +193,7 @@ class DataService(multiprocessing.Process):
                     # Loop takes 60s. 600 calls / 60s = 10 calls/s. Still safe.
                     candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit)
                     if candles_4h:
+                        await asyncio.to_thread(save_candles_bulk, candles_4h)
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                         
                 except Exception as e:
