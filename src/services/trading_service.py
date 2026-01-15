@@ -454,10 +454,16 @@ class TradingService(multiprocessing.Process):
                      await self._execute_signal(signal, futures_symbol, Decimal(str(trigger_price)), decision)
                  
                  # 5. Record Decision Trace (Throttled 5m)
-                 await self._record_decision_trace(symbol, signal, trigger_price)
+                 # await self._record_decision_trace(symbol, signal, trigger_price) <- Moved out
                           
          except Exception as e:
              logger.error(f"Analysis failed for {symbol}: {e}")
+             
+         # Record Trace regardless of signal (Visibility)
+         # Trigger price from last candle if not set
+         if c15m: 
+            trigger_price = c15m[-1].close
+            await self._record_decision_trace(symbol, signal, trigger_price)
 
     async def _execute_signal(self, signal: Signal, futures_symbol: str, price: Decimal, decision: RiskDecision):
         """Execute trade via Executor."""
@@ -705,7 +711,13 @@ class TradingService(multiprocessing.Process):
         last = self.last_trace_log.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
         now = datetime.now(timezone.utc)
         
-        if (now - last).total_seconds() > 300: # Every 5 minutes
+        # Dynamic Throttle
+        if signal.signal_type == SignalType.NO_SIGNAL:
+            throttle = 3600 # 1 hour for Heartbeats
+        else:
+            throttle = 300 # 5 mins for Active Signals
+
+        if (now - last).total_seconds() > throttle:
             await async_record_event(
                 "DECISION_TRACE", 
                 symbol, 
