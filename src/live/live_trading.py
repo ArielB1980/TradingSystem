@@ -12,7 +12,7 @@ from src.risk.risk_manager import RiskManager
 from src.execution.executor import Executor
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.execution_engine import ExecutionEngine
-from src.execution.position_manager import PositionManager, ActionType
+from src.execution.position_manager import PositionManager, ActionType, ManagementAction
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
 from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles
