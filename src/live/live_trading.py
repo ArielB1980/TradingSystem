@@ -147,10 +147,10 @@ class LiveTrading:
                 
                 for symbol in self.markets:
                     try:
-                        c_15 = await asyncio.to_thread(get_candles, symbol, "15m", limit=50)
-                        c_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=50)
-                        c_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=50)
-                        c_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=50)
+                        c_15 = await asyncio.to_thread(get_candles, symbol, "15m", limit=300)
+                        c_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=300)
+                        c_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=300)
+                        c_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=300)
                         
                         self.candles_15m[symbol] = c_15 if c_15 else []
                         self.candles_1h[symbol] = c_1h if c_1h else []
@@ -904,7 +904,7 @@ class LiveTrading:
             if (now - last_update).total_seconds() < (interval_min * 60):
                 return # Cache hit
                 
-            candles = await self.client.get_spot_ohlcv(symbol, tf, limit=100)  # Increased from 10 to 100
+            candles = await self.client.get_spot_ohlcv(symbol, tf, limit=300)  # Increased to 300 for Strategy
             if not candles: return
             
             # Update Cache
