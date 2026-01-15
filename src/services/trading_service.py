@@ -59,7 +59,6 @@ class TradingService(multiprocessing.Process):
 
     async def _service_loop(self):
         # Init Components
-        print(f"DEBUG: TradingService ({self.pid}) Init: KrakenClient", flush=True)
         self.kraken = KrakenClient(
             api_key=self.config.exchange.api_key,
             api_secret=self.config.exchange.api_secret,
@@ -69,29 +68,18 @@ class TradingService(multiprocessing.Process):
         )
         await self.kraken.initialize()
         
-        print(f"DEBUG: TradingService ({self.pid}) Init: PriceConverter", flush=True)
         self.price_converter = PriceConverter()
-        
-        print(f"DEBUG: TradingService ({self.pid}) Init: FuturesAdapter", flush=True)
         self.futures_adapter = FuturesAdapter(self.kraken, max_leverage=self.config.risk.max_leverage)
         
-        print(f"DEBUG: TradingService ({self.pid}) Init: Executor", flush=True)
         self.executor = Executor(
             self.config.execution, 
             self.futures_adapter
         )
-        
-        print(f"DEBUG: TradingService ({self.pid}) Init: ExecutionEngine", flush=True)
         self.execution_engine = ExecutionEngine(self.config)
-        
-        print(f"DEBUG: TradingService ({self.pid}) Init: RiskManager", flush=True)
         self.risk_manager = RiskManager(self.config.risk)
-        
-        print(f"DEBUG: TradingService ({self.pid}) Init: SMCEngine", flush=True)
         self.smc_engine = SMCEngine(self.config.strategy)
         
         # Position Management V2
-        print(f"DEBUG: TradingService ({self.pid}) Init: PositionManager", flush=True)
         self.position_manager = PositionManager()
         self.managed_positions: Dict[str, Position] = {}
         

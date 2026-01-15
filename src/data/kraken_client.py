@@ -141,11 +141,8 @@ class KrakenClient:
         Lazy initialization of CCXT exchanges.
         MUST be called inside the running event loop of the target process.
         """
-        print(f"DEBUG: KrakenClient ({id(self)}) Lazy Initializing...", flush=True)
-        
         # Initialize CCXT exchange (Spot - ASYNC)
         if not self.exchange:
-            print(f"DEBUG: KrakenClient - Spot Exchange Init", flush=True)
             self.exchange = ccxt_async.kraken({
                 'apiKey': self.api_key,
                 'secret': self.api_secret,
@@ -154,7 +151,6 @@ class KrakenClient:
 
         # Initialize CCXT Futures Exchange (Futures - Async)
         if self.futures_api_key and self.futures_api_secret and not self.futures_exchange:
-            print(f"DEBUG: KrakenClient - Futures Exchange Init", flush=True)
             self.futures_exchange = ccxt_async.krakenfutures({
                 'apiKey': self.futures_api_key,
                 'secret': self.futures_api_secret,
@@ -164,7 +160,7 @@ class KrakenClient:
             if self.futures_exchange and self.use_testnet:
                  self.futures_exchange.set_sandbox_mode(True)
         
-        print(f"DEBUG: KrakenClient Initialization Data Complete", flush=True)
+        logger.info("KrakenClient initialized (Lazy)")
         
         # Rate limiters (configurable per endpoint group)
         self.public_limiter = RateLimiter(capacity=PUBLIC_API_CAPACITY, refill_rate=PUBLIC_API_REFILL_RATE)
