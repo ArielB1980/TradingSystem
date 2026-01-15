@@ -65,19 +65,20 @@ class DataService:
         
         while self.active:
             # 1. Process Commands
-            while not self.command_queue.empty():
-                try:
-                    cmd = self.command_queue.get_nowait()
-                    if cmd.command == "STOP":
-                        logger.info("Received STOP command")
-                        self.active = False
+            try:
+                while not self.command_queue.empty():
+                    try:
+                        cmd = self.command_queue.get_nowait()
+                        if cmd.command == "STOP":
+                            logger.info("Received STOP command")
+                            self.active = False
+                            break
+                        elif cmd.command == "PING":
+                            self._send_status("RUNNING", {"pong": time.time()})
+                    except QueueEmpty:
                         break
-                    elif cmd.command == "PING":
-                        self._send_status("RUNNING", {"pong": time.time()})
-                except QueueEmpty:
-                    break
-        except Exception as e:
-            logger.error(f"Command processing error: {e}")
+            except Exception as e:
+                logger.error(f"Command processing error: {e}")
             
             if not self.active:
                 break
