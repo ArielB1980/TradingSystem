@@ -1,57 +1,66 @@
 import os
 import sys
 import asyncio
-from src.config.config import load_config
-from src.data.kraken_client import KrakenClient
+import pprint
+# Add src to path
+sys.path.append(os.getcwd())
+try:
+    from src.config.config import load_config
+    from src.data.kraken_client import KrakenClient
+except ImportError:
+    print("❌ Could not import src modules.")
+    sys.exit(1)
 
 async def debug_tickers():
     print("Loading Config...")
     config = load_config()
     
-    # 1. Simulate Market Loading Logic from LiveTrading
-    markets = config.exchange.spot_markets
-    if hasattr(config, "assets") and config.assets.mode == "whitelist":
-         markets = config.assets.whitelist
-         print("Mode: Whitelist")
-    elif config.coin_universe and config.coin_universe.enabled:
-         print("Mode: Coin Universe")
-         expanded = []
-         for tier, coins in config.coin_universe.liquidity_tiers.items():
-             expanded.extend(coins)
-         markets = list(set(expanded))
-    
-    print(f"Total Markets Loaded: {len(markets)}")
-    
-    target = "AGLD/USD"
-    if target in markets:
-        print(f"✅ {target} is in the target list.")
-    else:
-        print(f"❌ {target} is NOT in the target list! Config issue?")
-        return
-
-    # 2. Simulate Bulk Fetch
-    print(f"\nAttempting Bulk Fetch for {target}...")
     client = KrakenClient(
         api_key=config.exchange.api_key,
         api_secret=config.exchange.api_secret,
+        futures_api_key=os.getenv('KRAKEN_FUTURES_API_KEY'),
+        futures_api_secret=os.getenv('KRAKEN_FUTURES_API_SECRET')
     )
     
     try:
-        # We'll just fetch this one to see if it works in a list context
-        # In live it runs with 249 others, but let's try isolation first
-        tickers = await client.get_spot_tickers_bulk([target])
+        print("Initializing Client...")
+        await client.initialize()
         
-        if target in tickers:
-            t = tickers[target]
-            print(f"✅ Ticker Data Received:")
-            print(f"   Price: {t.get('last')}")
-            print(f"   Volume: {t.get('volume')}")
-            print(f"   QuoteVolume: {t.get('quoteVolume')}")
-        else:
-            print(f"❌ Fetch successful but {target} missing from result keys: {list(tickers.keys())}")
+        # 1. SPOT SEARCH
+        print("\n--- SPOT MARKETS SEARCH (AGLD) ---")
+        markets = await client.exchange.load_markets()
+        found_spot = False
+        for symbol, m in markets.items():
+            if 'AGLD' in symbol:
+                status = "✅ ACTIVE" if m.get('active') else "❌ INACTIVE"
+                print(f"{symbol:<15} ID: {m['id']:<10} {status}")
+                if m.get('active'):
+                    found_spot = True
+        
+        if not found_spot:
+            print("❌ NO ACTIVE SPOT PAIRS FOUND FOR AGLD on Kraken.")
+            print("   The SMCEngine relies on Spot Data. Without Spot data, we cannot trade.")
+
+        # 2. FUTURES SEARCH
+        print("\n--- FUTURES MARKETS SEARCH (AGLD) ---")
+        if client.futures_exchange:
+            f_markets = await client.futures_exchange.load_markets()
+            found_futures = False
+            for symbol, m in f_markets.items():
+                if 'AGLD' in symbol:
+                    print(f"{symbol:<15} ID: {m['id']:<10} Type: {m.get('type')}")
+                    found_futures = True
             
+            if not found_futures:
+                print("❌ NO FUTURES FOUND FOR AGLD.")
+            else:
+                print("✅ AGLD Futures Found. User is correct.")
+        else:
+             print("⚠️  Futures credentials missing, skipping futures check.")
+
+                 
     except Exception as e:
-        print(f"❌ Fetch Failed: {e}")
+        print(f"❌ EXCEPTION: {e}")
     finally:
         await client.close()
 
