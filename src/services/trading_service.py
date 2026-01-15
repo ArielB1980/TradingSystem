@@ -385,6 +385,9 @@ class TradingService:
          c15m = self.candles_15m.get(symbol, [])
          if len(c15m) < 50: return
          
+         if len(c15m) < 50: return
+         
+         signal = None
          # Run SMC Analysis
          try:
              signal = self.smc_engine.generate_signal(
@@ -463,7 +466,9 @@ class TradingService:
              
          # Record Trace regardless of signal (Visibility)
          # Trigger price from last candle if not set
-         if c15m: 
+         # Record Trace regardless of signal (Visibility)
+         # Trigger price from last candle if not set
+         if c15m and signal: 
             trigger_price = c15m[-1].close
             await self._record_decision_trace(symbol, signal, trigger_price)
 
