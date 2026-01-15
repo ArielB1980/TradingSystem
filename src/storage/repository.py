@@ -198,59 +198,58 @@ def save_candle(candle: Candle) -> None:
         session.add(candle_model)
 
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 def save_candles_bulk(candles: List[Candle]) -> int:
     """
-    Save multiple candles to the database efficiently.
-    Skips duplicates based on timestamp/symbol/timeframe.
+    Save multiple candles to the database using atomic Upsert (ON CONFLICT DO UPDATE).
+    Handles overlaps between Hydration and Polling tasks gracefully.
     
     Args:
         candles: List of Candle objects
         
     Returns:
-        Number of candles inserted
+        Number of candles processed
     """
     if not candles:
         return 0
         
     db = get_db()
+    
+    # Prepare data for bulk insert
+    values = [
+        {
+            "timestamp": c.timestamp,
+            "symbol": c.symbol,
+            "timeframe": c.timeframe,
+            "open": c.open,
+            "high": c.high,
+            "low": c.low,
+            "close": c.close,
+            "volume": c.volume
+        }
+        for c in candles
+    ]
+    
+    # Construct Upsert Statement
+    stmt = pg_insert(CandleModel).values(values)
+    
+    # Define conflict action: Update values if key exists
+    stmt = stmt.on_conflict_do_update(
+        constraint='uq_candle_key',
+        set_={
+            "open": stmt.excluded.open,
+            "high": stmt.excluded.high,
+            "low": stmt.excluded.low,
+            "close": stmt.excluded.close,
+            "volume": stmt.excluded.volume
+        }
+    )
+    
     with db.get_session() as session:
-        # 1. Identify scope
-        symbol = candles[0].symbol
-        timeframe = candles[0].timeframe
-        min_ts = min(c.timestamp for c in candles)
-        max_ts = max(c.timestamp for c in candles)
-        
-        # 2. Get existing timestamps in this range to avoid duplicates
-        # optimizing to avoid individual checks
-        existing_query = session.query(CandleModel.timestamp).filter(
-            CandleModel.symbol == symbol,
-            CandleModel.timeframe == timeframe,
-            CandleModel.timestamp >= min_ts,
-            CandleModel.timestamp <= max_ts
-        ).all()
-        
-        existing_timestamps = {r[0] for r in existing_query}
-        
-        # 3. Filter out existing
-        new_candles = []
-        for c in candles:
-            if c.timestamp not in existing_timestamps:
-                new_candles.append(CandleModel(
-                    timestamp=c.timestamp,
-                    symbol=c.symbol,
-                    timeframe=c.timeframe,
-                    open=c.open,
-                    high=c.high,
-                    low=c.low,
-                    close=c.close,
-                    volume=c.volume,
-                ))
-        
-        # 4. Bulk insert
-        if new_candles:
-            session.bulk_save_objects(new_candles)
+        session.execute(stmt)
             
-        return len(new_candles)
+    return len(candles)
 
 
 
