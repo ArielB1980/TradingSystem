@@ -98,95 +98,102 @@ class LiveTrading:
         logger.info("Live Trading initialized", markets=config.exchange.futures_markets)
     
     async def run(self):
-        """Run the main live trading loop."""
+        """
+        Main trading loop.
+        """
+        import os
+        import time
+        
+        # Smoke Mode / Local Dev Limits
+        max_loops = int(os.getenv("MAX_LOOPS", "-1"))
+        run_seconds = int(os.getenv("RUN_SECONDS", "-1"))
+        start_time = time.time()
+        loop_count = 0
+        
+        logger.info("Starting run loop", 
+                   max_loops=max_loops if max_loops > 0 else "unlimited",
+                   run_seconds=run_seconds if run_seconds > 0 else "unlimited",
+                   dry_run=self.config.system.dry_run)
+
         self.active = True
-        logger.critical("🚀 STARTING LIVE TRADING - REAL CAPITAL AT RISK")
+        logger.critical("🚀 STARTING LIVE TRADING")
         
         try:
-            # 0. Initialize Client (CRITICAL FIX: Must happen before any API calls)
+            # 1. Initialize Client
+            logger.info("Initializing Kraken client...")
             await self.client.initialize()
 
-            # 1. Initial Account Sync (Provide immediate feedback to dashboard)
-            await self._sync_account_state()
-            try:
-                await self._sync_positions()
-            except Exception as e:
-                logger.warning("Initial position sync failed", error=str(e))
-            
-            # Phase 10.5: Fast Startup - Load candles from database
-            # CRITICAL FIX: Load last 50 candles from database to avoid cold start
-            logger.info("Loading candles from database for fast startup...")
+            # 2. Sync State (skip in dry run if no keys)
+            if self.config.system.dry_run and not self.client.has_valid_futures_credentials():
+                 logger.warning("Dry Run Mode: No Futures credentials found. Skipping account sync.")
+            else:
+                # Sync Account
+                try:
+                    await self._sync_account_state()
+                    await self._sync_positions()
+                    await self.executor.sync_open_orders()
+                except Exception as e:
+                    logger.error("Initial sync failed", error=str(e))
+                    if not self.config.system.dry_run:
+                        raise
+
+            # 3. Fast Startup - Load candles
+            logger.info("Loading candles from database...")
             try:
                 self.candles_15m = {}
                 self.candles_1h = {}
                 self.candles_4h = {}
                 self.candles_1d = {}
                 
-                # Load candles from database (async-safe, uses thread pool)
                 for symbol in self.markets:
                     try:
-                        # Load last 50 candles for each timeframe (enough for signal generation)
-                        candles_15m = await asyncio.to_thread(get_candles, symbol, "15m", limit=50)
-                        candles_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=50)
-                        candles_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=50)
-                        candles_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=50)
+                        c_15 = await asyncio.to_thread(get_candles, symbol, "15m", limit=50)
+                        c_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=50)
+                        c_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=50)
+                        c_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=50)
                         
-                        self.candles_15m[symbol] = candles_15m if candles_15m else []
-                        self.candles_1h[symbol] = candles_1h if candles_1h else []
-                        self.candles_4h[symbol] = candles_4h if candles_4h else []
-                        self.candles_1d[symbol] = candles_1d if candles_1d else []
+                        self.candles_15m[symbol] = c_15 if c_15 else []
+                        self.candles_1h[symbol] = c_1h if c_1h else []
+                        self.candles_4h[symbol] = c_4h if c_4h else []
+                        self.candles_1d[symbol] = c_1d if c_1d else []
                     except Exception as e:
-                        logger.debug(f"Failed to load candles for {symbol} from DB", error=str(e))
-                        # Initialize empty if DB load fails
+                        logger.debug(f"Failed to load candles for {symbol}", error=str(e))
                         self.candles_15m[symbol] = []
                         self.candles_1h[symbol] = []
                         self.candles_4h[symbol] = []
                         self.candles_1d[symbol] = []
                 
-                loaded_count = sum(len(c) for c in self.candles_15m.values())
-                logger.info(f"Loaded {loaded_count} candles from database across {len(self.markets)} symbols")
-                
+                # Initialize throttling
+                now = datetime.now(timezone.utc)
+                for symbol in self.markets:
+                     self.last_candle_update[symbol] = {
+                         "15m": self.candles_15m.get(symbol, [])[-1].timestamp if self.candles_15m.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
+                         "1h": self.candles_1h.get(symbol, [])[-1].timestamp if self.candles_1h.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
+                         "4h": self.candles_4h.get(symbol, [])[-1].timestamp if self.candles_4h.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
+                         "1d": self.candles_1d.get(symbol, [])[-1].timestamp if self.candles_1d.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
+                     }
+                     
             except Exception as e:
-                logger.error("Failed to load candles from database", error=str(e))
-                # Fallback: initialize empty
-                self.candles_15m = {m: [] for m in self.markets}
-                self.candles_1h = {m: [] for m in self.markets}
-                self.candles_4h = {m: [] for m in self.markets}
-                self.candles_1d = {m: [] for m in self.markets}
+                 logger.error("Failed to hydrate candles", error=str(e))
 
-            # Set last update timestamps to prevent immediate re-fetch
-            # This logic must run whether hydration succeeded or failed/timed out
-            now = datetime.now(timezone.utc)
-            for symbol in self.markets:
-                self.last_candle_update[symbol] = {} # Initialize for symbol
-                
-                c_15 = self.candles_15m.get(symbol, [])
-                last_15m = c_15[-1].timestamp if c_15 else datetime.min.replace(tzinfo=timezone.utc)
-                self.last_candle_update[symbol]["15m"] = last_15m
-                
-                c_1h = self.candles_1h.get(symbol, [])
-                last_1h = c_1h[-1].timestamp if c_1h else datetime.min.replace(tzinfo=timezone.utc)
-                self.last_candle_update[symbol]["1h"] = last_1h
-                
-                c_4h = self.candles_4h.get(symbol, [])
-                last_4h = c_4h[-1].timestamp if c_4h else datetime.min.replace(tzinfo=timezone.utc)
-                self.last_candle_update[symbol]["4h"] = last_4h
-                
-                c_1d = self.candles_1d.get(symbol, [])
-                last_1d = c_1d[-1].timestamp if c_1d else datetime.min.replace(tzinfo=timezone.utc)
-                self.last_candle_update[symbol]["1d"] = last_1d
-
-            # CRITICAL: Sync open orders to populate Executor memory
-            # This prevents duplicate orders if the bot restarts with active pending orders
-            try:
-                await self.executor.sync_open_orders()
-            except Exception as e:
-                logger.error("Initial order sync failed", error=str(e))
-
-            await self.data_acq.start() # Start data acquisition directly
+            # 4. Start Data Acquisition
+            await self.data_acq.start()
             
-            # Main Loop
+
+            
+            # 5. Main Loop
             while self.active:
+            # Check Smoke Mode Limits
+                if max_loops > 0 and loop_count >= max_loops:
+                    logger.info("Smoke mode: Max loops reached", max_loops=max_loops)
+                    break
+                    
+                if run_seconds > 0 and (time.time() - start_time) >= run_seconds:
+                    logger.info("Smoke mode: Run time limit reached", run_seconds=run_seconds)
+                    break
+                
+                loop_count += 1
+
                 if self.kill_switch.is_active():
                     logger.critical("Kill switch active - pausing loop")
                     await asyncio.sleep(60)
@@ -339,7 +346,10 @@ class LiveTrading:
         # Phase 2 Fix: Pass positions to _sync_positions to avoid duplicate API call
         try:
             # This updates global state in Repository and internal trackers
-            all_raw_positions = await self.client.get_all_futures_positions()
+            if self.config.system.dry_run and not self.client.has_valid_futures_credentials():
+                all_raw_positions = []
+            else:
+                all_raw_positions = await self.client.get_all_futures_positions()
             # Pass positions to sync to avoid duplicate API call
             await self._sync_positions(all_raw_positions)
         except Exception as e:
@@ -484,6 +494,11 @@ class LiveTrading:
                     if signal.signal_type != SignalType.NO_SIGNAL and is_tradable:
                          await self._handle_signal(signal, spot_price, mark_price)
                     
+                    # V4: Dynamic Exits (Abandon Ship & Time-Based)
+                    # We check this AFTER signal generation because we need the fresh Bias
+                    if position_data and managed_pos:
+                         await self._check_dynamic_exits(symbol, managed_pos, signal, candle_count)
+
                     # Trace Logging (Throttled)
                     now = datetime.now(timezone.utc)
                     last_trace = self.last_trace_log.get(spot_symbol, datetime.min.replace(tzinfo=timezone.utc))
@@ -574,12 +589,8 @@ class LiveTrading:
         # 4.5 CRITICAL: Validate all positions have stop loss protection
         await self._validate_position_protection()
         
-        # 5. Account Sync (Throttled) - This was moved to step 2.
-        # The original code had a 15s throttle here. The new instruction implies a 60s throttle at the start.
-        # Keeping this commented out to avoid duplicate sync.
-        # if (now - self.last_account_sync).total_seconds() > 15:
-        #     await self._sync_account_state()
-        #     self.last_account_sync = now
+        # 5. Account Sync (Throttled) - Moved to step 2 to prevent duplicate calls
+        # Reference: _sync_positions call in Step 2 handles global state update
             
         # 7. Operational Maintenance (Daily)
         now = datetime.now(timezone.utc)
@@ -1083,3 +1094,62 @@ class LiveTrading:
             
         except Exception as e:
             logger.error("Failed to save trade history", symbol=position.symbol, error=str(e))
+
+    async def _check_dynamic_exits(self, symbol: str, position: Position, signal: Signal, candle_count: int):
+        """
+        Check and execute dynamic exits (Abandon Ship, Time-based).
+        V4 Strategy Enhancement.
+        """
+        if not position or position.size == 0:
+            return
+
+        actions = []
+        
+        # 1. Abandon Ship (Bias Flip)
+        if hasattr(self.config, 'abandon_ship_enabled') and self.config.abandon_ship_enabled:
+            # Bias direction map
+            bias = signal.higher_tf_bias # "bullish", "bearish", "neutral"
+            
+            # If we are LONG and bias flips to BEARISH -> Close
+            if position.side == Side.LONG and bias == "bearish":
+                logger.warning(f"🌊 ABANDON SHIP: Long position vs Bearish bias", symbol=symbol)
+                actions.append(ManagementAction(
+                    type=ActionType.CLOSE_POSITION,
+                    quantity=position.size,
+                    reason="abandon_ship_bias_flip"
+                ))
+            
+            # If we are SHORT and bias flips to BULLISH -> Close
+            elif position.side == Side.SHORT and bias == "bullish":
+                logger.warning(f"🌊 ABANDON SHIP: Short position vs Bullish bias", symbol=symbol)
+                actions.append(ManagementAction(
+                    type=ActionType.CLOSE_POSITION,
+                    quantity=position.size,
+                    reason="abandon_ship_bias_flip"
+                ))
+
+        # 2. Time-Based Exit
+        # If position held > X bars and we haven't hit TP1 yet (or just held too long)
+        # Using 15m bars approx
+        time_limit_bars = getattr(self.config, 'time_based_exit_bars', 0)
+        if time_limit_bars > 0:
+            # Calculate bars held
+            # Approximate using timestamps
+            elapsed = datetime.now(timezone.utc) - position.opened_at
+            # 15 mins per bar
+            bars_held = elapsed.total_seconds() / 900 
+            
+            if bars_held > time_limit_bars:
+                # Only close if not in profit? or strictly time based?
+                # User prompt: "If no take-profit (TP1...) is hit within X bars, close"
+                # Check active TP status (tp1_hit flag on position)
+                if not position.tp1_hit:
+                     logger.info(f"⌛ TIME EXIT: Held {bars_held:.1f} bars > limit {time_limit_bars}", symbol=symbol)
+                     actions.append(ManagementAction(
+                        type=ActionType.CLOSE_POSITION,
+                        quantity=position.size,
+                        reason="time_based_stale_exit"
+                    ))
+
+        if actions:
+            await self._execute_management_actions(symbol, actions, position)

@@ -136,6 +136,14 @@ class KrakenClient:
         
         logger.info("Kraken client configuration loaded")
     
+    def has_valid_spot_credentials(self) -> bool:
+        """Check if spot API keys are present."""
+        return bool(self.api_key and self.api_secret and not self.api_key.startswith("${"))
+
+    def has_valid_futures_credentials(self) -> bool:
+        """Check if futures API keys are present."""
+        return bool(self.futures_api_key and self.futures_api_secret and not self.futures_api_key.startswith("${"))
+
     async def initialize(self):
         """
         Lazy initialization of CCXT exchanges.

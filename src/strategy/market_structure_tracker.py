@@ -162,7 +162,8 @@ class MarketStructureTracker:
         self,
         symbol: str,
         candles_1h: list[Candle],
-        structure_change: StructureChange
+        structure_change: StructureChange,
+        required_candles: Optional[int] = None 
     ) -> bool:
         """
         Check if structure change is confirmed.
@@ -173,6 +174,7 @@ class MarketStructureTracker:
             symbol: Trading symbol
             candles_1h: Recent candles
             structure_change: The structure change to confirm
+            required_candles: Override default confirmation candles (Adaptive Strategy)
             
         Returns:
             True if confirmed
@@ -180,11 +182,13 @@ class MarketStructureTracker:
         if structure_change.confirmed:
             return True
         
-        if len(candles_1h) < self.confirmation_candles:
+        threshold = required_candles if required_candles is not None else self.confirmation_candles
+        
+        if len(candles_1h) < threshold:
             return False
         
         # Check if price has held above/below break
-        recent_candles = candles_1h[-self.confirmation_candles:]
+        recent_candles = candles_1h[-threshold:]
         break_price = structure_change.break_price
         
         if structure_change.new_state == MarketStructureState.BULLISH:

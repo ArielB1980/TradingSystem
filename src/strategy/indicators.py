@@ -180,7 +180,7 @@ class Indicators:
         lookback: int = 20,
     ) -> str:
         """
-        Detect RSI divergence (bullish or bearish).
+        Detect RSI divergence using swing points.
         
         Args:
             candles: List of spot candles
@@ -193,29 +193,71 @@ class Indicators:
         if len(candles) < lookback or len(rsi_values) < lookback:
             return "none"
         
-        df = Indicators._candles_to_df(candles)
-        
-        # Simple divergence: price makes lower low but RSI makes higher low (bullish)
-        # or price makes higher high but RSI makes lower high (bearish)
-        
-        recent_candles = df.tail(lookback)
-        recent_rsi = rsi_values.tail(lookback)
-        
-        price_low_idx = recent_candles['low'].idxmin()
-        rsi_low_idx = recent_rsi.idxmin()
-        
-        price_high_idx = recent_candles['high'].idxmax()
-        rsi_high_idx = recent_rsi.idxmax()
-        
-        # Bullish divergence
-        if price_low_idx > rsi_low_idx:
-            return "bullish"
-        
-        # Bearish divergence
-        if price_high_idx > rsi_high_idx:
-            return "bearish"
-        
-        return "none"
+        try:
+            # Get swing points (use existing helper)
+            recent_candles = candles[-lookback:]
+            # Need to align RSI with recent candles
+            recent_rsi = rsi_values.iloc[-lookback:]
+            
+            # Simple Swing Point Logic (Local Extrema)
+            # Find index of lowest low in price
+            price_lows = [c.low for c in recent_candles]
+            min_price_idx = np.argmin(price_lows)
+            
+            # Find index of lowest low in RSI
+            rsi_lows = recent_rsi.values
+            min_rsi_idx = np.argmin(rsi_lows)
+            
+            # Find index of highest high in price
+            price_highs = [c.high for c in recent_candles]
+            max_price_idx = np.argmax(price_highs)
+            
+            # Find index of highest high in RSI
+            rsi_highs = recent_rsi.values
+            max_rsi_idx = np.argmax(rsi_highs)
+            
+            # Bullish Divergence: Price makes Lower Low, RSI makes Higher Low
+            # Fallback to extreme comparison for efficiency:
+            latest_price_low = price_lows[-1]
+            # Look for recent swing low in the last 5-15 candles
+            prev_price_low_window = price_lows[:-5]
+            prev_price_low = min(prev_price_low_window) if len(prev_price_low_window) > 0 else latest_price_low
+            
+            latest_rsi_low = rsi_lows[-1]
+            prev_rsi_low_window = rsi_lows[:-5]
+            prev_rsi_low = min(prev_rsi_low_window) if len(prev_rsi_low_window) > 0 else latest_rsi_low
+            
+            if latest_price_low < prev_price_low and latest_rsi_low > prev_rsi_low:
+                 return "bullish"
+
+            latest_price_high = price_highs[-1]
+            prev_price_high_window = price_highs[:-5]
+            prev_price_high = max(prev_price_high_window) if len(prev_price_high_window) > 0 else latest_price_high
+            
+            latest_rsi_high = rsi_highs[-1]
+            prev_rsi_high_window = rsi_highs[:-5]
+            prev_rsi_high = max(prev_rsi_high_window) if len(prev_rsi_high_window) > 0 else latest_rsi_high
+            
+            if latest_price_high > prev_price_high and latest_rsi_high < prev_rsi_high:
+                return "bearish"
+                
+            return "none"
+            
+        except Exception as e:
+            logger.warning(
+                "Error detecting RSI divergence",
+                error=str(e)
+            )
+            return "none"
+            
+            if latest_price_high > prev_price_high and latest_rsi_high < prev_rsi_high:
+                return "bearish"
+                
+            return "none"
+            
+        except Exception as e:
+            logger.warning("RSI Divergence check failed", error=str(e))
+            return "none"
     
     @staticmethod
     def get_ema_slope(ema_values: pd.Series, lookback: int = 3) -> str:
