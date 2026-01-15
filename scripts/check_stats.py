@@ -52,6 +52,11 @@ def main():
             SystemEventModel.event_type.in_(['SIGNAL', 'SIGNAL_GENERATED'])
         )
         signal_count = signals_query.count()
+
+        # 1b. Count Recent Candles (Ingestion Velocity)
+        ingested_candles = session.query(CandleModel).filter(
+            CandleModel.timestamp >= cutoff
+        ).count()
         
         # 2. Trades & Performance
         trades_query = session.query(TradeModel).filter(
@@ -66,6 +71,7 @@ def main():
         win_rate = (winners / trade_count * 100) if trade_count > 0 else 0.0
 
         print(f"Signals Found: {signal_count}")
+        print(f"Candles Ingested: {ingested_candles} (active collection)")
         print(f"Trades Executed: {trade_count}")
         print(f"Total PnL: ${total_pnl:.2f}")
         print(f"Win Rate: {win_rate:.1f}%")
