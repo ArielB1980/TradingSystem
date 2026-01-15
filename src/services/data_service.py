@@ -40,6 +40,12 @@ class DataService(multiprocessing.Process):
             
     async def _service_loop(self):
         """Main async loop for Data Service."""
+        # Verify DB Connection & Env
+        import os
+        db_url = os.getenv("DATABASE_URL", "NOT_SET")
+        masked = db_url.split("@")[-1] if "@" in db_url else "LOCAL/SQLITE"
+        logger.info(f"DataService utilizing DB: {masked}")
+
         # Initialize resources in this process
         self.kraken = KrakenClient(
             api_key=self.config.exchange.api_key,
@@ -197,7 +203,8 @@ class DataService(multiprocessing.Process):
                         self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                         
                 except Exception as e:
-                   logger.debug(f"Polling failed for {symbol}: {e}")
+                   # CRITICAL DEBUG: Using error level to see why persistence fails
+                   logger.error(f"Polling/Persistence failed for {symbol}: {e}")
                    
                 # Throttle
                 await asyncio.sleep(0.1)
