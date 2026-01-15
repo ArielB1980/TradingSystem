@@ -12,12 +12,12 @@ from src.ipc.messages import ServiceCommand
 # Force 'spawn' method for macOS compatibility - try default for Linux container
 # multiprocessing.set_start_method("spawn", force=True)
 
-try:
-    import uvloop
-    import asyncio
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError:
-    pass
+# try:
+#     import uvloop
+#     import asyncio
+#     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# except ImportError:
+#     pass
 
 logger = get_logger("Main")
 
