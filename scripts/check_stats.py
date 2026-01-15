@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -27,7 +28,11 @@ def main():
     print(f"DB Engine: {db.engine.dialect.name}")
     print(f"DB Host/Info: {masked_url}")
     
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=10)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hours", type=int, default=7, help="Lookback hours (default: 7)")
+    args = parser.parse_args()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
     
     with db.get_session() as session:
         # Debug Totals
@@ -36,28 +41,38 @@ def main():
         print(f"\n--- Total Database State ---")
         print(f"Total System Events: {total_events}")
         print(f"Total Trades: {total_trades}")
+        
+        print(f"\n--- Statistics for last {args.hours} hours (since {cutoff.strftime('%Y-%m-%d %H:%M:%S UTC')}) ---")
 
         # 1. Count Signals
-        # 1. Count Signals
-        # Assuming event_type for signals is 'SIGNAL' or 'SIGNAL_GENERATED'
-        # Let's check distinct types to be sure if count is 0
-        
         signals_query = session.query(SystemEventModel).filter(
             SystemEventModel.timestamp >= cutoff,
             SystemEventModel.event_type.in_(['SIGNAL', 'SIGNAL_GENERATED'])
         )
         signal_count = signals_query.count()
         
-        # 2. Count Trades
+        # 2. Trades & Performance
         trades_query = session.query(TradeModel).filter(
-            TradeModel.entered_at >= cutoff
-        )
-        trade_count = trades_query.count()
+            TradeModel.exited_at >= cutoff
+        ).order_by(TradeModel.exited_at.desc())
         
-        print(f"\n--- Statistics for last 10 hours (since {cutoff.strftime('%Y-%m-%d %H:%M:%S UTC')}) ---")
+        trades = trades_query.all()
+        trade_count = len(trades)
+        
+        total_pnl = sum(t.net_pnl for t in trades)
+        winners = sum(1 for t in trades if t.net_pnl > 0)
+        win_rate = (winners / trade_count * 100) if trade_count > 0 else 0.0
+
         print(f"Signals Found: {signal_count}")
         print(f"Trades Executed: {trade_count}")
+        print(f"Total PnL: ${total_pnl:.2f}")
+        print(f"Win Rate: {win_rate:.1f}%")
         
+        if trade_count > 0:
+            print("\nRecent Trades:")
+            for t in trades[:5]:
+                print(f"  {t.symbol} ({t.side}): ${t.net_pnl:.2f} [{t.exit_reason}]")
+
         # 3. Market Coverage
         unique_symbols = session.query(SystemEventModel.symbol).distinct().count()
         print(f"Unique Symbols Active: {unique_symbols}")
