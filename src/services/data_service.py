@@ -28,6 +28,14 @@ class DataService(multiprocessing.Process):
         
     def run(self):
         """Entry point for the separate process."""
+        import sys
+        import os
+        print(f"DEBUG: DataService Process Starting (PID {self.pid})", flush=True)
+        
+        db_url = os.getenv("DATABASE_URL", "NOT_SET")
+        masked = db_url.split("@")[-1] if "@" in db_url else "LOCAL"
+        print(f"DEBUG: DataService Env DB_URL: {masked}", flush=True)
+
         setup_logging()
         logger.info("Data Service Process Started (PID %s)", self.pid)
         
