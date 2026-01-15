@@ -1,17 +1,18 @@
-import multiprocessing
+import asyncio
 import time
 import sys
 import signal
 import os
+from asyncio import Queue
+
 from src.config.config import Config, load_config
 from src.monitoring.logger import get_logger, setup_logging
 from src.services.data_service import DataService
 from src.services.trading_service import TradingService
 from src.ipc.messages import ServiceCommand
 
-# Force 'spawn' method for macOS compatibility - try default for Linux container
-# multiprocessing.set_start_method("spawn", force=True)
-
+# Disable uvloop for stability in single process for now, 
+# though it is much safer in single process than multi.
 # try:
 #     import uvloop
 #     import asyncio
@@ -21,96 +22,91 @@ from src.ipc.messages import ServiceCommand
 
 logger = get_logger("Main")
 
-
-def main():
+async def main_async():
     setup_logging()
-    logger.info("Initializing Architecture v2 (Multiprocessing)...")
+    logger.info("Initializing Architecture v3 (Single Process Async)...")
     
     # Load Config
     try:
         config = load_config()
     except Exception as e:
         logger.critical(f"Failed to load config: {e}")
-        sys.exit(1)
+        return
         
-    # Queues
+    # Async Queues
     # Data -> Trading
-    market_data_queue = multiprocessing.Queue()
+    market_data_queue = Queue()
     # Main -> Services
-    command_queue_data = multiprocessing.Queue()
-    command_queue_trading = multiprocessing.Queue()
+    command_queue_data = Queue()
+    command_queue_trading = Queue()
     
-    # Processes
+    # Services
     data_service = DataService(market_data_queue, command_queue_data, config)
     trading_service = TradingService(market_data_queue, command_queue_trading, config)
     
-    # Start
-    logger.info("Launching Services...")
-    data_service.start()
-    trading_service.start()
+    logger.info("Launching Service Tasks...")
     
-    logger.info(f"Services Started. Data PID: {data_service.pid}, Trading PID: {trading_service.pid}")
+    # Create Tasks
+    t_data = asyncio.create_task(data_service.start())
+    t_trading = asyncio.create_task(trading_service.start())
     
     # Verify DB Persistence
     try:
         from src.storage.repository import record_event
+        # Note: record_event is sync (blocking), but okay for startup event
+        # Ideally should be async or threaded, but it's one-off.
+        # PID is just current PID
+        pid = os.getpid()
         record_event("SYSTEM_STARTUP", "system", {
             "version": config.system.version,
-            "data_pid": data_service.pid,
-            "trading_pid": trading_service.pid
+            "pid": pid,
+            "mode": "SingleProcessAsync"
         })
-        logger.info("Startup Event recorded in DB")
+        logger.info(f"Startup Event recorded (PID {pid})")
     except Exception as e:
         logger.error(f"Failed to record startup event: {e}")
     
-    # Signal Handling
-    stop_event = multiprocessing.Event()
+    # Monitor Loop
+    stop_event = asyncio.Event()
     
-    def signal_handler(sig, frame):
+    def signal_handler():
         logger.info("Shutdown Signal Received.")
         stop_event.set()
         
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler)
+        
+    while not stop_event.is_set():
+        if t_data.done():
+            logger.critical("Data Service Task Ended Unexpectedly!")
+            if t_data.exception():
+                logger.critical(f"Data Exception: {t_data.exception()}")
+            break
+            
+        if t_trading.done():
+            logger.critical("Trading Service Task Ended Unexpectedly!")
+            if t_trading.exception():
+                logger.critical(f"Trading Exception: {t_trading.exception()}")
+            break
+            
+        await asyncio.sleep(1.0)
+        
+    # Shutdown
+    logger.info("Stopping Services...")
+    await command_queue_data.put(ServiceCommand("STOP"))
+    await command_queue_trading.put(ServiceCommand("STOP"))
     
-    # Monitor Loop
+    # Wait for completion
     try:
-        while not stop_event.is_set():
-            if not data_service.is_alive():
-                logger.critical("Data Service Died unexpectedly!")
-                stop_event.set()
-            if not trading_service.is_alive():
-                logger.critical("Trading Service Died unexpectedly!")
-                stop_event.set()
-            
-            time.sleep(1.0)
-            
-    except Exception as e:
-        logger.error(f"Main Loop Error: {e}")
-    finally:
-        logger.info("Stopping Services...")
+        await asyncio.wait_for(asyncio.gather(t_data, t_trading, return_exceptions=True), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("Timed out waiting for services to stop")
         
-        # Send Stop Commands
-        try:
-             command_queue_data.put(ServiceCommand("STOP"))
-             command_queue_trading.put(ServiceCommand("STOP"))
-        except:
-             pass
-             
-        # Wait for join
-        time.sleep(1.0) # Give time for graceful shutdown
-        data_service.join(timeout=5.0)
-        trading_service.join(timeout=5.0)
-        
-        # Force Kill if needed
-        if data_service.is_alive():
-            logger.warning("Force killing Data Service")
-            data_service.terminate()
-        if trading_service.is_alive():
-            logger.warning("Force killing Trading Service")
-            trading_service.terminate()
-            
-        logger.info("System Shutdown Complete.")
+    logger.info("System Shutdown Complete.")
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
