@@ -120,15 +120,21 @@ class KrakenClient:
         if self.futures_api_secret:
             self.futures_api_secret = sanitize_secret(self.futures_api_secret)
         
+        if self.futures_api_secret:
+            self.futures_api_secret = sanitize_secret(self.futures_api_secret)
+        
         # Initialize CCXT exchange (Spot - Sync)
+        print(f"DEBUG: KrakenClient Init - CCXT Spot (Sync) Starting...", flush=True)
         self.exchange = ccxt.kraken({
             'apiKey': self.api_key,
             'secret': self.api_secret,
             'enableRateLimit': True,
         })
+        print(f"DEBUG: KrakenClient Init - CCXT Spot (Sync) Done", flush=True)
         
         # Initialize CCXT Futures Exchange (Futures - Async)
         if self.futures_api_key and self.futures_api_secret:
+            print(f"DEBUG: KrakenClient Init - CCXT Futures (Async) Starting...", flush=True)
             self.futures_exchange = ccxt_async.krakenfutures({
                 'apiKey': self.futures_api_key,
                 'secret': self.futures_api_secret,
@@ -137,6 +143,7 @@ class KrakenClient:
             })
             if use_testnet:
                 self.futures_exchange.set_sandbox_mode(True)
+            print(f"DEBUG: KrakenClient Init - CCXT Futures (Async) Done", flush=True)
         else:
             self.futures_exchange = None
         
