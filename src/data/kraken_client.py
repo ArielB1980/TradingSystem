@@ -155,6 +155,7 @@ class KrakenClient:
                 'apiKey': self.api_key,
                 'secret': self.api_secret,
                 'enableRateLimit': True,
+                'timeout': 30000,
             })
 
         # Initialize CCXT Futures Exchange (Futures - Async)
@@ -163,6 +164,7 @@ class KrakenClient:
                 'apiKey': self.futures_api_key,
                 'secret': self.futures_api_secret,
                 'enableRateLimit': True,
+                'timeout': 30000,
                 'options': {'defaultType': 'future'},
             })
             if self.futures_exchange and self.use_testnet:
@@ -340,7 +342,8 @@ class KrakenClient:
             headers = await self._get_futures_auth_headers(url, "GET")
             
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -404,7 +407,8 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -455,7 +459,8 @@ class KrakenClient:
             # Fetch all tickers from V3 endpoint
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         raise Exception(f"Futures API error: {await response.text()}")

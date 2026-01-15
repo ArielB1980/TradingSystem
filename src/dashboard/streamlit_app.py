@@ -115,15 +115,22 @@ active_count = sum(1 for c in coins if c.status == "active")
 stale_count = sum(1 for c in coins if c.status == "stale")
 dead_count = sum(1 for c in coins if c.status == "dead")
 
-# Calculate average freshness
+# Calculate average freshness (exclude Dead/Never Updated coins)
 if coins:
-    avg_age_seconds = sum((now - c.last_update).total_seconds() for c in coins if c.last_update) / len([c for c in coins if c.last_update])
-    if avg_age_seconds < 300:
-        freshness_emoji = "🟢"
-    elif avg_age_seconds < 1800:
-        freshness_emoji = "🟡"
+    # Filter for coins updated within last 24 hours to give meaningful average
+    valid_coins = [c for c in coins if c.last_update and (now - c.last_update).total_seconds() < 86400]
+    
+    if valid_coins:
+        avg_age_seconds = sum((now - c.last_update).total_seconds() for c in valid_coins) / len(valid_coins)
+        if avg_age_seconds < 300:
+            freshness_emoji = "🟢"
+        elif avg_age_seconds < 1800:
+            freshness_emoji = "🟡"
+        else:
+            freshness_emoji = "🔴"
     else:
         freshness_emoji = "🔴"
+        avg_age_seconds = 0
 else:
     freshness_emoji = "⚪"
     avg_age_seconds = 0
