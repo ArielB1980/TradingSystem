@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import text
 
 # Robustly find project root relative to this script
@@ -44,10 +44,14 @@ def check_freshness():
                 timestamp = row['timestamp']
                 symbol = row['symbol']
                 
-                # Handling timezone awareness for diff
-                if timestamp.tzinfo is None and db_now.tzinfo is not None:
-                     # If DB returns naive but db_now is aware, usually safe to assume UTC or same TZ
-                     pass
+                # Normalize Timezones
+                # 1. Convert DB Now to Aware UTC if naive
+                if db_now.tzinfo is None:
+                    db_now = db_now.replace(tzinfo=timezone.utc)
+                
+                # 2. Convert Event Timestamp to Aware UTC if naive
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
                 
                 age = (db_now - timestamp).total_seconds() / 60
                 
@@ -59,7 +63,7 @@ def check_freshness():
                 if age > 15:
                     print(f"❌ CRITICAL: System appears STALLED (No traces in {age:.1f} mins)")
                 else:
-                    print("✅ System appears RUNNING")
+                    print("✅ System appears ALIVE")
             else:
                 print("❌ CRITICAL: No traces found in database whatsoever.")
 
