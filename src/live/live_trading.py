@@ -132,6 +132,17 @@ class LiveTrading:
         """
         import os
         import time
+        from src.storage.repository import record_event
+        
+        # 0. Record Startup Event
+        try:
+            record_event("SYSTEM_STARTUP", "system", {
+                "version": self.config.system.version,
+                "pid": os.getpid(),
+                "mode": "LiveTradingEngine"
+            })
+        except Exception as e:
+            logger.error("Failed to record startup event", error=str(e))
         
         # Smoke Mode / Local Dev Limits
         max_loops = int(os.getenv("MAX_LOOPS", "-1"))
