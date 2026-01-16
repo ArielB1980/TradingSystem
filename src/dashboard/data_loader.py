@@ -170,14 +170,20 @@ def load_all_coins() -> List[CoinSnapshot]:
         all_symbols = _get_monitored_symbols(config)
         
         # Get latest DECISION_TRACE for each symbol (creates a dict for quick lookup)
-        traces = get_latest_traces(limit=500)
-        traces_by_symbol = {trace.get('symbol'): trace for trace in traces}
+        traces = get_latest_traces(limit=1000) # Increased to cover full universe
+        traces_by_symbol = {trace.get('symbol'): trace for trace in traces if trace.get('symbol')}
+        
+        # Merge configured symbols with active trace symbols
+        # This ensures we see discovered markets even if file sharing fails or config is stale
+        monitored_set = set(all_symbols)
+        trace_set = set(traces_by_symbol.keys())
+        merged_symbols = list(monitored_set | trace_set)
         
         snapshots = []
         now = datetime.now(timezone.utc)
         
         # Process all configured symbols, not just ones with traces
-        for symbol in all_symbols:
+        for symbol in merged_symbols:
             trace = traces_by_symbol.get(symbol)
             
             if trace:
