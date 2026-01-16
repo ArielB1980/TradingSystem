@@ -6,7 +6,7 @@ Fetches and structures data for the single-page coin monitor.
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from src.storage.repository import get_latest_traces, get_candles
 from src.monitoring.logger import get_logger
 
