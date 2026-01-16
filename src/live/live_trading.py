@@ -16,7 +16,7 @@ from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_manager import PositionManager, ActionType, ManagementAction
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles
+from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles, get_latest_candle_timestamp
 from src.storage.maintenance import DatabasePruner
 
 logger = get_logger(__name__)
@@ -199,23 +199,21 @@ class LiveTrading:
                 self.candles_4h = {}
                 self.candles_1d = {}
                 
-                for symbol in self.markets:
-                    try:
-                        c_15 = await asyncio.to_thread(get_candles, symbol, "15m", limit=300)
-                        c_1h = await asyncio.to_thread(get_candles, symbol, "1h", limit=300)
-                        c_4h = await asyncio.to_thread(get_candles, symbol, "4h", limit=300)
-                        c_1d = await asyncio.to_thread(get_candles, symbol, "1d", limit=300)
-                        
-                        self.candles_15m[symbol] = c_15 if c_15 else []
-                        self.candles_1h[symbol] = c_1h if c_1h else []
-                        self.candles_4h[symbol] = c_4h if c_4h else []
-                        self.candles_1d[symbol] = c_1d if c_1d else []
-                    except Exception as e:
-                        logger.debug(f"Failed to load candles for {symbol}", error=str(e))
-                        self.candles_15m[symbol] = []
-                        self.candles_1h[symbol] = []
-                        self.candles_4h[symbol] = []
-                        self.candles_1d[symbol] = []
+                # Efficient Bulk Load
+                # Load enough history for SMC analysis (swings, structure)
+                logger.info("Bulk loading candles from database...", symbol_count=len(self.markets))
+                
+                self.candles_15m = await asyncio.to_thread(load_candles_map, self.markets, "15m", days=14)
+                logger.info("Loaded 15m candles")
+                
+                self.candles_1h = await asyncio.to_thread(load_candles_map, self.markets, "1h", days=60)
+                logger.info("Loaded 1h candles")
+                
+                self.candles_4h = await asyncio.to_thread(load_candles_map, self.markets, "4h", days=180)
+                logger.info("Loaded 4h candles")
+                
+                self.candles_1d = await asyncio.to_thread(load_candles_map, self.markets, "1d", days=365)
+                logger.info("Loaded 1d candles")
                 
                 # Initialize throttling
                 now = datetime.now(timezone.utc)
@@ -995,30 +993,46 @@ class LiveTrading:
             last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
             if (now - last_update).total_seconds() < (interval_min * 60):
                 return # Cache hit
-                
-            candles = await self.client.get_spot_ohlcv(symbol, tf, limit=300)  # Increased to 300 for Strategy
+            
+            # Determine fetch start time
+            # Prioritize in-memory buffer (most recent), then DB
+            last_ts = None
+            existing = buffer.get(symbol, [])
+            
+            if existing:
+                last_ts = existing[-1].timestamp
+            else:
+                 # Check DB
+                 last_ts = await asyncio.to_thread(get_latest_candle_timestamp, symbol, tf)
+                 
+            since_ms = None
+            if last_ts:
+                # Use timestamp (ms) for since
+                since_ms = int(last_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            
+            # Fetch (Incremental)
+            candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
             if not candles: return
             
             # Update Cache
             self.last_candle_update[symbol][tf] = now
             
-            existing = buffer.get(symbol, [])
-            # ... (rest of merge logic would be here, but we just replace or append)
-            # For simplicity/robustness in live, we can just replace usage with latest snippet
-            # BUT we need history. 
-            # Smart merge:
+            # Smart Merge into Buffer
             if not existing:
                 buffer[symbol] = candles
             else:
-                 # Append new ones
-                 last_ts = existing[-1].timestamp
-                 new_candles = [c for c in candles if c.timestamp > last_ts]
-                 buffer[symbol].extend(new_candles)
-                 # Limit buffer size
+                 # Append only new ones
+                 last_buffer_ts = existing[-1].timestamp
+                 new_candles = [c for c in candles if c.timestamp > last_buffer_ts]
+                 if new_candles:
+                      buffer[symbol].extend(new_candles)
+                 
+                 # Prune buffer (Keep 500 in memory)
                  if len(buffer[symbol]) > 500:
                      buffer[symbol] = buffer[symbol][-500:]
             
-            # Phase 2: Collect candles for batched save (saves at end of tick)
+            # Queue for DB Persistence 
+            # We queue all fetched candles. Repository handles deduplication (Upsert).
             if candles:
                 self.pending_candles.extend(candles)
 
