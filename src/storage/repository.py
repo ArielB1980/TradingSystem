@@ -943,7 +943,7 @@ def get_latest_account_state() -> Optional[Dict[str, Decimal]]:
         }
 
 
-def get_latest_traces(limit: int = 300) -> List[Dict]:
+def get_latest_traces(limit: int = 1000) -> List[Dict]:
     """
     Get the latest DECISION_TRACE event for each symbol.
     

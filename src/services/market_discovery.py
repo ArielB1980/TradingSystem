@@ -60,35 +60,26 @@ class MarketDiscoveryService:
                     futures_symbol = m.get('symbol', '')
                     
                     # Determine Spot Symbol (Base/Quote)
-                    # Kraken Futures symbols often "PF_ETHUSD" or "ETH/USD:USD" or "PI_XBTUSD"
-                    
-                    # Logic 1: Check info 'base' 'quote' if available in CCXT
+                    # CCXT usually normalizes 'symbol' to 'ETH/USD:USD'.
                     base = m.get('base')
                     quote = m.get('quote')
                     
                     spot_symbol = ""
                     if base and quote:
+                        # Standard normalization: XBT -> BTC
+                        if base == "XBT": base = "BTC"
                         spot_symbol = f"{base}/{quote}"
-                    elif ':' in futures_symbol:
-                        spot_symbol = futures_symbol.split(':')[0]
+                    elif ':' in m.get('symbol', ''):
+                        spot_symbol = m['symbol'].split(':')[0].replace("XBT", "BTC")
+                    elif '/' in m.get('symbol', ''):
+                        spot_symbol = m['symbol'].split(':')[0].replace("XBT", "BTC")
                     else:
-                        # Fallback for "PF_ETHUSD" -> try to parse? 
-                        # This is risky without standard format.
-                        # CCXT usually normalizes 'symbol' to 'ETH/USD:USD'.
-                        # If 'symbol' is 'PF_ETHUSD', we might need 'id'.
-                        # Let's rely on 'symbol' being standard CCXT format (Base/Quote:Settle)
-                        if '/' in futures_symbol:
-                             spot_symbol = futures_symbol.split(':')[0]
-                        else:
-                             # Skip weird symbols if handled poorly
-                             continue
+                        # Skip symbols we can't reliably map to spot
+                        continue
 
-                    # Handle XBT -> BTC normalization if needed
-                    # Config uses BTC/USD. Kraken often uses XBT.
-                    if "XBT" in spot_symbol:
-                         spot_symbol = spot_symbol.replace("XBT", "BTC")
-                    
-                    mapping[spot_symbol] = futures_symbol
+                    futures_symbol = m.get('symbol', '')
+                    if spot_symbol and futures_symbol:
+                        mapping[spot_symbol] = futures_symbol
                         
             sorted_spots = sorted(list(mapping.keys()))
             

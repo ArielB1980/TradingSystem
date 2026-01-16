@@ -105,17 +105,16 @@ class LiveTrading:
             logger.info("Executing periodic market discovery...")
             mapping = await self.market_discovery.discover_markets()
             
-            new_spot_symbols = list(mapping.keys())
-            new_futures_symbols = list(mapping.values())
-            
-            if not new_spot_symbols:
-                logger.warning("Market discovery returned empty list - keeping existing")
+            if not mapping:
+                logger.warning("Market discovery returned empty - keeping existing")
                 return
             
-            # Update internal state
-            self.markets = new_spot_symbols
+            # Update internal state (Maintain Spot -> Futures mapping)
+            self.markets = mapping
             
             # Update Data Acquisition
+            new_spot_symbols = list(mapping.keys())
+            new_futures_symbols = list(mapping.values())
             self.data_acq.update_symbols(new_spot_symbols, new_futures_symbols)
             
             # Initialize logic is handled lazily by CandleManager/PositionManager as needed
@@ -181,7 +180,7 @@ class LiveTrading:
             logger.info("Loading candles from database...")
             try:
                 # 3. Fast Startup - Load candles via Manager
-                await self.candle_manager.initialize(self.markets)
+                await self.candle_manager.initialize(list(self.markets.keys()))
                 
             except Exception as e:
                  logger.error("Failed to hydrate candles", error=str(e))
@@ -405,7 +404,7 @@ class LiveTrading:
         # 3. Batch Data Fetching (Optimization)
         try:
             # Fetch ALL spot tickers (chunked inside client)
-            map_spot_tickers = await self.client.get_spot_tickers_bulk(self.markets)
+            map_spot_tickers = await self.client.get_spot_tickers_bulk(list(self.markets.keys()))
             
             # Fetch ALL futures mark prices
             map_futures_tickers = await self.client.get_futures_tickers_bulk()
