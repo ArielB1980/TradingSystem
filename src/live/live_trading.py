@@ -109,11 +109,13 @@ class LiveTrading:
         run_seconds = int(os.getenv("RUN_SECONDS", "-1"))
         start_time = time.time()
         loop_count = 0
+        is_smoke_mode = max_loops > 0 or run_seconds > 0
         
         logger.info("Starting run loop", 
                    max_loops=max_loops if max_loops > 0 else "unlimited",
                    run_seconds=run_seconds if run_seconds > 0 else "unlimited",
-                   dry_run=self.config.system.dry_run)
+                   dry_run=self.config.system.dry_run,
+                   smoke_mode=is_smoke_mode)
 
         self.active = True
         logger.critical("🚀 STARTING LIVE TRADING")
@@ -185,11 +187,12 @@ class LiveTrading:
             while self.active:
             # Check Smoke Mode Limits
                 if max_loops > 0 and loop_count >= max_loops:
-                    logger.info("Smoke mode: Max loops reached", max_loops=max_loops)
+                    logger.info("Smoke mode: Max loops reached", max_loops=max_loops, loops_completed=loop_count)
                     break
                     
                 if run_seconds > 0 and (time.time() - start_time) >= run_seconds:
-                    logger.info("Smoke mode: Run time limit reached", run_seconds=run_seconds)
+                    elapsed = time.time() - start_time
+                    logger.info("Smoke mode: Run time limit reached", run_seconds=run_seconds, elapsed_seconds=f"{elapsed:.1f}")
                     break
                 
                 loop_count += 1
@@ -213,9 +216,24 @@ class LiveTrading:
                 elapsed = (datetime.now(timezone.utc) - loop_start).total_seconds()
                 sleep_time = max(5.0, 60.0 - elapsed)
                 await asyncio.sleep(sleep_time)
+            
+            # Smoke mode summary
+            if is_smoke_mode:
+                total_runtime = time.time() - start_time
+                logger.info(
+                    "✅ SMOKE TEST COMPLETED SUCCESSFULLY",
+                    loops_completed=loop_count,
+                    runtime_seconds=f"{total_runtime:.1f}",
+                    markets_tracked=len(self.markets),
+                    dry_run=self.config.system.dry_run
+                )
                 
         except asyncio.CancelledError:
             logger.info("Live trading loop cancelled")
+        except Exception as e:
+            # Log the exception and re-raise to ensure non-zero exit code
+            logger.critical("Live trading failed with exception", error=str(e), exc_info=True)
+            raise
         finally:
             self.active = False
             await self.data_acq.stop()
