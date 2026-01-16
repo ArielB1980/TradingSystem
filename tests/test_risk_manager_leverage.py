@@ -23,8 +23,7 @@ def test_position_sizing_with_10x_leverage():
         tight_smc_cost_cap_bps=25.0,
         tight_smc_min_rr_multiple=2.0,
         tight_smc_avg_hold_hours=6.0,
-        tight_smc_atr_stop_min=0.3,
-        tight_smc_atr_stop_max=0.6,
+
         wide_structure_max_distortion_pct=0.15,
         wide_structure_avg_hold_hours=36.0,
         taker_fee_bps=5.0,
@@ -71,15 +70,17 @@ def test_position_sizing_with_10x_leverage():
     # Stop distance = (889.6 - 871.008) / 889.6 = 2.09%
     # Position notional = 11.67 / 0.0209 = 558.37
     
-    expected_buying_power = account_equity * Decimal("10")
-    expected_risk = expected_buying_power * Decimal("0.003")
+    # Actual Logic (Risk Managed):
+    # Risk amount = 389.08 * 0.003 = 1.16724
+    # Stop distance = 2.09%
+    # Position notional = 1.16724 / 0.0209 = ~55.85
+    
+    expected_risk = account_equity * Decimal("0.003")
     stop_distance_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
     expected_notional = expected_risk / stop_distance_pct
     
     print(f"\n=== Position Sizing Test ===")
     print(f"Account Equity: ${account_equity}")
-    print(f"Leverage: 10x")
-    print(f"Buying Power: ${expected_buying_power}")
     print(f"Risk per trade: 0.3%")
     print(f"Risk Amount: ${expected_risk:.2f}")
     print(f"Stop Distance: {stop_distance_pct:.2%}")
@@ -115,8 +116,7 @@ def test_position_sizing_comparison_5x_vs_10x():
         tight_smc_cost_cap_bps=25.0,
         tight_smc_min_rr_multiple=2.0,
         tight_smc_avg_hold_hours=6.0,
-        tight_smc_atr_stop_min=0.3,
-        tight_smc_atr_stop_max=0.6,
+
         wide_structure_max_distortion_pct=0.15,
         wide_structure_avg_hold_hours=36.0,
         taker_fee_bps=5.0,
@@ -142,8 +142,7 @@ def test_position_sizing_comparison_5x_vs_10x():
         tight_smc_cost_cap_bps=25.0,
         tight_smc_min_rr_multiple=2.0,
         tight_smc_avg_hold_hours=6.0,
-        tight_smc_atr_stop_min=0.3,
-        tight_smc_atr_stop_max=0.6,
+
         wide_structure_max_distortion_pct=0.15,
         wide_structure_avg_hold_hours=36.0,
         taker_fee_bps=5.0,
@@ -194,14 +193,18 @@ def test_position_sizing_comparison_5x_vs_10x():
     print(f"10x Leverage Position: ${decision_10x.position_notional:.2f}")
     print(f"Ratio: {decision_10x.position_notional / decision_5x.position_notional:.2f}x")
     
-    # 10x should be exactly 2x the size of 5x
-    expected_ratio = Decimal("2.0")
+    # Both are risk-constrained, not leverage constrained.
+    # Risk (0.3%) dictates size: 389.08 * 0.003 / stop_dist = $58.36
+    # This is well within 5x leverage ($1945 capacity).
+    # So both should be Equal.
+    
+    expected_ratio = Decimal("1.0")
     actual_ratio = decision_10x.position_notional / decision_5x.position_notional
     
     assert abs(actual_ratio - expected_ratio) < Decimal("0.01"), \
-        f"10x position should be 2x larger than 5x, got {actual_ratio}x"
+        f"Position size should be identical (risk-constrained), got ratio {actual_ratio}x"
     
-    print(f"✅ 10x leverage produces 2x larger positions than 5x")
+    print(f"✅ Position sizes are identical (Risk Constrained)")
 
 
 if __name__ == "__main__":
