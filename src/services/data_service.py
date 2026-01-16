@@ -120,7 +120,7 @@ class DataService:
         # 2. PERIODIC GAP FILLING (Every 10 minutes, check last 24h)
         while self.active:
             await asyncio.sleep(600) # Wait 10 mins
-            logging.info("Starting periodic gap-fill hydration...")
+            logger.info("Starting periodic gap-fill hydration...")
             scopes_periodic = [
                 ("15m", 3), # Increased from 1 to 3 days to cover EMA 200 (~2.1 days)
                 ("1h", 7),  # Increased from 1 to 7 days for safety

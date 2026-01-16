@@ -83,11 +83,15 @@ class CandleModel(Base):
     timestamp = Column(DateTime, nullable=False)
     symbol = Column(String, nullable=False)
     timeframe = Column(String, nullable=False)
-    open = Column(Numeric(precision=20, scale=8), nullable=False)
-    high = Column(Numeric(precision=20, scale=8), nullable=False)
-    low = Column(Numeric(precision=20, scale=8), nullable=False)
-    close = Column(Numeric(precision=20, scale=8), nullable=False)
-    volume = Column(Numeric(precision=20, scale=8), nullable=False)
+    # Optimized for crypto precision (e.g. PEPE price 0.000001, SHIB volume 1T)
+    # Precision 30, Scale 10 allows:
+    # - Max Value: 99,999,999,999,999,999,999.9999999999 (20 digits integer part)
+    # - Min Resolution: 0.0000000001
+    open = Column(Numeric(precision=30, scale=10), nullable=False)
+    high = Column(Numeric(precision=30, scale=10), nullable=False)
+    low = Column(Numeric(precision=30, scale=10), nullable=False)
+    close = Column(Numeric(precision=30, scale=10), nullable=False)
+    volume = Column(Numeric(precision=30, scale=10), nullable=False)
 
 
 class TradeModel(Base):
