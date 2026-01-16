@@ -121,6 +121,7 @@ class CoinSnapshot:
     last_update: datetime
     last_signal: Optional[datetime]
     status: str  # "active" | "stale" | "dead"
+    candle_count: int  # Number of 15m candles available (data depth)
     
     @property
     def status_emoji(self) -> str:
@@ -218,6 +219,9 @@ def load_all_coins() -> List[CoinSnapshot]:
                 except (TypeError, ValueError):
                     spot_price = 0.0
                 
+                # Get candle count for data depth
+                candle_count = details.get('candle_count', 0)
+                
                 # Create snapshot
                 snapshot = CoinSnapshot(
                     symbol=symbol,
@@ -233,7 +237,8 @@ def load_all_coins() -> List[CoinSnapshot]:
                     score_breakdown=score_breakdown if isinstance(score_breakdown, dict) else {},
                     last_update=last_update or now,
                     last_signal=None,  # TODO: Query for last non-NO_SIGNAL
-                    status=status
+                    status=status,
+                    candle_count=candle_count
                 )
             else:
                 # No trace yet - create default snapshot
@@ -253,7 +258,8 @@ def load_all_coins() -> List[CoinSnapshot]:
                     score_breakdown={},
                     last_update=no_data_timestamp,
                     last_signal=None,
-                    status='dead'  # No data yet
+                    status='dead',  # No data yet
+                    candle_count=0
                 )
             
             snapshots.append(snapshot)
