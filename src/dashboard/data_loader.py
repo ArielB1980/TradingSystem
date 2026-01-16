@@ -293,8 +293,19 @@ def load_all_coins() -> List[CoinSnapshot]:
         # Sort alphabetically by symbol
         snapshots.sort(key=lambda x: x.symbol)
         
-        logger.info(f"Loaded {len(snapshots)} coin snapshots ({len([s for s in snapshots if s.status != 'dead'])} with data)")
-        return snapshots
+        # Attach metadata for debug/dashboard status
+        class SnapshotList(list):
+            pass
+        
+        final_list = SnapshotList(snapshots)
+        final_list.metadata = {
+            "config_count": len(monitored_set),
+            "trace_count": len(trace_set),
+            "discovery_count": len(discovery_set)
+        }
+        
+        logger.info(f"Loaded {len(final_list)} coin snapshots ({len([s for s in snapshots if s.status != 'dead'])} with data)")
+        return final_list
         
     except Exception as e:
         logger.error("Failed to load coin snapshots", error=str(e))

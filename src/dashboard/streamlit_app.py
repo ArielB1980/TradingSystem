@@ -135,9 +135,15 @@ else:
     freshness_emoji = "⚪"
     avg_age_seconds = 0
 
+# Build source debug info
+source_info = ""
+if hasattr(coins, "metadata"):
+    meta = coins.metadata
+    source_info = f" | 🔍 Config: {meta.get('config_count', 0)} Traces: {meta.get('trace_count', 0)} Discovery: {meta.get('discovery_count', 0)}"
+
 st.markdown(
     f'<div class="status-bar">⚡ Live: {len(coins)} coins | '
-    f'🟢 Active: {active_count} | 🟡 Stale: {stale_count} | 🔴 Dead: {dead_count} | '
+    f'🟢 Active: {active_count} | 🟡 Stale: {stale_count} | 🔴 Dead: {dead_count}{source_info} | '
     f'💰 Positions: {len(positions)} | '
     f'{freshness_emoji} Avg freshness: {int(avg_age_seconds/60)}m | '
     f'Last refresh: {now.strftime("%H:%M:%S UTC")}</div>',
