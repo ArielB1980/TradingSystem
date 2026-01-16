@@ -30,19 +30,29 @@ class CandleManager:
 
     async def initialize(self, markets: List[str]):
         """Bulk load history from database."""
-        logger.info("Bulk loading candles from database...", symbol_count=len(markets))
+        logger.info("Hydrating candle cache from database...", symbol_count=len(markets))
 
-        self.candles["15m"] = await asyncio.to_thread(load_candles_map, markets, "15m", days=14)
-        logger.info("Loaded 15m candles")
+        # Merge results into existing cache instead of replacing it
+        # This prevents data loss if initialize is called while the system is already running
+        res_15m = await asyncio.to_thread(load_candles_map, markets, "15m", days=14)
+        for s, cands in res_15m.items():
+            if s not in self.candles["15m"]: self.candles["15m"][s] = cands
+            else: self._merge_candles(s, "15m", cands)
 
-        self.candles["1h"] = await asyncio.to_thread(load_candles_map, markets, "1h", days=60)
-        logger.info("Loaded 1h candles")
+        res_1h = await asyncio.to_thread(load_candles_map, markets, "1h", days=60)
+        for s, cands in res_1h.items():
+            if s not in self.candles["1h"]: self.candles["1h"][s] = cands
+            else: self._merge_candles(s, "1h", cands)
         
-        self.candles["4h"] = await asyncio.to_thread(load_candles_map, markets, "4h", days=180)
-        logger.info("Loaded 4h candles")
+        res_4h = await asyncio.to_thread(load_candles_map, markets, "4h", days=180)
+        for s, cands in res_4h.items():
+            if s not in self.candles["4h"]: self.candles["4h"][s] = cands
+            else: self._merge_candles(s, "4h", cands)
         
-        self.candles["1d"] = await asyncio.to_thread(load_candles_map, markets, "1d", days=365)
-        logger.info("Loaded 1d candles")
+        res_1d = await asyncio.to_thread(load_candles_map, markets, "1d", days=365)
+        for s, cands in res_1d.items():
+            if s not in self.candles["1d"]: self.candles["1d"][s] = cands
+            else: self._merge_candles(s, "1d", cands)
         
         # Initialize update trackers
         now = datetime.now(timezone.utc)
@@ -53,6 +63,27 @@ class CandleManager:
                 "4h": self.candles["4h"].get(symbol, [])[-1].timestamp if self.candles["4h"].get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
                 "1d": self.candles["1d"].get(symbol, [])[-1].timestamp if self.candles["1d"].get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
             }
+
+    def _merge_candles(self, symbol: str, timeframe: str, new_candles: List[Candle]):
+        """Helper to merge candles into cache, avoiding duplicates."""
+        buffer = self.candles[timeframe]
+        if symbol not in buffer:
+            buffer[symbol] = new_candles
+            return
+            
+        existing = buffer[symbol]
+        if not existing:
+            buffer[symbol] = new_candles
+            return
+            
+        last_ts = existing[-1].timestamp
+        to_append = [c for c in new_candles if c.timestamp > last_ts]
+        if to_append:
+            existing.extend(to_append)
+        
+        # Prune if over limit (2,000 for HTF context)
+        if len(existing) > 2000:
+            buffer[symbol] = existing[-2000:]
 
     def get_candles(self, symbol: str, timeframe: str) -> List[Candle]:
         """Get cached candles."""
@@ -105,9 +136,9 @@ class CandleManager:
                  if new_candles:
                       buffer[symbol].extend(new_candles)
                  
-                 # Prune buffer (Keep 500 in memory)
-                 if len(buffer[symbol]) > 500:
-                     buffer[symbol] = buffer[symbol][-500:]
+                 # Prune buffer (Keep up to 2,000 in memory for HTF analysis)
+                 if len(buffer[symbol]) > 2000:
+                     buffer[symbol] = buffer[symbol][-2000:]
             
             # Queue for DB Persistence 
             # We queue all fetched candles. Repository handles deduplication (Upsert).
@@ -126,10 +157,13 @@ class CandleManager:
         if not self.pending_candles:
             return
 
+        # Snapshot the batch to avoid clearing new data if this batch fails
+        batch = list(self.pending_candles)
+        
         try:
-            # Group by symbol/tf
+            # Group by symbol/tf for efficient upsert
             grouped = defaultdict(list)
-            for candle in self.pending_candles:
+            for candle in batch:
                 key = (candle.symbol, candle.timeframe)
                 grouped[key].append(candle)
             
@@ -138,11 +172,23 @@ class CandleManager:
                 save_tasks.append(asyncio.to_thread(save_candles_bulk, candle_group))
             
             if save_tasks:
-                await asyncio.gather(*save_tasks, return_exceptions=True)
+                results = await asyncio.gather(*save_tasks, return_exceptions=True)
+                
+                # Check for individual task failures
+                failures = [r for r in results if isinstance(r, Exception)]
+                if failures:
+                    logger.error("Some candle batches failed to save", count=len(failures), error=str(failures[0]))
+                    # If any batch fails, we don't clear the queue to prevent data loss.
+                    # Duplicates are handled by DB-level Upsert.
+                    return 
+
+            # Only clear the items we successfully attempted to save
+            # This is safer than clear() if new items were added during the await
+            processed_ids = {(c.symbol, c.timeframe, c.timestamp) for c in batch}
+            self.pending_candles = [c for c in self.pending_candles if (c.symbol, c.timeframe, c.timestamp) not in processed_ids]
             
-            total = len(self.pending_candles)
-            self.pending_candles.clear()
-            logger.debug("Batched save complete", candles_saved=total)
+            if batch:
+                logger.debug("Batched save complete", candles_saved=len(batch))
         except Exception as e:
             logger.error("Failed to batch save candles", error=str(e))
-            self.pending_candles.clear()
+            # Keep pending_candles for next attempt
