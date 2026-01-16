@@ -35,7 +35,8 @@ async def main_async():
         
     # Async Queues
     # Data -> Trading
-    market_data_queue = Queue()
+    # Limit queue size to prevent memory explosion if consumer lags
+    market_data_queue = Queue(maxsize=100)
     # Main -> Services
     command_queue_data = Queue()
     command_queue_trading = Queue()
