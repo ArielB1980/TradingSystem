@@ -313,6 +313,15 @@ if filtered_coins:
         fib_score = coin.score_breakdown.get('fib', 0) if coin.score_breakdown else 0
         htf_score = coin.score_breakdown.get('htf', 0) if coin.score_breakdown else 0
         
+        # Format data depth (candle count)
+        candle_count = coin.candle_count if hasattr(coin, 'candle_count') else 0
+        if candle_count >= 200:
+            depth_str = f"✅ {candle_count}"
+        elif candle_count >= 50:
+            depth_str = f"🟡 {candle_count}"
+        else:
+            depth_str = f"🔴 {candle_count}"
+        
         data.append({
             "Status": coin.status_emoji,
             "Symbol": coin.symbol,
@@ -328,7 +337,8 @@ if filtered_coins:
             "ADX": f"{coin.adx:.1f}" if coin.adx > 0 else "0.0",
             "ATR": f"{coin.atr:.4f}" if coin.atr > 0 else "0.0000",
             "EMA200": coin.ema200_slope,
-            "Last Update": last_update_str,
+            "Data Depth": depth_str,
+            "Last Review": last_update_str,
         })
     
     df = pd.DataFrame(data)
