@@ -371,7 +371,9 @@ if filtered_coins:
                         st.write(f"**Regime:** {latest.get('regime', 'N/A')}")
                         st.write(f"**Bias:** {latest.get('bias', 'N/A')}")
                         st.write(f"**Signal:** {latest.get('signal', 'N/A')}")
-                        quality = latest.get('quality', 0)
+                        # Safe retrieval: get() returns None if key exists but is None, so format crashes
+                        quality = latest.get('quality')
+                        if quality is None: quality = 0.0
                         st.write(f"**Quality:** {quality:.0f}")
                         timestamp = latest.get('timestamp')
                         if timestamp:
@@ -402,7 +404,8 @@ if filtered_coins:
                             else:
                                 ts_str = "N/A"
                             signal = sig.get('signal', 'N/A')
-                            quality = sig.get('quality', 0)
+                            quality = sig.get('quality')
+                            if quality is None: quality = 0.0
                             st.write(f"• {ts_str}: {signal} (Q: {quality:.0f})")
                     else:
                         st.write("No recent signals")
