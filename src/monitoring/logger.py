@@ -19,6 +19,24 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
         log_format: Format (json or text)
         log_file: Optional log file path
     """
+    import os
+    
+    # Auto-detect log file from environment if not provided
+    if log_file is None:
+        # Check if we're in smoke mode
+        run_seconds = os.getenv("RUN_SECONDS")
+        max_loops = os.getenv("MAX_LOOPS")
+        
+        if run_seconds or max_loops:
+            log_file = "logs/smoke.log"
+        else:
+            log_file = "logs/run.log"
+    
+    # Ensure logs directory exists
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    
     # Set log level
     logging.basicConfig(
         format="%(message)s",
@@ -49,12 +67,9 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
         cache_logger_on_first_use=True,
     )
     
-    # Add file handler if specified
+    # Add file handler for dual output (console + file)
     if log_file:
         from logging.handlers import RotatingFileHandler
-        
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Rotating File Handler (10MB limit, 5 backups)
         file_handler = RotatingFileHandler(
@@ -63,7 +78,16 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
             backupCount=5
         )
         file_handler.setLevel(getattr(logging, log_level.upper()))
+        
+        # Use same format as console for consistency
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        
+        # Add to root logger
         logging.root.addHandler(file_handler)
+        
+        # Log startup message to confirm dual output
+        logger = get_logger(__name__)
+        logger.info("Logging initialized", log_file=str(log_file), log_level=log_level, log_format=log_format)
 
 
 def get_logger(name: str) -> structlog.BoundLogger:
