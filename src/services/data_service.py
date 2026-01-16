@@ -53,7 +53,7 @@ class DataService:
         )
         
         # Report Status
-        self._send_status("RUNNING", {"msg": "Service Initialization Complete"})
+        await self._send_status("RUNNING", {"msg": "Service Initialization Complete"})
 
         # Initialize Client Lazy
         await self.kraken.initialize()
@@ -75,7 +75,7 @@ class DataService:
                             self.active = False
                             break
                         elif cmd.command == "PING":
-                            self._send_status("RUNNING", {"pong": time.time()})
+                            await self._send_status("RUNNING", {"pong": time.time()})
                     except QueueEmpty:
                         break
             except Exception as e:
@@ -115,7 +115,7 @@ class DataService:
         ]
         await self._run_hydration_cycle(markets, scopes_initial)
         logger.info("Initial Background Hydration Fully Complete")
-        self._send_status("HYDRATION_COMPLETE", {"msg": "Initial Sync Done"})
+        await self._send_status("HYDRATION_COMPLETE", {"msg": "Initial Sync Done"})
 
         # 2. PERIODIC GAP FILLING (Every 10 minutes, check last 24h)
         while self.active:
@@ -148,7 +148,7 @@ class DataService:
                             timeframe=tf, 
                             is_historical=True
                         )
-                        self.output_queue.put_nowait(msg)
+                        await self.output_queue.put(msg)
                 except Exception as e:
                     logger.error(f"Hydration error for {symbol} {tf}: {e}")
 
@@ -191,7 +191,7 @@ class DataService:
                         candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=limit)
                         if candles_15m:
                             await asyncio.to_thread(save_candles_bulk, candles_15m)
-                            self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
+                            await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                             if is_bootstrap: bootstrapped_symbols.add(symbol)
                             
                         # 2. Secondary Polling: 1h (Periodic)
@@ -199,14 +199,14 @@ class DataService:
                             candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit)
                             if candles_1h:
                                 await asyncio.to_thread(save_candles_bulk, candles_1h)
-                                self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
+                                await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
 
                         # 3. Tertiary Polling: 4h (Periodic)
                         if do_4h:
                             candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit)
                             if candles_4h:
                                 await asyncio.to_thread(save_candles_bulk, candles_4h)
-                                self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
+                                await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                             
                     except asyncio.TimeoutError:
                         # Log as debug to reduce noise unless it persists
@@ -222,11 +222,14 @@ class DataService:
             sleep_time = max(5.0, 60.0 - elapsed)
             await asyncio.sleep(sleep_time)
 
-    def _send_status(self, status: str, details: Dict = None):
+    async def _send_status(self, status: str, details: Dict = None):
         msg = ServiceStatus(
             service_name="DataService",
             status=status,
             timestamp=datetime.now(timezone.utc),
             details=details
         )
-        self.output_queue.put_nowait(msg)
+        # Status messages should skip the queue if full, or wait?
+        # Better to wait to ensure observability, or drop if critical.
+        # Let's wait, as status is infrequent.
+        await self.output_queue.put(msg)
