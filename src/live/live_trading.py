@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import List, Dict, Optional
 
 from src.config.config import Config
+from src.services.market_discovery import MarketDiscoveryService
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
 from src.data.data_acquisition import DataAcquisition
@@ -54,6 +55,7 @@ class LiveTrading:
         self.execution_engine = ExecutionEngine(config)
         self.position_manager = PositionManager()
         self.kill_switch = KillSwitch(self.client)
+        self.market_discovery = MarketDiscoveryService(self.client)
         
         # State
         self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
@@ -97,6 +99,48 @@ class LiveTrading:
         
         logger.info("Live Trading initialized", markets=config.exchange.futures_markets)
     
+    async def _update_market_universe(self):
+        """Discover and update trading universe."""
+        if not self.config.exchange.use_market_discovery:
+            return
+            
+        try:
+            logger.info("Executing periodic market discovery...")
+            mapping = await self.market_discovery.discover_markets()
+            
+            new_spot_symbols = list(mapping.keys())
+            new_futures_symbols = list(mapping.values())
+            
+            if not new_spot_symbols:
+                logger.warning("Market discovery returned empty list - keeping existing")
+                return
+            
+            # Update internal state
+            self.markets = new_spot_symbols
+            
+            # Update Data Acquisition
+            self.data_acq.update_symbols(new_spot_symbols, new_futures_symbols)
+            
+            # Initialize storage for potential new coins
+            for sym in self.markets:
+                if sym not in self.candles_1d:
+                     self.candles_1d[sym] = []
+                     self.candles_4h[sym] = []
+                     self.candles_1h[sym] = []
+                     self.candles_15m[sym] = []
+                     # Initialize last update trackers
+                     self.last_candle_update[sym] = {
+                         "15m": datetime.min.replace(tzinfo=timezone.utc),
+                         "1h": datetime.min.replace(tzinfo=timezone.utc),
+                         "4h": datetime.min.replace(tzinfo=timezone.utc),
+                         "1d": datetime.min.replace(tzinfo=timezone.utc),
+                     }
+            
+            logger.info("Market universe updated", count=len(self.markets))
+            
+        except Exception as e:
+            logger.error("Failed to update market universe", error=str(e))
+
     async def run(self):
         """
         Main trading loop.
@@ -124,6 +168,14 @@ class LiveTrading:
             # 1. Initialize Client
             logger.info("Initializing Kraken client...")
             await self.client.initialize()
+            
+            # 1.5 Initial Market Discovery
+            if self.config.exchange.use_market_discovery:
+                logger.info("Performing initial market discovery...")
+                await self._update_market_universe()
+                self.last_discovery_time = datetime.now(timezone.utc)
+            else:
+                self.last_discovery_time = datetime.min.replace(tzinfo=timezone.utc)
 
             # 2. Sync State (skip in dry run if no keys)
             if self.config.system.dry_run and not self.client.has_valid_futures_credentials():
@@ -201,6 +253,16 @@ class LiveTrading:
                     logger.critical("Kill switch active - pausing loop")
                     await asyncio.sleep(60)
                     continue
+                
+                # Periodic Market Discovery
+                if self.config.exchange.use_market_discovery:
+                    now = datetime.now(timezone.utc)
+                    elapsed_discovery = (now - self.last_discovery_time).total_seconds()
+                    refresh_sec = self.config.exchange.discovery_refresh_hours * 3600
+                    
+                    if elapsed_discovery >= refresh_sec:
+                        await self._update_market_universe()
+                        self.last_discovery_time = now
                 
                 loop_start = datetime.now(timezone.utc)
                 
@@ -466,10 +528,16 @@ class LiveTrading:
                             "last_processed": datetime.min.replace(tzinfo=timezone.utc),
                             "candle_count": 0
                         }
+                    
+                    prev_count = self.coin_processing_stats[spot_symbol]["candle_count"]
+                        
                     self.coin_processing_stats[spot_symbol]["processed_count"] += 1
                     self.coin_processing_stats[spot_symbol]["last_processed"] = datetime.now(timezone.utc)
                     self.coin_processing_stats[spot_symbol]["candle_count"] = candle_count
                     
+                    if prev_count > 50 and candle_count == 0:
+                        logger.critical("Data Depth Drop Detected!", symbol=spot_symbol, prev=prev_count, now=0)
+
                     if candle_count < 50:
                         # Still log trace even if insufficient candles (monitoring status)
                         now = datetime.now(timezone.utc)
@@ -505,12 +573,14 @@ class LiveTrading:
                                 logger.error("Failed to record monitoring trace", symbol=spot_symbol, error=str(e))
                         return
 
+                    # Corrected Argument Mapping:
+                    # generate_signal(symbol, bias_4h, bias_1d, exec_15m, exec_1h)
                     signal = self.smc_engine.generate_signal(
                         spot_symbol,
-                        candles,
-                        self.candles_1h.get(spot_symbol, []),
-                        self.candles_4h.get(spot_symbol, []),
-                        self.candles_1d.get(spot_symbol, [])
+                        self.candles_4h.get(spot_symbol, []),  # bias_4h
+                        self.candles_1d.get(spot_symbol, []),  # bias_1d
+                        candles,                               # exec_15m (15m cached)
+                        self.candles_1h.get(spot_symbol, [])   # exec_1h
                     )
                     
                     # Pass context to signal for execution (mark price for futures)
