@@ -199,11 +199,12 @@ def save_candle(candle: Candle) -> None:
 
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import insert as generic_insert
 
 def save_candles_bulk(candles: List[Candle]) -> int:
     """
-    Save multiple candles to the database using atomic Upsert (ON CONFLICT DO UPDATE).
-    Handles overlaps between Hydration and Polling tasks gracefully.
+    Save multiple candles to the database using atomic Upsert.
+    Database-agnostic: works with both PostgreSQL and SQLite.
     
     Args:
         candles: List of Candle objects
@@ -231,25 +232,50 @@ def save_candles_bulk(candles: List[Candle]) -> int:
         for c in candles
     ]
     
-    # Construct Upsert Statement
-    stmt = pg_insert(CandleModel).values(values)
-    
-    # Define conflict action: Update values if key exists
-    stmt = stmt.on_conflict_do_update(
-        constraint='uq_candle_key',
-        set_={
-            "open": stmt.excluded.open,
-            "high": stmt.excluded.high,
-            "low": stmt.excluded.low,
-            "close": stmt.excluded.close,
-            "volume": stmt.excluded.volume
-        }
-    )
+    # Detect database type
+    is_postgres = db.database_url.startswith("postgresql")
     
     with db.get_session() as session:
-        session.execute(stmt)
+        if is_postgres:
+            # PostgreSQL: Use ON CONFLICT DO UPDATE
+            stmt = pg_insert(CandleModel).values(values)
+            stmt = stmt.on_conflict_do_update(
+                constraint='uq_candle_key',
+                set_={
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                    "volume": stmt.excluded.volume
+                }
+            )
+            session.execute(stmt)
+        else:
+            # SQLite: Use INSERT OR REPLACE (upsert equivalent)
+            # Note: SQLite doesn't support ON CONFLICT with partial updates well
+            # So we do individual upserts for each candle
+            for value in values:
+                # Check if exists
+                existing = session.query(CandleModel).filter(
+                    CandleModel.symbol == value["symbol"],
+                    CandleModel.timeframe == value["timeframe"],
+                    CandleModel.timestamp == value["timestamp"]
+                ).first()
+                
+                if existing:
+                    # Update
+                    existing.open = value["open"]
+                    existing.high = value["high"]
+                    existing.low = value["low"]
+                    existing.close = value["close"]
+                    existing.volume = value["volume"]
+                else:
+                    # Insert
+                    candle_model = CandleModel(**value)
+                    session.add(candle_model)
             
     return len(candles)
+
 
 
 
