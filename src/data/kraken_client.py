@@ -227,29 +227,40 @@ class KrakenClient:
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i:i + chunk_size]
             try:
-                tickers = await self.exchange.fetch_tickers(chunk)
+                # Wrap bulk fetch in timeout
+                tickers = await asyncio.wait_for(
+                    self.exchange.fetch_tickers(chunk),
+                    timeout=5.0
+                )
                 results.update(tickers)
+            except asyncio.TimeoutError:
+                 logger.warning(f"Bulk fetch timed out for chunk {i//chunk_size}")
+                 # Proceed to fallback
+                 pass 
             except Exception as e:
                 # If bulk fetch fails, try individual fetches for the chunk
-                error_msg = str(e).lower()
-                if "does not have market" in error_msg or "invalid symbol" in error_msg:
-                    # Try fetching individually to identify which symbol(s) are invalid
-                    for symbol in chunk:
-                        try:
-                            ticker = await self.get_spot_ticker(symbol)
-                            results[symbol] = ticker
-                        except:
-                            # Skip invalid symbols silently
-                            pass
-                else:
-                    # For other errors, log and continue with partial results
-                    logger.warning(f"Bulk fetch failed for chunk, trying individual fetches", error=str(e))
-                    for symbol in chunk:
-                        try:
-                            ticker = await self.get_spot_ticker(symbol)
-                            results[symbol] = ticker
-                        except:
-                            pass
+                logger.warning(f"Bulk fetch failed for chunk {i//chunk_size}", error=str(e))
+                pass
+            except BaseException as be:
+                logger.critical(f"Critical error in bulk fetch chunk {i//chunk_size}", error=str(be))
+                # Don't re-raise immediately, try to fallback or continue
+                pass
+
+            # Fallback logic if results were not updated (either timeout or exception)
+            # Check which symbols are missing from results
+            missing = [s for s in chunk if s not in results]
+            if missing:
+                for symbol in missing:
+                    try:
+                        # Wrap individual fetch in short timeout
+                        ticker = await asyncio.wait_for(
+                            self.get_spot_ticker(symbol),
+                            timeout=2.0
+                        )
+                        results[symbol] = ticker
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0) # Yield
         
         return results
 
@@ -275,8 +286,12 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(
-                symbol, timeframe, since=since, limit=limit
+            # Wrap fetch in timeout to prevent hangs
+            ohlcv = await asyncio.wait_for(
+                self.exchange.fetch_ohlcv(
+                    symbol, timeframe, since=since, limit=limit
+                ),
+                timeout=5.0
             )
             
             candles = []
