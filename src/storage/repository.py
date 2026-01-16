@@ -338,14 +338,12 @@ def count_candles(symbol: str, timeframe: str) -> int:
     Used for dashboard data depth verification.
     """
     try:
-        session = get_db()
-        try:
+        # Use a proper session from the Database instance
+        with get_db().get_session() as session:
             return session.query(CandleModel).filter(
                 CandleModel.symbol == symbol,
                 CandleModel.timeframe == timeframe
             ).count()
-        finally:
-            session.close()
     except Exception as e:
         # Don't log error here to avoid spam, just return 0
         return 0
