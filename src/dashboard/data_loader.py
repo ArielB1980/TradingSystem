@@ -122,6 +122,8 @@ class CoinSnapshot:
     last_signal: Optional[datetime]
     status: str  # "active" | "stale" | "dead"
     candle_count: int  # Number of 15m candles available (data depth)
+    structure: Dict[str, float]
+    meta: Dict[str, Any]
     
     @property
     def status_emoji(self) -> str:
@@ -258,7 +260,9 @@ def load_all_coins() -> List[CoinSnapshot]:
                     last_update=last_update or now,
                     last_signal=None,  # TODO: Query for last non-NO_SIGNAL
                     status=status,
-                    candle_count=candle_count
+                    candle_count=candle_count,
+                    structure=details.get('structure', {}),
+                    meta=details.get('meta', {})
                 )
             else:
                 # No trace yet - create default snapshot
@@ -279,7 +283,9 @@ def load_all_coins() -> List[CoinSnapshot]:
                     last_update=no_data_timestamp,
                     last_signal=None,
                     status='dead',  # No data yet
-                    candle_count=count_candles(symbol, "15m") # Check DB just in case
+                    candle_count=count_candles(symbol, "15m"), # Check DB just in case
+                    structure={},
+                    meta={}
                 )
             
             snapshots.append(snapshot)
@@ -336,6 +342,8 @@ def get_coin_detail(symbol: str) -> Optional[Dict]:
                 'signal': details.get('signal'),
                 'quality': details.get('setup_quality'),
                 'reasoning': details.get('reasoning', 'No reasoning available'),
+                'structure': details.get('structure', {}),
+                'meta': details.get('meta', {}),
                 'timestamp': to_datetime(latest.get('timestamp'))
             },
             'recent_signals': [
