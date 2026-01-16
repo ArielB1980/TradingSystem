@@ -151,6 +151,13 @@ class TradingService:
                 
             if not self.active: break
             
+            # Explicit Garbage Collection (Help combat fragmentation on small instances)
+            # Run every ~100 loops (1 second sleep = 100 seconds) or use timer.
+            # Using simple modulo for now.
+            if processed > 0: # Only if we did work
+                 import gc
+                 gc.collect()
+
             # Yield to loop
             await asyncio.sleep(0.01)
             
