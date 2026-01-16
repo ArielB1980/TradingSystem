@@ -314,6 +314,24 @@ def get_candles(
     return result
 
 
+def get_latest_candle_timestamp(symbol: str, timeframe: str) -> Optional[datetime]:
+    """
+    Get timestamp of the most recent candle for a symbol/timeframe.
+    Optimized for incremental fetching.
+    """
+    db = get_db()
+    with db.get_session() as session:
+        # Use simple query with order_by desc
+        result = session.query(CandleModel.timestamp).filter(
+            CandleModel.symbol == symbol,
+            CandleModel.timeframe == timeframe
+        ).order_by(CandleModel.timestamp.desc()).first()
+        
+        if result:
+            return result[0].replace(tzinfo=timezone.utc)
+        return None
+
+
 def _get_candles_from_db(
     symbol: str,
     timeframe: str,
