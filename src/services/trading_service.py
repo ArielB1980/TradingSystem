@@ -732,14 +732,26 @@ class TradingService:
             throttle = 300 # 5 mins for Active Signals
 
         if (now - last).total_seconds() > throttle:
+            # Get candle count for data depth
+            c15m = self.candles_15m.get(symbol, [])
+            candle_count = len(c15m)
+            
             await async_record_event(
                 "DECISION_TRACE", 
                 symbol, 
                 {
-                    "price": float(price),
-                    "signal_type": signal.signal_type.value,
+                    "spot_price": float(price),
+                    "signal": signal.signal_type.value,
                     "regime": signal.regime,
-                    "score": signal.score
+                    "bias": signal.higher_tf_bias if hasattr(signal, 'higher_tf_bias') else "neutral",
+                    "adx": float(signal.adx) if signal.adx else 0.0,
+                    "atr": float(signal.atr) if signal.atr else 0.0,
+                    "ema200_slope": signal.ema200_slope if hasattr(signal, 'ema200_slope') else "flat",
+                    "setup_quality": signal.score if hasattr(signal, 'score') else 0.0,
+                    "score_breakdown": signal.score_breakdown if hasattr(signal, 'score_breakdown') else {},
+                    "candle_count": candle_count,
+                    "status": "active",
+                    "reasoning": signal.reasoning if hasattr(signal, 'reasoning') else ""
                 }
             )
             self.last_trace_log[symbol] = now
