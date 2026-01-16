@@ -455,6 +455,14 @@ class SMCEngine:
                                 "htf": score_obj.htf_alignment,
                                 "adx": score_obj.adx_strength,
                                 "cost": score_obj.cost_efficiency
+                            },
+                            structure_info=structure_signal or {},
+                            meta_info={
+                                "fib_levels": {str(k): float(v) for k, v in fib_levels.items()} if fib_levels else {},
+                                "filters": {
+                                    "adx": adx_value,
+                                    "atr": float(atr_value)
+                                }
                             }
                         )
                 elif signal is None:

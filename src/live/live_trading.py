@@ -573,7 +573,10 @@ class LiveTrading:
                                 "score_breakdown": signal.score_breakdown or {},
                                 "status": "active",
                                 "candle_count": candle_count,
-                                "reason": signal.reasoning # CAPTURE REASON
+                                "candle_count": candle_count,
+                                "reason": signal.reasoning, # CAPTURE REASON
+                                "structure": signal.structure_info,
+                                "meta": signal.meta_info
                             }
                             
                             if signal.signal_type == SignalType.NO_SIGNAL and signal.reasoning:
