@@ -106,7 +106,7 @@ def load_positions_data():
     from src.dashboard.positions_loader import load_active_positions
     return load_active_positions()
 
-coins = load_dashboard_data()
+coins, coins_metadata = load_dashboard_data()
 positions = load_positions_data()
 
 # Status bar with freshness info
@@ -137,9 +137,8 @@ else:
 
 # Build source debug info
 source_info = ""
-if hasattr(coins, "metadata"):
-    meta = coins.metadata
-    source_info = f" | 🔍 Config: {meta.get('config_count', 0)} Traces: {meta.get('trace_count', 0)} Discovery: {meta.get('discovery_count', 0)}"
+if coins_metadata:
+    source_info = f" | 🔍 Config: {coins_metadata.get('config_count', 0)} Traces: {coins_metadata.get('trace_count', 0)} Discovery: {coins_metadata.get('discovery_count', 0)}"
 
 st.markdown(
     f'<div class="status-bar">⚡ Live: {len(coins)} coins | '
