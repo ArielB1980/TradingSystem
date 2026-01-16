@@ -164,7 +164,7 @@ def load_all_coins() -> List[CoinSnapshot]:
     try:
         from src.config.config import load_config
         from src.dashboard.utils import _get_monitored_symbols
-        from src.storage.repository import get_recent_events
+        from src.storage.repository import get_recent_events, count_candles
         
         # Get all configured symbols (should be 250 coins)
         config = load_config()
@@ -237,8 +237,10 @@ def load_all_coins() -> List[CoinSnapshot]:
                 except (TypeError, ValueError):
                     spot_price = 0.0
                 
-                # Get candle count for data depth
+                # Get candle count for data depth (Robust fallback)
                 candle_count = details.get('candle_count', 0)
+                if candle_count == 0:
+                     candle_count = count_candles(symbol, "15m")
                 
                 # Create snapshot
                 snapshot = CoinSnapshot(
@@ -277,7 +279,7 @@ def load_all_coins() -> List[CoinSnapshot]:
                     last_update=no_data_timestamp,
                     last_signal=None,
                     status='dead',  # No data yet
-                    candle_count=0
+                    candle_count=count_candles(symbol, "15m") # Check DB just in case
                 )
             
             snapshots.append(snapshot)

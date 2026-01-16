@@ -330,6 +330,25 @@ def get_latest_candle_timestamp(symbol: str, timeframe: str) -> Optional[datetim
         if result:
             return result[0].replace(tzinfo=timezone.utc)
         return None
+    
+    
+def count_candles(symbol: str, timeframe: str) -> int:
+    """
+    Count candles for a symbol/timeframe.
+    Used for dashboard data depth verification.
+    """
+    try:
+        session = get_db()
+        try:
+            return session.query(CandleModel).filter(
+                CandleModel.symbol == symbol,
+                CandleModel.timeframe == timeframe
+            ).count()
+        finally:
+            session.close()
+    except Exception as e:
+        # Don't log error here to avoid spam, just return 0
+        return 0
 
 
 def _get_candles_from_db(
