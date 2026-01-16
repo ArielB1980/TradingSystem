@@ -23,6 +23,7 @@ class DataService:
         self.command_queue = command_queue
         self.config = config
         self.active = True
+        self.iteration_count = 0
         
     async def start(self):
         """Entry point for the async task."""
@@ -168,44 +169,54 @@ class DataService:
             loop_start = time.time()
             
             # Parallel Polling for 250 symbols
-            sem = asyncio.Semaphore(15) # Max 15 concurrent symbols to respect rate limits
+            # Reduced concurrency to prevent rate limit queue stacking
+            sem = asyncio.Semaphore(8) 
             
+            # Smart Polling: Only fetch 1h every 15 mins, 4h every 60 mins
+            fetch_1h = (self.iteration_count % 15 == 0)
+            fetch_4h = (self.iteration_count % 60 == 0)
+
             async def poll_symbol(symbol: str):
                 async with sem:
                     if not self.active: return
                     
-                    # Determine limit: 300 for first run (Bootstrap), 3 for updates (Incremental)
                     is_bootstrap = symbol not in bootstrapped_symbols
+                    # If bootstrap, we MUST fetch everything regardless of cycle
+                    do_1h = fetch_1h or is_bootstrap
+                    do_4h = fetch_4h or is_bootstrap
                     limit = 300 if is_bootstrap else 3
                     
                     try:
                         # 1. Primary Polling: 15m (Every loop)
-                        # Ensure we don't hang on a single slow symbol
-                        candles_15m = await asyncio.wait_for(self.kraken.get_spot_ohlcv(symbol, "15m", limit=limit), timeout=20.0)
+                        candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=limit)
                         if candles_15m:
                             await asyncio.to_thread(save_candles_bulk, candles_15m)
                             self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                             if is_bootstrap: bootstrapped_symbols.add(symbol)
                             
-                        # 2. Secondary Polling: 1h
-                        candles_1h = await asyncio.wait_for(self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit), timeout=20.0)
-                        if candles_1h:
-                            await asyncio.to_thread(save_candles_bulk, candles_1h)
-                            self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
+                        # 2. Secondary Polling: 1h (Periodic)
+                        if do_1h:
+                            candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit)
+                            if candles_1h:
+                                await asyncio.to_thread(save_candles_bulk, candles_1h)
+                                self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
 
-                        # 3. Tertiary Polling: 4h
-                        candles_4h = await asyncio.wait_for(self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit), timeout=20.0)
-                        if candles_4h:
-                            await asyncio.to_thread(save_candles_bulk, candles_4h)
-                            self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
+                        # 3. Tertiary Polling: 4h (Periodic)
+                        if do_4h:
+                            candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit)
+                            if candles_4h:
+                                await asyncio.to_thread(save_candles_bulk, candles_4h)
+                                self.output_queue.put_nowait(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
                             
                     except asyncio.TimeoutError:
-                        logger.warning(f"Timeout polling {symbol}")
+                        # Log as debug to reduce noise unless it persists
+                        logger.debug(f"Timeout polling {symbol}")
                     except Exception as e:
                         logger.error(f"Polling failed for {symbol}: {e}")
 
             # Run all polls and wait
             await asyncio.gather(*[poll_symbol(s) for s in markets], return_exceptions=True)
+            self.iteration_count += 1
 
             elapsed = time.time() - loop_start
             sleep_time = max(5.0, 60.0 - elapsed)

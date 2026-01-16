@@ -230,7 +230,7 @@ class KrakenClient:
                 # Wrap bulk fetch in timeout
                 tickers = await asyncio.wait_for(
                     self.exchange.fetch_tickers(chunk),
-                    timeout=5.0
+                    timeout=10.0
                 )
                 results.update(tickers)
             except asyncio.TimeoutError:
@@ -291,7 +291,7 @@ class KrakenClient:
                 self.exchange.fetch_ohlcv(
                     symbol, timeframe, since=since, limit=limit
                 ),
-                timeout=5.0
+                timeout=10.0
             )
             
             candles = []
