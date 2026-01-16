@@ -417,6 +417,66 @@ class Config(BaseSettings):
             raise ValueError("Basis guard must be configured (basis_max_pct > 0)")
 
 
+def validate_required_env_vars() -> None:
+    """
+    Validate that required environment variables are set.
+    
+    Fails fast with clear error messages if required vars are missing.
+    
+    Raises:
+        ValueError: If required environment variables are missing
+    """
+    import os
+    
+    env = os.getenv("ENV", "prod")
+    dry_run = os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", "0"))
+    
+    # Convert dry_run to boolean
+    is_dry_run = dry_run in ("1", "true", "True", "TRUE")
+    
+    missing_vars = []
+    
+    # Database is always required (but has defaults in local mode)
+    if not is_dry_run and env == "prod":
+        # Production mode - strict requirements
+        if not os.getenv("DATABASE_URL"):
+            missing_vars.append("DATABASE_URL")
+        
+        # API keys required for live trading
+        if not os.getenv("KRAKEN_FUTURES_API_KEY"):
+            missing_vars.append("KRAKEN_FUTURES_API_KEY")
+        if not os.getenv("KRAKEN_FUTURES_API_SECRET"):
+            missing_vars.append("KRAKEN_FUTURES_API_SECRET")
+    
+    if missing_vars:
+        error_msg = f"""
+╔══════════════════════════════════════════════════════════════╗
+║  CONFIGURATION ERROR: Missing Required Environment Variables ║
+╚══════════════════════════════════════════════════════════════╝
+
+The following required environment variables are not set:
+{chr(10).join(f"  ❌ {var}" for var in missing_vars)}
+
+Current environment:
+  ENV: {env}
+  DRY_RUN: {dry_run}
+
+To fix this:
+  1. For local development:
+     - Copy .env.local.example to .env.local
+     - Set DRY_RUN=1 for safe testing
+     - Run: make smoke
+
+  2. For production:
+     - Set all required environment variables in DigitalOcean App Platform
+     - Ensure DRY_RUN=0 or unset
+     - Ensure DATABASE_URL points to production database
+
+See LOCAL_DEV.md for detailed setup instructions.
+"""
+        raise ValueError(error_msg)
+
+
 def load_config(config_path: str | None = None) -> Config:
     """
     Load and validate configuration.
@@ -431,6 +491,9 @@ def load_config(config_path: str | None = None) -> Config:
         FileNotFoundError: If config file not found
         ValueError: If configuration validation fails
     """
+    # Validate environment variables first
+    validate_required_env_vars()
+    
     if config_path is None:
         config_path = Path(__file__).parent / "config.yaml"
     
