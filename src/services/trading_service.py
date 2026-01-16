@@ -535,7 +535,7 @@ class TradingService:
                  if not sl_id:
                      logger.critical(f"FAILED TO PLACE STOP LOSS for {futures_symbol}!")
 
-                 # 4. Initialize V3 Position State
+                 # 4. Initialize Position State
                  v3_pos = Position(
                      symbol=futures_symbol,
                      side=intent_model.side,
@@ -549,7 +549,7 @@ class TradingService:
                      margin_used=Decimal("0"),
                      opened_at=datetime.now(timezone.utc),
                      
-                     # V3 Immutable Parameters
+                     # Immutable Parameters
                      initial_stop_price=intent_model.stop_loss_futures,
                      trade_type=signal.regime,
                      tp1_price=tp1,
@@ -562,7 +562,7 @@ class TradingService:
                  )
                  
                  self.managed_positions[futures_symbol] = v3_pos
-                 logger.info("V3 Position State initialized", symbol=futures_symbol)
+                 logger.info("Position State initialized", symbol=futures_symbol)
                  
                  # Persist Event
                  await async_record_event("TRADE_EXECUTION", futures_symbol, {
@@ -576,7 +576,7 @@ class TradingService:
     async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):
         """Execute logic actions decided by PositionManager."""
         for action in actions:
-            logger.info(f"V3 Action: {action.type.value}", symbol=symbol, reason=action.reason)
+            logger.info(f"Action: {action.type.value}", symbol=symbol, reason=action.reason)
             
             try:
                 if action.type == ActionType.CLOSE_POSITION:

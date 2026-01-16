@@ -165,12 +165,12 @@ class StrategyConfig(BaseSettings):
     fib_proximity_bps: float = Field(default=20.0, ge=0.0, le=100.0) # 0.2%
 
 
-    # V3: Market Structure Change Confirmation
+    # Market Structure Change Confirmation
     require_ms_change_confirmation: bool = Field(default=True)
     ms_confirmation_candles: int = Field(default=3, ge=1, le=10)
     ms_reconfirmation_candles: int = Field(default=2, ge=1, le=10)
     
-    # V4: Adaptive Strategy Logic
+    # Adaptive Strategy Logic
     adaptive_enabled: bool = True
     atr_confirmation_threshold_high: float = Field(default=1.5, ge=1.0) # > 1.5x avg ATR -> High Vol
     atr_confirmation_threshold_low: float = Field(default=0.5, le=1.0) # < 0.5x avg ATR -> Low Vol

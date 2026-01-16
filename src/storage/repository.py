@@ -137,7 +137,7 @@ class PositionModel(Base):
     stop_loss_order_id = Column(String, nullable=True)
     take_profit_order_id = Column(String, nullable=True)
     
-    # V3 Active Trade Management fields
+    # Active Trade Management fields
     initial_stop_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp1_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp2_price = Column(Numeric(precision=20, scale=8), nullable=True)
@@ -456,7 +456,7 @@ def save_position(position: Position) -> None:
             position_model.margin_used = position.margin_used
             position_model.stop_loss_order_id = position.stop_loss_order_id
             position_model.take_profit_order_id = position.take_profit_order_id
-            # V3 fields
+            # Management fields
             position_model.initial_stop_price = position.initial_stop_price
             position_model.tp1_price = position.tp1_price
             position_model.tp2_price = position.tp2_price
@@ -477,7 +477,7 @@ def save_position(position: Position) -> None:
                 margin_used=position.margin_used,
                 stop_loss_order_id=position.stop_loss_order_id,
                 take_profit_order_id=position.take_profit_order_id,
-                # V3 fields
+                # Management fields
                 initial_stop_price=position.initial_stop_price,
                 tp1_price=position.tp1_price,
                 tp2_price=position.tp2_price,
@@ -529,7 +529,7 @@ def sync_active_positions(positions: List[Position]) -> None:
                 pm.margin_used = pos.margin_used
                 pm.stop_loss_order_id = pos.stop_loss_order_id
                 pm.take_profit_order_id = pos.take_profit_order_id
-                # V3 fields
+                # Management fields
                 pm.initial_stop_price = pos.initial_stop_price
                 pm.tp1_price = pos.tp1_price
                 pm.tp2_price = pos.tp2_price
@@ -550,7 +550,7 @@ def sync_active_positions(positions: List[Position]) -> None:
                     margin_used=pos.margin_used,
                     stop_loss_order_id=pos.stop_loss_order_id,
                     take_profit_order_id=pos.take_profit_order_id,
-                    # V3 fields
+                    # Management fields
                     initial_stop_price=pos.initial_stop_price,
                     tp1_price=pos.tp1_price,
                     tp2_price=pos.tp2_price,
@@ -590,7 +590,7 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
             margin_used=Decimal(str(pm.margin_used)),
             opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
             updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
-            # V3 Params
+            # Management Params
             initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
             trade_type=pm.trade_type,
             tp1_price=Decimal(str(pm.tp1_price)) if pm.tp1_price else None,
