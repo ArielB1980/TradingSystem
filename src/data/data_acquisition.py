@@ -68,6 +68,28 @@ class DataAcquisition:
             spot_symbols=spot_symbols,
             futures_symbols=futures_symbols,
         )
+        
+    def update_symbols(self, spot_symbols: List[str], futures_symbols: List[str]):
+        """
+        Update the list of tracked symbols dynamically.
+        
+        Args:
+            spot_symbols: New list of spot symbols
+            futures_symbols: New list of futures symbols
+        """
+        self.spot_symbols = spot_symbols
+        self.futures_symbols = futures_symbols
+        
+        # Initialize new orderbooks (if missing)
+        for symbol in futures_symbols:
+            if symbol not in self.orderbooks:
+                self.orderbooks[symbol] = OrderBook(symbol)
+                
+        logger.info(
+            "DataAcquisition symbols updated",
+            spot_count=len(spot_symbols),
+            futures_count=len(futures_symbols)
+        )
     
     async def start(self):
         """Start data acquisition."""
