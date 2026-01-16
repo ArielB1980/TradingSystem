@@ -365,9 +365,9 @@ class TradingService:
             for c in new_data:
                 merged[c.timestamp] = c
             target_map[symbol] = sorted(merged.values(), key=lambda x: x.timestamp)
-            # Cap size
-            if len(target_map[symbol]) > 1000:
-                target_map[symbol] = target_map[symbol][-1000:]
+            # Cap size - Reduced from 1000 to 300 to prevent memory exhaustion
+            if len(target_map[symbol]) > 300:
+                target_map[symbol] = target_map[symbol][-300:]
             
         # 2. Trigger Strategy (Live Signal)
         if not msg.is_historical and tf == "15m":
