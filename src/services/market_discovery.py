@@ -100,8 +100,24 @@ class MarketDiscoveryService:
                 sample=sorted_spots[:5]
             )
             
-            # Persist for dashboard/debug
+            # Persist for dashboard/debug (File)
             self._save_to_disk(sorted_spots)
+            
+            # Persist to DB for Dashboard (Container-safe)
+            try:
+                from src.storage.repository import async_record_event
+                await async_record_event(
+                    event_type="DISCOVERY_UPDATE",
+                    symbol="SYSTEM",
+                    details={
+                        "count": len(sorted_spots),
+                        "markets": sorted_spots,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    },
+                    timestamp=datetime.now(timezone.utc)
+                )
+            except Exception as e:
+                logger.error("Failed to record discovery event", error=str(e))
             
             return mapping
             

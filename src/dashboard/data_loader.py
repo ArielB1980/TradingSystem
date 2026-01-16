@@ -164,6 +164,7 @@ def load_all_coins() -> List[CoinSnapshot]:
     try:
         from src.config.config import load_config
         from src.dashboard.utils import _get_monitored_symbols
+        from src.storage.repository import get_recent_events
         
         # Get all configured symbols (should be 250 coins)
         config = load_config()
@@ -173,11 +174,22 @@ def load_all_coins() -> List[CoinSnapshot]:
         traces = get_latest_traces(limit=1000) # Increased to cover full universe
         traces_by_symbol = {trace.get('symbol'): trace for trace in traces if trace.get('symbol')}
         
-        # Merge configured symbols with active trace symbols
+        # Get latest DISCOVERY_UPDATE (Robust source)
+        discovery_list = []
+        try:
+            discovery_events = get_recent_events(limit=1, event_type="DISCOVERY_UPDATE")
+            if discovery_events:
+                 discovery_list = discovery_events[0].get('details', {}).get('markets', [])
+        except Exception as e:
+            logger.error("Failed to load discovery events", error=str(e))
+        
+        # Merge all sources
         # This ensures we see discovered markets even if file sharing fails or config is stale
         monitored_set = set(all_symbols)
         trace_set = set(traces_by_symbol.keys())
-        merged_symbols = list(monitored_set | trace_set)
+        discovery_set = set(discovery_list)
+        
+        merged_symbols = list(monitored_set | trace_set | discovery_set)
         
         snapshots = []
         now = datetime.now(timezone.utc)
