@@ -525,8 +525,12 @@ class LiveTrading:
                                 "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
                                 "score_breakdown": signal.score_breakdown or {},
                                 "status": "active",
-                                "candle_count": candle_count
+                                "candle_count": candle_count,
+                                "reason": signal.reason # CAPTURE REASON
                             }
+                            
+                            if signal.signal_type == SignalType.NO_SIGNAL and signal.reason:
+                                logger.info(f"SMC Analysis {spot_symbol}: NO_SIGNAL -> {signal.reason}")
                             
                             await async_record_event(
                                 event_type="DECISION_TRACE",
