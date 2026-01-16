@@ -39,6 +39,7 @@ class Indicators:
                 candles=len(candles),
                 period=period,
             )
+            return pd.Series()
         
         df = Indicators._candles_to_df(candles)
         ema = df['close'].ewm(span=period, adjust=False).mean()
@@ -64,6 +65,7 @@ class Indicators:
                 candles=len(candles),
                 period=period,
             )
+            return pd.DataFrame()
         
         df = Indicators._candles_to_df(candles)
         
@@ -118,6 +120,7 @@ class Indicators:
                 candles=len(candles),
                 period=period,
             )
+            return pd.Series()
         
         df = Indicators._candles_to_df(candles)
         
@@ -152,6 +155,7 @@ class Indicators:
                 candles=len(candles),
                 period=period,
             )
+            return pd.Series()
         
         df = Indicators._candles_to_df(candles)
         
