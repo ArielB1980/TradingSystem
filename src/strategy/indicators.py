@@ -34,7 +34,7 @@ class Indicators:
             Pandas Series with EMA values
         """
         if len(candles) < period:
-            logger.warning(
+            logger.debug(
                 "Insufficient candles for EMA calculation",
                 candles=len(candles),
                 period=period,
@@ -60,7 +60,7 @@ class Indicators:
             DataFrame with ADX, +DI, -DI columns
         """
         if len(candles) < period * 2:
-            logger.warning(
+            logger.debug(
                 "Insufficient candles for ADX calculation",
                 candles=len(candles),
                 period=period,
@@ -115,7 +115,7 @@ class Indicators:
             Pandas Series with ATR values
         """
         if len(candles) < period:
-            logger.warning(
+            logger.debug(
                 "Insufficient candles for ATR calculation",
                 candles=len(candles),
                 period=period,
@@ -150,7 +150,7 @@ class Indicators:
             Pandas Series with RSI values
         """
         if len(candles) < period:
-            logger.warning(
+            logger.debug(
                 "Insufficient candles for RSI calculation",
                 candles=len(candles),
                 period=period,
