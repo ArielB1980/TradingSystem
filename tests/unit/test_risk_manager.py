@@ -19,6 +19,8 @@ def test_position_sizing_formula():
         timestamp=datetime.now(timezone.utc),
         symbol="BTC/USD",
         signal_type=SignalType.LONG,
+        setup_type="test_setup",
+        regime="trending",
         entry_price=Decimal("50000"),
         stop_loss=Decimal("49000"),  # 2% stop distance
         take_profit=Decimal("52000"),
@@ -50,6 +52,8 @@ def test_leverage_cap_enforcement():
         timestamp=datetime.now(timezone.utc),
         symbol="BTC/USD",
         signal_type=SignalType.LONG,
+        setup_type="test_setup",
+        regime="trending",
         entry_price=Decimal("50000"),
         stop_loss=Decimal("49950"),  # 0.1% stop (would need 50× leverage)
         take_profit=None,

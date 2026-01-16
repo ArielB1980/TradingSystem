@@ -8,6 +8,7 @@ from src.services.market_discovery import MarketDiscoveryService
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
 from src.data.data_acquisition import DataAcquisition
+from src.data.candle_manager import CandleManager
 from src.strategy.smc_engine import SMCEngine
 from src.risk.risk_manager import RiskManager
 from src.execution.executor import Executor
@@ -58,14 +59,13 @@ class LiveTrading:
         self.market_discovery = MarketDiscoveryService(self.client)
         
         # State
+        # State
         self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
         self.active = False
-        self.candles_1d: Dict[str, List[Candle]] = {}
-        self.candles_4h: Dict[str, List[Candle]] = {}
-        self.candles_1h: Dict[str, List[Candle]] = {}
-        self.candles_1h: Dict[str, List[Candle]] = {}
-        self.candles_15m: Dict[str, List[Candle]] = {}
-        self.last_candle_update: Dict[str, Dict[str, datetime]] = {} # Cache tracking
+        
+        # Candle data managed by dedicated service
+        self.candle_manager = CandleManager(self.client)
+        
         self.last_trace_log: Dict[str, datetime] = {} # Dashboard update throttling
         self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
         self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
@@ -74,9 +74,6 @@ class LiveTrading:
         # Coin processing tracking
         self.coin_processing_stats: Dict[str, Dict] = {}  # Track processing stats per coin
         self.last_status_summary = datetime.min.replace(tzinfo=timezone.utc)
-        
-        # Batched candle storage (Phase 2 optimization)
-        self.pending_candles: List[Candle] = []  # Batch candles before saving
         
         # Market Expansion (Coin Universe)
         self.markets = config.exchange.spot_markets
@@ -121,20 +118,9 @@ class LiveTrading:
             # Update Data Acquisition
             self.data_acq.update_symbols(new_spot_symbols, new_futures_symbols)
             
-            # Initialize storage for potential new coins
-            for sym in self.markets:
-                if sym not in self.candles_1d:
-                     self.candles_1d[sym] = []
-                     self.candles_4h[sym] = []
-                     self.candles_1h[sym] = []
-                     self.candles_15m[sym] = []
-                     # Initialize last update trackers
-                     self.last_candle_update[sym] = {
-                         "15m": datetime.min.replace(tzinfo=timezone.utc),
-                         "1h": datetime.min.replace(tzinfo=timezone.utc),
-                         "4h": datetime.min.replace(tzinfo=timezone.utc),
-                         "1d": datetime.min.replace(tzinfo=timezone.utc),
-                     }
+            # Initialize logic is handled lazily by CandleManager/PositionManager as needed
+            # We just ensure DataAcquisition is updated (done above)
+            pass
             
             logger.info("Market universe updated", count=len(self.markets))
             
@@ -194,36 +180,11 @@ class LiveTrading:
             # 3. Fast Startup - Load candles
             logger.info("Loading candles from database...")
             try:
-                self.candles_15m = {}
-                self.candles_1h = {}
-                self.candles_4h = {}
-                self.candles_1d = {}
+                # 3. Fast Startup - Load candles via Manager
+                await self.candle_manager.initialize(self.markets)
                 
-                # Efficient Bulk Load
-                # Load enough history for SMC analysis (swings, structure)
-                logger.info("Bulk loading candles from database...", symbol_count=len(self.markets))
-                
-                self.candles_15m = await asyncio.to_thread(load_candles_map, self.markets, "15m", days=14)
-                logger.info("Loaded 15m candles")
-                
-                self.candles_1h = await asyncio.to_thread(load_candles_map, self.markets, "1h", days=60)
-                logger.info("Loaded 1h candles")
-                
-                self.candles_4h = await asyncio.to_thread(load_candles_map, self.markets, "4h", days=180)
-                logger.info("Loaded 4h candles")
-                
-                self.candles_1d = await asyncio.to_thread(load_candles_map, self.markets, "1d", days=365)
-                logger.info("Loaded 1d candles")
-                
-                # Initialize throttling
-                now = datetime.now(timezone.utc)
-                for symbol in self.markets:
-                     self.last_candle_update[symbol] = {
-                         "15m": self.candles_15m.get(symbol, [])[-1].timestamp if self.candles_15m.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
-                         "1h": self.candles_1h.get(symbol, [])[-1].timestamp if self.candles_1h.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
-                         "4h": self.candles_4h.get(symbol, [])[-1].timestamp if self.candles_4h.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
-                         "1d": self.candles_1d.get(symbol, [])[-1].timestamp if self.candles_1d.get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
-                     }
+            except Exception as e:
+                 logger.error("Failed to hydrate candles", error=str(e))
                      
             except Exception as e:
                  logger.error("Failed to hydrate candles", error=str(e))
@@ -516,7 +477,7 @@ class LiveTrading:
                     # Signal Generation (SMC)
                     # Use 15m candles (primary timeframe)
                     # NOTE: _update_candles ensures self.candles_15m is populated
-                    candles = self.candles_15m.get(spot_symbol, [])
+                    candles = self.candle_manager.get_candles(spot_symbol, "15m")
                     candle_count = len(candles)
                     
                     # Update processing stats
@@ -575,10 +536,10 @@ class LiveTrading:
                     # generate_signal(symbol, bias_4h, bias_1d, exec_15m, exec_1h)
                     signal = self.smc_engine.generate_signal(
                         spot_symbol,
-                        self.candles_4h.get(spot_symbol, []),  # bias_4h
-                        self.candles_1d.get(spot_symbol, []),  # bias_1d
+                        self.candle_manager.get_candles(spot_symbol, "4h"),  # bias_4h
+                        self.candle_manager.get_candles(spot_symbol, "1d"),  # bias_1d
                         candles,                               # exec_15m (15m cached)
-                        self.candles_1h.get(spot_symbol, [])   # exec_1h
+                        self.candle_manager.get_candles(spot_symbol, "1h")   # exec_1h
                     )
                     
                     # Pass context to signal for execution (mark price for futures)
@@ -635,36 +596,15 @@ class LiveTrading:
         await asyncio.gather(*[process_coin(s) for s in self.markets], return_exceptions=True)
         
         # Phase 2: Batch save all collected candles (grouped by symbol/timeframe)
-        if self.pending_candles:
-            try:
-                from collections import defaultdict
-                # Group candles by (symbol, timeframe) since save_candles_bulk requires same symbol/tf
-                grouped = defaultdict(list)
-                for candle in self.pending_candles:
-                    key = (candle.symbol, candle.timeframe)
-                    grouped[key].append(candle)
-                
-                # Save each group in parallel (async-safe)
-                save_tasks = []
-                for (symbol, tf), candle_group in grouped.items():
-                    save_tasks.append(asyncio.to_thread(save_candles_bulk, candle_group))
-                
-                if save_tasks:
-                    await asyncio.gather(*save_tasks, return_exceptions=True)
-                
-                total_saved = len(self.pending_candles)
-                self.pending_candles.clear()
-                logger.debug(f"Batched save complete", candles_saved=total_saved, groups=len(grouped))
-            except Exception as e:
-                logger.error("Failed to batch save candles", error=str(e))
-                self.pending_candles.clear()  # Clear on error to prevent memory leak
+        # Phase 2: Batch save all collected candles (delegated to Manager)
+        await self.candle_manager.flush_pending()
         
         # Log periodic status summary (every 5 minutes)
         now = datetime.now(timezone.utc)
         if (now - self.last_status_summary).total_seconds() > 300:  # 5 minutes
             try:
                 total_coins = len(self.markets)
-                coins_with_candles = sum(1 for s in self.markets if len(self.candles_15m.get(s, [])) >= 50)
+                coins_with_candles = sum(1 for s in self.markets if len(self.candle_manager.get_candles(s, "15m")) >= 50)
                 coins_processed_recently = sum(
                     1 for s in self.markets 
                     if self.coin_processing_stats.get(s, {}).get("last_processed", datetime.min.replace(tzinfo=timezone.utc)) > (now - timedelta(minutes=10))
@@ -699,61 +639,7 @@ class LiveTrading:
             except Exception as e:
                 logger.error("Daily maintenance failed", error=str(e))
 
-    async def _background_hydration_task(self):
-        """
-        Incrementally load historical data from DB in background.
-        Prevents startup hang by avoiding massive synchronous reads.
-        """
-        # Wait a few seconds for initial API sync to settle
-        await asyncio.sleep(5.0)
-        logger.info("[Background] Starting historical data hydration...")
-        
-        scopes = [
-            ("15m", 30), # Priority 1: Strategy timeframe
-            ("1h", 60),  # Priority 2: High timeframe confirmation
-            ("4h", 90),
-            ("1d", 180)
-        ]
-        
-        total_start = datetime.now()
-        
-        for tf, days in scopes:
-            start_date = datetime.now(timezone.utc) - timedelta(days=days)
-            loaded_count = 0
-            
-            for symbol in self.markets:
-                if not self.active: return
-                
-                try:
-                    # Offload DB read to thread
-                    def _fetch():
-                        return get_candles(symbol, tf, start_time=start_date)
-                    
-                    history = await asyncio.to_thread(_fetch)
-                    
-                    if history:
-                        target_map = getattr(self, f"candles_{tf}")
-                        current_candles = target_map.get(symbol, [])
-                        
-                        # Smart Merge: Use history as base, overwrite with newer API data
-                        # Dictionary by timestamp for O(N) merge
-                        merged_dict = {c.timestamp: c for c in history}
-                        for c in current_candles:
-                            merged_dict[c.timestamp] = c
-                            
-                        # Convert back to sorted list
-                        target_map[symbol] = sorted(merged_dict.values(), key=lambda x: x.timestamp)
-                        loaded_count += 1
-                        
-                except Exception as e:
-                    logger.debug(f"[Background] Failed to load {symbol} {tf}: {e}")
-                
-                # Yield to Main Loop (Prevent GIL starvation)
-                await asyncio.sleep(0.02) 
-            
-            logger.info(f"[Background] Hydrated {tf}: {loaded_count}/{len(self.markets)} symbols")
-            
-        logger.info(f"[Background] Hydration complete in {(datetime.now() - total_start).total_seconds():.1f}s")
+    # _background_hydration_task removed (Replaced by CandleManager.initialize)
 
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
@@ -983,70 +869,7 @@ class LiveTrading:
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition with throttling."""
-        
-        now = datetime.now(timezone.utc)
-        if symbol not in self.last_candle_update:
-            self.last_candle_update[symbol] = {}
-            
-        async def fetch_tf(tf: str, buffer: Dict[str, List[Candle]], interval_min: int):
-            # Check cache
-            last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
-            if (now - last_update).total_seconds() < (interval_min * 60):
-                return # Cache hit
-            
-            # Determine fetch start time
-            # Prioritize in-memory buffer (most recent), then DB
-            last_ts = None
-            existing = buffer.get(symbol, [])
-            
-            if existing:
-                last_ts = existing[-1].timestamp
-            else:
-                 # Check DB
-                 last_ts = await asyncio.to_thread(get_latest_candle_timestamp, symbol, tf)
-                 
-            since_ms = None
-            if last_ts:
-                # Use timestamp (ms) for since
-                since_ms = int(last_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            
-            # Fetch (Incremental)
-            candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
-            if not candles: return
-            
-            # Update Cache
-            self.last_candle_update[symbol][tf] = now
-            
-            # Smart Merge into Buffer
-            if not existing:
-                buffer[symbol] = candles
-            else:
-                 # Append only new ones
-                 last_buffer_ts = existing[-1].timestamp
-                 new_candles = [c for c in candles if c.timestamp > last_buffer_ts]
-                 if new_candles:
-                      buffer[symbol].extend(new_candles)
-                 
-                 # Prune buffer (Keep 500 in memory)
-                 if len(buffer[symbol]) > 500:
-                     buffer[symbol] = buffer[symbol][-500:]
-            
-            # Queue for DB Persistence 
-            # We queue all fetched candles. Repository handles deduplication (Upsert).
-            if candles:
-                self.pending_candles.extend(candles)
-
-        # Parallel fetch with thresholds
-        # 15m -> 1 min update
-        # 1h -> 5 min update 
-        # 4h -> 15 min update
-        # 1d -> 60 min update
-        await asyncio.gather(
-            fetch_tf("15m", self.candles_15m, 1),
-            fetch_tf("1h", self.candles_1h, 5),
-            fetch_tf("4h", self.candles_4h, 15),
-            fetch_tf("1d", self.candles_1d, 60)
-        )
+        await self.candle_manager.update_candles(symbol)
 
     def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
         """Hydrate Position object from exchange data (for recovery)."""
