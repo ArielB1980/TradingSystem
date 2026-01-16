@@ -156,12 +156,12 @@ class CoinSnapshot:
             return "quality-low"
 
 
-def load_all_coins() -> List[CoinSnapshot]:
+def load_all_coins() -> tuple[List[CoinSnapshot], Dict[str, int]]:
     """
     Load latest analysis state for all tracked coins.
     
     Returns:
-        List of CoinSnapshot objects, sorted alphabetically by symbol.
+        Tuple of (snapshots list, metadata dict with source counts).
     """
     try:
         from src.config.config import load_config
@@ -293,23 +293,19 @@ def load_all_coins() -> List[CoinSnapshot]:
         # Sort alphabetically by symbol
         snapshots.sort(key=lambda x: x.symbol)
         
-        # Attach metadata for debug/dashboard status
-        class SnapshotList(list):
-            pass
-        
-        final_list = SnapshotList(snapshots)
-        final_list.metadata = {
+        # Build metadata for debug/dashboard status
+        metadata = {
             "config_count": len(monitored_set),
             "trace_count": len(trace_set),
             "discovery_count": len(discovery_set)
         }
         
-        logger.info(f"Loaded {len(final_list)} coin snapshots ({len([s for s in snapshots if s.status != 'dead'])} with data)")
-        return final_list
+        logger.info(f"Loaded {len(snapshots)} coin snapshots ({len([s for s in snapshots if s.status != 'dead'])} with data)")
+        return snapshots, metadata
         
     except Exception as e:
         logger.error("Failed to load coin snapshots", error=str(e))
-        return []
+        return [], {}
 
 
 def get_coin_detail(symbol: str) -> Optional[Dict]:
