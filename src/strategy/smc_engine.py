@@ -52,7 +52,7 @@ class SMCEngine:
         from src.strategy.signal_scorer import SignalScorer
         self.signal_scorer = SignalScorer(config)
         
-        # V3: Market Structure Tracker (confirmation + reconfirmation)
+        # Market Structure Tracker (confirmation + reconfirmation)
         from src.strategy.market_structure_tracker import MarketStructureTracker
         self.ms_tracker = MarketStructureTracker(
             confirmation_candles=getattr(config, 'ms_confirmation_candles', 3),
@@ -122,7 +122,7 @@ class SMCEngine:
                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
 
         # Step 2: Market Structure Change Detection & Confirmation
-        # V3: Require structure change confirmation + reconfirmation before entry
+        # Require structure change confirmation + reconfirmation before entry
         if signal is None:
             # Update market structure tracking
             ms_state, ms_change = self.ms_tracker.update_structure(symbol, exec_candles_1h)
@@ -244,7 +244,7 @@ class SMCEngine:
             else:
                 structures = structure_signal  # Save for classification
                 
-                # V3: If entry ready, verify signal direction matches structure change
+                # If entry ready, verify signal direction matches structure change
                 if self.ms_tracker.is_entry_ready(symbol):
                     entry_signal = self.ms_tracker.get_entry_signal(symbol)
                     if entry_signal:
@@ -339,7 +339,7 @@ class SMCEngine:
                 if not fib_valid:
                      signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
                 
-                # Step 5.5: V3 - Verify signal direction matches MS change (if entry ready)
+                # Step 5.5: Verify signal direction matches MS change (if entry ready)
                 if signal is None and signal_type != SignalType.NO_SIGNAL:
                     if self.ms_tracker.is_entry_ready(symbol):
                         entry_signal = self.ms_tracker.get_entry_signal(symbol)

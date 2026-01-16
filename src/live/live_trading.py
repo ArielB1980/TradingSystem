@@ -56,7 +56,7 @@ class LiveTrading:
         self.kill_switch = KillSwitch(self.client)
         
         # State
-        self.managed_positions: Dict[str, Position] = {}  # V3 State Tracking
+        self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
         self.active = False
         self.candles_1d: Dict[str, List[Candle]] = {}
         self.candles_4h: Dict[str, List[Candle]] = {}
@@ -875,14 +875,14 @@ class LiveTrading:
              if tp_order:
                  tp_ids.append(tp_order.order_id)
              
-             # V3: Initialize Active Trade Management State
+             # Initialize Active Trade Management State
              # We optimisticly track the position with its immutable intents
              futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
              tps = order_intent['take_profits']
              tp1 = tps[0]['price'] if len(tps) > 0 else None
              tp2 = tps[1]['price'] if len(tps) > 1 else None
              
-             v3_pos = Position(
+             position_state = Position(
                  symbol=futures_symbol,
                  side=intent_model.side,
                  size=Decimal("0"), # Pending Fill
@@ -895,7 +895,7 @@ class LiveTrading:
                  margin_used=Decimal("0"),
                  opened_at=datetime.now(timezone.utc),
                  
-                 # V3 Immutable Parameters
+                 # Immutable Parameters
                  initial_stop_price=intent_model.stop_loss_futures,
                  trade_type=signal.regime,
                  tp1_price=tp1,
@@ -907,8 +907,8 @@ class LiveTrading:
                  tp_order_ids=tp_ids
              )
              
-             self.managed_positions[futures_symbol] = v3_pos
-             logger.info("V3 Position State initialized", symbol=futures_symbol)
+             self.managed_positions[futures_symbol] = position_state
+             logger.info("Position State initialized", symbol=futures_symbol)
              
              # Trade persistence happens on exit defined in Rules 11
 
@@ -966,7 +966,7 @@ class LiveTrading:
 
     def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
         """Hydrate Position object from exchange data (for recovery)."""
-        logger.warning(f"Hydrating position for {exchange_data['symbol']} without V3 params (Recovery)")
+        logger.warning(f"Hydrating position for {exchange_data['symbol']} (Recovery)")
         
         # Defensive: Ensure required keys exist
         if 'entry_price' not in exchange_data:
@@ -986,7 +986,7 @@ class LiveTrading:
             margin_used=Decimal("0"),
             opened_at=datetime.now(timezone.utc),
             
-            # Init V3 defaults (safe fallback)
+            # Init defaults (safe fallback)
             initial_stop_price=None,
             tp1_price=None,
             tp2_price=None,
@@ -998,7 +998,7 @@ class LiveTrading:
     async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):
         """Execute logic actions decided by PositionManager."""
         for action in actions:
-            logger.info(f"V3 Action: {action.type.value}", symbol=symbol, reason=action.reason)
+            logger.info(f"Management Action: {action.type.value}", symbol=symbol, reason=action.reason)
             
             try:
                 if action.type == ActionType.CLOSE_POSITION:

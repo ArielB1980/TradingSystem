@@ -1,5 +1,5 @@
 """
-V3 Position Manager.
+Position Manager.
 Implements Active Trade Management Rules (1-12).
 """
 from dataclasses import dataclass, field
@@ -36,7 +36,7 @@ class ManagementAction:
 
 class PositionManager:
     """
-    Active Trade Management Engine (V3).
+    Active Trade Management Engine.
     Enforces rules 1-12 for live positions.
     """
     
@@ -106,7 +106,7 @@ class PositionManager:
                  # Rule 6: Post-TP1 Stop Adjustment
                  new_stop = position.entry_price # Option A: Break-Even
                  # Check if we assume Option A (BE) or B (Reduced Risk). 
-                 # Defaulting to BE for safety as per standard V3 flow.
+                 # Defaulting to BE for safety.
                  
                  valid_move, fail_reason = self._validate_stop_move(position, new_stop)
                  if valid_move:

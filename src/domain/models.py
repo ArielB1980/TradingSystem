@@ -183,8 +183,8 @@ class Position:
     break_even_active: bool = False
     peak_price: Optional[Decimal] = None  # Highest/Lowest mark price since trail activation
     
-    # V3 Active Trade Management
-    # V3 Immutable Parameters (set at entry, never changed)
+    # Active Trade Management
+    # Immutable Parameters (set at entry, never changed)
     initial_stop_price: Optional[Decimal] = None  # Original stop loss level
     trade_type: Optional[str] = None  # "breakout", "pullback", "reversal"
     tp1_price: Optional[Decimal] = None  # First TP target
@@ -212,7 +212,7 @@ class Position:
     # Metadata
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
-    # V2.1 Metadata
+    # Metadata
     setup_type: Optional[str] = None # e.g. "ob", "fvg"
     regime: Optional[str] = None # "tight_smc" or "wide_structure"
     
@@ -281,6 +281,6 @@ class Trade:
     # Exit reason
     exit_reason: str  # "stop_loss", "take_profit", "manual", "kill_switch"
     
-    # V2.1 Metadata
+    # Metadata
     setup_type: Optional[str] = None
     regime: Optional[str] = None
