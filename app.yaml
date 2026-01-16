@@ -57,7 +57,7 @@ services:
     github:
       repo: ArielB1980/TradingSystem
       branch: main
-    run_command: python -m src.main
+    run_command: python run.py live --force
     instance_count: 1
     instance_size_slug: basic-xs
     envs:
