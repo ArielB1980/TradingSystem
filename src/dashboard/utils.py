@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import asyncio
 
+from src.monitoring.logger import get_logger
 from src.config.config import load_config
 from src.storage.repository import (
     get_active_position,
@@ -15,9 +16,13 @@ from src.storage.repository import (
     get_recent_events,
     get_latest_account_state,
     get_event_stats,
+    get_trades_since,
 )
 from src.domain.models import Position, Side
 from src.domain.events import CoinStateSnapshot, REASON_CODES
+
+
+logger = get_logger(__name__)
 
 
 def _get_monitored_symbols(config) -> List[str]:
@@ -31,7 +36,6 @@ def _get_monitored_symbols(config) -> List[str]:
     """
     # 1. Check for discovered markets in DB (Most reliable in production)
     try:
-        from src.storage.repository import get_recent_events
         discovery_events = get_recent_events(limit=1, event_type="DISCOVERY_UPDATE")
         if discovery_events:
             markets = discovery_events[0].get('details', {}).get('markets', [])
@@ -256,7 +260,7 @@ def get_event_feed(limit: int = 50, symbol: Optional[str] = None) -> List[Dict[s
 
 def _format_event_message(event: Dict) -> str:
     """Format event for display."""
-    event_type = event.get('event_type', '')
+    event_type = event.get('type', '')
     details = event.get('details', {})
     
     if event_type == "SIGNAL_GENERATED":
@@ -283,7 +287,7 @@ def _format_event_message(event: Dict) -> str:
 
 def _get_event_severity(event: Dict) -> str:
     """Get event severity for color coding."""
-    event_type = event.get('event_type', '')
+    event_type = event.get('type', '')
     details = event.get('details', {})
     
     if event_type == "RISK_VALIDATION":
