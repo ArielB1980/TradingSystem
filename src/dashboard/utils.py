@@ -24,16 +24,30 @@ def _get_monitored_symbols(config) -> List[str]:
     """
     Helper to get full list of monitored symbols.
     
-    Priority (same as live trading system):
-    1. Discovered markets (from daily discovery process)
+    Priority:
+    1. DB Discovery Events (Truth from live worker)
     2. Coin Universe (if enabled)
     3. Config markets (fallback)
     """
-    # Check for discovered markets first (same priority as live trading)
-    from src.utils.market_discovery import load_discovered_markets
-    discovered_markets = load_discovered_markets()
-    if discovered_markets:
-        return discovered_markets
+    # 1. Check for discovered markets in DB (Most reliable in production)
+    try:
+        from src.storage.repository import get_recent_events
+        discovery_events = get_recent_events(limit=1, event_type="DISCOVERY_UPDATE")
+        if discovery_events:
+            markets = discovery_events[0].get('details', {}).get('markets', [])
+            if markets:
+                return markets
+    except Exception as e:
+        logger.debug(f"Failed to fetch discovery from DB: {e}")
+
+    # 2. Fallback to Local discovery file (if exists, e.g. local dev)
+    try:
+        from src.utils.market_discovery import load_discovered_markets
+        discovered_markets = load_discovered_markets()
+        if discovered_markets:
+            return discovered_markets
+    except Exception:
+        pass
     
     # Fallback to Coin Universe if enabled
     if hasattr(config, "coin_universe") and config.coin_universe.enabled:
