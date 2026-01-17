@@ -195,21 +195,7 @@ class AccountStateModel(Base):
 
 
 # Repository Functions
-def save_candle(candle: Candle) -> None:
-    """Save a candle to the database."""
-    db = get_db()
-    with db.get_session() as session:
-        candle_model = CandleModel(
-            timestamp=candle.timestamp,
-            symbol=candle.symbol,
-            timeframe=candle.timeframe,
-            open=candle.open,
-            high=candle.high,
-            low=candle.low,
-            close=candle.close,
-            volume=candle.volume,
-        )
-        session.add(candle_model)
+
 
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -291,6 +277,11 @@ def save_candles_bulk(candles: List[Candle]) -> int:
     return len(candles)
 
 
+
+
+def save_candle(candle: Candle) -> None:
+    """Save a candle to the database."""
+    save_candles_bulk([candle])
 
 
 def get_candles(

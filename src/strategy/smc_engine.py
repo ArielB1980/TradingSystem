@@ -104,6 +104,34 @@ class SMCEngine:
         decision_id = str(uuid.uuid4())
         reasoning_parts = []
         
+        # DEFENSIVE CHECK: Data Integrity
+        # Ensure we have minimum required data to function
+        if not exec_candles_15m:
+            # logger.error(f"SMC Engine Validation Failed: Missing 15m candles for {symbol}")
+            return Signal(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                signal_type=SignalType.NO_SIGNAL,
+                entry_price=Decimal("0"),
+                stop_loss=Decimal("0"),
+                reasoning="ERROR: Missing 15m Data",
+                setup_type=None,
+                regime="no_data"
+            )
+            
+        if not exec_candles_1h:
+             # logger.error(f"SMC Engine Validation Failed: Missing 1h candles for {symbol}")
+             return Signal(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                signal_type=SignalType.NO_SIGNAL,
+                entry_price=Decimal("0"),
+                stop_loss=Decimal("0"),
+                reasoning="ERROR: Missing 1h Data",
+                setup_type=None,
+                regime="no_data"
+            )
+
         bias = "neutral"
         structure_signal = None
         adx_value = 0.0

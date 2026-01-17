@@ -7,6 +7,7 @@ import asyncio
 import sys
 import os
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -67,6 +68,7 @@ async def test_kraken_api(config):
             api_secret=config.exchange.api_secret or "",
             use_testnet=config.exchange.use_testnet
         )
+        await client.initialize()
         
         # Test spot market data (no auth required)
         print("Testing spot market data access...")
@@ -110,13 +112,22 @@ async def test_data_acquisition(config):
             api_secret=config.exchange.api_secret or "",
             use_testnet=config.exchange.use_testnet
         )
+        await client.initialize()
         
-        data_acq = DataAcquisition(client, config)
+        data_acq = DataAcquisition(
+            client, 
+            spot_symbols=config.exchange.spot_markets,
+            futures_symbols=config.exchange.futures_markets
+        )
         
         # Test getting candles for a few coins
         test_symbols = ["BTC/USD", "ETH/USD"]
-        if hasattr(config, 'coin_universe') and config.coin_universe.markets:
-            test_symbols = config.coin_universe.markets[:3]  # Test first 3 coins
+        if hasattr(config, 'coin_universe') and hasattr(config.coin_universe, 'liquidity_tiers'):
+            # Use tier 1 coins if available
+            if 'tier_1' in config.coin_universe.liquidity_tiers:
+                 test_symbols = config.coin_universe.liquidity_tiers['tier_1'][:3]
+        elif config.exchange.spot_markets:
+             test_symbols = config.exchange.spot_markets[:3]
         
         print(f"Testing data acquisition for {len(test_symbols)} coins...")
         
@@ -124,7 +135,9 @@ async def test_data_acquisition(config):
         for symbol in test_symbols:
             try:
                 print(f"  Fetching {symbol}...")
-                candles = await data_acq.get_candles(symbol, "15m", limit=10)
+                end_time = datetime.now(timezone.utc)
+                start_time = end_time - timedelta(hours=4)
+                candles = await data_acq.fetch_spot_historical(symbol, "15m", start_time, end_time)
                 if candles and len(candles) > 0:
                     latest = candles[-1]
                     print(f"    ✅ {symbol}: Got {len(candles)} candles, latest: ${latest.close} @ {latest.timestamp}")
@@ -162,23 +175,36 @@ async def test_signal_processing(config):
             api_secret=config.exchange.api_secret or "",
             use_testnet=config.exchange.use_testnet
         )
+        await client.initialize()
         
-        data_acq = DataAcquisition(client, config)
+        data_acq = DataAcquisition(
+            client, 
+            spot_symbols=config.exchange.spot_markets,
+            futures_symbols=config.exchange.futures_markets
+        )
         smc_engine = SMCEngine(config.strategy)
         
         # Test signal generation for a coin
         test_symbol = "BTC/USD"
-        if hasattr(config, 'coin_universe') and config.coin_universe.markets:
-            test_symbol = config.coin_universe.markets[0]
+        if hasattr(config, 'coin_universe') and hasattr(config.coin_universe, 'liquidity_tiers'):
+            if 'tier_1' in config.coin_universe.liquidity_tiers:
+                 test_symbol = config.coin_universe.liquidity_tiers['tier_1'][0]
+        elif config.exchange.spot_markets:
+            test_symbol = config.exchange.spot_markets[0]
         
         print(f"Testing signal generation for {test_symbol}...")
         
         # Get required candles
         print("  Fetching candles...")
-        candles_15m = await data_acq.get_candles(test_symbol, "15m", limit=100)
-        candles_1h = await data_acq.get_candles(test_symbol, "1h", limit=100)
-        candles_4h = await data_acq.get_candles(test_symbol, "4h", limit=100)
-        candles_1d = await data_acq.get_candles(test_symbol, "1d", limit=100)
+        print("  Fetching candles...")
+        end_time = datetime.now(timezone.utc)
+        start_time_short = end_time - timedelta(days=5) # Enough for 15m/1h execution
+        start_time_long = end_time - timedelta(days=300) # Enough for 1d/4h bias
+        
+        candles_15m = await data_acq.fetch_spot_historical(test_symbol, "15m", start_time_short, end_time)
+        candles_1h = await data_acq.fetch_spot_historical(test_symbol, "1h", start_time_short, end_time)
+        candles_4h = await data_acq.fetch_spot_historical(test_symbol, "4h", start_time_long, end_time)
+        candles_1d = await data_acq.fetch_spot_historical(test_symbol, "1d", start_time_long, end_time)
         
         if not all([candles_15m, candles_1h, candles_4h, candles_1d]):
             print(f"  ❌ Missing candle data for signal generation")

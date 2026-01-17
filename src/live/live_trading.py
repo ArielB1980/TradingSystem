@@ -613,11 +613,11 @@ class LiveTrading:
                     # Corrected Argument Mapping:
                     # generate_signal(symbol, bias_4h, bias_1d, exec_15m, exec_1h)
                     signal = self.smc_engine.generate_signal(
-                        spot_symbol,
-                        self.candle_manager.get_candles(spot_symbol, "4h"),  # bias_4h
-                        self.candle_manager.get_candles(spot_symbol, "1d"),  # bias_1d
-                        candles,                               # exec_15m (15m cached)
-                        self.candle_manager.get_candles(spot_symbol, "1h")   # exec_1h
+                        symbol=spot_symbol,
+                        bias_candles_4h=self.candle_manager.get_candles(spot_symbol, "4h"),
+                        bias_candles_1d=self.candle_manager.get_candles(spot_symbol, "1d"),
+                        exec_candles_15m=candles,
+                        exec_candles_1h=self.candle_manager.get_candles(spot_symbol, "1h")
                     )
                     
                     # Pass context to signal for execution (mark price for futures)

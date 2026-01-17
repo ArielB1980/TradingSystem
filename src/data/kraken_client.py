@@ -230,7 +230,7 @@ class KrakenClient:
                 # Wrap bulk fetch in timeout
                 tickers = await asyncio.wait_for(
                     self.exchange.fetch_tickers(chunk),
-                    timeout=10.0
+                    timeout=3.0
                 )
                 results.update(tickers)
             except asyncio.TimeoutError:
@@ -255,7 +255,7 @@ class KrakenClient:
                         # Wrap individual fetch in short timeout
                         ticker = await asyncio.wait_for(
                             self.get_spot_ticker(symbol),
-                            timeout=2.0
+                            timeout=0.5
                         )
                         results[symbol] = ticker
                     except Exception:
