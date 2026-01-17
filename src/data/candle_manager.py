@@ -121,7 +121,9 @@ class CandleManager:
             
             # Fetch (Incremental)
             candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
-            if not candles: return
+            if not candles:
+                logger.warning(f"Fetched EMPTY candles for {symbol} {tf}", since_ms=since_ms, limit=300)
+                return
             
             # Update Cache
             self.last_candle_update[symbol][tf] = now

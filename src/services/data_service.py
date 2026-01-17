@@ -200,6 +200,8 @@ class DataService:
                             if candles_1h:
                                 await asyncio.to_thread(save_candles_bulk, candles_1h)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
+                            else:
+                                logger.warning(f"Fetched EMPTY 1h candles for {symbol} (DataService)", limit=limit)
 
                         # 3. Tertiary Polling: 4h (Periodic)
                         if do_4h:
