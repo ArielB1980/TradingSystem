@@ -376,6 +376,9 @@ class TradingService:
             if len(target_map[symbol]) > 300:
                 target_map[symbol] = target_map[symbol][-300:]
             
+            if tf == "1h":
+                 logger.info(f"TradingService: Updated 1h cache for {symbol}", size=len(target_map[symbol]), last_ts=target_map[symbol][-1].timestamp if target_map[symbol] else "None")
+            
         # 2. Trigger Strategy (Live Signal)
         if not msg.is_historical and tf == "15m":
              await self._analyze_symbol(symbol)

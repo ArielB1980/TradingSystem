@@ -200,6 +200,7 @@ class DataService:
                             if candles_1h:
                                 await asyncio.to_thread(save_candles_bulk, candles_1h)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
+                                logger.info(f"DataService: Fetched {len(candles_1h)} 1h candles for {symbol}", is_bootstrap=is_bootstrap)
                             else:
                                 logger.warning(f"Fetched EMPTY 1h candles for {symbol} (DataService)", limit=limit)
 
