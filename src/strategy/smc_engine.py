@@ -103,6 +103,11 @@ class SMCEngine:
         # Context Variables for Trace
         decision_id = str(uuid.uuid4())
         reasoning_parts = []
+        
+        # DEBUG: Trace input size
+        debug_last = str(exec_candles_1h[-1])[:50] if exec_candles_1h else 'None'
+        reasoning_parts.append(f"DEBUG_INPUTS: 1h_len={len(exec_candles_1h)} Last={debug_last}")
+
         bias = "neutral"
         structure_signal = None
         adx_value = 0.0
