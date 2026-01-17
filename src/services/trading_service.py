@@ -411,7 +411,8 @@ class TradingService:
              c4h = self.candles_4h.get(symbol, [])
              c1d = self.candles_1d.get(symbol, [])
              
-             logger.info(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}, 4h={len(c4h)}")
+             last_candle_repr = str(c1h[-1]) if c1h else "None"
+             logger.info(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}, 4h={len(c4h)} Last1H={last_candle_repr[:100]}")
 
              signal = self.smc_engine.generate_signal(
                  symbol,
