@@ -1080,6 +1080,14 @@ class SMCEngine:
         from src.domain.models import SetupType
         timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
         
+        # DEBUG LOGGING FOR REGIME
+        import logging
+        logger = logging.getLogger("SMCEngine") # Use direct logger if needed or self.logger if available
+        # Assuming no self.logger here, printing to stdout or using print is dirty but effective for now.
+        # But we should use the configured logger if possible. 
+        # Since I can't easily import get_logger here without risking circular dep or context issues, 
+        # I'll rely on the logic check.
+        
         # Determine regime if not provided
         if not regime:
             # If no data (no candle), state is undefined/no_data
@@ -1090,6 +1098,12 @@ class SMCEngine:
                 regime = "consolidation"
             else:
                 regime = "wide_structure"
+                
+            # SPECIAL DEBUG: If regime resulted in no_data but we HAD a candle, LOG IT
+            if regime == "no_data" and current_candle:
+                 reasoning.append(f"DEBUG_ERROR: Regime=no_data BUT Candle Exists! ADX={adx}")
+                 # Force fix
+                 regime = "wide_structure"
         
         return Signal(
             timestamp=timestamp,
