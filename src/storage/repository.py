@@ -1003,7 +1003,7 @@ def get_decision_traces_since(since: datetime) -> List[Dict]:
         since: Datetime to filter from (inclusive)
     
     Returns:
-        List of event dictionaries with parsed details (if valid JSON)
+        Generator yielding event dictionaries with parsed details
     """
     db = get_db()
     
@@ -1013,24 +1013,22 @@ def get_decision_traces_since(since: datetime) -> List[Dict]:
         
     with db.get_session() as session:
         # Use the composite index (event_type, timestamp)
-        events = session.query(SystemEventModel).filter(
+        # Use yield_per to stream results in chunks to avoid OOM
+        query = session.query(SystemEventModel).filter(
             SystemEventModel.event_type == "DECISION_TRACE",
             SystemEventModel.timestamp >= since
-        ).order_by(SystemEventModel.timestamp.asc()).all()
+        ).order_by(SystemEventModel.timestamp.asc())
         
-        results = []
-        for e in events:
+        # Stream results in batches of 1000
+        for e in query.yield_per(1000):
             try:
                 details = json.loads(e.details)
             except:
                 details = {}
                 
-            results.append({
+            yield {
                 "id": e.id,
                 "timestamp": e.timestamp.replace(tzinfo=timezone.utc),
                 "symbol": e.symbol,
                 "details": details
-            })
-            
-        return results
-
+            }
