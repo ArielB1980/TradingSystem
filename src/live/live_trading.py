@@ -725,6 +725,11 @@ class LiveTrading:
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
         try:
+            # 1. Get Balances
+            balance = await self.client.get_futures_balance()
+            if not balance:
+                return
+
             # 2. Calculate Effective Equity (Shared Logic)
             # This handles Multi-Collateral (Flex) and Inverse (Crypto-Margined) accounts correctly
             equity, avail_margin, margin_used_val = await self._calculate_effective_equity(balance)
