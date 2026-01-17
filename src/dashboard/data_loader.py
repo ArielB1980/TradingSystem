@@ -13,25 +13,31 @@ from src.monitoring.logger import get_logger
 logger = get_logger(__name__)
 
 
-def calculate_signal_strength(details: dict) -> float:
+def calculate_quality_score(details: dict) -> float:
     """
-    Calculate signal strength from score breakdown.
-    
+    Calculate quality score for display (0-100 scale).
+
     Args:
-        details: Trace details containing score_breakdown
-        
+        details: Trace details containing setup_quality or score_breakdown
+
     Returns:
-        Signal strength (0.0 to 1.0)
+        Quality score (0.0 to 100.0)
     """
+    # First try setup_quality (already on 0-100 scale)
+    setup_quality = details.get('setup_quality')
+    if setup_quality is not None and setup_quality > 0:
+        return float(setup_quality)
+
+    # Fall back to calculating from score_breakdown
     score_breakdown = details.get('score_breakdown', {})
     if not score_breakdown:
         return 0.0
-    
-    # Sum all score components
+
+    # Sum all score components and scale to 0-100
     total_score = sum(float(v) for v in score_breakdown.values())
-    
-    # Normalize to 0-1 range (assuming max score is ~5)
-    return min(total_score / 5.0, 1.0)
+
+    # Normalize to 0-100 range (assuming max score is ~5)
+    return min(total_score / 5.0, 1.0) * 100.0
 
 
 def calculate_24h_change(symbol: str, current_price: float) -> float:
@@ -218,11 +224,11 @@ def load_all_coins() -> tuple[List[CoinSnapshot], Dict[str, int]]:
                         last_update = last_update.replace(tzinfo=timezone.utc)
                     
                     age_seconds = (now - last_update).total_seconds()
-                    # More lenient thresholds: active = 1h, stale = 6h, dead = >6h
-                    # Accounts for batch processing of 250 coins with throttling
-                    if age_seconds < 3600:  # < 1 hour (was 10 minutes)
+                    # Production thresholds:
+                    # active = 1h, stale = 6h, dead = >6h
+                    if age_seconds < 3600:  # < 1 hour
                         status = "active"
-                    elif age_seconds < 21600:  # < 6 hours (was 1 hour)
+                    elif age_seconds < 21600:  # < 6 hours
                         status = "stale"
                     else:
                         status = "dead"
@@ -252,7 +258,7 @@ def load_all_coins() -> tuple[List[CoinSnapshot], Dict[str, int]]:
                     regime=details.get('regime', 'unknown'),
                     bias=details.get('bias', 'neutral'),
                     signal=details.get('signal', 'NO_SIGNAL'),
-                    quality=calculate_signal_strength(details),
+                    quality=calculate_quality_score(details),
                     adx=float(details.get('adx', 0.0)) if details.get('adx') is not None else 0.0,
                     atr=float(details.get('atr', 0.0)) if details.get('atr') is not None else 0.0,
                     ema200_slope=details.get('ema200_slope', 'flat'),

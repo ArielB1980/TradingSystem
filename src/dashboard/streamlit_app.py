@@ -635,6 +635,7 @@ def render_positions(positions: List[Dict]):
         with col2:
             st.markdown(f"**{pos['leverage']:.0f}x** leverage")
         
+<<<<<<< HEAD
         with col3:
             st.markdown(f"Entry: **${pos['entry_price']:.4f}** → ${pos['current_price']:.4f}")
         
@@ -661,6 +662,16 @@ def render_positions(positions: List[Dict]):
             st.caption(" | ".join(details))
         
         st.markdown("---")
+    
+    # Positions table (Local Dev Addition)
+    positions_df = pd.DataFrame(positions)
+    st.markdown("### Detailed Positions Table")
+    st.dataframe(
+        positions_df,
+        width="stretch",
+        hide_index=True,
+        height=min(400, 50 + len(positions) * 35),
+    )
 
 
 def render_performance(metrics: Dict):
@@ -746,9 +757,23 @@ def render_coin_scanner(coins: List[Dict]):
     if not coins:
         st.info("No coin analysis data available")
         return
+
+    df = pd.DataFrame(coins)
     
-    # Filters
-    col1, col2, col3 = st.columns(3)
+    # Display table
+    st.dataframe(
+        df,
+        width="stretch",
+        height=600,
+        hide_index=True,
+        column_config={
+            "24h %": st.column_config.NumberColumn(
+                "24h %",
+                format="%.2f%%",
+            )
+        }
+    )
+
     
     with col1:
         signal_filter = st.selectbox("Signal", ["All", "LONG", "SHORT", "NONE"], key="signal_filter")
@@ -774,6 +799,7 @@ def render_coin_scanner(coins: List[Dict]):
         status_emoji = {'active': '🟢', 'stale': '🟡', 'dead': '🔴'}.get(c['status'], '⚪')
         signal_emoji = {'LONG': '🟢', 'SHORT': '🔴', 'NONE': '⚪'}.get(c['signal'], '⚪')
         
+<<<<<<< HEAD
         data.append({
             'Status': status_emoji,
             'Symbol': c['symbol'],
@@ -789,6 +815,28 @@ def render_coin_scanner(coins: List[Dict]):
     if data:
         df = pd.DataFrame(data)
         st.dataframe(df, use_container_width=True, hide_index=True, height=400)
+=======
+        # Display summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Signals", len(signals_data))
+        with col2:
+            long_count = sum(1 for s in signals_data if "LONG" in s['Signal'])
+            st.metric("LONG Signals", long_count)
+        with col3:
+            short_count = sum(1 for s in signals_data if "SHORT" in s['Signal'])
+            st.metric("SHORT Signals", short_count)
+        
+        st.markdown("")  # Spacing
+        
+        # Display table
+        st.dataframe(
+            signals_df,
+            width="stretch",
+            hide_index=True,
+            height=min(400, 50 + len(signals_data) * 35),
+        )
+>>>>>>> 440dfab (feat(dashboard): prep for prod - schema migration & strict thresholds)
     else:
         st.info("No coins match the current filters")
 

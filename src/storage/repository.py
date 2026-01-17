@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import List, Optional, Dict, Tuple, Any
 import json
 from src.storage.db import Base, get_db
-from src.domain.models import Candle, Trade, Position
+from src.domain.models import Candle, Trade, Position, Side
 
 
 # Query Cache
@@ -126,7 +126,7 @@ class TradeModel(Base):
 class PositionModel(Base):
     """ORM model for open positions (state tracking)."""
     __tablename__ = "positions"
-    
+
     symbol = Column(String, primary_key=True)
     side = Column(String, nullable=False)
     size = Column(Numeric(precision=20, scale=8), nullable=False)
@@ -137,16 +137,26 @@ class PositionModel(Base):
     unrealized_pnl = Column(Numeric(precision=20, scale=2), nullable=False)
     leverage = Column(Numeric(precision=10, scale=2), nullable=False)
     margin_used = Column(Numeric(precision=20, scale=2), nullable=False)
-    
+
     stop_loss_order_id = Column(String, nullable=True)
     take_profit_order_id = Column(String, nullable=True)
-    
+
     # Active Trade Management fields
     initial_stop_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp1_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp2_price = Column(Numeric(precision=20, scale=8), nullable=True)
     final_target_price = Column(Numeric(precision=20, scale=8), nullable=True)
-    
+    trade_type = Column(String, nullable=True)  # "breakout", "pullback", "reversal"
+    partial_close_pct = Column(Numeric(precision=5, scale=2), nullable=True)  # % to close at TP1
+    original_size = Column(Numeric(precision=20, scale=8), nullable=True)  # Original position size
+    tp_order_ids = Column(String, nullable=True)  # JSON list of TP order IDs
+
+    # Basis and Funding Tracking
+    basis_at_entry = Column(Numeric(precision=20, scale=8), nullable=True)  # Futures - Spot at entry
+    basis_current = Column(Numeric(precision=20, scale=8), nullable=True)  # Current basis
+    funding_rate = Column(Numeric(precision=20, scale=8), nullable=True)  # Current funding rate
+    cumulative_funding = Column(Numeric(precision=20, scale=8), nullable=True)  # Total funding
+
     opened_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
