@@ -403,15 +403,22 @@ class TradingService:
              logger.warning(f"Skipping analysis for {symbol}: Insufficient 15m data ({len(c15m)})")
              return
          
+         
          signal = None
          # Run SMC Analysis
          try:
+             c1h = self.candles_1h.get(symbol, [])
+             c4h = self.candles_4h.get(symbol, [])
+             c1d = self.candles_1d.get(symbol, [])
+             
+             logger.info(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}, 4h={len(c4h)}")
+
              signal = self.smc_engine.generate_signal(
                  symbol,
                  c15m,
-                 self.candles_1h.get(symbol, []),
-                 self.candles_4h.get(symbol, []),
-                 self.candles_1d.get(symbol, [])
+                 c1h,
+                 c4h,
+                 c1d
              )
              
              if signal.signal_type != SignalType.NO_SIGNAL:
@@ -419,6 +426,9 @@ class TradingService:
                  
                  # Current Price (from last candle)
                  trigger_price = c15m[-1].close
+             else:
+                 logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning[:50]}...")
+
                  
                  # Determine Futures Symbol
                  futures_symbol = self.futures_adapter.map_spot_to_futures(symbol)
