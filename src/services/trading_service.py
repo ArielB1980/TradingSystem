@@ -378,6 +378,9 @@ class TradingService:
             
             if tf == "1h":
                  logger.info(f"TradingService: Updated 1h cache for {symbol}", size=len(target_map[symbol]), last_ts=target_map[symbol][-1].timestamp if target_map[symbol] else "None")
+                 # Trigger analysis on 1h update too (to clear no_data/stale state if 1h arrived after 15m)
+                 if not msg.is_historical:
+                     await self._analyze_symbol(symbol)
             
         # 2. Trigger Strategy (Live Signal)
         if not msg.is_historical and tf == "15m":
