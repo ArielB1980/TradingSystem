@@ -1,8 +1,15 @@
 from src.storage.db import get_db, Base
 from sqlalchemy import text
+import os
+from dotenv import load_dotenv
+
+# Load environment variables (try .env.local first, then .env)
+load_dotenv(".env.local")
+load_dotenv(".env")
 
 def migrate():
     print("Running schema migration...")
+    print(f"Target Database: {os.environ.get('DATABASE_URL', 'default (sqlite)')}")
     db = get_db()
     engine = db.engine
     

@@ -691,6 +691,34 @@ class LiveTrading:
                     
                 logger.debug("Synced Multi-Collateral state", equity=str(equity))
             
+            # 2.5 Logic for Single-Collateral (Inverse) or incomplete Flex data
+            # If Equity is suspiciously low (< 10 USD) but we have crypto balance, calculate approximate equity
+            if equity < 10:
+                # Check for XBT/BTC/ETH
+                for asset in ['XBT', 'BTC', 'ETH', 'SOL', 'USDT', 'USDC']:
+                    if asset == base_currency: 
+                        continue
+                        
+                    asset_qty = Decimal(str(total.get(asset, 0)))
+                    if asset_qty > 0:
+                        # Fetch price
+                        ticker_symbol = f"{asset}/USD"
+                        try:
+                            # Try map to proper pair
+                            if asset == 'XBT': ticker_symbol = "BTC/USD"
+                            
+                            ticker = await self.client.get_ticker(ticker_symbol)
+                            price = Decimal(str(ticker['last']))
+                            
+                            asset_equity = asset_qty * price
+                            logger.info(f"Found non-USD collateral: {asset_qty} {asset} (~${asset_equity:,.2f})")
+                            
+                            equity += asset_equity
+                            # Note: Margin used/avail might still be wrong if not from Flex endpoint, 
+                            # but at least Equity reflects reality.
+                        except Exception as ex:
+                             logger.warning(f"Could not value collateral {asset}", error=str(ex))
+
             # 3. Persist
             save_account_state(
                 equity=equity,
