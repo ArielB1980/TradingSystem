@@ -773,7 +773,8 @@ def render_coin_scanner(coins: List[Dict]):
         }
     )
 
-    
+    # Filters
+    col1, col2, col3 = st.columns(3)
     with col1:
         signal_filter = st.selectbox("Signal", ["All", "LONG", "SHORT", "NONE"], key="signal_filter")
     with col2:
