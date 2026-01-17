@@ -994,3 +994,43 @@ def get_latest_traces(limit: int = 1000) -> List[Dict]:
         
         return results
 
+
+def get_decision_traces_since(since: datetime) -> List[Dict]:
+    """
+    Retrieve DECISION_TRACE events since a specific time.
+    
+    Args:
+        since: Datetime to filter from (inclusive)
+    
+    Returns:
+        List of event dictionaries with parsed details (if valid JSON)
+    """
+    db = get_db()
+    
+    # Ensure timezone awareness
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+        
+    with db.get_session() as session:
+        # Use the composite index (event_type, timestamp)
+        events = session.query(SystemEventModel).filter(
+            SystemEventModel.event_type == "DECISION_TRACE",
+            SystemEventModel.timestamp >= since
+        ).order_by(SystemEventModel.timestamp.asc()).all()
+        
+        results = []
+        for e in events:
+            try:
+                details = json.loads(e.details)
+            except:
+                details = {}
+                
+            results.append({
+                "id": e.id,
+                "timestamp": e.timestamp.replace(tzinfo=timezone.utc),
+                "symbol": e.symbol,
+                "details": details
+            })
+            
+        return results
+

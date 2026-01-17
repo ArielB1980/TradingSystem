@@ -373,6 +373,22 @@ def status(
     typer.echo("\n" + "=" * 50)
 
 
+@app.command()
+def report(
+    hours: int = typer.Option(24, "--hours", help="Hours to look back"),
+    format: str = typer.Option("text", "--format", help="Output format (text/table)"),
+):
+    """
+    Generate activity report (coins scanned, signals, regimes).
+    
+    Example:
+        python src/cli.py report --hours 24
+    """
+    from src.reporting.activity import generate_activity_report
+    generate_activity_report(hours=hours, format_type=format)
+
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(False, "--version", help="Show version and exit"),
