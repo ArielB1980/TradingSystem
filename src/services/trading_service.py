@@ -382,6 +382,9 @@ class TradingService:
                  if not msg.is_historical:
                      await self._analyze_symbol(symbol)
             
+            if tf == "15m" and len(target_map[symbol]) < 50:
+                 logger.warning(f"TradingService: 15m cache shallow for {symbol} ({len(target_map[symbol])} candles)")
+            
         # 2. Trigger Strategy (Live Signal)
         if not msg.is_historical and tf == "15m":
              await self._analyze_symbol(symbol)
@@ -396,9 +399,9 @@ class TradingService:
 
          # Ensure enough data
          c15m = self.candles_15m.get(symbol, [])
-         if len(c15m) < 50: return
-         
-         if len(c15m) < 50: return
+         if len(c15m) < 50: 
+             logger.warning(f"Skipping analysis for {symbol}: Insufficient 15m data ({len(c15m)})")
+             return
          
          signal = None
          # Run SMC Analysis
