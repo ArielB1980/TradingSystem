@@ -449,6 +449,7 @@ class SMCEngine:
                             atr_ratio=atr_ratio,
                             ema200_slope=ema200_slope,
                             tp_candidates=tp_candidates,
+                            score=score_obj.total_score,
                             score_breakdown={
                                 "smc": score_obj.smc_quality,
                                 "fib": score_obj.fib_confluence,
