@@ -427,7 +427,7 @@ class TradingService:
                  # Current Price (from last candle)
                  trigger_price = c15m[-1].close
              else:
-                 logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning[:50]}...")
+                 logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning}")
 
                  
                  # Determine Futures Symbol
