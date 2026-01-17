@@ -412,14 +412,14 @@ class TradingService:
              c1d = self.candles_1d.get(symbol, [])
              
              last_candle_repr = str(c1h[-1]) if c1h else "None"
-             logger.info(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}, 4h={len(c4h)} Last1H={last_candle_repr[:100]}")
+             # logger.debug(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}")
 
              signal = self.smc_engine.generate_signal(
-                 symbol,
-                 c15m,
-                 c1h,
-                 c4h,
-                 c1d
+                 symbol=symbol,
+                 exec_candles_15m=c15m,
+                 exec_candles_1h=c1h,
+                 bias_candles_4h=c4h,
+                 bias_candles_1d=c1d
              )
              
              if signal.signal_type != SignalType.NO_SIGNAL:
