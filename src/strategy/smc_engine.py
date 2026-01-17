@@ -112,14 +112,62 @@ class SMCEngine:
         
         # Logic Flow
         signal = None
+
+        # Step 0: Calculate Indicators (ADX, ATR, Fibs) - Early Calc for Context
+        # Cache key based on symbol and last candle timestamp (optimized)
+        cache_key = self._get_cache_key(symbol, exec_candles_1h)
         
+        # Check cache for indicators
+        cached_indicators = self.indicator_cache.get(cache_key)
+        
+        if cached_indicators:
+            # Use cached values
+            adx_value = cached_indicators['adx']
+            atr_value = cached_indicators['atr']
+            fib_levels = cached_indicators['fib_levels']
+        else:
+            # Calculate fresh
+            adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
+            if not adx_df.empty:
+                adx_value = float(adx_df['ADX_14'].iloc[-1])
+            else:
+                adx_value = 0.0
+            
+            # ATR
+            atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+            if not atr_df.empty:
+                atr_value = Decimal(str(atr_df.iloc[-1]))
+            else:
+                atr_value = Decimal("0")
+            
+            # Fib Levels (pre-calculate for later use)
+            fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
+            
+            # Store in cache
+            self.indicator_cache[cache_key] = {
+                'adx': adx_value,
+                'atr': atr_value,
+                'fib_levels': fib_levels
+            }
+            
+            # Periodic cleanup
+            if len(self.indicator_cache) % 100 == 0:
+                self._clean_cache()
+        
+
         # Step 1: Higher-timeframe bias
         if signal is None:
             bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
             # V2.1: Neutral bias DOES NOT block immediately - waits for Score Gate
             # unless bias determination failed completely (e.g. insufficient data)
             if "Insufficient candles" in reasoning_parts[-1]:
-                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                signal = self._no_signal(
+                    symbol, 
+                    reasoning_parts, 
+                    exec_candles_1h[-1] if exec_candles_1h else None,
+                    adx=adx_value,
+                    atr=atr_value
+                )
 
         # Step 2: Market Structure Change Detection & Confirmation
         # Require structure change confirmation + reconfirmation before entry
@@ -213,12 +261,24 @@ class SMCEngine:
                         reasoning_parts.append(
                             f"⏳ Structure change confirmed, waiting for reconfirmation (retrace to entry zone)"
                         )
-                        signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                        signal = self._no_signal(
+                            symbol, 
+                            reasoning_parts, 
+                            exec_candles_1h[-1] if exec_candles_1h else None,
+                            adx=adx_value,
+                            atr=atr_value
+                        )
                 else:
                     reasoning_parts.append(
                         f"⏳ Structure change detected ({ms_change.new_state.value}), waiting for confirmation"
                     )
-                    signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                    signal = self._no_signal(
+                        symbol, 
+                        reasoning_parts, 
+                        exec_candles_1h[-1] if exec_candles_1h else None,
+                        adx=adx_value,
+                        atr=atr_value
+                    )
             else:
                 # No structure change - check if we're waiting for one
                 if not self.ms_tracker.is_entry_ready(symbol):
@@ -228,7 +288,13 @@ class SMCEngine:
                         reasoning_parts.append(
                             f"⏳ No market structure change detected - waiting for structure break"
                         )
-                        signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                        signal = self._no_signal(
+                            symbol, 
+                            reasoning_parts, 
+                            exec_candles_1h[-1] if exec_candles_1h else None,
+                            adx=adx_value,
+                            atr=atr_value
+                        )
         
         # Step 2.5: Execution timeframe structure (only if entry ready or MS change not required)
         structures = {}  # Store for regime classification
@@ -240,7 +306,13 @@ class SMCEngine:
                 reasoning_parts,
             )
             if structure_signal is None:
-                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                 signal = self._no_signal(
+                     symbol, 
+                     reasoning_parts, 
+                     exec_candles_1h[-1] if exec_candles_1h else None,
+                     adx=adx_value,
+                     atr=atr_value
+                 )
             else:
                 structures = structure_signal  # Save for classification
                 
@@ -254,49 +326,19 @@ class SMCEngine:
 
         # Step 3: Filters
         if signal is None:
-            # Cache key based on symbol and last candle timestamp (optimized)
-            cache_key = self._get_cache_key(symbol, exec_candles_1h)
-            
-            # Check cache for indicators
-            cached_indicators = self.indicator_cache.get(cache_key)
-            
-            if cached_indicators:
-                # Use cached values
-                adx_value = cached_indicators['adx']
-                atr_value = cached_indicators['atr']
-                fib_levels = cached_indicators['fib_levels']
-            else:
-                # Calculate fresh
-                adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
-                if not adx_df.empty:
-                    adx_value = float(adx_df['ADX_14'].iloc[-1])
-                else:
-                    adx_value = 0.0
-                
-                # ATR
-                atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
-                if not atr_df.empty:
-                    atr_value = Decimal(str(atr_df.iloc[-1]))
-                else:
-                    atr_value = Decimal("0")
-                
-                # Fib Levels (pre-calculate for later use)
-                fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
-                
-                # Store in cache
-                self.indicator_cache[cache_key] = {
-                    'adx': adx_value,
-                    'atr': atr_value,
-                    'fib_levels': fib_levels
-                }
-                
-                # Periodic cleanup
-                if len(self.indicator_cache) % 100 == 0:
-                    self._clean_cache()
+            # Filters applied below using pre-calculated values
+            # (Indicator calculation moved to Step 0)
+
             
             # Apply filters
             if not self._apply_filters(exec_candles_1h, reasoning_parts):
-                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                 signal = self._no_signal(
+                     symbol, 
+                     reasoning_parts, 
+                     exec_candles_1h[-1] if exec_candles_1h else None,
+                     adx=adx_value,
+                     atr=atr_value
+                 )
 
             # Step 4: Calculate Levels (If passed all checks)
             if signal is None:
@@ -337,7 +379,14 @@ class SMCEngine:
                         fib_valid = False
                 
                 if not fib_valid:
-                     signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
+                     signal = self._no_signal(
+                         symbol, 
+                         reasoning_parts, 
+                         exec_candles_1h[-1],
+                         adx=adx_value,
+                         atr=atr_value,
+                         regime=regime
+                     )
                 
                 # Step 5.5: Verify signal direction matches MS change (if entry ready)
                 if signal is None and signal_type != SignalType.NO_SIGNAL:
@@ -350,12 +399,26 @@ class SMCEngine:
                                 reasoning_parts.append(
                                     f"❌ Signal direction mismatch: MS change expects LONG but got {signal_type.value}"
                                 )
-                                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                                signal = self._no_signal(
+                                    symbol, 
+                                    reasoning_parts, 
+                                    exec_candles_1h[-1] if exec_candles_1h else None,
+                                    adx=adx_value,
+                                    atr=atr_value,
+                                    regime=regime
+                                )
                             elif expected_direction == "SHORT" and signal_type != SignalType.SHORT:
                                 reasoning_parts.append(
                                     f"❌ Signal direction mismatch: MS change expects SHORT but got {signal_type.value}"
                                 )
-                                signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
+                                signal = self._no_signal(
+                                    symbol, 
+                                    reasoning_parts, 
+                                    exec_candles_1h[-1] if exec_candles_1h else None,
+                                    adx=adx_value,
+                                    atr=atr_value,
+                                    regime=regime
+                                )
                             else:
                                 reasoning_parts.append(
                                     f"✓ Signal direction matches MS change ({expected_direction})"
@@ -416,7 +479,10 @@ class SMCEngine:
                                 "htf": score_obj.htf_alignment,
                                 "adx": score_obj.adx_strength,
                                 "cost": score_obj.cost_efficiency
-                            }
+                            },
+                            adx=adx_value,
+                            atr=atr_value,
+                            regime=regime
                         )
                         
                         # LOG REJECTION (Mandatory)
@@ -468,13 +534,25 @@ class SMCEngine:
                         )
                 elif signal is None:
                      # Calculate levels returned None (should be handled by signal_type check but safe fallback)
-                     signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1])
+                     signal = self._no_signal(
+                         symbol, 
+                         reasoning_parts, 
+                         exec_candles_1h[-1],
+                         adx=adx_value,
+                         atr=atr_value
+                     )
 
         # If signal is still None after all steps
         if signal is None:
             current_candle = exec_candles_1h[-1] if exec_candles_1h else None
             timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
-            signal = self._no_signal(symbol, reasoning_parts, current_candle)
+            signal = self._no_signal(
+                symbol, 
+                reasoning_parts, 
+                current_candle,
+                adx=adx_value,
+                atr=atr_value
+            )
 
 
         # --- EXPLAINABILITY INSTRUMENTATION ---
@@ -993,11 +1071,25 @@ class SMCEngine:
         symbol: str,
         reasoning: List[str],
         current_candle: Optional[Candle],
-        score_breakdown: Optional[Dict] = None
+        score_breakdown: Optional[Dict] = None,
+        adx: float = 0.0,
+        atr: Decimal = Decimal("0"),
+        regime: Optional[str] = None
     ) -> Signal:
         """Create a NO_SIGNAL signal."""
         from src.domain.models import SetupType
         timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
+        
+        # Determine regime if not provided
+        if not regime:
+            # If no data (no candle), state is undefined/no_data
+            if not current_candle:
+                regime = "no_data"
+            # If we have data and low volatility -> consolidation
+            elif adx > 0 and adx < 25:
+                regime = "consolidation"
+            else:
+                regime = "wide_structure"
         
         return Signal(
             timestamp=timestamp,
@@ -1008,10 +1100,11 @@ class SMCEngine:
             take_profit=None,
             reasoning="\n".join(reasoning),
             setup_type=SetupType.TREND,  # Default for no signal
-            regime="wide_structure",
+            regime=regime,
             higher_tf_bias="neutral",
-            adx=Decimal("0"),
-            atr=Decimal("0"),
+            adx=Decimal(str(adx)) if adx else Decimal("0"),
+            atr=atr,
+
             ema200_slope="flat",
             score_breakdown=score_breakdown or {}
         )
