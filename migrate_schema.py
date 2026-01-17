@@ -29,5 +29,34 @@ def migrate():
             # For SQLite, it's dynamic typing anyway, so it usually just works, 
             # or requires a full table rebuild which is overkill for local dev right now.
 
+    # 2. Add new columns to positions table if they don't exist
+    # This block handles adding new columns (safe to run if they exist with safeguards, or just let it fail/catch)
+    # Ideally we check existence, but for a simple migration script:
+    with engine.connect() as conn:
+        dialect = engine.dialect.name
+        if dialect == "postgresql":
+            print("Checking/Adding new columns to positions table (PostgreSQL)...")
+            # List of new columns: name, type
+            new_cols = [
+                ("trade_type", "VARCHAR"),
+                ("partial_close_pct", "NUMERIC(5, 2)"),
+                ("original_size", "NUMERIC(20, 8)"),
+                ("tp_order_ids", "VARCHAR"),
+                ("basis_at_entry", "NUMERIC(20, 8)"),
+                ("basis_current", "NUMERIC(20, 8)"),
+                ("funding_rate", "NUMERIC(20, 8)"),
+                ("cumulative_funding", "NUMERIC(20, 8)"),
+            ]
+            
+            for col_name, col_type in new_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                    print(f"Added {col_name} column.")
+                except Exception as e:
+                    print(f"Could not add {col_name}: {e}")
+            
+            conn.commit()
+            print("Column addition complete!")
+
 if __name__ == "__main__":
     migrate()
