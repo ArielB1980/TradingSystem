@@ -271,6 +271,74 @@ class LiveTrading:
             await self.client.close()
             logger.info("Live trading shutdown complete")
             
+    async def _calculate_effective_equity(self, balance: Dict) -> tuple[Decimal, Decimal, Decimal]:
+        """
+        Calculate effective equity/margin from balance dict.
+        Handlers:
+        1. Multi-Collateral (Flex) - Using 'info' from Kraken
+        2. Single-Collateral (Inverse) - Valuing crypto collateral manually
+        3. Standard - Using base currency balance
+        
+        Returns:
+            (equity, available_margin, margin_used)
+        """
+        # Default to standard CCXT total['USD']
+        base_currency = getattr(self.config.exchange, "base_currency", "USD")
+        total = balance.get('total', {})
+        
+        equity = Decimal(str(total.get(base_currency, 0)))
+        avail_margin = Decimal(str(balance.get('free', {}).get(base_currency, 0)))
+        margin_used = Decimal(str(balance.get('used', {}).get(base_currency, 0)))
+        
+        # 2. Check for Kraken Futures Multi-Collateral ("flex")
+        info = balance.get('info', {})
+        if info and 'accounts' in info and 'flex' in info['accounts']:
+            flex = info['accounts']['flex']
+            
+            pv = flex.get('portfolioValue')
+            am = flex.get('availableMargin')
+            im = flex.get('initialMargin')
+            
+            if pv is not None:
+                equity = Decimal(str(pv))
+            if am is not None:
+                avail_margin = Decimal(str(am))
+            if im is not None:
+                margin_used = Decimal(str(im))
+                
+            return equity, avail_margin, margin_used
+        
+        # 3. Logic for Single-Collateral (Inverse) or incomplete Flex data
+        # If Equity is suspiciously low (< 10 USD) but we have crypto balance, calculate approximate equity
+        if equity < 10:
+            # Check for XBT/BTC/ETH
+            for asset in ['XBT', 'BTC', 'ETH', 'SOL', 'USDT', 'USDC']:
+                if asset == base_currency: 
+                    continue
+                    
+                asset_qty = Decimal(str(total.get(asset, 0)))
+                if asset_qty > 0:
+                    try:
+                        # Fetch price for valuation
+                        ticker_symbol = f"{asset}/USD"
+                        if asset == 'XBT': ticker_symbol = "BTC/USD"
+                        
+                        ticker = await self.client.get_ticker(ticker_symbol)
+                        price = Decimal(str(ticker['last']))
+                        
+                        asset_equity = asset_qty * price
+                        
+                        equity += asset_equity
+                        # Approximate available margin if strictly 0 (risky but better than 0)
+                        if avail_margin == 0:
+                            avail_margin += asset_equity
+                            
+                        logger.info(f"Valued non-USD collateral: {asset_qty} {asset} (~${asset_equity:,.2f})")
+                    except Exception as ex:
+                         logger.warning(f"Could not value collateral {asset}", error=str(ex))
+                         
+        return equity, avail_margin, margin_used
+
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
         # Handle key variations (CCXT vs Raw vs Internal)
@@ -657,67 +725,9 @@ class LiveTrading:
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
         try:
-            # 1. Get Balances
-            balance = await self.client.get_futures_balance()
-            if not balance:
-                return
-
-            # Default to standard CCXT total['USD']
-            base_currency = getattr(self.config.exchange, "base_currency", "USD")
-            total = balance.get('total', {})
-            equity = Decimal(str(total.get(base_currency, 0)))
-            avail_margin = Decimal(str(balance.get('free', {}).get(base_currency, 0)))
-            margin_used_val = Decimal(str(balance.get('used', {}).get(base_currency, 0)))
-            
-            # 2. Check for Kraken Futures Multi-Collateral ("flex")
-            # This is critical because 'total' only shows token amounts, not USD value of collateral
-            info = balance.get('info', {})
-            if info and 'accounts' in info and 'flex' in info['accounts']:
-                flex = info['accounts']['flex']
-                # portfolioValue = Total Equity (Balance + Unr. PnL + Collateral Value)
-                # availableMargin = Margin available for new positions
-                # initialMargin = Margin used
-                
-                pv = flex.get('portfolioValue')
-                am = flex.get('availableMargin')
-                im = flex.get('initialMargin')
-                
-                if pv is not None:
-                    equity = Decimal(str(pv))
-                if am is not None:
-                    avail_margin = Decimal(str(am))
-                if im is not None:
-                    margin_used_val = Decimal(str(im))
-                    
-                logger.debug("Synced Multi-Collateral state", equity=str(equity))
-            
-            # 2.5 Logic for Single-Collateral (Inverse) or incomplete Flex data
-            # If Equity is suspiciously low (< 10 USD) but we have crypto balance, calculate approximate equity
-            if equity < 10:
-                # Check for XBT/BTC/ETH
-                for asset in ['XBT', 'BTC', 'ETH', 'SOL', 'USDT', 'USDC']:
-                    if asset == base_currency: 
-                        continue
-                        
-                    asset_qty = Decimal(str(total.get(asset, 0)))
-                    if asset_qty > 0:
-                        # Fetch price
-                        ticker_symbol = f"{asset}/USD"
-                        try:
-                            # Try map to proper pair
-                            if asset == 'XBT': ticker_symbol = "BTC/USD"
-                            
-                            ticker = await self.client.get_ticker(ticker_symbol)
-                            price = Decimal(str(ticker['last']))
-                            
-                            asset_equity = asset_qty * price
-                            logger.info(f"Found non-USD collateral: {asset_qty} {asset} (~${asset_equity:,.2f})")
-                            
-                            equity += asset_equity
-                            # Note: Margin used/avail might still be wrong if not from Flex endpoint, 
-                            # but at least Equity reflects reality.
-                        except Exception as ex:
-                             logger.warning(f"Could not value collateral {asset}", error=str(ex))
+            # 2. Calculate Effective Equity (Shared Logic)
+            # This handles Multi-Collateral (Flex) and Inverse (Crypto-Margined) accounts correctly
+            equity, avail_margin, margin_used_val = await self._calculate_effective_equity(balance)
 
             # 3. Persist
             save_account_state(
@@ -770,10 +780,10 @@ class LiveTrading:
         # 1. Fetch Account Equity
         # For futures, we need futures balance
         balance = await self.client.get_futures_balance()
-        # CCXT balance often has 'total' as dict of currency -> total
-        # Usually we use USD or USDT as base. Ref config for base currency.
-        base_currency = getattr(self.config.exchange, "base_currency", "USD")
-        equity = Decimal(str(balance.get('total', {}).get(base_currency, 0)))
+        
+        # Calculate Effective Equity using shared logic
+        # This fixes the issue where inverse/multi-collateral accounts saw $0 equity
+        equity, _, _ = await self._calculate_effective_equity(balance)
         
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
