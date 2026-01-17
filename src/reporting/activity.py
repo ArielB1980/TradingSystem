@@ -24,13 +24,9 @@ def generate_activity_report(hours: int = 24, format_type: str = "text") -> None
     
     events = get_decision_traces_since(cutoff)
     
-    if not events:
-        console.print("[yellow]No activity recorded in this period.[/yellow]")
-        return
-
     # 2. Process Data
     stats = {
-        "total_reviews": len(events),
+        "total_reviews": 0,
         "distinct_coins": set(),
         "coins_data": defaultdict(lambda: {
             "review_count": 0,
@@ -43,6 +39,7 @@ def generate_activity_report(hours: int = 24, format_type: str = "text") -> None
     }
     
     for e in events:
+        stats["total_reviews"] += 1
         symbol = e["symbol"]
         stats["distinct_coins"].add(symbol)
         
@@ -73,6 +70,10 @@ def generate_activity_report(hours: int = 24, format_type: str = "text") -> None
             stats["signals_generated"].append(sig_entry)
 
     # 3. Output Report
+    
+    if stats["total_reviews"] == 0:
+        console.print("[yellow]No activity recorded in this period.[/yellow]")
+        return
     
     # Header
     console.print("\n[bold]📈 System Activity Summary[/bold]")
