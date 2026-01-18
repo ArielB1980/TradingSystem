@@ -9,11 +9,12 @@ regime classification logic.
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from sqlalchemy import text
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.storage.repository import get_db_connection
+from src.storage.db import get_db
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -24,56 +25,59 @@ def check_regime_distribution():
     print("\n📊 Current Regime Distribution in Database:\n")
     print("=" * 60)
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Query regime distribution
-    query = """
-        SELECT 
-            details->>'regime' as regime,
-            COUNT(*) as count,
-            MAX(timestamp) as latest_update
-        FROM decision_traces
-        WHERE details->>'regime' IS NOT NULL
-        GROUP BY details->>'regime'
-        ORDER BY count DESC;
-    """
-    
-    cursor.execute(query)
-    results = cursor.fetchall()
-    
-    if not results:
-        print("❌ No decision traces found in database")
-        cursor.close()
-        conn.close()
-        return
-    
-    total = sum(r[1] for r in results)
-    
-    for regime, count, latest in results:
-        percentage = (count / total) * 100
-        print(f"  {regime:20s}: {count:5d} ({percentage:5.1f}%)  Latest: {latest}")
-    
-    print("=" * 60)
-    print(f"  {'TOTAL':20s}: {total:5d} (100.0%)\n")
-    
-    # Check age of traces
-    cursor.execute("""
-        SELECT 
-            MIN(timestamp) as oldest,
-            MAX(timestamp) as newest,
-            COUNT(*) as total
-        FROM decision_traces;
-    """)
-    
-    oldest, newest, total = cursor.fetchone()
-    print(f"📅 Trace Age:")
-    print(f"  Oldest: {oldest}")
-    print(f"  Newest: {newest}")
-    print(f"  Total:  {total} traces\n")
-    
-    cursor.close()
-    conn.close()
+    db = get_db()
+    with db.get_session() as session:
+        # Query regime distribution
+        # Note: assumes PostgreSQL JSON syntax (->>)
+        query = text("""
+            SELECT 
+                details->>'regime' as regime,
+                COUNT(*) as count,
+                MAX(timestamp) as latest_update
+            FROM decision_traces
+            WHERE details->>'regime' IS NOT NULL
+            GROUP BY details->>'regime'
+            ORDER BY count DESC;
+        """)
+        
+        try:
+            result = session.execute(query)
+            rows = result.fetchall()
+            
+            if not rows:
+                print("❌ No decision traces found in database")
+                return
+            
+            total = sum(r[1] for r in rows)
+            
+            for regime, count, latest in rows:
+                percentage = (count / total) * 100
+                print(f"  {regime:20s}: {count:5d} ({percentage:5.1f}%)  Latest: {latest}")
+            
+            print("=" * 60)
+            print(f"  {'TOTAL':20s}: {total:5d} (100.0%)\n")
+            
+            # Check age of traces
+            age_query = text("""
+                SELECT 
+                    MIN(timestamp) as oldest,
+                    MAX(timestamp) as newest,
+                    COUNT(*) as total
+                FROM decision_traces;
+            """)
+            
+            age_res = session.execute(age_query).fetchone()
+            if age_res:
+                oldest, newest, total = age_res
+                print(f"📅 Trace Age:")
+                print(f"  Oldest: {oldest}")
+                print(f"  Newest: {newest}")
+                print(f"  Total:  {total} traces\n")
+                
+        except Exception as e:
+            print(f"❌ Error querying database: {e}")
+            if "no such table" in str(e).lower():
+                print("   (Ensure 'decision_traces' table exists and migrations are run)")
 
 
 def clear_old_traces(hours=1, dry_run=True):
@@ -84,35 +88,24 @@ def clear_old_traces(hours=1, dry_run=True):
         hours: Clear traces older than this many hours
         dry_run: If True, only show what would be deleted
     """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    
-    # Count what would be deleted
-    cursor.execute("""
-        SELECT COUNT(*) 
-        FROM decision_traces 
-        WHERE timestamp < %s;
-    """, (cutoff,))
-    
-    count = cursor.fetchone()[0]
-    
-    if dry_run:
-        print(f"\n🔍 DRY RUN: Would delete {count} traces older than {hours}h")
-        print(f"   Cutoff time: {cutoff}")
-        print("\n   Run with --execute to actually delete\n")
-    else:
-        print(f"\n🗑️  Deleting {count} traces older than {hours}h...")
-        cursor.execute("""
-            DELETE FROM decision_traces 
-            WHERE timestamp < %s;
-        """, (cutoff,))
-        conn.commit()
-        print(f"   ✅ Deleted {count} traces\n")
-    
-    cursor.close()
-    conn.close()
+    db = get_db()
+    with db.get_session() as session:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        
+        # Count what would be deleted
+        count_query = text("SELECT COUNT(*) FROM decision_traces WHERE timestamp < :cutoff")
+        count = session.execute(count_query, {"cutoff": cutoff}).scalar()
+        
+        if dry_run:
+            print(f"\n🔍 DRY RUN: Would delete {count} traces older than {hours}h")
+            print(f"   Cutoff time: {cutoff}")
+            print("\n   Run with --execute to actually delete\n")
+        else:
+            print(f"\n🗑️  Deleting {count} traces older than {hours}h...")
+            delete_query = text("DELETE FROM decision_traces WHERE timestamp < :cutoff")
+            session.execute(delete_query, {"cutoff": cutoff})
+            session.commit()
+            print(f"   ✅ Deleted {count} traces\n")
 
 
 def main():
