@@ -4,21 +4,23 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
-	@echo "  make venv        Create virtual environment"
-	@echo "  make install     Install dependencies"
-	@echo "  make validate    Validate environment configuration"
-	@echo "  make run         Run bot in local mode (dry-run)"
-	@echo "  make smoke       Run smoke test (30s)"
-	@echo "  make test        Run unit tests"
-	@echo "  make logs        Tail run logs"
-	@echo "  make smoke-logs  Tail smoke logs"
-	@echo "  make status      Check if bot is running"
-	@echo "  make clean       Remove .venv and caches"
-	@echo "  make clean-logs  Remove log files"
+	@echo "  make venv          Create virtual environment"
+	@echo "  make install       Install dependencies"
+	@echo "  make validate      Validate environment configuration"
+	@echo "  make run           Run bot in local mode (dry-run)"
+	@echo "  make smoke         Run smoke test (30s)"
+	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
+	@echo "  make pre-deploy    Run all pre-deployment tests (REQUIRED before push to main)"
+	@echo "  make test          Run unit tests"
+	@echo "  make logs          Tail run logs"
+	@echo "  make smoke-logs    Tail smoke logs"
+	@echo "  make status        Check if bot is running"
+	@echo "  make clean         Remove .venv and caches"
+	@echo "  make clean-logs    Remove log files"
 
 venv:
 	python3 -m venv .venv
@@ -72,6 +74,47 @@ smoke:
 		echo "❌ .env.local not found. Run 'make validate' first."; \
 		exit 1; \
 	fi
+
+integration:
+	@mkdir -p logs
+	@echo "Starting integration test (5 minutes)..."
+	@echo "This will test signal generation for 20+ symbols to catch bugs early."
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		ENV=local ENVIRONMENT=dev DRY_RUN=1 LOG_LEVEL=INFO $(PYTHON) src/test_integration.py 300 2>&1 | tee logs/integration.log; \
+		EXIT_CODE=$$?; \
+		if [ $$EXIT_CODE -eq 0 ]; then \
+			echo ""; \
+			echo "✅ INTEGRATION TEST PASSED"; \
+			echo "Exit code: $$EXIT_CODE"; \
+		else \
+			echo ""; \
+			echo "❌ INTEGRATION TEST FAILED"; \
+			echo "Exit code: $$EXIT_CODE"; \
+			echo "Check logs/integration.log for details"; \
+		fi; \
+		exit $$EXIT_CODE; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+pre-deploy:
+	@echo "=========================================="
+	@echo "PRE-DEPLOYMENT TEST SUITE"
+	@echo "=========================================="
+	@echo ""
+	@echo "Step 1/2: Running smoke test (30s)..."
+	@$(MAKE) smoke
+	@echo ""
+	@echo "Step 2/2: Running integration test (5 mins)..."
+	@$(MAKE) integration
+	@echo ""
+	@echo "=========================================="
+	@echo "✅ ALL PRE-DEPLOYMENT TESTS PASSED"
+	@echo "=========================================="
+	@echo ""
+	@echo "Safe to push to main and deploy to production."
 
 test:
 	@echo "Running unit tests..."
