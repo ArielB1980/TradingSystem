@@ -130,18 +130,42 @@ ProjectTrading/
 
 ## Testing
 
+### Pre-Deployment Testing (MANDATORY)
+
+**Before pushing to main**, always run:
+
 ```bash
-# Run all tests
-pytest tests/
-
-# Run with coverage
-pytest --cov=src --cov-fail-under=80
-
-# Run specific test suite
-pytest tests/unit/
-pytest tests/integration/
-pytest tests/failure_modes/
+make pre-deploy
 ```
+
+This runs:
+1. **Smoke test** (30s) - Verifies system starts
+2. **Integration test** (5 mins) - Tests signal generation for 20+ symbols
+
+See [TESTING.md](TESTING.md) for full protocol.
+
+### Quick Tests
+
+```bash
+# Smoke test only (30s)
+make smoke
+
+# Integration test only (5 mins)
+make integration
+
+# Unit tests (when available)
+make test
+```
+
+### Why This Matters
+
+The integration test catches bugs like:
+- `trigger_price` UnboundLocalError (caught 2026-01-18)
+- Signal generation failures
+- Data acquisition issues
+- Type errors and logic bugs
+
+**Never skip `make pre-deploy` before pushing to main.**
 
 ## Documentation
 
