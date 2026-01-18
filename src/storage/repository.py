@@ -266,6 +266,9 @@ def save_candles_bulk(candles: List[Candle]) -> int:
             )
             session.execute(stmt)
             
+    # Invalidate query cache after writes to prevent stale data
+    clear_cache()
+    
     return len(candles)
 
 

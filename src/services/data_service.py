@@ -246,9 +246,9 @@ class DataService:
             # Reduced concurrency to prevent rate limit queue stacking
             sem = asyncio.Semaphore(8) 
             
-            # Smart Polling: Only fetch 1h every 15 mins, 4h every 60 mins, 1d every 4 hours
+            # Smart Polling: Only fetch 1h every 15 mins, 4h every 4 hours, 1d every 4 hours
             fetch_1h = (self.iteration_count % 15 == 0)
-            fetch_4h = (self.iteration_count % 60 == 0)
+            fetch_4h = (self.iteration_count % 240 == 0)  # Changed from 60 to 240 (4h candles close every 4h)
             fetch_1d = (self.iteration_count % 240 == 0)
 
             async def poll_symbol(symbol: str):
