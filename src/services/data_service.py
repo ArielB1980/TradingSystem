@@ -124,7 +124,8 @@ class DataService:
             scopes_periodic = [
                 ("15m", 3), # Increased from 1 to 3 days to cover EMA 200 (~2.1 days)
                 ("1h", 7),  # Increased from 1 to 7 days for safety
-                ("4h", 30)  # Increased from 1 to 30 days
+                ("4h", 30), # Increased from 1 to 30 days
+                ("1d", 30)  # Added to ensure Daily bias data is self-healing
             ]
             await self._run_hydration_cycle(markets, scopes_periodic)
 
@@ -172,9 +173,10 @@ class DataService:
             # Reduced concurrency to prevent rate limit queue stacking
             sem = asyncio.Semaphore(8) 
             
-            # Smart Polling: Only fetch 1h every 15 mins, 4h every 60 mins
+            # Smart Polling: Only fetch 1h every 15 mins, 4h every 60 mins, 1d every 4 hours
             fetch_1h = (self.iteration_count % 15 == 0)
             fetch_4h = (self.iteration_count % 60 == 0)
+            fetch_1d = (self.iteration_count % 240 == 0)
 
             async def poll_symbol(symbol: str):
                 async with sem:
@@ -184,6 +186,7 @@ class DataService:
                     # If bootstrap, we MUST fetch everything regardless of cycle
                     do_1h = fetch_1h or is_bootstrap
                     do_4h = fetch_4h or is_bootstrap
+                    do_1d = fetch_1d or is_bootstrap
                     limit = 300 if is_bootstrap else 3
                     
                     try:
@@ -210,6 +213,13 @@ class DataService:
                             if candles_4h:
                                 await asyncio.to_thread(save_candles_bulk, candles_4h)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
+                            
+                        # 4. Quaternary Polling: 1d (Periodic)
+                        if do_1d:
+                            candles_1d = await self.kraken.get_spot_ohlcv(symbol, "1d", limit=limit)
+                            if candles_1d:
+                                await asyncio.to_thread(save_candles_bulk, candles_1d)
+                                await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1d, timeframe="1d", is_historical=False))
                             
                     except asyncio.TimeoutError:
                         # Log as debug to reduce noise unless it persists

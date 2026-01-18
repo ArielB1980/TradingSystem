@@ -382,6 +382,9 @@ class TradingService:
                  if not msg.is_historical:
                      await self._analyze_symbol(symbol)
             
+            if tf == "1d":
+                 logger.info(f"TradingService: Updated 1d cache for {symbol}", size=len(target_map[symbol]), last_ts=target_map[symbol][-1].timestamp if target_map[symbol] else "None")
+            
             if tf == "15m" and len(target_map[symbol]) < 50:
                  logger.warning(f"TradingService: 15m cache shallow for {symbol} ({len(target_map[symbol])} candles)")
             
