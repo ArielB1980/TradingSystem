@@ -351,6 +351,37 @@ class TradingService:
             # Check every 10 seconds
             await asyncio.sleep(10.0)
 
+    def _check_data_freshness(self, symbol: str) -> bool:
+        """
+        Verify data is fresh enough for trading.
+        
+        Returns:
+            True if data is fresh, False if stale
+        """
+        now = datetime.now(timezone.utc)
+        
+        # Check 15m data (should be <30 mins old)
+        c15m = self.candles_15m.get(symbol, [])
+        if not c15m or (now - c15m[-1].timestamp).total_seconds() > 1800:
+            logger.warning(
+                f"Stale 15m data for {symbol}",
+                last_update=c15m[-1].timestamp if c15m else "None",
+                age_mins=(now - c15m[-1].timestamp).total_seconds() / 60 if c15m else "N/A"
+            )
+            return False
+        
+        # Check 1d data (should be <48 hours old)
+        c1d = self.candles_1d.get(symbol, [])
+        if not c1d or (now - c1d[-1].timestamp).total_seconds() > 172800:
+            logger.warning(
+                f"Stale 1d data for {symbol}",
+                last_update=c1d[-1].timestamp if c1d else "None",
+                age_hours=(now - c1d[-1].timestamp).total_seconds() / 3600 if c1d else "N/A"
+            )
+            return False
+        
+        return True
+
     # ... (rest of methods)
 
     async def _handle_market_update(self, msg: MarketUpdate):
@@ -404,6 +435,11 @@ class TradingService:
          c15m = self.candles_15m.get(symbol, [])
          if len(c15m) < 50: 
              logger.warning(f"Skipping analysis for {symbol}: Insufficient 15m data ({len(c15m)})")
+             return
+         
+         # DATA STALENESS CHECK: Prevent trading on stale data
+         if not self._check_data_freshness(symbol):
+             logger.warning(f"Skipping analysis for {symbol}: Stale data detected")
              return
          
          
