@@ -11,6 +11,7 @@ help:
 	@echo "  make venv          Create virtual environment"
 	@echo "  make install       Install dependencies"
 	@echo "  make validate      Validate environment configuration"
+	@echo "  make backfill      Download 250 days of historical data for all coins"
 	@echo "  make run           Run bot in local mode (dry-run)"
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
@@ -21,6 +22,16 @@ help:
 	@echo "  make status        Check if bot is running"
 	@echo "  make clean         Remove .venv and caches"
 	@echo "  make clean-logs    Remove log files"
+
+backfill:
+	@echo "Backfilling historical candle data (250 days)..."
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		ENV=local ENVIRONMENT=dev $(PYTHON) scripts/backfill_historical_data.py; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
 
 venv:
 	python3 -m venv .venv
