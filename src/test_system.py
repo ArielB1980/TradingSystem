@@ -72,7 +72,7 @@ async def test_kraken_api(config):
         
         # Test spot market data (no auth required)
         print("Testing spot market data access...")
-        ticker = await client.get_ticker("BTC/USD")
+        ticker = await client.get_spot_ticker("BTC/USD")
         if ticker:
             print(f"✅ Spot API working - BTC/USD price: ${ticker.get('last', 'N/A')}")
         else:
