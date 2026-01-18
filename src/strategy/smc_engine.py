@@ -198,6 +198,24 @@ class SMCEngine:
                     atr=atr_value
                 )
 
+        # Step 1.5: Identify Structure & Regime Early (NEW)
+        # We perform this here so that even rejected signals have accurate regime info.
+        structures = {}
+        regime_early = None
+        structure_signal = None
+        
+        if signal is None:
+            structure_signal = self._detect_structure(
+                exec_candles_15m,
+                exec_candles_1h,
+                bias,
+                reasoning_parts,
+            )
+            if structure_signal:
+                structures = structure_signal
+                regime_early = self._classify_regime_from_structure(structure_signal)
+                reasoning_parts.append(f"📊 Market Regime: {regime_early}")
+
         # Step 2: Market Structure Change Detection & Confirmation
         # Require structure change confirmation + reconfirmation before entry
         if signal is None:
@@ -295,7 +313,8 @@ class SMCEngine:
                             reasoning_parts, 
                             exec_candles_1h[-1] if exec_candles_1h else None,
                             adx=adx_value,
-                            atr=atr_value
+                            atr=atr_value,
+                            regime=regime_early
                         )
                 else:
                     reasoning_parts.append(
@@ -306,7 +325,8 @@ class SMCEngine:
                         reasoning_parts, 
                         exec_candles_1h[-1] if exec_candles_1h else None,
                         adx=adx_value,
-                        atr=atr_value
+                        atr=atr_value,
+                        regime=regime_early
                     )
             else:
                 # No structure change - check if we're waiting for one
@@ -322,38 +342,26 @@ class SMCEngine:
                             reasoning_parts, 
                             exec_candles_1h[-1] if exec_candles_1h else None,
                             adx=adx_value,
-                            atr=atr_value
+                            atr=atr_value,
+                            regime=regime_early
                         )
         
-        # Step 2.5: Execution timeframe structure (only if entry ready or MS change not required)
-        structures = {}  # Store for regime classification
-        regime_early = None  # Track regime as soon as we can determine it
+        # Step 2.5: Execution timeframe structure (Already calculated in Step 1.5)
+        # Just handle the case where no structure was found
         
+        if signal is None and structure_signal is None:
+             # If we failed to find structure earlier, reject now
+             signal = self._no_signal(
+                 symbol, 
+                 reasoning_parts, 
+                 exec_candles_1h[-1] if exec_candles_1h else None,
+                 adx=adx_value,
+                 atr=atr_value,
+                 regime=regime_early
+             )
+
         if signal is None:
-            structure_signal = self._detect_structure(
-                exec_candles_15m,
-                exec_candles_1h,
-                bias,
-                reasoning_parts,
-            )
-            if structure_signal is None:
-                 signal = self._no_signal(
-                     symbol, 
-                     reasoning_parts, 
-                     exec_candles_1h[-1] if exec_candles_1h else None,
-                     adx=adx_value,
-                     atr=atr_value
-                 )
-            else:
-                structures = structure_signal  # Save for classification
-                
-                # EARLY REGIME CLASSIFICATION (NEW)
-                # Classify regime immediately after structure detection
-                # This ensures rejected signals still show correct regime
-                regime_early = self._classify_regime_from_structure(structure_signal)
-                reasoning_parts.append(f"📊 Market Regime: {regime_early}")
-                
-                # If entry ready, verify signal direction matches structure change
+            # If entry ready, verify signal direction matches structure change
                 if self.ms_tracker.is_entry_ready(symbol):
                     entry_signal = self.ms_tracker.get_entry_signal(symbol)
                     if entry_signal:
