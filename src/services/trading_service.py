@@ -403,9 +403,9 @@ class TradingService:
             for c in new_data:
                 merged[c.timestamp] = c
             target_map[symbol] = sorted(merged.values(), key=lambda x: x.timestamp)
-            # Cap size - Reduced from 1000 to 300 to prevent memory exhaustion
-            if len(target_map[symbol]) > 300:
-                target_map[symbol] = target_map[symbol][-300:]
+            # Cap size - Reduced from 300 to 200 to save memory (SMC needs ~100 candles)
+            if len(target_map[symbol]) > 200:
+                target_map[symbol] = target_map[symbol][-200:]
             
             if tf == "1h":
                  logger.info(f"TradingService: Updated 1h cache for {symbol}", size=len(target_map[symbol]), last_ts=target_map[symbol][-1].timestamp if target_map[symbol] else "None")
