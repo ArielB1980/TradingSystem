@@ -156,13 +156,9 @@ class IntegrationTest:
     async def _test_signal_generation(self, symbol, c15m, c1h, c4h, c1d):
         """Test signal generation for a symbol."""
         from src.strategy.smc_engine import SMCEngine
-        from src.strategy.fibonacci_engine import FibonacciEngine
-        from src.strategy.signal_scorer import SignalScorer
         
-        # Initialize engines
-        fib_engine = FibonacciEngine(self.config.strategy)
-        scorer = SignalScorer(self.config.strategy)
-        smc_engine = SMCEngine(self.config.strategy, fib_engine, scorer)
+        # Initialize SMC engine (it creates its own fib_engine and scorer internally)
+        smc_engine = SMCEngine(self.config.strategy)
         
         try:
             # Generate signal
