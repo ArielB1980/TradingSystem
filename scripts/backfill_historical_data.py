@@ -91,8 +91,7 @@ async def backfill_historical_data(
     # Initialize Kraken client
     kraken_client = KrakenClient(
         api_key=os.getenv("KRAKEN_API_KEY", ""),
-        api_secret=os.getenv("KRAKEN_API_SECRET", ""),
-        timeout=30
+        api_secret=os.getenv("KRAKEN_API_SECRET", "")
     )
     
     # Initialize data acquisition
