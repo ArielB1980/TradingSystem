@@ -25,6 +25,16 @@ class DataService:
         self.active = True
         self.iteration_count = 0
         
+        # Data Quality Metrics
+        self.metrics = {
+            'api_calls_total': 0,
+            'api_failures': 0,
+            'last_update': {},  # symbol -> {tf -> timestamp}
+            'candle_counts': {},  # symbol -> {tf -> count}
+        }
+        
+        logger.info("DataService initialized")
+        
     async def start(self):
         """Entry point for the async task."""
         logger.info("Data Service Task Starting...")
@@ -58,11 +68,10 @@ class DataService:
         # Initialize Client Lazy
         await self.kraken.initialize()
         
-        # Start Background Hydration as a Task
+        # Spawn background tasks
         asyncio.create_task(self._perform_background_hydration())
-        
-        # Start Live Polling Task
         asyncio.create_task(self._perform_live_polling())
+        asyncio.create_task(self._periodic_gap_detection())  # New: Gap detection every 6 hours Task
         
         while self.active:
             # 1. Process Commands
@@ -264,49 +273,167 @@ class DataService:
                     
                     try:
                         # 1. Primary Polling: 15m (Every loop)
+                        self.metrics['api_calls_total'] += 1
                         candles_15m = await self.kraken.get_spot_ohlcv(symbol, "15m", limit=limit)
                         if candles_15m:
                             await asyncio.to_thread(save_candles_bulk, candles_15m)
                             await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_15m, timeframe="15m", is_historical=False))
                             if is_bootstrap: bootstrapped_symbols.add(symbol)
+                            # Track metrics
+                            self._update_metrics(symbol, "15m", len(candles_15m))
                             
                         # 2. Secondary Polling: 1h (Periodic)
                         if do_1h:
+                            self.metrics['api_calls_total'] += 1
                             candles_1h = await self.kraken.get_spot_ohlcv(symbol, "1h", limit=limit)
                             if candles_1h:
                                 await asyncio.to_thread(save_candles_bulk, candles_1h)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1h, timeframe="1h", is_historical=False))
                                 logger.info(f"DataService: Fetched {len(candles_1h)} 1h candles for {symbol}", is_bootstrap=is_bootstrap)
+                                self._update_metrics(symbol, "1h", len(candles_1h))
                             else:
                                 logger.warning(f"Fetched EMPTY 1h candles for {symbol} (DataService)", limit=limit)
 
                         # 3. Tertiary Polling: 4h (Periodic)
                         if do_4h:
+                            self.metrics['api_calls_total'] += 1
                             candles_4h = await self.kraken.get_spot_ohlcv(symbol, "4h", limit=limit)
                             if candles_4h:
                                 await asyncio.to_thread(save_candles_bulk, candles_4h)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_4h, timeframe="4h", is_historical=False))
+                                self._update_metrics(symbol, "4h", len(candles_4h))
                             
                         # 4. Quaternary Polling: 1d (Periodic)
                         if do_1d:
+                            self.metrics['api_calls_total'] += 1
                             candles_1d = await self.kraken.get_spot_ohlcv(symbol, "1d", limit=limit)
                             if candles_1d:
                                 await asyncio.to_thread(save_candles_bulk, candles_1d)
                                 await self.output_queue.put(MarketUpdate(symbol=symbol, candles=candles_1d, timeframe="1d", is_historical=False))
+                                self._update_metrics(symbol, "1d", len(candles_1d))
                             
                     except asyncio.TimeoutError:
-                        # Log as debug to reduce noise unless it persists
+                        self.metrics['api_failures'] += 1
                         logger.debug(f"Timeout polling {symbol}")
                     except Exception as e:
+                        self.metrics['api_failures'] += 1
                         logger.error(f"Polling failed for {symbol}: {e}")
 
             # Run all polls and wait
             await asyncio.gather(*[poll_symbol(s) for s in markets], return_exceptions=True)
             self.iteration_count += 1
+            
+            # Log data quality metrics every 60 iterations (~1 hour)
+            if self.iteration_count % 60 == 0:
+                self._log_data_quality()
 
             elapsed = time.time() - loop_start
             sleep_time = max(5.0, 60.0 - elapsed)
             await asyncio.sleep(sleep_time)
+    
+    def _update_metrics(self, symbol: str, tf: str, count: int):
+        """Update data quality metrics for a symbol/timeframe."""
+        if symbol not in self.metrics['last_update']:
+            self.metrics['last_update'][symbol] = {}
+            self.metrics['candle_counts'][symbol] = {}
+        
+        self.metrics['last_update'][symbol][tf] = datetime.now(timezone.utc)
+        self.metrics['candle_counts'][symbol][tf] = count
+    
+    def _log_data_quality(self):
+        """Log data quality metrics for monitoring."""
+        total_calls = self.metrics['api_calls_total']
+        failures = self.metrics['api_failures']
+        failure_rate = (failures / total_calls * 100) if total_calls > 0 else 0
+        
+        logger.info(
+            "Data Quality Metrics",
+            symbols_tracked=len(self.metrics['last_update'])
+        )
+    
+    def _find_gaps(self, candles: List[Candle], tf: str) -> List[tuple]:
+        """
+        Detect gaps in candle data.
+        
+        Returns:
+            List of (gap_start, gap_end) tuples
+        """
+        if len(candles) < 2:
+            return []
+        
+        # Calculate expected interval in seconds
+        intervals = {
+            "15m": 900,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400
+        }
+        expected_interval = intervals.get(tf, 3600)
+        
+        gaps = []
+        for i in range(len(candles) - 1):
+            current = candles[i]
+            next_candle = candles[i + 1]
+            
+            actual_gap = (next_candle.timestamp - current.timestamp).total_seconds()
+            
+            # If gap is more than 2x expected interval, it's a missing candle
+            if actual_gap > expected_interval * 2:
+                gaps.append((current.timestamp, next_candle.timestamp))
+        
+        return gaps
+    
+    async def _detect_and_fill_gaps(self):
+        """Detect gaps in candle data and backfill automatically."""
+        markets = self._get_active_markets()
+        
+        for symbol in markets[:10]:  # Limit to 10 symbols per check to avoid overload
+            for tf in ["15m", "1h", "4h", "1d"]:
+                try:
+                    # Get recent candles from DB
+                    def _fetch():
+                        return get_candles(symbol, tf, limit=100)
+                    
+                    candles = await asyncio.to_thread(_fetch)
+                    
+                    if not candles:
+                        continue
+                    
+                    gaps = self._find_gaps(candles, tf)
+                    
+                    for gap_start, gap_end in gaps:
+                        logger.warning(
+                            f"Gap detected: {symbol} {tf}",
+                            gap_start=gap_start,
+                            gap_end=gap_end,
+                            gap_hours=(gap_end - gap_start).total_seconds() / 3600
+                        )
+                        
+                        # Fetch missing data
+                        since_ms = int(gap_start.timestamp() * 1000)
+                        missing = await self.kraken.get_spot_ohlcv(
+                            symbol, tf, since=since_ms, limit=100
+                        )
+                        
+                        if missing:
+                            await asyncio.to_thread(save_candles_bulk, missing)
+                            logger.info(f"Gap filled: {symbol} {tf}, fetched {len(missing)} candles")
+                
+                except Exception as e:
+                    logger.debug(f"Gap detection failed for {symbol} {tf}: {e}")
+    
+    async def _periodic_gap_detection(self):
+        """Run gap detection every 6 hours."""
+        # Wait for initial hydration to complete
+        await asyncio.sleep(300)  # 5 minutes
+        
+        while self.active:
+            logger.info("Starting periodic gap detection...")
+            await self._detect_and_fill_gaps()
+            logger.info("Gap detection complete")
+            
+            # Run every 6 hours
+            await asyncio.sleep(21600)
 
     async def _send_status(self, status: str, details: Dict = None):
         msg = ServiceStatus(
