@@ -461,11 +461,11 @@ class TradingService:
                  bias_candles_1d=c1d
              )
              
+             # Current Price (from last candle) - Define BEFORE checking signal type
+             trigger_price = c15m[-1].close if c15m else Decimal('0')
+             
              if signal.signal_type != SignalType.NO_SIGNAL:
                  logger.info(f"SIGNAL FOUND: {symbol} {signal.signal_type} {signal.regime} Score={signal.score}")
-                 
-                 # Current Price (from last candle)
-                 trigger_price = c15m[-1].close
              else:
                  logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning}")
 
@@ -531,11 +531,7 @@ class TradingService:
              logger.error(f"Analysis failed for {symbol}: {e}")
              
          # Record Trace regardless of signal (Visibility)
-         # Trigger price from last candle if not set
-         # Record Trace regardless of signal (Visibility)
-         # Trigger price from last candle if not set
          if c15m and signal: 
-            trigger_price = c15m[-1].close
             await self._record_decision_trace(symbol, signal, trigger_price)
 
     async def _execute_signal(self, signal: Signal, futures_symbol: str, price: Decimal, decision: RiskDecision):
