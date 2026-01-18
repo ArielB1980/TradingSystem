@@ -94,6 +94,9 @@ async def backfill_historical_data(
         api_secret=os.getenv("KRAKEN_API_SECRET", "")
     )
     
+    # Initialize the client (sets up CCXT exchange objects)
+    await kraken_client.initialize()
+    
     # Initialize data acquisition
     data_acq = DataAcquisition(
         kraken_client=kraken_client,
