@@ -327,6 +327,8 @@ class SMCEngine:
         
         # Step 2.5: Execution timeframe structure (only if entry ready or MS change not required)
         structures = {}  # Store for regime classification
+        regime_early = None  # Track regime as soon as we can determine it
+        
         if signal is None:
             structure_signal = self._detect_structure(
                 exec_candles_15m,
@@ -344,6 +346,12 @@ class SMCEngine:
                  )
             else:
                 structures = structure_signal  # Save for classification
+                
+                # EARLY REGIME CLASSIFICATION (NEW)
+                # Classify regime immediately after structure detection
+                # This ensures rejected signals still show correct regime
+                regime_early = self._classify_regime_from_structure(structure_signal)
+                reasoning_parts.append(f"📊 Market Regime: {regime_early}")
                 
                 # If entry ready, verify signal direction matches structure change
                 if self.ms_tracker.is_entry_ready(symbol):
@@ -366,7 +374,8 @@ class SMCEngine:
                      reasoning_parts, 
                      exec_candles_1h[-1] if exec_candles_1h else None,
                      adx=adx_value,
-                     atr=atr_value
+                     atr=atr_value,
+                     regime=regime_early  # Pass early-classified regime
                  )
 
             # Step 4: Calculate Levels (If passed all checks)
@@ -662,6 +671,32 @@ class SMCEngine:
         else:
             # HTF trend following only
             return (SetupType.TREND, "wide_structure")
+    
+    def _classify_regime_from_structure(self, structure: dict) -> str:
+        """
+        Classify regime from detected structure (early classification).
+        
+        This is called immediately after structure detection to ensure
+        rejected signals still show the correct regime on the dashboard.
+        
+        Returns:
+            regime string: "tight_smc" or "wide_structure"
+        
+        Priority (highest first):
+        1. If Order Block present → "tight_smc"
+        2. If Fair Value Gap present → "tight_smc"
+        3. If Break of Structure confirmed → "wide_structure"
+        4. Else (HTF trend only) → "wide_structure"
+        """
+        if structure.get("order_block"):
+            return "tight_smc"
+        elif structure.get("fvg"):
+            return "tight_smc"
+        elif structure.get("bos"):
+            return "wide_structure"
+        else:
+            # HTF trend following only
+            return "wide_structure"
     
     def _determine_bias(
         self,
@@ -1117,22 +1152,31 @@ class SMCEngine:
         # Since I can't easily import get_logger here without risking circular dep or context issues, 
         # I'll rely on the logic check.
         
-        # Determine regime if not provided
+        # Determine regime if not provided (fallback for early rejections)
         if not regime:
             # If no data (no candle), state is undefined/no_data
             if not current_candle:
                 regime = "no_data"
-            # If we have data and low volatility -> consolidation
-            elif adx > 0 and adx < 25:
-                regime = "consolidation"
             else:
-                regime = "wide_structure"
+                # Use ADX-based heuristic for early rejections (before structure analysis)
+                # ADX < 20: Very low trend strength → consolidation
+                # ADX 20-25: Low trend strength → consolidation (ranging)
+                # ADX 25-40: Moderate trend → wide_structure (could be trending)
+                # ADX > 40: Strong trend → wide_structure (definitely trending)
+                if adx > 0 and adx < 20:
+                    regime = "consolidation"  # Very weak/no trend
+                elif adx >= 20 and adx < 25:
+                    regime = "consolidation"  # Ranging market
+                else:
+                    # ADX >= 25: Trending market
+                    # Default to wide_structure since we don't have structure details
+                    regime = "wide_structure"
                 
             # SPECIAL DEBUG: If regime resulted in no_data but we HAD a candle, LOG IT
             if regime == "no_data" and current_candle:
                  reasoning.append(f"DEBUG_ERROR: Regime=no_data BUT Candle Exists! ADX={adx}")
                  # Force fix
-                 regime = "wide_structure"
+                 regime = "consolidation"  # Conservative default
         
         return Signal(
             timestamp=timestamp,
