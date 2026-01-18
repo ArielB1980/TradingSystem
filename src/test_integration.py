@@ -18,8 +18,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
