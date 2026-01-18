@@ -164,8 +164,8 @@ class IntegrationTest:
             # Generate signal
             signal = smc_engine.generate_signal(
                 symbol=symbol,
-                candles_15m=c15m,
-                candles_1h=c1h,
+                exec_candles_15m=c15m,
+                exec_candles_1h=c1h,
                 bias_candles_4h=c4h,
                 bias_candles_1d=c1d
             )
