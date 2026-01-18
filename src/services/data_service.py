@@ -8,7 +8,7 @@ from src.config.config import Config
 from src.monitoring.logger import get_logger, setup_logging
 from src.data.kraken_client import KrakenClient
 from src.ipc.messages import MarketUpdate, ServiceCommand, ServiceStatus
-from src.storage.repository import get_candles, save_candle, save_candles_bulk
+from src.storage.repository import get_candles, save_candle, save_candles_bulk, get_latest_candle_timestamp
 from src.domain.models import Candle
 
 logger = get_logger("DataService")
@@ -106,14 +106,24 @@ class DataService:
         markets = self._get_active_markets()
         logger.info(f"Hydrating {len(markets)} markets")
         
-        # 1. INITIAL FULL HYDRATION
+        # 1. INITIAL DB PRE-LOAD (Fast startup)
+        # Load existing data from database BEFORE hitting API
+        logger.info("Phase 1: Loading existing data from database...")
         scopes_initial = [
             ("15m", 30),
             ("1h", 60), 
             ("4h", 90),
             ("1d", 180)
         ]
-        await self._run_hydration_cycle(markets, scopes_initial)
+        
+        # Pre-load from DB in parallel
+        await self._preload_from_database(markets, scopes_initial)
+        logger.info("Database pre-load complete - trading can begin immediately")
+        
+        # 2. INCREMENTAL API FETCH (Only recent/missing data)
+        # Now fetch only what's missing or recent from API
+        logger.info("Phase 2: Fetching recent data from API...")
+        await self._run_hydration_cycle(markets, scopes_initial, incremental=True)
         logger.info("Initial Background Hydration Fully Complete")
         await self._send_status("HYDRATION_COMPLETE", {"msg": "Initial Sync Done"})
 
@@ -129,7 +139,44 @@ class DataService:
             ]
             await self._run_hydration_cycle(markets, scopes_periodic)
 
-    async def _run_hydration_cycle(self, markets: List[str], scopes: List[tuple]):
+    async def _preload_from_database(self, markets: List[str], scopes: List[tuple]):
+        """Pre-load existing candle data from database to enable fast startup."""
+        sem = asyncio.Semaphore(20)  # Higher concurrency for DB reads (no API limits)
+        
+        async def load_symbol_data(symbol: str, tf: str, days: int):
+            async with sem:
+                if not self.active:
+                    return
+                try:
+                    start_date = datetime.now(timezone.utc) - timedelta(days=days)
+                    
+                    def _fetch():
+                        return get_candles(symbol, tf, start_time=start_date)
+                    
+                    history = await asyncio.to_thread(_fetch)
+                    
+                    if history:
+                        msg = MarketUpdate(
+                            symbol=symbol,
+                            candles=history,
+                            timeframe=tf,
+                            is_historical=True
+                        )
+                        await self.output_queue.put(msg)
+                        logger.debug(f"Pre-loaded {len(history)} {tf} candles for {symbol} from DB")
+                except Exception as e:
+                    logger.debug(f"DB pre-load failed for {symbol} {tf}: {e}")
+        
+        # Load all symbols/timeframes in parallel
+        tasks = []
+        for tf, days in scopes:
+            for symbol in markets:
+                tasks.append(load_symbol_data(symbol, tf, days))
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Database pre-load complete: {len(markets)} symbols × {len(scopes)} timeframes")
+
+    async def _run_hydration_cycle(self, markets: List[str], scopes: List[tuple], incremental: bool = False):
         """Internal helper to iterate through a set of scopes and markets."""
         sem = asyncio.Semaphore(5) # Strict concurrency for hydration to favor polling
 
@@ -137,6 +184,32 @@ class DataService:
             async with sem:
                 if not self.active: return
                 try:
+                    # If incremental mode, fetch only recent data from API
+                    if incremental:
+                        # Get latest timestamp from DB
+                        def _get_latest():
+                            return get_latest_candle_timestamp(symbol, tf)
+                        
+                        latest_ts = await asyncio.to_thread(_get_latest)
+                        
+                        if latest_ts:
+                            # Fetch only data since latest timestamp
+                            since_ms = int(latest_ts.timestamp() * 1000)
+                            candles = await self.kraken.get_spot_ohlcv(symbol, tf, since=since_ms, limit=100)
+                            
+                            if candles:
+                                await asyncio.to_thread(save_candles_bulk, candles)
+                                msg = MarketUpdate(
+                                    symbol=symbol,
+                                    candles=candles,
+                                    timeframe=tf,
+                                    is_historical=False
+                                )
+                                await self.output_queue.put(msg)
+                                logger.debug(f"Incremental fetch: {len(candles)} new {tf} candles for {symbol}")
+                            return
+                    
+                    # Non-incremental mode: load from DB (legacy behavior)
                     def _fetch():
                         return get_candles(symbol, tf, start_time=start_date)
                     
