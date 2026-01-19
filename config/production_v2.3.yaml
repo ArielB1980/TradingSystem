@@ -1,0 +1,252 @@
+# ============================================================================
+# v2.3 Production Config - DigitalOcean Deployment
+# ============================================================================
+# Date: January 19, 2026
+# Author: Ariel Barack / EnduranceReader
+# 
+# Notes:
+# - require_ms_change_confirmation set to false temporarily for activity in trends
+# - Monitor for 48h in paper mode; if win rate <30%, re-enable confirmation
+# - ADX >= 25 filters ranging markets; tolerance scales with ATR
+# - Capital: Start with $10k sim for testing
+# - Today's market: BTC ~$93K consolidating, ETH ~$3.2K, SOL ~$133
+#   Could signal regime flip favoring these short-biased signals
+# ============================================================================
+
+system:
+  name: "Trading System V2.3"
+  version: "2.3.0"
+  environment: "paper"  # Switch to "prod" after 48h validation
+
+# ============================================================================
+# STRATEGY CONFIGURATION
+# ============================================================================
+strategy:
+  # Timeframes
+  bias_timeframes:
+    - "4h"
+    - "1d"
+  execution_timeframes:
+    - "15m"
+    - "1h"
+
+  # Indicators
+  ema_period: 200
+  adx_period: 14
+  atr_period: 14
+  rsi_period: 14
+  atr_multiplier_stop: 1.5
+  rsi_divergence_enabled: false
+
+  # SMC Parameters
+  orderblock_lookback: 50
+  ob_entry_mode: "mid"
+  ob_discount_pct: 0.25
+  fvg_min_size_pct: 0.001
+  bos_confirmation_candles: 3
+  require_bos_confirmation: false
+  fvg_mitigation_mode: "touched"
+  fvg_partial_fill_pct: 0.5
+
+  # ============================================================================
+  # V2.3 KEY CHANGES - Entry Zone Tolerance & Confirmation
+  # ============================================================================
+  
+  # CONFIRMATION (Temporarily bypassed for trending markets)
+  # Original: true, 3 candles. Re-enable if over-trading observed.
+  require_ms_change_confirmation: false
+  ms_confirmation_candles: 2
+  
+  # RECONFIRMATION BYPASS (Enter immediately after MSS in strong trends)
+  skip_reconfirmation_in_trends: true
+  ms_reconfirmation_candles: 2
+
+  # ADX REGIME FILTER (Skip ranging markets)
+  # Require ADX > 25 on 1H/4H for trade approval
+  adx_threshold: 25.0
+
+  # ENTRY ZONE TOLERANCE (Allows "near" OB/FVG entries)
+  # 2% buffer for entries; scales with ATR in volatile conditions
+  entry_zone_tolerance_pct: 0.02
+  entry_zone_tolerance_adaptive: true
+  entry_zone_tolerance_atr_mult: 0.3
+  entry_zone_tolerance_score_penalty: -5
+
+  # ============================================================================
+  # SCORE THRESHOLDS (Slightly relaxed for more candidates)
+  # ============================================================================
+  ema_neutral_zone_bps: 10.0
+  min_score_tight_smc_aligned: 65.0      # Was 70.0
+  min_score_tight_smc_neutral: 75.0
+  min_score_wide_structure_aligned: 60.0  # Was 65.0
+  min_score_wide_structure_neutral: 70.0
+  fib_proximity_bps: 20.0
+
+  # Regime-specific stops
+  tight_smc_atr_stop_min: 0.3
+  tight_smc_atr_stop_max: 0.6
+  wide_structure_atr_stop_min: 1.0
+  wide_structure_atr_stop_max: 1.2
+
+  # Adaptive confirmation
+  adaptive_enabled: true
+  atr_confirmation_threshold_high: 1.5
+  atr_confirmation_threshold_low: 0.5
+  base_confirmation_candles: 3
+  max_confirmation_candles: 5
+  min_confirmation_candles: 2
+
+  # RSI Divergence
+  rsi_divergence_check: true
+  rsi_divergence_lookback: 20
+
+  # Exits
+  abandon_ship_enabled: true
+  time_based_exit_bars: 20
+
+# ============================================================================
+# RISK MANAGEMENT
+# ============================================================================
+risk:
+  # Position sizing (Conservative for paper validation)
+  risk_per_trade_pct: 0.003  # 0.3% per trade
+  max_leverage: 10.0
+  sizing_method: "fixed"
+
+  # Kelly Criterion (Tuned conservatively post-backtest)
+  kelly_win_prob: 0.45  # Was 0.55
+  kelly_win_loss_ratio: 2.0
+  kelly_max_fraction: 0.25
+
+  # Volatility Sizing
+  vol_sizing_atr_threshold_high: 1.5
+  vol_sizing_atr_threshold_low: 0.5
+  vol_sizing_high_vol_penalty: 0.30
+  vol_sizing_low_vol_boost: 0.20
+
+  # Position caps
+  max_position_size_usd: 500.0  # Per-trade cap
+  max_risk_per_trade_entry_pct: 0.02
+
+  # Liquidation safety
+  min_liquidation_buffer_pct: 0.35
+
+  # Portfolio limits
+  max_concurrent_positions: 10
+  daily_loss_limit_pct: 0.05
+
+  # Loss streak protection (2h cooldown after 3 losses)
+  loss_streak_cooldown: 3
+  loss_streak_pause_minutes: 120
+  loss_streak_min_loss_bps: 20.0
+
+  # Basis guards
+  basis_max_pct: 0.0075
+  basis_max_post_pct: 0.0075
+
+  # Fee/Funding modeling
+  taker_fee_bps: 5.0
+  maker_fee_bps: 2.0
+  funding_rate_daily_bps: 10.0
+  use_live_funding_rate: false
+  max_fee_funding_rr_distortion_pct: 0.20
+  rr_distortion_strict_limit_pct: 0.10
+  tight_stop_threshold_pct: 0.015
+  funding_cost_threshold_pct: 0.02
+
+  # Regime-specific risk
+  tight_smc_cost_cap_bps: 25.0
+  tight_smc_min_rr_multiple: 2.0
+  tight_smc_avg_hold_hours: 6.0
+  wide_structure_max_distortion_pct: 0.15
+  wide_structure_avg_hold_hours: 36.0
+  loss_streak_cooldown_tight: 3
+  loss_streak_cooldown_wide: 5
+  loss_streak_pause_minutes_tight: 120
+  loss_streak_pause_minutes_wide: 90
+
+# ============================================================================
+# EXECUTION
+# ============================================================================
+execution:
+  use_mark_price: true
+  default_order_type: "limit"
+  slippage_tolerance_pct: 0.001
+  order_timeout_seconds: 30
+  max_retries: 3
+  retry_backoff_seconds: 2
+  pyramiding_enabled: false
+
+# ============================================================================
+# MULTI-TP CONFIGURATION
+# ============================================================================
+multi_tp:
+  enabled: true
+  tp1_r_multiple: 1.0
+  tp1_close_pct: 0.40
+  tp2_r_multiple: 2.5
+  tp2_close_pct: 0.40
+  runner_pct: 0.20
+  move_sl_to_be_after_tp1: true
+  trailing_stop_enabled: true
+  trailing_stop_atr_multiplier: 1.5
+
+# ============================================================================
+# COIN UNIVERSE (Focus on majors for paper mode)
+# ============================================================================
+coin_universe:
+  enabled: true
+  min_spot_volume_24h: 1000000
+  active_pairs:
+    - "BTC/USD"
+    - "ETH/USD"
+    - "SOL/USD"
+
+# ============================================================================
+# DATA & MONITORING
+# ============================================================================
+data:
+  ws_reconnect_max_retries: 10
+  ws_reconnect_backoff_seconds: 5
+  max_gap_seconds: 60
+  database_url: "${DATABASE_URL}"
+
+monitoring:
+  log_level: "DEBUG"  # DEBUG for paper validation, INFO for prod
+  log_format: "json"
+  alert_margin_usage_threshold_pct: 0.70
+  alert_liquidation_buffer_threshold_pct: 0.35
+  alert_repeated_rejections_count: 3
+  alert_repeated_rejections_window_seconds: 300
+  alert_methods:
+    - "log"
+
+# ============================================================================
+# PAPER TRADING MODE
+# ============================================================================
+paper:
+  simulate_realistic_slippage: true
+  simulate_fill_delays_ms: 100
+
+# ============================================================================
+# BACKTEST REFERENCE (For comparison)
+# ============================================================================
+backtest:
+  starting_equity: 10000
+  assume_maker_fills: true
+  slippage_bps: 2
+  maker_fee_bps: 2
+  taker_fee_bps: 5
+  basis_model: "static"
+  static_basis_bps: 5
+
+# ============================================================================
+# EXCHANGE (Use Kraken for production)
+# ============================================================================
+exchange:
+  name: "kraken"
+  api_key: "${KRAKEN_API_KEY}"
+  api_secret: "${KRAKEN_API_SECRET}"
+  futures_api_key: "${KRAKEN_FUTURES_API_KEY}"
+  futures_api_secret: "${KRAKEN_FUTURES_API_SECRET}"
+  use_testnet: false
