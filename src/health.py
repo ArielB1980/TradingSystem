@@ -162,7 +162,7 @@ async def test_system():
 
 
 @app.get("/api/debug/signals")
-async def debug_signals():
+async def debug_signals(symbol: Optional[str] = None):
     """
     Debug endpoint to find the last generated signal.
     Queries the system_events table directly.
@@ -182,15 +182,26 @@ async def debug_signals():
         
         with db.get_session() as session:
             # Get last 50 decision traces
-            query = text("""
-                SELECT timestamp, details, symbol
-                FROM system_events 
-                WHERE event_type = 'DECISION_TRACE' 
-                ORDER BY timestamp DESC 
-                LIMIT 50
-            """)
+            if symbol:
+                query = text("""
+                    SELECT timestamp, details, symbol
+                    FROM system_events 
+                    WHERE event_type = 'DECISION_TRACE' AND symbol = :symbol
+                    ORDER BY timestamp DESC 
+                    LIMIT 20
+                """)
+                params = {"symbol": symbol}
+            else:
+                query = text("""
+                    SELECT timestamp, details, symbol
+                    FROM system_events 
+                    WHERE event_type = 'DECISION_TRACE' 
+                    ORDER BY timestamp DESC 
+                    LIMIT 50
+                """)
+                params = {}
             
-            rows = session.execute(query)
+            rows = session.execute(query, params)
             
             for row in rows:
                 timestamp = row[0]
