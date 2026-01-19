@@ -160,6 +160,90 @@ async def test_system():
         )
 
 
+
+@app.get("/api/debug/signals")
+async def debug_signals():
+    """
+    Debug endpoint to find the last generated signal.
+    Queries the system_events table directly.
+    """
+    try:
+        from src.storage.db import get_db
+        from sqlalchemy import text
+        import json
+        
+        db = get_db()
+        results = {
+            "status": "success",
+            "last_signal": None,
+            "checked_events": 0,
+            "recent_decisions": []
+        }
+        
+        with db.get_session() as session:
+            # Get last 50 decision traces
+            query = text("""
+                SELECT timestamp, details, symbol
+                FROM system_events 
+                WHERE event_type = 'DECISION_TRACE' 
+                ORDER BY timestamp DESC 
+                LIMIT 50
+            """)
+            
+            rows = session.execute(query)
+            
+            for row in rows:
+                timestamp = row[0]
+                details_raw = row[1]
+                symbol = row[2]
+                
+                results["checked_events"] += 1
+                
+                # Parse details
+                try:
+                    if isinstance(details_raw, str):
+                        data = json.loads(details_raw)
+                    else:
+                        data = details_raw
+                except:
+                    data = {"error": "failed to parse details"}
+                
+                signal = data.get('signal', 'NONE')
+                quality = data.get('setup_quality', 0)
+                
+                # Add to recent list (summary)
+                results["recent_decisions"].append({
+                    "time": str(timestamp),
+                    "symbol": symbol,
+                    "signal": signal,
+                    "quality": quality
+                })
+                
+                # Check if it's a valid signal
+                if signal and signal.upper() in ['LONG', 'SHORT']:
+                    if results["last_signal"] is None:
+                        results["last_signal"] = {
+                            "timestamp": str(timestamp),
+                            "symbol": symbol,
+                            "signal": signal,
+                            "quality": quality,
+                            "details": data
+                        }
+                        break
+            
+            return JSONResponse(content=results)
+            
+    except Exception as e:
+        return JSONResponse(
+            content={
+                "status": "error",
+                "message": str(e),
+                "type": type(e).__name__
+            },
+            status_code=500
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
