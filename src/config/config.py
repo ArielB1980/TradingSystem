@@ -63,6 +63,10 @@ class RiskConfig(BaseSettings):
     vol_sizing_high_vol_penalty: float = Field(default=0.30, le=0.9) # -30% size
     vol_sizing_low_vol_boost: float = Field(default=0.20, le=0.5) # +20% size
     
+    # Position size caps
+    max_position_size_usd: float = Field(default=100000.0, ge=1000.0, le=1000000.0)  # Max notional position
+    max_risk_per_trade_entry_pct: float = Field(default=0.02, ge=0.001, le=0.10)  # Max risk per trade for Kelly
+    
     # Liquidation safety
     min_liquidation_buffer_pct: float = Field(default=0.35, ge=0.30, le=0.50)
     
@@ -186,6 +190,17 @@ class StrategyConfig(BaseSettings):
     # Exits
     abandon_ship_enabled: bool = True
     time_based_exit_bars: int = Field(default=20, ge=5) # Bars to hold without TP before exit
+
+    # Entry Zone Tolerance (for relaxed reconfirmation)
+    # Allows entries when price is "near" OB/FVG zone, not strictly inside
+    entry_zone_tolerance_pct: float = Field(default=0.015, ge=0.005, le=0.05)  # 1.5% buffer
+    entry_zone_tolerance_adaptive: bool = Field(default=True)  # Scale with ATR
+    entry_zone_tolerance_atr_mult: float = Field(default=0.3, ge=0.1, le=1.0)  # ATR multiplier
+    entry_zone_tolerance_score_penalty: int = Field(default=-5, ge=-15, le=0)  # Score adjustment for tolerance entries
+    
+    # Skip Reconfirmation in Trending Markets
+    # When True, enters immediately after MSS confirmation without waiting for retrace
+    skip_reconfirmation_in_trends: bool = Field(default=True)  # Default True for trending markets
 
 
 
