@@ -85,18 +85,27 @@ strategy:
   fvg_min_size_pct: 0.001  # 0.1% minimum gap size
   bos_confirmation_candles: 3
   
-  # V3: Market Structure Change Confirmation
-  require_ms_change_confirmation: true  # Require MS change before entry
-  ms_confirmation_candles: 3  # Candles price must hold after break
+  # V2.3: Market Structure Change Confirmation
+  # NOTE: Temporarily disabled for trending markets (Jan 2026)
+  # Monitor for 48h; re-enable if over-trading observed
+  require_ms_change_confirmation: false  # Bypass for trend activity (original: true)
+  ms_confirmation_candles: 2  # Faster confirmation (was 3)
   ms_reconfirmation_candles: 2  # Candles for reconfirmation (retrace)
+  skip_reconfirmation_in_trends: true  # Enter immediately after MSS in trends
 
-  # V2.1 Scoring & Regimes
+  # V2.3 Scoring & Regimes (Slightly relaxed)
   ema_neutral_zone_bps: 10.0
-  min_score_tight_smc_aligned: 70.0
+  min_score_tight_smc_aligned: 65.0  # Was 70.0
   min_score_tight_smc_neutral: 75.0
-  min_score_wide_structure_aligned: 65.0
+  min_score_wide_structure_aligned: 60.0  # Was 65.0
   min_score_wide_structure_neutral: 70.0
   fib_proximity_bps: 20.0
+  
+  # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
+  entry_zone_tolerance_pct: 0.02  # 2% buffer
+  entry_zone_tolerance_adaptive: true  # Scale with ATR
+  entry_zone_tolerance_atr_mult: 0.3  # ATR multiplier
+  entry_zone_tolerance_score_penalty: -5  # Penalty for tolerance entries
   
   # Regime-specific stops
   tight_smc_atr_stop_min: 0.3

@@ -56,8 +56,14 @@ class SMCEngine:
         from src.strategy.market_structure_tracker import MarketStructureTracker
         self.ms_tracker = MarketStructureTracker(
             confirmation_candles=getattr(config, 'ms_confirmation_candles', 3),
-            reconfirmation_candles=getattr(config, 'ms_reconfirmation_candles', 2)
+            reconfirmation_candles=getattr(config, 'ms_reconfirmation_candles', 2),
+            entry_zone_tolerance_pct=getattr(config, 'entry_zone_tolerance_pct', 0.015),
+            entry_zone_tolerance_adaptive=getattr(config, 'entry_zone_tolerance_adaptive', True),
+            entry_zone_tolerance_atr_mult=getattr(config, 'entry_zone_tolerance_atr_mult', 0.3)
         )
+        
+        # Store score penalty for tolerance entries
+        self.entry_zone_tolerance_score_penalty = getattr(config, 'entry_zone_tolerance_score_penalty', -5)
         
         logger.info("SMC Engine initialized", config=config.model_dump())
     
@@ -138,6 +144,7 @@ class SMCEngine:
         atr_value = 0.0
         atr_ratio = None
         tp_candidates = []
+        used_tolerance = False  # Track if entry zone tolerance was used
         
         # Logic Flow
         signal = None
@@ -300,9 +307,31 @@ class SMCEngine:
                             fvg = structure_signal['fvg']
                             entry_zone = {'bottom': fvg.get('bottom'), 'top': fvg.get('top')}
                     
-                    reconfirmed = self.ms_tracker.check_reconfirmation(
-                        symbol, exec_candles_15m, exec_candles_1h, ms_change, entry_zone
-                    )
+                    # Get ATR value for adaptive tolerance calculation
+                    atr_value = None
+                    if exec_candles_1h and len(exec_candles_1h) >= 14:
+                        atr_series = self.indicators.calculate_atr(exec_candles_1h, 14)
+                        if len(atr_series) > 0:
+                            atr_value = Decimal(str(atr_series.iloc[-1]))
+                    
+                    # Check if we should skip reconfirmation (for trending markets)
+                    skip_reconfirmation = getattr(self.config, 'skip_reconfirmation_in_trends', True)
+                    
+                    if skip_reconfirmation:
+                        # In trending markets, enter immediately after confirmation
+                        reconfirmed = True
+                        used_tolerance = False
+                        reasoning_parts.append(f"✅ Structure confirmed - entering on confirmation (skip reconfirmation)")
+                    else:
+                        # Original logic: wait for retrace to entry zone
+                        # check_reconfirmation now returns (is_reconfirmed, used_tolerance)
+                        reconfirmed, used_tolerance = self.ms_tracker.check_reconfirmation(
+                            symbol, exec_candles_15m, exec_candles_1h, ms_change, entry_zone, atr_value
+                        )
+                        
+                        # Track if tolerance was used for score adjustment later
+                        if used_tolerance:
+                            reasoning_parts.append(f"📍 Entry used tolerance (near zone, not exact)")
                     
                     if not reconfirmed:
                         reasoning_parts.append(
@@ -375,15 +404,30 @@ class SMCEngine:
             # (Indicator calculation moved to Step 0)
 
             
-            # Apply filters
-            if not self._apply_filters(exec_candles_1h, reasoning_parts):
+            # ADX REGIME FILTER: Skip ranging markets
+            adx_threshold = getattr(self.config, 'adx_threshold', 25.0)
+            if adx_value < adx_threshold:
+                reasoning_parts.append(
+                    f"❌ Ranging market: ADX {adx_value:.1f} < {adx_threshold} threshold (skip)"
+                )
+                signal = self._no_signal(
+                    symbol, 
+                    reasoning_parts, 
+                    exec_candles_1h[-1] if exec_candles_1h else None,
+                    adx=adx_value,
+                    atr=atr_value,
+                    regime=regime_early
+                )
+            
+            # Apply other filters
+            if signal is None and not self._apply_filters(exec_candles_1h, reasoning_parts):
                  signal = self._no_signal(
                      symbol, 
                      reasoning_parts, 
                      exec_candles_1h[-1] if exec_candles_1h else None,
                      adx=adx_value,
                      atr=atr_value,
-                     regime=regime_early  # Pass early-classified regime
+                     regime=regime_early
                  )
 
             # Step 4: Calculate Levels (If passed all checks)
@@ -509,6 +553,12 @@ class SMCEngine:
                         cost_bps,
                         bias
                     )
+                    
+                    # Apply tolerance penalty if entry used zone tolerance
+                    if used_tolerance:
+                        penalty = self.entry_zone_tolerance_score_penalty
+                        score_obj.total_score += penalty  # penalty is negative
+                        reasoning_parts.append(f"📊 Tolerance penalty applied: {penalty} points")
                     
                     # GATE: Check score
                     passed, threshold = self.signal_scorer.check_score_gate(score_obj.total_score, setup_type, bias)

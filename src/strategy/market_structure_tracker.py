@@ -51,17 +51,32 @@ class MarketStructureTracker:
     4. Signal entry ready
     """
     
-    def __init__(self, confirmation_candles: int = 3, reconfirmation_candles: int = 2):
+    def __init__(
+        self, 
+        confirmation_candles: int = 3, 
+        reconfirmation_candles: int = 2,
+        entry_zone_tolerance_pct: float = 0.015,
+        entry_zone_tolerance_adaptive: bool = True,
+        entry_zone_tolerance_atr_mult: float = 0.3
+    ):
         """
         Initialize tracker.
         
         Args:
             confirmation_candles: Number of candles price must hold after break
             reconfirmation_candles: Number of candles for reconfirmation
+            entry_zone_tolerance_pct: Base tolerance for "near zone" entries (default 1.5%)
+            entry_zone_tolerance_adaptive: If True, scale tolerance with ATR
+            entry_zone_tolerance_atr_mult: ATR multiplier for adaptive tolerance
         """
         self.indicators = Indicators()
         self.confirmation_candles = confirmation_candles
         self.reconfirmation_candles = reconfirmation_candles
+        
+        # Entry zone tolerance settings
+        self.entry_zone_tolerance_pct = entry_zone_tolerance_pct
+        self.entry_zone_tolerance_adaptive = entry_zone_tolerance_adaptive
+        self.entry_zone_tolerance_atr_mult = entry_zone_tolerance_atr_mult
         
         # Per-symbol tracking
         self.structure_state: Dict[str, MarketStructureState] = {}
@@ -226,12 +241,14 @@ class MarketStructureTracker:
         candles_15m: list[Candle],
         candles_1h: list[Candle],
         structure_change: StructureChange,
-        entry_zone: Optional[dict] = None
-    ) -> bool:
+        entry_zone: Optional[dict] = None,
+        atr_value: Optional[Decimal] = None
+    ) -> Tuple[bool, bool]:
         """
         Check if structure change is reconfirmed (ready for entry).
         
         Reconfirmation: Price retraces to entry zone (OB/FVG) after confirmation.
+        Now supports configurable tolerance for "near zone" entries.
         
         Args:
             symbol: Trading symbol
@@ -239,54 +256,118 @@ class MarketStructureTracker:
             candles_1h: 1h candles for structure
             structure_change: The confirmed structure change
             entry_zone: Optional entry zone (order block or FVG)
+            atr_value: Optional ATR value for adaptive tolerance
             
         Returns:
-            True if reconfirmed (ready for entry)
+            Tuple of (is_reconfirmed, used_tolerance)
+            - is_reconfirmed: True if ready for entry
+            - used_tolerance: True if entry used tolerance (not exact zone hit)
         """
         if not structure_change.confirmed:
-            return False
+            return False, False
         
         if structure_change.reconfirmed:
-            return True
+            return True, getattr(structure_change, '_used_tolerance', False)
         
         if not candles_15m or len(candles_15m) < 3:
-            return False
+            return False, False
         
         current_price = candles_15m[-1].close
         break_price = structure_change.break_price
         
-        # Reconfirmation logic:
-        # 1. Price must have moved in direction of break (confirmation held)
-        # 2. Price retraces back toward entry zone
-        # 3. Entry zone is tested (price touches or gets close)
+        # Calculate adaptive tolerance
+        # Base tolerance from config (e.g., 1.5%)
+        base_tolerance = Decimal(str(self.entry_zone_tolerance_pct))
+        
+        # If adaptive and ATR provided, scale tolerance with volatility
+        if self.entry_zone_tolerance_adaptive and atr_value:
+            # Higher ATR = higher tolerance (more room in volatile markets)
+            # Calculate ATR as % of current price
+            atr_pct = atr_value / current_price if current_price > 0 else Decimal("0")
+            atr_adjustment = atr_pct * Decimal(str(self.entry_zone_tolerance_atr_mult))
+            tolerance = base_tolerance + atr_adjustment
+            # Cap at 5% max
+            tolerance = min(tolerance, Decimal("0.05"))
+        else:
+            tolerance = base_tolerance
+        
+        # Helper to check zone proximity with tolerance
+        def is_in_or_near_zone(price: Decimal, zone_low: Decimal, zone_high: Decimal) -> Tuple[bool, bool]:
+            """
+            Check if price is in zone or within tolerance.
+            Returns (in_or_near, used_tolerance)
+            """
+            # Exact zone hit
+            if zone_low <= price <= zone_high:
+                return True, False
+            
+            # Tolerance zone (extends both sides of OB/FVG)
+            tolerance_buffer_low = zone_low * (Decimal("1") - tolerance)
+            tolerance_buffer_high = zone_high * (Decimal("1") + tolerance)
+            
+            if tolerance_buffer_low <= price <= tolerance_buffer_high:
+                return True, True
+            
+            return False, False
+        
+        used_tolerance = False
         
         if structure_change.new_state == MarketStructureState.BULLISH:
             # Bullish: Price should have moved up, then retraced to OB/FVG
-            # Check if price is retracing toward entry zone
             if entry_zone:
                 zone_top = entry_zone.get('high') or entry_zone.get('top')
                 zone_bottom = entry_zone.get('low') or entry_zone.get('bottom')
                 
                 if zone_top and zone_bottom:
-                    # Check if price is in or near entry zone
-                    in_zone = zone_bottom <= current_price <= zone_top
-                    near_zone = (current_price >= zone_bottom * Decimal("0.99") and 
-                                current_price <= zone_top * Decimal("1.01"))
+                    zone_top = Decimal(str(zone_top))
+                    zone_bottom = Decimal(str(zone_bottom))
                     
-                    if in_zone or near_zone:
+                    # Check if price is in or near entry zone (with tolerance)
+                    in_zone, used_tolerance = is_in_or_near_zone(current_price, zone_bottom, zone_top)
+                    
+                    if in_zone:
                         # Check if we've had a pullback (price went up then came back)
                         recent_high = max(c.high for c in candles_15m[-10:])
                         if recent_high > break_price:  # Price moved up after break
                             structure_change.reconfirmed = True
                             structure_change.reconfirmed_at = candles_15m[-1].timestamp
                             structure_change.entry_ready = True
+                            structure_change._used_tolerance = used_tolerance
+                            
+                            entry_type = "TOLERANCE" if used_tolerance else "EXACT"
                             logger.info(
-                                "Market structure reconfirmed - entry ready",
+                                f"Market structure reconfirmed ({entry_type}) - entry ready",
                                 symbol=symbol,
                                 entry_zone=f"${zone_bottom}-${zone_top}",
-                                current_price=str(current_price)
+                                current_price=str(current_price),
+                                tolerance=f"{float(tolerance)*100:.2f}%",
+                                used_tolerance=used_tolerance
                             )
-                            return True
+                            return True, used_tolerance
+            else:
+                # FALLBACK: No OB/FVG zone defined - use tolerance zone around break price
+                # For bullish: reconfirm if price retraces near break price after moving up
+                recent_high = max(c.high for c in candles_15m[-10:])
+                if recent_high > break_price:  # Confirmed move up
+                    # Check if price has retraced toward break price (within tolerance)
+                    tolerance_zone_top = break_price * (Decimal("1") + tolerance)
+                    tolerance_zone_bottom = break_price * (Decimal("1") - tolerance)
+                    
+                    if tolerance_zone_bottom <= current_price <= tolerance_zone_top:
+                        structure_change.reconfirmed = True
+                        structure_change.reconfirmed_at = candles_15m[-1].timestamp
+                        structure_change.entry_ready = True
+                        structure_change._used_tolerance = True
+                        
+                        logger.info(
+                            f"Market structure reconfirmed (BREAK_PRICE_TOLERANCE) - entry ready",
+                            symbol=symbol,
+                            break_price=str(break_price),
+                            current_price=str(current_price),
+                            tolerance=f"{float(tolerance)*100:.2f}%",
+                            used_tolerance=True
+                        )
+                        return True, True
         
         elif structure_change.new_state == MarketStructureState.BEARISH:
             # Bearish: Price should have moved down, then retraced to OB/FVG
@@ -295,27 +376,57 @@ class MarketStructureTracker:
                 zone_bottom = entry_zone.get('low') or entry_zone.get('bottom')
                 
                 if zone_top and zone_bottom:
-                    # Check if price is in or near entry zone
-                    in_zone = zone_bottom <= current_price <= zone_top
-                    near_zone = (current_price >= zone_bottom * Decimal("0.99") and 
-                                current_price <= zone_top * Decimal("1.01"))
+                    zone_top = Decimal(str(zone_top))
+                    zone_bottom = Decimal(str(zone_bottom))
                     
-                    if in_zone or near_zone:
+                    # Check if price is in or near entry zone (with tolerance)
+                    in_zone, used_tolerance = is_in_or_near_zone(current_price, zone_bottom, zone_top)
+                    
+                    if in_zone:
                         # Check if we've had a pullback (price went down then came back)
                         recent_low = min(c.low for c in candles_15m[-10:])
                         if recent_low < break_price:  # Price moved down after break
                             structure_change.reconfirmed = True
                             structure_change.reconfirmed_at = candles_15m[-1].timestamp
                             structure_change.entry_ready = True
+                            structure_change._used_tolerance = used_tolerance
+                            
+                            entry_type = "TOLERANCE" if used_tolerance else "EXACT"
                             logger.info(
-                                "Market structure reconfirmed - entry ready",
+                                f"Market structure reconfirmed ({entry_type}) - entry ready",
                                 symbol=symbol,
                                 entry_zone=f"${zone_bottom}-${zone_top}",
-                                current_price=str(current_price)
+                                current_price=str(current_price),
+                                tolerance=f"{float(tolerance)*100:.2f}%",
+                                used_tolerance=used_tolerance
                             )
-                            return True
+                            return True, used_tolerance
+            else:
+                # FALLBACK: No OB/FVG zone defined - use tolerance zone around break price
+                # For bearish: reconfirm if price retraces near break price after moving down
+                recent_low = min(c.low for c in candles_15m[-10:])
+                if recent_low < break_price:  # Confirmed move down
+                    # Check if price has retraced toward break price (within tolerance)
+                    tolerance_zone_top = break_price * (Decimal("1") + tolerance)
+                    tolerance_zone_bottom = break_price * (Decimal("1") - tolerance)
+                    
+                    if tolerance_zone_bottom <= current_price <= tolerance_zone_top:
+                        structure_change.reconfirmed = True
+                        structure_change.reconfirmed_at = candles_15m[-1].timestamp
+                        structure_change.entry_ready = True
+                        structure_change._used_tolerance = True
+                        
+                        logger.info(
+                            f"Market structure reconfirmed (BREAK_PRICE_TOLERANCE) - entry ready",
+                            symbol=symbol,
+                            break_price=str(break_price),
+                            current_price=str(current_price),
+                            tolerance=f"{float(tolerance)*100:.2f}%",
+                            used_tolerance=True
+                        )
+                        return True, True
         
-        return False
+        return False, False
     
     def is_entry_ready(self, symbol: str) -> bool:
         """Check if entry is ready for symbol (structure change reconfirmed)."""
