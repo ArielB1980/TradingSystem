@@ -130,7 +130,7 @@ class FibonacciEngine:
             timeframe=timeframe,
             swing_high=str(swing_high),
             swing_low=str(swing_low),
-            range_pct=float(range_size / swing_low * 100)
+            range_pct=float(range_size / swing_low * 100) if swing_low > Decimal("0") else 0.0
         )
         
         return fib_levels

@@ -735,6 +735,11 @@ class SMCEngine:
         current_price = candles_1d[-1].close
         ema_value = Decimal(str(ema_1d.iloc[-1]))
         
+        # Guard against division by zero
+        if ema_value == Decimal("0"):
+            reasoning.append("❌ EMA value is zero - cannot determine bias")
+            return "neutral"
+        
         # Check Neutral Zone
         dist_bps = abs(current_price - ema_value) / ema_value * Decimal("10000")
         neutral_zone = Decimal(str(self.config.ema_neutral_zone_bps))
