@@ -210,13 +210,15 @@ async def debug_signals():
                 
                 signal = data.get('signal', 'NONE')
                 quality = data.get('setup_quality', 0)
+                reasoning = data.get('reasoning', [])
                 
                 # Add to recent list (summary)
                 results["recent_decisions"].append({
                     "time": str(timestamp),
                     "symbol": symbol,
                     "signal": signal,
-                    "quality": quality
+                    "quality": quality,
+                    "reasoning": reasoning[-1] if reasoning else "No reasoning logged"
                 })
                 
                 # Check if it's a valid signal
@@ -227,7 +229,8 @@ async def debug_signals():
                             "symbol": symbol,
                             "signal": signal,
                             "quality": quality,
-                            "details": data
+                            "details": data,
+                            "reasoning": reasoning
                         }
                         break
             
