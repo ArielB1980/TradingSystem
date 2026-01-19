@@ -5,6 +5,7 @@ Simple HTTP server to respond to health checks.
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import os
+from typing import Optional
 
 app = FastAPI(title="Trading System Health Check")
 
