@@ -46,7 +46,7 @@ async def periodic_data_maintenance(monitored_symbols: List[str], max_age_hours:
         if isinstance(last_update, str):
             try:
                 last_update = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
-            except:
+            except (ValueError, AttributeError) as e:
                 continue
         elif last_update and last_update.tzinfo is None:
             last_update = last_update.replace(tzinfo=timezone.utc)

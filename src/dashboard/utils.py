@@ -121,8 +121,8 @@ def get_all_positions() -> List[Dict[str, Any]]:
                 "current_price": float(pos.current_mark_price),
                 "unrealized_pnl": float(pos.unrealized_pnl),
                 "liq_price": float(pos.liquidation_price) if pos.liquidation_price else 0.0,
-                
-                # V3 Active Management Fields - using correct field names for dashboard
+
+                # Active Management Fields - using correct field names for dashboard
                 "initial_stop_price": float(pos.initial_stop_price) if pos.initial_stop_price else None,
                 "tp1_price": float(pos.tp1_price) if pos.tp1_price else None,
                 "tp2_price": float(pos.tp2_price) if pos.tp2_price else None,

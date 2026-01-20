@@ -11,15 +11,6 @@ from src.services.data_service import DataService
 from src.services.trading_service import TradingService
 from src.ipc.messages import ServiceCommand
 
-# Disable uvloop for stability in single process for now, 
-# though it is much safer in single process than multi.
-# try:
-#     import uvloop
-#     import asyncio
-#     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-# except ImportError:
-#     pass
-
 logger = get_logger("Main")
 
 async def main_async():
