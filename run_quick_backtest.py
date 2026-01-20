@@ -37,44 +37,31 @@ async def run_quick_backtest():
     # Load config
     config = load_config("src/config/config.yaml")
     setup_logging("INFO", "json")
-    
     # =========================================================================
-    # BALANCED PRODUCTION CONFIG (v2.2) - Optimized for Quality + Activity
+    # SHADOW MODE - VERIFY LAST 12 HOURS (Production v2.3 Config)
     # =========================================================================
     
-    # Core quality gate - KEEP enabled for signal quality
-    config.strategy.require_ms_change_confirmation = True
-    config.strategy.ms_confirmation_candles = 2  # Faster confirmation (was 3)
+    # 1. Trend Fixes (v2.3)
+    config.strategy.require_ms_change_confirmation = False  # MATCH PROD: Bypass for trend
+    config.strategy.skip_reconfirmation_in_trends = True    # MATCH PROD: Enter on confirmation
     
-    # Entry tolerance - allows entries "near" OB/FVG zones
-    config.strategy.entry_zone_tolerance_pct = 0.02  # 2% tolerance
-    config.strategy.entry_zone_tolerance_adaptive = True  # Scale with ATR
-    config.strategy.entry_zone_tolerance_atr_mult = 0.3  # ATR scaling factor
+    # 2. Filters (v2.3)
+    config.strategy.adx_threshold = 25.0                    # MATCH PROD: ADX > 25
+    config.strategy.entry_zone_tolerance_pct = 0.02         # MATCH PROD: 2% tolerance
     
-    # Score thresholds - slightly relaxed for more candidates
-    config.strategy.min_score_tight_smc_aligned = 65.0  # Was 70
-    config.strategy.min_score_wide_structure_aligned = 60.0  # Was 65
+    # 3. Scores (v2.3)
+    config.strategy.min_score_tight_smc_aligned = 65.0      # MATCH PROD
+    config.strategy.min_score_wide_structure_aligned = 60.0 # MATCH PROD
     
-    # REGIME FILTER: Require ADX > threshold for trending markets (skip chop)
-    config.strategy.adx_threshold = 25.0  # Minimum ADX for trade approval
-    
-    # DIAGNOSTIC: Disable confirmation to see raw signal flow
-    # This will show us how many setups the strategy identifies
-    config.strategy.require_ms_change_confirmation = False
-    config.strategy.skip_reconfirmation_in_trends = True
-    
-    print(f"\n📊 DIAGNOSTIC CONFIG (no confirmation gate):")
+    print(f"\n🔍 SHADOW MODE (Last 12h Verification):")
     print(f"   require_ms_change_confirmation: {config.strategy.require_ms_change_confirmation}")
-    print(f"   ms_confirmation_candles: {config.strategy.ms_confirmation_candles}")
-    print(f"   skip_reconfirmation_in_trends: {config.strategy.skip_reconfirmation_in_trends}")
+    print(f"   skip_reconfirmation_in_trends: {getattr(config.strategy, 'skip_reconfirmation_in_trends', 'N/A')}")
     print(f"   entry_zone_tolerance_pct: {config.strategy.entry_zone_tolerance_pct}")
     print(f"   adx_threshold: {config.strategy.adx_threshold}")
-    print(f"   min_score_tight_smc_aligned: {config.strategy.min_score_tight_smc_aligned}")
-    print(f"   min_score_wide_structure_aligned: {config.strategy.min_score_wide_structure_aligned}")
     
-    # Set backtest parameters - EXTENDED to 90 days for more samples
+    # Set backtest parameters - Recent 30 days for verification
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=90)
+    start_date = end_date - timedelta(days=30)
     
     symbols = ["BTC/USD", "ETH/USD", "SOL/USD"]
     
