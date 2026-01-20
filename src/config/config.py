@@ -50,8 +50,8 @@ class RiskConfig(BaseSettings):
     target_leverage: float = Field(default=7.0, ge=1.0, le=10.0)  # Actual leverage to use
     max_position_size_usd: float = Field(default=50000.0, ge=1000.0)
 
-    # Sizing Method: fixed, kelly, volatility, kelly_volatility
-    sizing_method: Literal["fixed", "kelly", "volatility", "kelly_volatility"] = "fixed"
+    # Sizing Method: fixed, kelly, volatility, kelly_volatility, leverage_based
+    sizing_method: Literal["fixed", "kelly", "volatility", "kelly_volatility", "leverage_based"] = "fixed"
     
     # Kelly Criterion Settings
     kelly_win_prob: float = Field(default=0.55, ge=0.1, le=0.9)
