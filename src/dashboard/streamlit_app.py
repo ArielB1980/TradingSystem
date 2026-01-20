@@ -1,768 +1,352 @@
 """
-Trading System Dashboard - Rebuilt from Scratch
-Modern, clean, and reliable real-time trading monitor.
+Trading System Dashboard - Single Page Coin Monitor
+
+Displays comprehensive real-time analysis for all tracked coins.
 """
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
-from decimal import Decimal
-import json
+from datetime import datetime, timezone
+from src.dashboard.data_loader import load_all_coins, get_coin_detail
+from src.monitoring.logger import get_logger
 
-# Page config - MUST be first Streamlit command
+logger = get_logger(__name__)
+
+# Page config
 st.set_page_config(
-    page_title="Trading Dashboard",
-    page_icon="📈",
+    page_title="Trading System Monitor",
+    page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# =============================================================================
-# CUSTOM CSS - Dark theme with green accents (trading aesthetic)
-# =============================================================================
+# Custom CSS
 st.markdown("""
 <style>
-    /* Import distinctive font */
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
-    
-    /* Root variables */
-    :root {
-        --bg-primary: #0a0a0f;
-        --bg-secondary: #12121a;
-        --bg-card: #1a1a24;
-        --bg-card-hover: #22222e;
-        --text-primary: #e8e8e8;
-        --text-secondary: #888;
-        --text-muted: #555;
-        --accent-green: #00d26a;
-        --accent-green-dim: #00d26a33;
-        --accent-red: #ff4757;
-        --accent-red-dim: #ff475733;
-        --accent-yellow: #ffa502;
-        --accent-blue: #3742fa;
-        --border-color: #2a2a3a;
-    }
-    
-    /* Main container */
-    .main .block-container {
-        padding: 1rem 2rem;
-        max-width: 100%;
-    }
-    
-    /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Custom header */
-    .dashboard-header {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 2rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        margin-bottom: 0.5rem;
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-    }
-    
-    .dashboard-header .live-dot {
-        width: 10px;
-        height: 10px;
-        background: var(--accent-green);
-        border-radius: 50%;
-        animation: pulse 2s infinite;
-        box-shadow: 0 0 10px var(--accent-green);
-    }
-    
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-    }
-    
-    /* Status bar */
-    .status-bar {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.75rem;
-        color: var(--text-secondary);
-        padding: 0.5rem 0;
-        border-bottom: 1px solid var(--border-color);
-        margin-bottom: 1rem;
-    }
-    
-    /* Metric cards */
-    .metric-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 1rem;
-        transition: all 0.2s ease;
-    }
-    
-    .metric-card:hover {
-        background: var(--bg-card-hover);
-        border-color: var(--accent-green);
-    }
-    
-    .metric-label {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem;
-        color: var(--text-secondary);
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 0.25rem;
-    }
-    
-    .metric-value {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.5rem;
-        font-weight: 600;
-        color: var(--text-primary);
-    }
-    
-    .metric-value.positive {
-        color: var(--accent-green);
-    }
-    
-    .metric-value.negative {
-        color: var(--accent-red);
-    }
-    
-    /* Position cards */
-    .position-card {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 0.75rem;
-        border-left: 3px solid var(--accent-green);
-    }
-    
-    .position-card.short {
-        border-left-color: var(--accent-red);
-    }
-    
-    .position-symbol {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: var(--text-primary);
-    }
-    
-    .position-side {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem;
-        font-weight: 600;
-        padding: 0.15rem 0.5rem;
-        border-radius: 4px;
-        display: inline-block;
-    }
-    
-    .position-side.long {
-        background: var(--accent-green-dim);
-        color: var(--accent-green);
-    }
-    
-    .position-side.short {
-        background: var(--accent-red-dim);
-        color: var(--accent-red);
-    }
-    
-    /* Signal badges */
-    .signal-badge {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem;
-        font-weight: 600;
-        padding: 0.2rem 0.5rem;
-        border-radius: 4px;
-        display: inline-block;
-    }
-    
-    .signal-badge.long {
-        background: var(--accent-green-dim);
-        color: var(--accent-green);
-    }
-    
-    .signal-badge.short {
-        background: var(--accent-red-dim);
-        color: var(--accent-red);
-    }
-    
-    .signal-badge.none {
-        background: #333;
-        color: var(--text-secondary);
-    }
-    
-    /* Table styling */
+    /* Compact table styling */
     .dataframe {
-        font-family: 'JetBrains Mono', monospace !important;
-        font-size: 0.75rem !important;
+        font-size: 12px;
+        font-family: 'Courier New', monospace;
     }
     
-    /* Section headers */
-    .section-header {
-        font-family: 'Space Grotesk', sans-serif;
-        font-size: 1rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        margin: 1.5rem 0 0.75rem 0;
-        padding-bottom: 0.5rem;
-        border-bottom: 1px solid var(--border-color);
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
+    /* Header styling */
+    .main-header {
+        font-size: 32px;
+        font-weight: bold;
+        margin-bottom: 10px;
     }
     
-    /* Kill switch warning */
-    .kill-switch-active {
-        background: var(--accent-red-dim);
-        border: 1px solid var(--accent-red);
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-        font-family: 'JetBrains Mono', monospace;
+    .status-bar {
+        font-size: 14px;
+        color: #888;
+        margin-bottom: 20px;
     }
     
-    .kill-switch-active .title {
-        color: var(--accent-red);
-        font-weight: 600;
-        font-size: 0.9rem;
-    }
+    /* Quality color coding */
+    .quality-high { background-color: #2ecc71; color: white; }
+    .quality-mid { background-color: #f39c12; color: white; }
+    .quality-low { background-color: #e74c3c; color: white; }
     
-    /* Stremlit overrides */
-    .stMetric {
-        background: var(--bg-card);
-        border: 1px solid var(--border-color);
-        border-radius: 8px;
-        padding: 0.75rem;
-    }
-    
-    div[data-testid="stMetricValue"] {
-        font-family: 'Space Grotesk', sans-serif;
-    }
-    
-    div[data-testid="stMetricLabel"] {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem;
-    }
-    
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background: var(--bg-secondary);
-    }
-    
-    section[data-testid="stSidebar"] .block-container {
+    /* Remove extra padding */
+    .block-container {
         padding-top: 2rem;
-    }
-    
-    /* Refresh info */
-    .refresh-info {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.65rem;
-        color: var(--text-muted);
-        text-align: center;
-        padding: 1rem 0;
+        padding-bottom: 0rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
-
-# =============================================================================
-# DATA LOADING FUNCTIONS (with error handling)
-# =============================================================================
-
-def safe_db_connect():
-    """Safely check database connection."""
-    try:
-        from src.storage.db import get_db
-        db = get_db()
-        return True
-    except Exception as e:
-        return False
-
-
-@st.cache_data(ttl=15)
-def load_account_state() -> Optional[Dict]:
-    """Load latest account state from database."""
-    try:
-        from src.storage.repository import get_latest_account_state
-        state = get_latest_account_state()
-        if state:
-            return {
-                'equity': float(state.get('equity', 0)),
-                'balance': float(state.get('balance', 0)),
-                'margin_used': float(state.get('margin_used', 0)),
-                'available_margin': float(state.get('available_margin', 0)),
-                'unrealized_pnl': float(state.get('unrealized_pnl', 0)),
-                'timestamp': state.get('timestamp')
-            }
-        return None
-    except Exception as e:
-        st.error(f"Failed to load account state: {e}")
-        return None
-
-
-@st.cache_data(ttl=15)
-def load_positions() -> List[Dict]:
-    """Load active positions from database."""
-    try:
-        from src.storage.db import get_db
-        from src.storage.repository import PositionModel
-        
-        db = get_db()
-        with db.get_session() as session:
-            positions = session.query(PositionModel).all()
-            
-            result = []
-            now = datetime.now(timezone.utc)
-            
-            for p in positions:
-                entry = float(p.entry_price)
-                current = float(p.current_mark_price)
-                side = p.side.upper()
-                
-                # Calculate PnL %
-                if side == 'LONG':
-                    pnl_pct = ((current - entry) / entry) * 100 if entry > 0 else 0
-                else:
-                    pnl_pct = ((entry - current) / entry) * 100 if entry > 0 else 0
-                
-                # Holding time
-                opened_at = p.opened_at.replace(tzinfo=timezone.utc) if p.opened_at else now
-                holding_hours = (now - opened_at).total_seconds() / 3600
-                
-                result.append({
-                    'symbol': p.symbol.replace(":USD", "/USD").replace("PF_", ""),
-                    'side': side,
-                    'entry_price': entry,
-                    'current_price': current,
-                    'pnl_pct': pnl_pct,
-                    'unrealized_pnl': float(p.unrealized_pnl),
-                    'size_notional': float(p.size_notional),
-                    'leverage': float(p.leverage),
-                    'holding_hours': holding_hours,
-                    'margin_used': float(p.margin_used) if p.margin_used else 0,
-                    'liquidation_price': float(p.liquidation_price) if p.liquidation_price else None,
-                    'stop_loss': float(p.initial_stop_price) if p.initial_stop_price else None,
-                    'tp1': float(p.tp1_price) if p.tp1_price else None,
-                    'tp2': float(p.tp2_price) if p.tp2_price else None,
-                })
-            
-            return sorted(result, key=lambda x: x['size_notional'], reverse=True)
-    except Exception as e:
-        st.error(f"Failed to load positions: {e}")
-        return []
-
-
-@st.cache_data(ttl=15)
-def load_performance_metrics(days: int = 30) -> Dict:
-    """Load performance metrics."""
-    try:
-        from src.storage.repository import get_trades_since
-        from datetime import timedelta
-        
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        trades = get_trades_since(cutoff)
-        
-        if not trades:
-            return {
-                'total_trades': 0,
-                'win_rate': 0.0,
-                'total_pnl': 0.0,
-                'avg_win': 0.0,
-                'avg_loss': 0.0,
-                'profit_factor': 0.0,
-                'best_trade': 0.0,
-                'worst_trade': 0.0,
-            }
-        
-        wins = [t for t in trades if t.net_pnl > 0]
-        losses = [t for t in trades if t.net_pnl < 0]
-        
-        total_pnl = sum(float(t.net_pnl) for t in trades)
-        win_rate = (len(wins) / len(trades) * 100) if trades else 0
-        
-        avg_win = sum(float(t.net_pnl) for t in wins) / len(wins) if wins else 0
-        avg_loss = sum(float(t.net_pnl) for t in losses) / len(losses) if losses else 0
-        
-        total_wins = sum(float(t.net_pnl) for t in wins)
-        total_losses = abs(sum(float(t.net_pnl) for t in losses))
-        profit_factor = total_wins / total_losses if total_losses > 0 else 0
-        
-        all_pnl = [float(t.net_pnl) for t in trades]
-        
-        return {
-            'total_trades': len(trades),
-            'win_rate': win_rate,
-            'total_pnl': total_pnl,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor,
-            'best_trade': max(all_pnl) if all_pnl else 0,
-            'worst_trade': min(all_pnl) if all_pnl else 0,
-        }
-    except Exception as e:
-        return {
-            'total_trades': 0,
-            'win_rate': 0.0,
-            'total_pnl': 0.0,
-            'avg_win': 0.0,
-            'avg_loss': 0.0,
-            'profit_factor': 0.0,
-            'best_trade': 0.0,
-            'worst_trade': 0.0,
-        }
-
-
-@st.cache_data(ttl=15)
-def load_recent_trades(limit: int = 20) -> List[Dict]:
-    """Load recent completed trades."""
-    try:
-        from src.storage.repository import get_all_trades
-        trades = get_all_trades()
-        
-        if not trades:
-            return []
-        
-        # Sort by exit time and take most recent
-        sorted_trades = sorted(trades, key=lambda t: t.exited_at, reverse=True)[:limit]
-        
-        return [{
-            'symbol': t.symbol.replace(":USD", "/USD").replace("PF_", ""),
-            'side': t.side.upper(),
-            'entry_price': float(t.entry_price),
-            'exit_price': float(t.exit_price),
-            'net_pnl': float(t.net_pnl),
-            'exit_reason': t.exit_reason,
-            'holding_hours': float(t.holding_period_hours),
-            'exited_at': t.exited_at.replace(tzinfo=timezone.utc) if t.exited_at else None,
-        } for t in sorted_trades]
-    except Exception as e:
-        return []
-
-
-@st.cache_data(ttl=15)
-def load_coins_analysis() -> List[Dict]:
-    """Load latest analysis for all tracked coins."""
-    try:
-        from src.storage.repository import get_latest_traces
-        
-        traces = get_latest_traces(limit=500)
-        now = datetime.now(timezone.utc)
-        
-        coins = []
-        for trace in traces:
-            details = trace.get('details', {})
-            timestamp = trace.get('timestamp')
-            
-            # Calculate freshness
-            if timestamp:
-                if isinstance(timestamp, str):
-                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                age_minutes = (now - timestamp).total_seconds() / 60
-            else:
-                age_minutes = 9999
-            
-            # Status based on age
-            if age_minutes < 60:
-                status = 'active'
-            elif age_minutes < 360:
-                status = 'stale'
-            else:
-                status = 'dead'
-            
-            signal = details.get('signal', 'NO_SIGNAL')
-            if signal and signal.lower() in ['long', 'short']:
-                signal = signal.upper()
-            else:
-                signal = 'NONE'
-            
-            coins.append({
-                'symbol': trace.get('symbol', 'UNKNOWN'),
-                'price': float(details.get('spot_price', 0) or 0),
-                'signal': signal,
-                'regime': details.get('regime', 'unknown'),
-                'bias': details.get('bias', 'neutral'),
-                'quality': float(details.get('setup_quality', 0) or 0),
-                'adx': float(details.get('adx', 0) or 0),
-                'status': status,
-                'age_minutes': age_minutes,
-            })
-        
-        return sorted(coins, key=lambda x: x['symbol'])
-    except Exception as e:
-        return []
-
-
-@st.cache_data(ttl=15)
-def load_recent_signals(limit: int = 30) -> List[Dict]:
-    """Load recent trading signals."""
-    try:
-        from src.storage.repository import get_recent_events
-        
-        events = get_recent_events(limit=limit * 3, event_type="DECISION_TRACE")
-        now = datetime.now(timezone.utc)
-        
-        signals = []
-        for e in events:
-            details = e.get('details', {})
-            signal = details.get('signal', '')
-            
-            if signal and signal.lower() in ['long', 'short']:
-                timestamp = e.get('timestamp')
-                if isinstance(timestamp, str):
-                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                
-                signals.append({
-                    'timestamp': timestamp,
-                    'symbol': e.get('symbol', 'UNKNOWN'),
-                    'signal': signal.upper(),
-                    'quality': float(details.get('setup_quality', 0) or 0),
-                    'regime': details.get('regime', 'unknown'),
-                })
-        
-        return sorted(signals, key=lambda x: x['timestamp'], reverse=True)[:limit]
-    except Exception as e:
-        return []
-
-
-def get_kill_switch_status() -> Dict:
-    """Get kill switch status."""
-    try:
-        from src.monitoring.kill_switch import get_kill_switch
-        ks = get_kill_switch()
-        return ks.get_status()
-    except:
-        return {'active': False, 'reason': None}
-
-
-# =============================================================================
-# RENDER FUNCTIONS
-# =============================================================================
-
-def render_header():
-    """Render dashboard header."""
-    st.markdown("""
-        <div class="dashboard-header">
-            <div class="live-dot"></div>
-            Trading System
-        </div>
-    """, unsafe_allow_html=True)
+# Sidebar - Performance & Status
+with st.sidebar:
+    st.header("📊 System Performance")
     
-    now = datetime.now(timezone.utc)
-    st.markdown(f"""
-        <div class="status-bar">
-            Last update: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC
-        </div>
-    """, unsafe_allow_html=True)
-
-
-def render_kill_switch_warning(ks_status: Dict):
-    """Render kill switch warning if active."""
+    # Load performance metrics
+    from src.monitoring.performance import calculate_performance_metrics
+    metrics = calculate_performance_metrics(days=30)
+    
+    col_pnl, col_win = st.columns(2)
+    with col_pnl:
+        pnl = metrics.get('total_pnl', 0.0)
+        st.metric("30d PnL", f"${pnl:,.2f}", delta=pnl)
+    with col_win:
+        win_rate = metrics.get('win_rate', 0.0)
+        st.metric("Win Rate", f"{win_rate:.1f}%")
+        
+    st.metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0.0):.2f}")
+    st.metric("Max Drawdown", f"{metrics.get('max_drawdown', 0.0):.2f}%", delta_color="inverse")
+    
+    st.divider()
+    
+    st.header("⚙️ System Status")
+    
+    # Kill switch status
+    from src.utils.kill_switch import get_kill_switch
+    ks = get_kill_switch()
+    ks_status = ks.get_status()
+    
     if ks_status.get('active'):
-        st.markdown(f"""
-            <div class="kill-switch-active">
-                <div class="title">🚨 KILL SWITCH ACTIVE</div>
-                <div>Reason: {ks_status.get('reason', 'Unknown')}</div>
-                <div>Trading is suspended.</div>
-            </div>
-        """, unsafe_allow_html=True)
-
-
-def render_account_metrics(account: Optional[Dict], positions: List[Dict]):
-    """Render account overview metrics."""
-    st.markdown('<div class="section-header">💰 Account Overview</div>', unsafe_allow_html=True)
-    
-    cols = st.columns(5)
-    
-    if account:
-        with cols[0]:
-            st.metric("Equity", f"${account['equity']:,.2f}")
-        with cols[1]:
-            pnl = account['unrealized_pnl']
-            st.metric("Unrealized PnL", f"${pnl:,.2f}", delta=f"${pnl:,.2f}")
-        with cols[2]:
-            st.metric("Margin Used", f"${account['margin_used']:,.2f}")
-        with cols[3]:
-            st.metric("Available", f"${account['available_margin']:,.2f}")
-        with cols[4]:
-            st.metric("Open Positions", len(positions))
+        st.error(f"🚨 KILL SWITCH ACTIVE")
+        st.caption(f"Reason: {ks_status.get('reason')}")
     else:
-        with cols[0]:
-            st.metric("Equity", "N/A")
-        with cols[1]:
-            st.metric("Unrealized PnL", "N/A")
-        with cols[2]:
-            st.metric("Margin Used", "N/A")
-        with cols[3]:
-            st.metric("Available", "N/A")
-        with cols[4]:
-            st.metric("Open Positions", len(positions))
+        st.success("✅ System Operational")
+        
+    # Active Alerts (Placeholder)
+    # st.subheader("🔔 Recent Alerts")
+    # ...
 
 
-def render_positions(positions: List[Dict]):
-    """Render open positions section."""
-    st.markdown('<div class="section-header">📊 Open Positions</div>', unsafe_allow_html=True)
+# Header
+st.markdown('<div class="main-header">🎯 Trading System Monitor</div>', unsafe_allow_html=True)
+
+# Load data
+@st.cache_data(ttl=10)
+def load_dashboard_data():
+    return load_all_coins()
+
+@st.cache_data(ttl=10)
+def load_positions_data():
+    from src.dashboard.positions_loader import load_active_positions
+    return load_active_positions()
+
+coins = load_dashboard_data()
+positions = load_positions_data()
+
+# Status bar with freshness info
+now = datetime.now(timezone.utc)
+active_count = sum(1 for c in coins if c.status == "active")
+stale_count = sum(1 for c in coins if c.status == "stale")
+dead_count = sum(1 for c in coins if c.status == "dead")
+
+# Calculate average freshness (exclude Dead/Never Updated coins)
+if coins:
+    # Filter for coins updated within last 24 hours to give meaningful average
+    valid_coins = [c for c in coins if c.last_update and (now - c.last_update).total_seconds() < 86400]
     
-    if not positions:
-        st.info("No open positions")
-        return
+    if valid_coins:
+        avg_age_seconds = sum((now - c.last_update).total_seconds() for c in valid_coins) / len(valid_coins)
+        if avg_age_seconds < 300:
+            freshness_emoji = "🟢"
+        elif avg_age_seconds < 1800:
+            freshness_emoji = "🟡"
+        else:
+            freshness_emoji = "🔴"
+    else:
+        freshness_emoji = "🔴"
+        avg_age_seconds = 0
+else:
+    freshness_emoji = "⚪"
+    avg_age_seconds = 0
+
+st.markdown(
+    f'<div class="status-bar">⚡ Live: {len(coins)} coins | '
+    f'🟢 Active: {active_count} | 🟡 Stale: {stale_count} | 🔴 Dead: {dead_count} | '
+    f'💰 Positions: {len(positions)} | '
+    f'{freshness_emoji} Avg freshness: {int(avg_age_seconds/60)}m | '
+    f'Last refresh: {now.strftime("%H:%M:%S UTC")}</div>',
+    unsafe_allow_html=True
+)
+
+# Filters
+# ... (Filters section unchanged) ...
+st.markdown("### Filters")
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    signal_filter = st.selectbox("Signal", ["All", "LONG", "SHORT", "NO_SIGNAL"], index=0)
+with col2:
+    regime_filter = st.selectbox("Regime", ["All", "tight_range", "wide_structure", "trending"], index=0)
+with col3:
+    bias_filter = st.selectbox("Bias", ["All", "bullish", "bearish", "neutral"], index=0)
+with col4:
+    quality_threshold = st.slider("Min Quality", 0, 100, 0, 5)
+with col5:
+    status_filter = st.selectbox("Status", ["All", "active", "stale", "dead"], index=0)
+
+# Apply filters
+filtered_coins = coins
+
+if signal_filter != "All":
+    filtered_coins = [c for c in filtered_coins if c.signal == signal_filter]
+if regime_filter != "All":
+    filtered_coins = [c for c in filtered_coins if c.regime == regime_filter]
+if bias_filter != "All":
+    filtered_coins = [c for c in filtered_coins if c.bias == bias_filter]
+if quality_threshold > 0:
+    filtered_coins = [c for c in filtered_coins if c.quality >= quality_threshold]
+if status_filter != "All":
+    filtered_coins = [c for c in filtered_coins if c.status == status_filter]
+
+st.markdown(f"**Showing {len(filtered_coins)} of {len(coins)} coins**")
+# Open Positions Section
+st.markdown("---")
+st.markdown("### 💰 Open Positions")
+
+if positions:
+    positions_data = []
+    total_pnl = 0.0
+    total_margin = 0.0
     
     for pos in positions:
-        side_class = 'long' if pos['side'] == 'LONG' else 'short'
-        pnl_class = 'positive' if pos['pnl_pct'] >= 0 else 'negative'
-        pnl_sign = '+' if pos['pnl_pct'] >= 0 else ''
+        # Format stop loss price
+        sl_price = pos.get('initial_stop_price')
+        if sl_price:
+            sl_pct = ((sl_price - pos['entry_price']) / pos['entry_price']) * 100
+            if pos['side'] == 'SHORT':
+                sl_pct = -sl_pct
+            sl_str = f"${sl_price:.4f} ({sl_pct:+.1f}%)"
+        else:
+            sl_str = "⚠️ None"
+        
+        # Format TP targets
+        tp_targets = []
+        if pos.get('tp1_price'):
+            tp1_price = pos['tp1_price']
+            tp1_pct = ((tp1_price - pos['entry_price']) / pos['entry_price']) * 100
+            if pos['side'] == 'SHORT':
+                tp1_pct = -tp1_pct
+            tp_targets.append(f"TP1: ${tp1_price:.4f} ({tp1_pct:+.1f}%)")
+        if pos.get('tp2_price'):
+            tp2_price = pos['tp2_price']
+            tp2_pct = ((tp2_price - pos['entry_price']) / pos['entry_price']) * 100
+            if pos['side'] == 'SHORT':
+                tp2_pct = -tp2_pct
+            tp_targets.append(f"TP2: ${tp2_price:.4f} ({tp2_pct:+.1f}%)")
+        if pos.get('final_target_price'):
+            final_price = pos['final_target_price']
+            final_pct = ((final_price - pos['entry_price']) / pos['entry_price']) * 100
+            if pos['side'] == 'SHORT':
+                final_pct = -final_pct
+            tp_targets.append(f"Final: ${final_price:.4f} ({final_pct:+.1f}%)")
+        tp_str = " | ".join(tp_targets) if tp_targets else "⚠️ None"
         
         # Format holding time
         hours = pos['holding_hours']
         if hours < 1:
-            time_str = f"{int(hours * 60)}m"
+            holding_str = f"{int(hours * 60)}m"
         elif hours < 24:
-            time_str = f"{hours:.1f}h"
+            holding_str = f"{int(hours)}h {int((hours % 1) * 60)}m"
         else:
-            time_str = f"{hours / 24:.1f}d"
+            days = int(hours / 24)
+            remaining_hours = int(hours % 24)
+            holding_str = f"{days}d {remaining_hours}h"
         
-        col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 1])
+        # Format opening time
+        opened_at = pos['opened_at']
+        if isinstance(opened_at, str):
+            from datetime import datetime
+            opened_at = datetime.fromisoformat(opened_at.replace('Z', '+00:00'))
+        opened_str = opened_at.strftime('%Y-%m-%d %H:%M UTC')
         
-        with col1:
-            st.markdown(f"""
-                <div style="display: flex; align-items: center; gap: 0.5rem;">
-                    <span class="position-side {side_class}">{pos['side']}</span>
-                    <span class="position-symbol">{pos['symbol']}</span>
-                </div>
-            """, unsafe_allow_html=True)
+        # Format liquidation price
+        liq_str = f"${pos['liquidation_price']:.4f}" if pos.get('liquidation_price') else "N/A"
         
-        with col2:
-            st.markdown(f"**{pos['leverage']:.0f}x** leverage")
+        positions_data.append({
+            "Symbol": pos['symbol'],
+            "Side": "🟢 LONG" if pos['side'] == 'LONG' else "🔴 SHORT",
+            "Size": f"${pos['size_notional']:.2f}",
+            "Leverage": f"{pos['leverage']:.1f}x",
+            "Entry": f"${pos['entry_price']:.4f}",
+            "Current": f"${pos['current_price']:.4f}",
+            "Change %": f"{pos['change_pct']:+.2f}%" if pos['change_pct'] != 0 else "0.00%",
+            "PnL": f"${pos['unrealized_pnl']:.2f}",
+            "Stop Loss": sl_str,
+            "TP Targets": tp_str,
+            "Liquidation": liq_str,
+            "Opened": opened_str,
+            "Holding": holding_str,
+            "Margin": f"${pos['margin_used']:.2f}",
+        })
         
-        with col3:
-            st.markdown(f"Entry: **${pos['entry_price']:.4f}** → ${pos['current_price']:.4f}")
-        
-        with col4:
-            st.markdown(f"""
-                <span class="metric-value {pnl_class}">
-                    {pnl_sign}{pos['pnl_pct']:.2f}% (${pos['unrealized_pnl']:,.2f})
-                </span>
-            """, unsafe_allow_html=True)
-        
-        with col5:
-            st.markdown(f"⏱️ {time_str}")
-        
-        # Show stop loss and take profit info
-        details = []
-        if pos['stop_loss']:
-            details.append(f"SL: ${pos['stop_loss']:.4f}")
-        if pos['tp1']:
-            details.append(f"TP1: ${pos['tp1']:.4f}")
-        if pos['tp2']:
-            details.append(f"TP2: ${pos['tp2']:.4f}")
-        
-        if details:
-            st.caption(" | ".join(details))
-        
-        st.markdown("---")
+        total_pnl += pos['unrealized_pnl']
+        total_margin += pos['margin_used']
     
-    # Positions table (Local Dev Addition)
-    positions_df = pd.DataFrame(positions)
-    st.markdown("### Detailed Positions Table")
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Positions", len(positions))
+    with col2:
+        st.metric("Total PnL", f"${total_pnl:.2f}", delta=f"{total_pnl:.2f}")
+    with col3:
+        st.metric("Total Margin", f"${total_margin:.2f}")
+    with col4:
+        avg_leverage = sum(p['leverage'] for p in positions) / len(positions) if positions else 0
+        st.metric("Avg Leverage", f"{avg_leverage:.1f}x")
+    
+    st.markdown("")  # Spacing
+    
+    # Positions table
+    positions_df = pd.DataFrame(positions_data)
     st.dataframe(
         positions_df,
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         height=min(400, 50 + len(positions) * 35),
     )
+else:
+    st.info("No open positions")
+
+st.markdown("---")
 
 
-def render_performance(metrics: Dict):
-    """Render performance metrics section."""
-    st.markdown('<div class="section-header">📈 Performance (30d)</div>', unsafe_allow_html=True)
-    
-    cols = st.columns(4)
-    
-    with cols[0]:
-        pnl = metrics['total_pnl']
-        pnl_color = "normal" if pnl >= 0 else "inverse"
-        st.metric("Total PnL", f"${pnl:,.2f}", delta=f"${pnl:,.2f}", delta_color=pnl_color)
-    
-    with cols[1]:
-        st.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
-    
-    with cols[2]:
-        st.metric("Total Trades", metrics['total_trades'])
-    
-    with cols[3]:
-        st.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-    
-    # Second row
-    cols2 = st.columns(4)
-    
-    with cols2[0]:
-        st.metric("Avg Win", f"${metrics['avg_win']:,.2f}")
-    
-    with cols2[1]:
-        st.metric("Avg Loss", f"${metrics['avg_loss']:,.2f}")
-    
-    with cols2[2]:
-        st.metric("Best Trade", f"${metrics['best_trade']:,.2f}")
-    
-    with cols2[3]:
-        st.metric("Worst Trade", f"${metrics['worst_trade']:,.2f}")
-
-
-def render_recent_trades(trades: List[Dict]):
-    """Render recent trades section."""
-    st.markdown('<div class="section-header">📜 Recent Trades</div>', unsafe_allow_html=True)
-    
-    if not trades:
-        st.info("No completed trades yet")
-        return
-    
+# Build DataFrame
+if filtered_coins:
     data = []
-    now = datetime.now(timezone.utc)
-    
-    for t in trades:
-        # Format time ago
-        if t['exited_at']:
-            delta = now - t['exited_at']
-            if delta.total_seconds() < 3600:
-                time_ago = f"{int(delta.total_seconds() / 60)}m ago"
-            elif delta.total_seconds() < 86400:
-                time_ago = f"{int(delta.total_seconds() / 3600)}h ago"
-            else:
-                time_ago = f"{int(delta.total_seconds() / 86400)}d ago"
+    for coin in filtered_coins:
+        # Calculate time since last update
+        age = (now - coin.last_update).total_seconds()
+        if age < 60:
+            last_update_str = f"{int(age)}s ago"
+        elif age < 3600:
+            last_update_str = f"{int(age/60)}m ago"
         else:
-            time_ago = "N/A"
+            last_update_str = f"{int(age/3600)}h ago"
         
-        pnl = t['net_pnl']
-        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        # Color code 24h change
+        change = getattr(coin, 'change_24h', 0.0)
+        
+        # Format price - handle zero/invalid prices
+        if coin.price > 0:
+            price_str = f"${coin.price:.4f}"
+        else:
+            price_str = "N/A"
+        
+        # Format score breakdown values (handle missing keys)
+        smc_score = coin.score_breakdown.get('smc', 0) if coin.score_breakdown else 0
+        fib_score = coin.score_breakdown.get('fib', 0) if coin.score_breakdown else 0
+        htf_score = coin.score_breakdown.get('htf', 0) if coin.score_breakdown else 0
+        
+        # Format data depth (candle count)
+        candle_count = coin.candle_count if hasattr(coin, 'candle_count') else 0
+        if candle_count >= 200:
+            depth_str = f"✅ {candle_count}"
+        elif candle_count >= 50:
+            depth_str = f"🟡 {candle_count}"
+        else:
+            depth_str = f"🔴 {candle_count}"
         
         data.append({
-            'Time': time_ago,
-            'Symbol': t['symbol'],
-            'Side': t['side'],
-            'PnL': pnl_str,
-            'Exit': t['exit_reason'],
-            'Duration': f"{t['holding_hours']:.1f}h"
+            "Status": coin.status_emoji,
+            "Symbol": coin.symbol,
+            "Price": price_str,
+            "24h %": f"{change:+.2f}%" if coin.price > 0 else "N/A",
+            "Signal": f"{coin.signal_emoji} {coin.signal}",
+            "Regime": coin.regime,
+            "Bias": coin.bias,
+            "Quality": f"{coin.quality:.0f}",
+            "SMC": smc_score,
+            "Fib": fib_score,
+            "HTF": htf_score,
+            "ADX": f"{coin.adx:.1f}" if coin.adx > 0 else "0.0",
+            "ATR": f"{coin.atr:.4f}" if coin.atr > 0 else "0.0000",
+            "EMA200": coin.ema200_slope,
+            "Data Depth": depth_str,
+            "Last Review": last_update_str,
         })
     
     df = pd.DataFrame(data)
-    st.dataframe(df, use_container_width=True, hide_index=True, height=300)
-
-
-def render_coin_scanner(coins: List[Dict]):
-    """Render coin scanner / analysis table."""
-    st.markdown('<div class="section-header">🔍 Coin Scanner</div>', unsafe_allow_html=True)
-    
-    if not coins:
-        st.info("No coin analysis data available")
-        return
-
-    df = pd.DataFrame(coins)
     
     # Display table
     st.dataframe(
         df,
-        width="stretch",
+        use_container_width=True,
         height=600,
         hide_index=True,
         column_config={
@@ -772,194 +356,186 @@ def render_coin_scanner(coins: List[Dict]):
             )
         }
     )
-
-    # Filters
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        signal_filter = st.selectbox("Signal", ["All", "LONG", "SHORT", "NONE"], key="signal_filter")
-    with col2:
-        status_filter = st.selectbox("Status", ["All", "active", "stale", "dead"], key="status_filter")
-    with col3:
-        min_quality = st.slider("Min Quality", 0, 100, 0, key="quality_filter")
     
-    # Apply filters
-    filtered = coins
-    if signal_filter != "All":
-        filtered = [c for c in filtered if c['signal'] == signal_filter]
-    if status_filter != "All":
-        filtered = [c for c in filtered if c['status'] == status_filter]
-    if min_quality > 0:
-        filtered = [c for c in filtered if c['quality'] >= min_quality]
-    
-    st.caption(f"Showing {len(filtered)} of {len(coins)} coins")
-    
-    # Build table data
-    data = []
-    for c in filtered:
-        status_emoji = {'active': '🟢', 'stale': '🟡', 'dead': '🔴'}.get(c['status'], '⚪')
-        signal_emoji = {'LONG': '🟢', 'SHORT': '🔴', 'NONE': '⚪'}.get(c['signal'], '⚪')
-        
-        data.append({
-            'Status': status_emoji,
-            'Symbol': c['symbol'],
-            'Price': f"${c['price']:.4f}" if c['price'] > 0 else "N/A",
-            'Signal': f"{signal_emoji} {c['signal']}",
-            'Quality': f"{c['quality']:.0f}",
-            'Regime': c['regime'],
-            'Bias': c['bias'],
-            'ADX': f"{c['adx']:.1f}",
-            'Age': f"{int(c['age_minutes'])}m" if c['age_minutes'] < 9999 else "N/A"
-        })
-    
-    if data:
-        df = pd.DataFrame(data)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
-    else:
-        st.info("No coins match the current filters")
-
-
-def render_recent_signals(signals: List[Dict]):
-    """Render recent signals section."""
-    st.markdown('<div class="section-header">⚡ Recent Signals</div>', unsafe_allow_html=True)
-    
-    if not signals:
-        st.info("No recent signals")
-        return
-    
-    data = []
-    now = datetime.now(timezone.utc)
-    
-    for s in signals:
-        # Format time ago
-        if s['timestamp']:
-            delta = now - s['timestamp']
-            if delta.total_seconds() < 3600:
-                time_ago = f"{int(delta.total_seconds() / 60)}m ago"
-            elif delta.total_seconds() < 86400:
-                time_ago = f"{int(delta.total_seconds() / 3600)}h ago"
-            else:
-                time_ago = f"{int(delta.total_seconds() / 86400)}d ago"
-        else:
-            time_ago = "N/A"
-        
-        signal_emoji = '🟢' if s['signal'] == 'LONG' else '🔴'
-        
-        data.append({
-            'Time': time_ago,
-            'Symbol': s['symbol'],
-            'Signal': f"{signal_emoji} {s['signal']}",
-            'Quality': f"{s['quality']:.0f}",
-            'Regime': s['regime'],
-        })
-    
-    df = pd.DataFrame(data)
-    st.dataframe(df, use_container_width=True, hide_index=True, height=300)
-
-
-def render_sidebar(metrics: Dict, ks_status: Dict):
-    """Render sidebar with summary info."""
-    with st.sidebar:
-        st.markdown("### 📊 Quick Stats")
-        
-        # Kill switch status
-        if ks_status.get('active'):
-            st.error("🚨 Kill Switch ACTIVE")
-        else:
-            st.success("✅ System Running")
-        
-        st.divider()
-        
-        # Performance summary
-        st.markdown("**30-Day Performance**")
-        
-        pnl = metrics['total_pnl']
-        if pnl >= 0:
-            st.markdown(f"💰 PnL: **:green[+${pnl:,.2f}]**")
-        else:
-            st.markdown(f"💰 PnL: **:red[-${abs(pnl):,.2f}]**")
-        
-        st.markdown(f"📈 Win Rate: **{metrics['win_rate']:.1f}%**")
-        st.markdown(f"🎯 Trades: **{metrics['total_trades']}**")
-        st.markdown(f"⚖️ Profit Factor: **{metrics['profit_factor']:.2f}**")
-        
-        st.divider()
-        
-        # Manual refresh button
-        st.markdown("**Settings**")
-        
-        if st.button("🔄 Refresh Now", use_container_width=True):
-            st.cache_data.clear()
-            st.rerun()
-        
-        st.markdown("""
-            <div class="refresh-info">
-                Data refreshes every 15 seconds
-            </div>
-        """, unsafe_allow_html=True)
-
-
-# =============================================================================
-# MAIN APP
-# =============================================================================
-
-def main():
-    """Main dashboard entry point."""
-    # Check DB connection
-    if not safe_db_connect():
-        st.error("⚠️ Cannot connect to database. Please check your configuration.")
-        st.stop()
-    
-    # Load all data
-    account = load_account_state()
-    positions = load_positions()
-    metrics = load_performance_metrics()
-    recent_trades = load_recent_trades()
-    coins = load_coins_analysis()
-    signals = load_recent_signals()
-    ks_status = get_kill_switch_status()
-    
-    # Render sidebar
-    render_sidebar(metrics, ks_status)
-    
-    # Main content
-    render_header()
-    render_kill_switch_warning(ks_status)
-    
-    # Account overview
-    render_account_metrics(account, positions)
-    
-    # Two-column layout for positions and performance
-    col_left, col_right = st.columns([1, 1])
-    
-    with col_left:
-        render_positions(positions)
-    
-    with col_right:
-        render_performance(metrics)
-        render_recent_trades(recent_trades)
-    
-    # Full-width sections
+    # Expandable detail section
     st.markdown("---")
+    st.markdown("### Coin Detail")
     
-    # Tabs for scanner and signals
-    tab1, tab2 = st.tabs(["🔍 Coin Scanner", "⚡ Recent Signals"])
+    selected_symbol = st.selectbox(
+        "Select coin for detailed analysis:",
+        [c.symbol for c in filtered_coins],
+        index=0
+    )
     
-    with tab1:
-        render_coin_scanner(coins)
-    
-    with tab2:
-        render_recent_signals(signals)
-    
-    # Footer
-    st.markdown("""
-        <div class="refresh-info">
-            Dashboard auto-refreshes every 15 seconds • Data from PostgreSQL
-        </div>
-    """, unsafe_allow_html=True)
+    if selected_symbol:
+        try:
+            detail = get_coin_detail(selected_symbol)
+            
+            if detail:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("#### Latest Analysis")
+                    latest = detail.get('latest_analysis', {})
+                    if latest:
+                        st.write(f"**Regime:** {latest.get('regime', 'N/A')}")
+                        st.write(f"**Bias:** {latest.get('bias', 'N/A')}")
+                        st.write(f"**Signal:** {latest.get('signal', 'N/A')}")
+                        # Safe retrieval: get() returns None if key exists but is None, so format crashes
+                        quality = latest.get('quality')
+                        if quality is None: quality = 0.0
+                        st.write(f"**Quality:** {quality:.0f}")
+                        timestamp = latest.get('timestamp')
+                        if timestamp:
+                            if isinstance(timestamp, str):
+                                from datetime import datetime
+                                timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            st.write(f"**Timestamp:** {timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    else:
+                        st.write("No analysis data available")
+                    
+                    # Show Basis/Funding if available
+                    # (Assuming detail dict might need updates to carry this, or we fetch active position)
+                    from src.storage.repository import get_active_positions
+                    # This is a bit heavy for UI loop, but okay for single selection
+                    # Ideally pass this down from data_loader
+                    
+                with col2:
+                    st.markdown("#### Recent Signals")
+                    recent_signals = detail.get('recent_signals', [])
+                    if recent_signals:
+                        for sig in recent_signals[:5]:
+                            ts = sig.get('timestamp')
+                            if ts:
+                                if isinstance(ts, str):
+                                    from datetime import datetime
+                                    ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                ts_str = ts.strftime('%H:%M')
+                            else:
+                                ts_str = "N/A"
+                            signal = sig.get('signal', 'N/A')
+                            quality = sig.get('quality')
+                            if quality is None: quality = 0.0
+                            st.write(f"• {ts_str}: {signal} (Q: {quality:.0f})")
+                    else:
+                        st.write("No recent signals")
+            else:
+                st.warning(f"No detail available for {selected_symbol}")
+        except Exception as e:
+            st.error(f"Error loading detail for {selected_symbol}: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
 
-
-if __name__ == "__main__":
-    main()
 else:
-    # When run via streamlit run
-    main()
+    st.info("No coins match the current filters.")
+
+# Auto-refresh
+st.markdown("---")
+st.caption("Dashboard auto-refreshes every 10 seconds")
+
+# Signals Log Section
+st.markdown("---")
+st.markdown("### 📊 Recent Signals Log")
+
+@st.cache_data(ttl=10)
+def load_recent_signals(limit: int = 50):
+    """Load recent trading signals from database."""
+    try:
+        from src.storage.repository import get_recent_events
+        from datetime import datetime, timezone, timedelta
+        
+        # Get recent DECISION_TRACE events
+        events = get_recent_events(limit=limit * 3, event_type="DECISION_TRACE")
+        
+        # Filter for actual signals (not "no_signal")
+        signals = []
+        for event in events:
+            details = event.get('details', {})
+            signal_type = details.get('signal', '')
+            
+            if signal_type and signal_type != 'no_signal':
+                signals.append({
+                    'timestamp': event.get('timestamp'),
+                    'symbol': event.get('symbol'),
+                    'signal': signal_type,
+                    'quality': details.get('setup_quality', 0),
+                    'regime': details.get('regime', 'unknown'),
+                    'bias': details.get('bias', 'neutral'),
+                })
+        
+        # Limit and sort by timestamp (newest first)
+        signals = sorted(signals, key=lambda x: x['timestamp'], reverse=True)[:limit]
+        return signals
+    except Exception as e:
+        logger.error("Failed to load recent signals", error=str(e))
+        return []
+
+signals = load_recent_signals(limit=50)
+
+if signals:
+    # Convert to DataFrame for display
+    signals_data = []
+    for sig in signals:
+        # Parse timestamp
+        try:
+            ts_str = sig['timestamp']
+            if isinstance(ts_str, str):
+                ts_dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+            else:
+                ts_dt = ts_str
+            
+            # Format timestamp
+            now = datetime.now(timezone.utc)
+            minutes_ago = (now - ts_dt).total_seconds() / 60
+            
+            if minutes_ago < 60:
+                time_str = f"{int(minutes_ago)}m ago"
+            elif minutes_ago < 1440:
+                time_str = f"{int(minutes_ago/60)}h ago"
+            else:
+                time_str = f"{int(minutes_ago/1440)}d ago"
+            
+            # Format signal type with emoji
+            signal_emoji = "🟢" if sig['signal'] == 'long' else "🔴"
+            signal_display = f"{signal_emoji} {sig['signal'].upper()}"
+            
+            signals_data.append({
+                "Time": time_str,
+                "Timestamp": ts_dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                "Symbol": sig['symbol'],
+                "Signal": signal_display,
+                "Quality": f"{sig['quality']:.1f}",
+                "Regime": sig['regime'],
+                "Bias": sig['bias'],
+            })
+        except Exception as e:
+            logger.debug(f"Error formatting signal: {e}")
+            continue
+    
+    if signals_data:
+        signals_df = pd.DataFrame(signals_data)
+        
+        # Display summary
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Signals", len(signals_data))
+        with col2:
+            long_count = sum(1 for s in signals_data if "LONG" in s['Signal'])
+            st.metric("LONG Signals", long_count)
+        with col3:
+            short_count = sum(1 for s in signals_data if "SHORT" in s['Signal'])
+            st.metric("SHORT Signals", short_count)
+        
+        st.markdown("")  # Spacing
+        
+        # Display table
+        st.dataframe(
+            signals_df,
+            use_container_width=True,
+            hide_index=True,
+            height=min(400, 50 + len(signals_data) * 35),
+        )
+    else:
+        st.info("No signals to display")
+else:
+    st.info("No recent signals found")

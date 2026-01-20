@@ -431,25 +431,37 @@ class LiveTrading:
         Optimized for batch processing (Phase 10).
         """
         # 0. Kill Switch Check (HIGHEST PRIORITY)
-        from src.monitoring.kill_switch import get_kill_switch
         ks = get_kill_switch()
         
         if ks.is_active():
             logger.critical("Kill switch is active - halting trading")
+
             # Cancel all pending orders
             try:
-                # TODO: Implement cancel_all_orders
                 logger.warning("Cancelling all pending orders...")
+                cancelled = await self.client.cancel_all_orders()
+                logger.info(f"Kill switch: Cancelled {len(cancelled)} orders")
             except Exception as e:
                 logger.error("Failed to cancel orders during kill switch", error=str(e))
-            
+
             # Close all positions
             try:
                 logger.critical("Closing all positions due to kill switch")
-                # TODO: Implement close_all_positions
+                positions = await self.client.get_all_futures_positions()
+                for pos in positions:
+                    if pos.get('size', 0) != 0:  # Only close non-zero positions
+                        symbol = pos.get('symbol')
+                        try:
+                            await self.client.close_position(symbol)
+                            logger.warning(f"Kill switch: Closed position for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Kill switch: Failed to close {symbol}", error=str(e))
+
+                if not positions or all(pos.get('size', 0) == 0 for pos in positions):
+                    logger.info("Kill switch: No open positions to close")
             except Exception as e:
                 logger.error("Failed to close positions during kill switch", error=str(e))
-            
+
             # Stop processing
             return
         
@@ -856,10 +868,14 @@ class LiveTrading:
             stop_loss_futures=order_intent['metadata']['fut_sl'],
             take_profit_futures=order_intent['take_profits'][0]['price'] if order_intent['take_profits'] else None
         )
-        
-        # 4. Execute
-        entry_order = await self.executor.execute_signal(intent_model, mark_price, [])
-        
+
+        # 4. Execute (pass actual positions for pyramiding guard)
+        entry_order = await self.executor.execute_signal(
+            intent_model,
+            mark_price,
+            self.risk_manager.current_positions
+        )
+
         if entry_order:
              logger.info("Entry order placed", order_id=entry_order.order_id)
              

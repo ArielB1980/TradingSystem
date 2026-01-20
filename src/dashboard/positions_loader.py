@@ -60,7 +60,7 @@ def load_active_positions() -> List[Dict]:
                     'take_profit_order_id': pm.take_profit_order_id,
                     'liquidation_price': float(pm.liquidation_price) if pm.liquidation_price is not None else None,
                     'margin_used': float(pm.margin_used) if pm.margin_used else 0.0,
-                    # V3 fields
+                    # Position fields
                     'initial_stop_price': float(pm.initial_stop_price) if pm.initial_stop_price else None,
                     'tp1_price': float(pm.tp1_price) if pm.tp1_price else None,
                     'tp2_price': float(pm.tp2_price) if pm.tp2_price else None,

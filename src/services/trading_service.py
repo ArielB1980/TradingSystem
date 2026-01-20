@@ -18,7 +18,7 @@ from src.storage.repository import async_record_event, sync_active_positions, sa
 from src.execution.position_manager import PositionManager, ActionType, ManagementAction
 from src.execution.execution_engine import ExecutionEngine
 from src.storage.maintenance import DatabasePruner
-from src.monitoring.kill_switch import get_kill_switch
+from src.utils.kill_switch import get_kill_switch
 
 logger = get_logger("TradingService")
 

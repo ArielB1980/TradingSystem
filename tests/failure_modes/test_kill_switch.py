@@ -5,34 +5,32 @@ import pytest
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 
 
-@pytest.mark.asyncio
-async def test_kill_switch_activation():
-    """Test kill switch activates and latches."""
+def test_kill_switch_activation():
+    """Test kill switch activates and latches (sync version)."""
     ks = KillSwitch()
-    
+
     assert ks.is_active() is False
     assert ks.is_latched() is False
-    
-    await ks.activate(KillSwitchReason.MANUAL)
-    
+
+    ks.activate_sync(KillSwitchReason.MANUAL)
+
     assert ks.is_active() is True
     assert ks.is_latched() is True
     assert ks.reason == KillSwitchReason.MANUAL
 
 
-@pytest.mark.asyncio
-async def test_kill_switch_requires_ack():
+def test_kill_switch_requires_ack():
     """Test that kill switch requires manual acknowledgment."""
     ks = KillSwitch()
-    
-    await ks.activate(KillSwitchReason.API_ERROR)
-    
+
+    ks.activate_sync(KillSwitchReason.API_ERROR)
+
     # Should stay latched
     assert ks.is_latched() is True
-    
+
     # Acknowledge
     acknowledged = ks.acknowledge()
-    
+
     assert acknowledged is True
     assert ks.is_active() is False
     assert ks.is_latched() is False

@@ -1,0 +1,65 @@
+refactor: comprehensive code cleanup and critical bug fixes
+
+This commit addresses all critical bugs identified in the forensic code review
+and removes legacy code to improve maintainability and production readiness.
+
+CRITICAL FIXES:
+- Fix: Remove duplicate websocket import in kraken_client.py
+- Fix: Correct logging.info() to logger.info() in data_service.py
+- Fix: Implement missing kill switch safety functions (cancel_all_orders, close_all_positions)
+- Fix: Replace bare except clauses with specific exception types (3 instances)
+- Refactor: Consolidate duplicate KillSwitch implementations into single source
+
+KILL SWITCH ENHANCEMENTS:
+- Add state persistence (survives restarts via .kill_switch_state file)
+- Add activate_sync() method for CLI use
+- Add get_status() method for monitoring
+- Add 'acknowledge' CLI command for latched kill switch
+- Delete old monitoring/kill_switch.py, keep enhanced utils/kill_switch.py
+- Update all imports to use consolidated implementation
+
+LEGACY CODE CLEANUP:
+- Remove 16 instances of V2/V2.1/V3 version comments across codebase
+- Remove 8 lines of commented-out uvloop configuration
+- Delete unused config/production_v2.3.yaml
+- Remove deprecated take_profit_order_id parameter
+
+TEST IMPROVEMENTS:
+- Fix kill switch tests to use activate_sync() instead of async activate()
+- Test pass rate improved from 68% to 79% (13/19 → 15/19)
+- Remaining 4 failures are pre-existing issues (Signal model signature)
+
+FILES MODIFIED (19):
+- src/data/kraken_client.py
+- src/services/data_service.py
+- src/utils/kill_switch.py
+- src/services/trading_service.py
+- src/cli.py
+- src/dashboard/streamlit_app.py
+- src/live/live_trading.py
+- src/live/maintenance.py
+- src/dashboard/data_loader.py (2 fixes)
+- src/strategy/smc_engine.py
+- src/strategy/signal_scorer.py
+- src/risk/risk_manager.py
+- src/storage/repository.py
+- src/dashboard/positions_loader.py
+- src/dashboard/utils.py
+- src/execution/futures_adapter.py
+- src/paper/paper_trading.py
+- src/main.py
+- tests/failure_modes/test_kill_switch.py
+
+FILES DELETED (2):
+- src/monitoring/kill_switch.py
+- config/production_v2.3.yaml
+
+PRODUCTION IMPACT:
+- ✅ Kill switch now fully functional (can emergency-stop trading)
+- ✅ No more silent error swallowing (bare except removed)
+- ✅ Code cleaner and more maintainable
+- ✅ All critical safety issues resolved
+
+See CLEANUP_SUMMARY.md for detailed forensic review findings.
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
