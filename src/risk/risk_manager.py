@@ -71,7 +71,7 @@ class RiskManager:
             RiskDecision with approval status and details
         """
         rejection_reasons = []
-        
+
         # Calculate position size using FUTURES prices if available (more accurate)
         # Otherwise fall back to spot prices
         if futures_entry_price and futures_stop_loss:
@@ -80,9 +80,39 @@ class RiskManager:
         else:
             entry_for_risk = signal.entry_price
             stop_for_risk = signal.stop_loss
-        
+
+        # Validate entry price to prevent division by zero
+        if entry_for_risk <= 0:
+            logger.error(
+                "Invalid entry price for risk calculation",
+                symbol=signal.symbol,
+                entry_for_risk=str(entry_for_risk),
+                futures_entry_price=str(futures_entry_price) if futures_entry_price else None,
+                signal_entry_price=str(signal.entry_price)
+            )
+            return RiskDecision(
+                approved=False,
+                rejection_reasons=["Invalid entry price (zero or negative)"],
+                position_notional=Decimal("0"),
+                leverage=Decimal("1")
+            )
+
         stop_distance_pct = abs(entry_for_risk - stop_for_risk) / entry_for_risk
-        
+
+        # Validate account equity to prevent division by zero
+        if account_equity <= 0:
+            logger.error(
+                "Invalid account equity for risk calculation",
+                symbol=signal.symbol,
+                account_equity=str(account_equity)
+            )
+            return RiskDecision(
+                approved=False,
+                rejection_reasons=["Invalid account equity (zero or negative)"],
+                position_notional=Decimal("0"),
+                leverage=Decimal("1")
+            )
+
         # Calculate leverage setting (Fixed target as per PRD)
         requested_leverage = Decimal(str(self.config.max_leverage))
         
@@ -215,7 +245,16 @@ class RiskManager:
                 )
         
         # Calculate basis divergence
-        basis_divergence_pct = abs(spot_price - perp_mark_price) / spot_price
+        if spot_price <= 0:
+            logger.error(
+                "Invalid spot price for basis calculation",
+                symbol=signal.symbol,
+                spot_price=str(spot_price)
+            )
+            rejection_reasons.append("Invalid spot price (zero or negative)")
+            basis_divergence_pct = Decimal("0")
+        else:
+            basis_divergence_pct = abs(spot_price - perp_mark_price) / spot_price
         
         # BASIS GUARD ENFORCEMENT
         # This was missing a hard check
