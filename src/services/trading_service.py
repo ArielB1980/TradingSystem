@@ -466,10 +466,7 @@ class TradingService:
              
              if signal.signal_type != SignalType.NO_SIGNAL:
                  logger.info(f"SIGNAL FOUND: {symbol} {signal.signal_type} {signal.regime} Score={signal.score}")
-             else:
-                 logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning}")
 
-                 
                  # Determine Futures Symbol
                  futures_symbol = self.futures_adapter.map_spot_to_futures(symbol)
                  if futures_symbol:
@@ -491,11 +488,11 @@ class TradingService:
 
                      # 2. Risk Validation (Safety Gate)
                      decision = self.risk_manager.validate_trade(
-                        signal, equity, 
-                        spot_price=Decimal(str(trigger_price)), 
+                        signal, equity,
+                        spot_price=Decimal(str(trigger_price)),
                         perp_mark_price=Decimal(str(trigger_price)) # Approx if no mark available yet
                      )
-                     
+
                      if not decision.approved:
                         logger.info(f"Trade rejected by Risk: {decision.rejection_reasons}")
                         return
@@ -514,7 +511,7 @@ class TradingService:
                                  del self.managed_positions[decision.close_symbol]
                              # Update Risk Manager
                              self.risk_manager.current_positions = [
-                                 p for p in self.risk_manager.current_positions 
+                                 p for p in self.risk_manager.current_positions
                                  if p.symbol != decision.close_symbol
                              ]
                          except Exception as e:
@@ -523,9 +520,8 @@ class TradingService:
 
                      # 4. Execute Entry
                      await self._execute_signal(signal, futures_symbol, Decimal(str(trigger_price)), decision)
-                 
-                 # 5. Record Decision Trace (Throttled 5m)
-                 # await self._record_decision_trace(symbol, signal, trigger_price) <- Moved out
+             else:
+                 logger.info(f"NO SIGNAL for {symbol}: Regime={signal.regime} Reason={signal.reasoning}")
                           
          except Exception as e:
              logger.error(
