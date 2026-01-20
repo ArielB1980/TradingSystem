@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 import pandas as pd
-from src.domain.models import Candle, Signal, SignalType
+from src.domain.models import Candle, Signal, SignalType, SetupType
 from src.strategy.indicators import Indicators
 from src.config.config import StrategyConfig
 from src.monitoring.logger import get_logger
@@ -120,9 +120,14 @@ class SMCEngine:
                 signal_type=SignalType.NO_SIGNAL,
                 entry_price=Decimal("0"),
                 stop_loss=Decimal("0"),
+                take_profit=None,
                 reasoning="ERROR: Missing 15m Data",
-                setup_type=None,
-                regime="no_data"
+                setup_type=SetupType.TREND,
+                regime="no_data",
+                higher_tf_bias="neutral",
+                adx=Decimal("0"),
+                atr=Decimal("0"),
+                ema200_slope="flat"
             )
             
         if not exec_candles_1h:
@@ -133,9 +138,14 @@ class SMCEngine:
                 signal_type=SignalType.NO_SIGNAL,
                 entry_price=Decimal("0"),
                 stop_loss=Decimal("0"),
+                take_profit=None,
                 reasoning="ERROR: Missing 1h Data",
-                setup_type=None,
-                regime="no_data"
+                setup_type=SetupType.TREND,
+                regime="no_data",
+                higher_tf_bias="neutral",
+                adx=Decimal("0"),
+                atr=Decimal("0"),
+                ema200_slope="flat"
             )
 
         bias = "neutral"
@@ -223,6 +233,10 @@ class SMCEngine:
                 regime_early = self._classify_regime_from_structure(structure_signal)
                 reasoning_parts.append(f"📊 Market Regime: {regime_early}")
 
+        import traceback
+        
+        # Step 2: Market Structure Change Detection & Confirmation
+        # Require structure change confirmation + reconfirmation before entry
         # Step 2: Market Structure Change Detection & Confirmation
         # Require structure change confirmation + reconfirmation before entry
         if signal is None:
@@ -253,7 +267,6 @@ class SMCEngine:
                                 reasoning_parts.append(f"🌊 High Volatility (ATR Ratio {ratio_val:.2f}) -> Extended Confirmation ({required_candles} candles)")
                             elif ratio_val < self.config.atr_confirmation_threshold_low:
                                 required_candles = self.config.min_confirmation_candles
-                                # reasoning_parts.append(f"💧 Low Volatility (ATR Ratio {ratio_val:.2f}) -> Reduced Confirmation ({required_candles} candles)")
 
                 except Exception as e:
                     # Fallback to default if ATR calc fails
@@ -621,7 +634,7 @@ class SMCEngine:
                             },
                             structure_info=structure_signal or {},
                             meta_info={
-                                "fib_levels": {str(k): float(v) for k, v in fib_levels.items()} if fib_levels else {},
+                                "fib_levels": {k: float(v) for k, v in vars(fib_levels).items() if isinstance(v, Decimal)} if fib_levels else {},
                                 "filters": {
                                     "adx": adx_value,
                                     "atr": float(atr_value)
@@ -1061,7 +1074,7 @@ class SMCEngine:
             atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
             atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
         else:
-            atr = atr_value  # Use cached value
+            atr = Decimal(str(atr_value))  # Use cached value, ensure Decimal
         
         # 3. Determine Stop Multiplier based on Regime
         if regime == "tight_smc":

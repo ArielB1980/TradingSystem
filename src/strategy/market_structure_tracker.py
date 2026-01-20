@@ -204,11 +204,12 @@ class MarketStructureTracker:
         
         # Check if price has held above/below break
         recent_candles = candles_1h[-threshold:]
-        break_price = structure_change.break_price
+        break_price = Decimal(str(structure_change.break_price))
         
         if structure_change.new_state == MarketStructureState.BULLISH:
             # Bullish break: price must stay above break
-            all_above = all(c.low >= break_price * Decimal("0.995") for c in recent_candles)  # 0.5% tolerance
+            # Convert candle low to Decimal for safe comparison
+            all_above = all(Decimal(str(c.low)) >= break_price * Decimal("0.995") for c in recent_candles)  # 0.5% tolerance
             if all_above:
                 structure_change.confirmed = True
                 structure_change.confirmed_at = recent_candles[-1].timestamp
@@ -221,7 +222,8 @@ class MarketStructureTracker:
                 return True
         elif structure_change.new_state == MarketStructureState.BEARISH:
             # Bearish break: price must stay below break
-            all_below = all(c.high <= break_price * Decimal("1.005") for c in recent_candles)  # 0.5% tolerance
+            # Convert candle high to Decimal for safe comparison
+            all_below = all(Decimal(str(c.high)) <= break_price * Decimal("1.005") for c in recent_candles)  # 0.5% tolerance
             if all_below:
                 structure_change.confirmed = True
                 structure_change.confirmed_at = recent_candles[-1].timestamp
@@ -232,6 +234,8 @@ class MarketStructureTracker:
                     confirmed_at=structure_change.confirmed_at
                 )
                 return True
+            
+        return False
         
         return False
     
@@ -272,8 +276,8 @@ class MarketStructureTracker:
         if not candles_15m or len(candles_15m) < 3:
             return False, False
         
-        current_price = candles_15m[-1].close
-        break_price = structure_change.break_price
+        current_price = Decimal(str(candles_15m[-1].close))
+        break_price = Decimal(str(structure_change.break_price))
         
         # Calculate adaptive tolerance
         # Base tolerance from config (e.g., 1.5%)
@@ -328,7 +332,7 @@ class MarketStructureTracker:
                     if in_zone:
                         # Check if we've had a pullback (price went up then came back)
                         recent_high = max(c.high for c in candles_15m[-10:])
-                        if recent_high > break_price:  # Price moved up after break
+                        if Decimal(str(recent_high)) > break_price:  # Price moved up after break
                             structure_change.reconfirmed = True
                             structure_change.reconfirmed_at = candles_15m[-1].timestamp
                             structure_change.entry_ready = True
@@ -348,7 +352,7 @@ class MarketStructureTracker:
                 # FALLBACK: No OB/FVG zone defined - use tolerance zone around break price
                 # For bullish: reconfirm if price retraces near break price after moving up
                 recent_high = max(c.high for c in candles_15m[-10:])
-                if recent_high > break_price:  # Confirmed move up
+                if Decimal(str(recent_high)) > break_price:  # Confirmed move up
                     # Check if price has retraced toward break price (within tolerance)
                     tolerance_zone_top = break_price * (Decimal("1") + tolerance)
                     tolerance_zone_bottom = break_price * (Decimal("1") - tolerance)
@@ -385,7 +389,7 @@ class MarketStructureTracker:
                     if in_zone:
                         # Check if we've had a pullback (price went down then came back)
                         recent_low = min(c.low for c in candles_15m[-10:])
-                        if recent_low < break_price:  # Price moved down after break
+                        if Decimal(str(recent_low)) < break_price:  # Price moved down after break
                             structure_change.reconfirmed = True
                             structure_change.reconfirmed_at = candles_15m[-1].timestamp
                             structure_change.entry_ready = True
@@ -405,7 +409,7 @@ class MarketStructureTracker:
                 # FALLBACK: No OB/FVG zone defined - use tolerance zone around break price
                 # For bearish: reconfirm if price retraces near break price after moving down
                 recent_low = min(c.low for c in candles_15m[-10:])
-                if recent_low < break_price:  # Confirmed move down
+                if Decimal(str(recent_low)) < break_price:  # Confirmed move down
                     # Check if price has retraced toward break price (within tolerance)
                     tolerance_zone_top = break_price * (Decimal("1") + tolerance)
                     tolerance_zone_bottom = break_price * (Decimal("1") - tolerance)

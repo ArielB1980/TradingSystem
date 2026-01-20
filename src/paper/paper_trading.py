@@ -243,7 +243,6 @@ class PaperTrading:
             trailing_active=False,
             break_even_active=False,
             peak_price=fill_price,
-            peak_price=fill_price,
             opened_at=datetime.now(timezone.utc),
             setup_type=signal.setup_type.value if hasattr(signal.setup_type, 'value') else signal.setup_type,
             regime=signal.regime

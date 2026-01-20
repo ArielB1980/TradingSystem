@@ -133,6 +133,9 @@ class BacktestEngine:
         end_date: datetime,
     ) -> BacktestMetrics:
         """Run backtest for given date range."""
+        # Initialize Kraken client (lazy init for CCXT)
+        await self.client.initialize()
+        
         logger.info("Starting backtest", start=start_date, end=end_date, symbol=self.symbol)
         
         # Calculate warmup period (need ~200 days for daily EMA)
