@@ -26,7 +26,8 @@ exchange:
 risk:
   # Position sizing (adaptive based on signal quality)
   risk_per_trade_pct: 0.015  # 1.5% base risk per trade
-  max_leverage: 10.0  # Use full 10x leverage capacity
+  max_leverage: 10.0  # Maximum leverage allowed (hard cap)
+  target_leverage: 7.0  # Target leverage for position sizing (5-10x range)
 
   # Sizing method: kelly_volatility combines Kelly Criterion with volatility adjustment
   sizing_method: "kelly_volatility"  # Options: fixed, kelly, volatility, kelly_volatility
@@ -141,7 +142,8 @@ execution:
   # Order settings
   default_order_type: "limit"
   slippage_tolerance_pct: 0.001  # 0.1%
-  order_timeout_seconds: 30
+  order_timeout_seconds: 120  # 2 minutes for limit orders to fill
+  order_price_invalidation_pct: 0.03  # Cancel if price moves 3% away from order
   max_retries: 3
   retry_backoff_seconds: 2
   

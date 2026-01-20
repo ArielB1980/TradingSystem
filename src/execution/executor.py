@@ -544,57 +544,95 @@ class Executor:
         
         return ghost_ids
     
-    async def check_order_timeouts(self) -> int:
+    async def check_order_timeouts(self, current_prices: Optional[Dict[str, Decimal]] = None) -> int:
         """
-        Check for expired orders and cancel them.
-        
+        Check for expired and price-invalidated orders and cancel them.
+
+        Args:
+            current_prices: Optional dict of symbol -> current_price for price-based cancellation
+
         Returns:
             Number of orders cancelled
         """
+        # 1. Time-based expiration
         expired_orders = self.order_monitor.get_expired_orders()
-        
-        if not expired_orders:
-            return 0
-        
-        cancelled_count = 0
-        
+
+        # 2. Price-based invalidation (if prices provided)
+        price_invalidated = []
+        if current_prices and hasattr(self.config, 'order_price_invalidation_pct'):
+            price_invalidated = self.order_monitor.get_price_invalidated_orders(
+                current_prices,
+                self.config.order_price_invalidation_pct
+            )
+
+        # Combine all orders to cancel (avoid duplicates)
+        orders_to_cancel_set = set()
         for tracked in expired_orders:
+            orders_to_cancel_set.add(tracked.order.order_id)
+        for tracked in price_invalidated:
+            orders_to_cancel_set.add(tracked.order.order_id)
+
+        # Build list of tracked orders to cancel
+        all_orders_to_cancel = []
+        for tracked in expired_orders + price_invalidated:
+            if tracked.order.order_id in orders_to_cancel_set:
+                all_orders_to_cancel.append(tracked)
+                orders_to_cancel_set.remove(tracked.order.order_id)  # Prevent duplicates
+
+        if not all_orders_to_cancel:
+            return 0
+
+        cancelled_count = 0
+
+        for tracked in all_orders_to_cancel:
             order = tracked.order
+
+            # Determine reason
+            is_expired = tracked.is_expired
+            is_price_invalid = tracked in price_invalidated
+
+            reason_parts = []
+            if is_expired:
+                reason_parts.append(f"timeout ({tracked.age_seconds:.0f}s > {tracked.timeout_seconds}s)")
+            if is_price_invalid:
+                reason_parts.append("price moved away")
+            reason = " & ".join(reason_parts)
+
             try:
                 logger.warning(
-                    "Order timeout detected, cancelling",
+                    f"Cancelling order: {reason}",
                     order_id=order.order_id,
                     symbol=order.symbol,
-                    age_seconds=tracked.age_seconds,
-                    timeout=tracked.timeout_seconds
+                    age_seconds=tracked.age_seconds
                 )
-                
+
                 # Cancel the order
                 await self.futures_adapter.cancel_order(order.order_id, order.symbol)
-                
+
                 # Mark as cancelled in monitor
                 self.order_monitor.mark_as_cancelled(order.order_id)
-                
+
                 # Remove from submitted orders
                 if order.client_order_id in self.submitted_orders:
                     del self.submitted_orders[order.client_order_id]
-                
+
                 cancelled_count += 1
-                
+
                 logger.info(
-                    "Expired order cancelled",
+                    "Order cancelled",
                     order_id=order.order_id,
-                    symbol=order.symbol
+                    symbol=order.symbol,
+                    reason=reason
                 )
-                
+
             except Exception as e:
                 logger.error(
-                    "Failed to cancel expired order",
+                    "Failed to cancel order",
                     order_id=order.order_id,
                     symbol=order.symbol,
                     error=str(e)
                 )
-        
+
         return cancelled_count
     
     async def reconcile_orders(self, exchange_orders: list[Order]) -> None:
