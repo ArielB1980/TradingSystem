@@ -31,9 +31,9 @@ async def import_unmanaged_positions():
 
     # Initialize clients
     kraken_client = KrakenClient(
-        api_key=config.kraken.futures_api_key,
-        api_secret=config.kraken.futures_api_secret,
-        use_testnet=config.kraken.use_testnet
+        api_key=config.exchange.futures_api_key,
+        api_secret=config.exchange.futures_api_secret,
+        use_testnet=config.exchange.use_testnet
     )
 
     position_manager = PositionManager(
