@@ -528,7 +528,19 @@ class TradingService:
                  # await self._record_decision_trace(symbol, signal, trigger_price) <- Moved out
                           
          except Exception as e:
-             logger.error(f"Analysis failed for {symbol}: {e}")
+             logger.error(
+                 f"Analysis failed for {symbol}: {type(e).__name__} - {e}",
+                 exc_info=True,
+                 extra={
+                     "symbol": symbol,
+                     "error_type": type(e).__name__,
+                     "trigger_price": str(trigger_price) if trigger_price else None,
+                     "has_15m": c15m is not None,
+                     "has_1h": c1h is not None,
+                     "has_4h": c4h is not None,
+                     "has_1d": c1d is not None
+                 }
+             )
              
          # Record Trace regardless of signal (Visibility)
          if c15m and signal: 

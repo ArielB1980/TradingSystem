@@ -57,6 +57,14 @@ class BasisGuard:
         Returns:
             (approved, divergence_pct, rejection_reason)
         """
+        if spot_price <= 0:
+            logger.error(
+                "Invalid spot price in pre-entry basis check",
+                symbol=symbol,
+                spot_price=str(spot_price)
+            )
+            return False, Decimal("0"), "Invalid spot price (zero or negative)"
+
         divergence_pct = abs(spot_price - perp_mark_price) / spot_price
         max_basis = Decimal(str(self.config.basis_max_pct))
         
@@ -100,6 +108,14 @@ class BasisGuard:
         Returns:
             (allow_pyramiding, divergence_pct)
         """
+        if spot_price <= 0:
+            logger.error(
+                "Invalid spot price in post-entry basis check",
+                symbol=symbol,
+                spot_price=str(spot_price)
+            )
+            return False, Decimal("0")
+
         divergence_pct = abs(spot_price - perp_mark_price) / spot_price
         max_basis_post = Decimal(str(self.config.basis_max_post_pct))
         
