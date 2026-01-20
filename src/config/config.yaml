@@ -24,9 +24,12 @@ exchange:
 
 ## Risk Management
 risk:
-  # Position sizing (ULTRA-CONSERVATIVE for live start)
-  risk_per_trade_pct: 0.003  # 0.3% of account equity per trade
+  # Position sizing (adaptive based on signal quality)
+  risk_per_trade_pct: 0.015  # 1.5% base risk per trade
   max_leverage: 10.0  # Use full 10x leverage capacity
+
+  # Sizing method: kelly_volatility combines Kelly Criterion with volatility adjustment
+  sizing_method: "kelly_volatility"  # Options: fixed, kelly, volatility, kelly_volatility
   
   # Liquidation safety
   min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
@@ -47,6 +50,23 @@ risk:
   rr_distortion_strict_limit_pct: 0.10  # Strict cap for normal stops (>1.5%)
   tight_stop_threshold_pct: 0.015  # Definition of "tight stop" (1.5%)
   funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
+
+  # Kelly Criterion Settings (for kelly and kelly_volatility sizing)
+  kelly_win_prob: 0.55  # 55% win rate assumption
+  kelly_win_loss_ratio: 2.0  # Average winner is 2x average loser
+  kelly_max_fraction: 0.30  # Cap at 30% of Kelly recommendation (safety)
+
+  # Max risk per trade when using Kelly sizing
+  max_risk_per_trade_entry_pct: 0.03  # Max 3% risk per trade (cap for Kelly)
+
+  # Volatility sizing adjustments
+  vol_sizing_atr_threshold_high: 1.5  # Reduce size if ATR > 1.5x average
+  vol_sizing_atr_threshold_low: 0.5  # Increase size if ATR < 0.5x average
+  vol_sizing_high_vol_penalty: 0.30  # -30% size in high volatility
+  vol_sizing_low_vol_boost: 0.20  # +20% size in low volatility
+
+  # Position size cap
+  max_position_size_usd: 100000  # Max $100k notional per position
 
   # V2.1 Regime Risk
   tight_smc_cost_cap_bps: 25.0
