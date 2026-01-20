@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from data.kraken_client import KrakenFuturesClient
+from data.kraken_client import KrakenClient
 from config.config import load_config
 from domain.models import Side
 from execution.position_manager import PositionManager
@@ -30,11 +30,9 @@ async def import_unmanaged_positions():
     config = load_config()
 
     # Initialize clients
-    kraken_client = KrakenFuturesClient(
-        api_key=config.kraken.api_key,
-        api_secret=config.kraken.api_secret,
-        futures_api_key=config.kraken.futures_api_key,
-        futures_api_secret=config.kraken.futures_api_secret,
+    kraken_client = KrakenClient(
+        api_key=config.kraken.futures_api_key,
+        api_secret=config.kraken.futures_api_secret,
         use_testnet=config.kraken.use_testnet
     )
 
