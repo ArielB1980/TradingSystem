@@ -17,7 +17,6 @@ import time
 import asyncio
 import json
 import websockets
-import websockets
 import aiohttp
 import certifi
 import ssl
@@ -472,7 +471,7 @@ class KrakenClient:
         """
         await self.public_limiter.wait_for_token()
         try:
-            # Fetch all tickers from V3 endpoint
+            # Fetch all tickers from API endpoint
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             timeout = aiohttp.ClientTimeout(total=30)

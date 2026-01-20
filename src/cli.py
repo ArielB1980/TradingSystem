@@ -253,30 +253,43 @@ def kill_switch_cmd(
         python src/cli.py kill-switch status
     """
     from rich.console import Console
-    from src.monitoring.kill_switch import get_kill_switch
-    
+    from src.utils.kill_switch import get_kill_switch, KillSwitchReason
+
     console = Console()
     ks = get_kill_switch()
-    
+
     if action == "activate":
-        ks.activate(reason=reason, activated_by="CLI")
+        ks.activate_sync(reason=KillSwitchReason.MANUAL)
         console.print("[bold red]🚨 KILL SWITCH ACTIVATED[/bold red]")
         console.print(f"Reason: {reason}")
-        console.print("\nAll trading halted. Positions will be closed on next tick.")
-        
+        console.print("\nAll trading halted. Orders will be cancelled and positions closed on next tick.")
+        console.print("Use 'acknowledge' to allow restart after resolving the issue.")
+
+    elif action == "acknowledge":
+        if ks.acknowledge():
+            console.print("[bold green]✅ KILL SWITCH ACKNOWLEDGED[/bold green]")
+            console.print("Trading can resume.")
+        else:
+            console.print("[yellow]Kill switch is not latched - nothing to acknowledge[/yellow]")
+
     elif action == "deactivate":
-        ks.deactivate(deactivated_by="CLI")
-        console.print("[bold green]✅ KILL SWITCH DEACTIVATED[/bold green]")
-        console.print("Trading can resume.")
+        console.print("[yellow]Note: Use 'acknowledge' instead of 'deactivate' for latched kill switch[/yellow]")
+        if ks.acknowledge():
+            console.print("[bold green]✅ KILL SWITCH DEACTIVATED[/bold green]")
+            console.print("Trading can resume.")
+        else:
+            console.print("[yellow]Kill switch is not active[/yellow]")
         
     elif action == "status":
         status = ks.get_status()
         if status["active"]:
             console.print("[bold red]🚨 KILL SWITCH: ACTIVE[/bold red]")
+            console.print(f"Latched: {status['latched']}")
             console.print(f"Activated at: {status['activated_at']}")
-            console.print(f"Activated by: {status['activated_by']}")
             console.print(f"Reason: {status['reason']}")
             console.print(f"Duration: {status['duration_seconds']:.0f}s")
+            if status['latched']:
+                console.print("\n[yellow]Run 'kill-switch acknowledge' to allow restart[/yellow]")
         else:
             console.print("[bold green]✅ KILL SWITCH: INACTIVE[/bold green]")
             console.print("Trading is operational.")

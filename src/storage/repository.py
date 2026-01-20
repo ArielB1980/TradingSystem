@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import List, Optional, Dict, Tuple, Any
 import json
 from src.storage.db import Base, get_db
-from src.domain.models import Candle, Trade, Position, Side
+from src.domain.models import Candle, Trade, Position
 
 
 # Query Cache
@@ -83,15 +83,11 @@ class CandleModel(Base):
     timestamp = Column(DateTime, nullable=False)
     symbol = Column(String, nullable=False)
     timeframe = Column(String, nullable=False)
-    # Optimized for crypto precision (e.g. PEPE price 0.000001, SHIB volume 1T)
-    # Precision 30, Scale 10 allows:
-    # - Max Value: 99,999,999,999,999,999,999.9999999999 (20 digits integer part)
-    # - Min Resolution: 0.0000000001
-    open = Column(Numeric(precision=30, scale=10), nullable=False)
-    high = Column(Numeric(precision=30, scale=10), nullable=False)
-    low = Column(Numeric(precision=30, scale=10), nullable=False)
-    close = Column(Numeric(precision=30, scale=10), nullable=False)
-    volume = Column(Numeric(precision=30, scale=10), nullable=False)
+    open = Column(Numeric(precision=20, scale=8), nullable=False)
+    high = Column(Numeric(precision=20, scale=8), nullable=False)
+    low = Column(Numeric(precision=20, scale=8), nullable=False)
+    close = Column(Numeric(precision=20, scale=8), nullable=False)
+    volume = Column(Numeric(precision=20, scale=8), nullable=False)
 
 
 class TradeModel(Base):
@@ -126,7 +122,7 @@ class TradeModel(Base):
 class PositionModel(Base):
     """ORM model for open positions (state tracking)."""
     __tablename__ = "positions"
-
+    
     symbol = Column(String, primary_key=True)
     side = Column(String, nullable=False)
     size = Column(Numeric(precision=20, scale=8), nullable=False)
@@ -137,26 +133,16 @@ class PositionModel(Base):
     unrealized_pnl = Column(Numeric(precision=20, scale=2), nullable=False)
     leverage = Column(Numeric(precision=10, scale=2), nullable=False)
     margin_used = Column(Numeric(precision=20, scale=2), nullable=False)
-
+    
     stop_loss_order_id = Column(String, nullable=True)
     take_profit_order_id = Column(String, nullable=True)
-
+    
     # Active Trade Management fields
     initial_stop_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp1_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp2_price = Column(Numeric(precision=20, scale=8), nullable=True)
     final_target_price = Column(Numeric(precision=20, scale=8), nullable=True)
-    trade_type = Column(String, nullable=True)  # "breakout", "pullback", "reversal"
-    partial_close_pct = Column(Numeric(precision=5, scale=2), nullable=True)  # % to close at TP1
-    original_size = Column(Numeric(precision=20, scale=8), nullable=True)  # Original position size
-    tp_order_ids = Column(String, nullable=True)  # JSON list of TP order IDs
-
-    # Basis and Funding Tracking
-    basis_at_entry = Column(Numeric(precision=20, scale=8), nullable=True)  # Futures - Spot at entry
-    basis_current = Column(Numeric(precision=20, scale=8), nullable=True)  # Current basis
-    funding_rate = Column(Numeric(precision=20, scale=8), nullable=True)  # Current funding rate
-    cumulative_funding = Column(Numeric(precision=20, scale=8), nullable=True)  # Total funding
-
+    
     opened_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -195,11 +181,24 @@ class AccountStateModel(Base):
 
 
 # Repository Functions
-
+def save_candle(candle: Candle) -> None:
+    """Save a candle to the database."""
+    db = get_db()
+    with db.get_session() as session:
+        candle_model = CandleModel(
+            timestamp=candle.timestamp,
+            symbol=candle.symbol,
+            timeframe=candle.timeframe,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            volume=candle.volume,
+        )
+        session.add(candle_model)
 
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import insert as generic_insert
 
 def save_candles_bulk(candles: List[Candle]) -> int:
@@ -252,31 +251,32 @@ def save_candles_bulk(candles: List[Candle]) -> int:
             )
             session.execute(stmt)
         else:
-            # SQLite: Use bulk INSERT OR REPLACE for atomic upsert (50x faster than N+1)
-            stmt = sqlite_insert(CandleModel).values(values)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=['symbol', 'timeframe', 'timestamp'],
-                set_={
-                    'open': stmt.excluded.open,
-                    'high': stmt.excluded.high,
-                    'low': stmt.excluded.low,
-                    'close': stmt.excluded.close,
-                    'volume': stmt.excluded.volume
-                }
-            )
-            session.execute(stmt)
+            # SQLite: Use INSERT OR REPLACE (upsert equivalent)
+            # Note: SQLite doesn't support ON CONFLICT with partial updates well
+            # So we do individual upserts for each candle
+            for value in values:
+                # Check if exists
+                existing = session.query(CandleModel).filter(
+                    CandleModel.symbol == value["symbol"],
+                    CandleModel.timeframe == value["timeframe"],
+                    CandleModel.timestamp == value["timestamp"]
+                ).first()
+                
+                if existing:
+                    # Update
+                    existing.open = value["open"]
+                    existing.high = value["high"]
+                    existing.low = value["low"]
+                    existing.close = value["close"]
+                    existing.volume = value["volume"]
+                else:
+                    # Insert
+                    candle_model = CandleModel(**value)
+                    session.add(candle_model)
             
-    # Invalidate query cache after writes to prevent stale data
-    clear_cache()
-    
     return len(candles)
 
 
-
-
-def save_candle(candle: Candle) -> None:
-    """Save a candle to the database."""
-    save_candles_bulk([candle])
 
 
 def get_candles(
@@ -312,41 +312,6 @@ def get_candles(
     _query_cache.set(cache_key, result)
     
     return result
-
-
-def get_latest_candle_timestamp(symbol: str, timeframe: str) -> Optional[datetime]:
-    """
-    Get timestamp of the most recent candle for a symbol/timeframe.
-    Optimized for incremental fetching.
-    """
-    db = get_db()
-    with db.get_session() as session:
-        # Use simple query with order_by desc
-        result = session.query(CandleModel.timestamp).filter(
-            CandleModel.symbol == symbol,
-            CandleModel.timeframe == timeframe
-        ).order_by(CandleModel.timestamp.desc()).first()
-        
-        if result:
-            return result[0].replace(tzinfo=timezone.utc)
-        return None
-    
-    
-def count_candles(symbol: str, timeframe: str) -> int:
-    """
-    Count candles for a symbol/timeframe.
-    Used for dashboard data depth verification.
-    """
-    try:
-        # Use a proper session from the Database instance
-        with get_db().get_session() as session:
-            return session.query(CandleModel).filter(
-                CandleModel.symbol == symbol,
-                CandleModel.timeframe == timeframe
-            ).count()
-    except Exception as e:
-        # Don't log error here to avoid spam, just return 0
-        return 0
 
 
 def _get_candles_from_db(
@@ -662,7 +627,7 @@ def get_active_positions() -> List[Position]:
                 margin_used=Decimal(str(pm.margin_used)),
                 opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
                 updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
-                # V3 Params
+                # Position params
                 initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
                 trade_type=pm.trade_type,
                 tp1_price=Decimal(str(pm.tp1_price)) if pm.tp1_price else None,
@@ -941,7 +906,7 @@ def get_latest_account_state() -> Optional[Dict[str, Decimal]]:
         }
 
 
-def get_latest_traces(limit: int = 1000) -> List[Dict]:
+def get_latest_traces(limit: int = 300) -> List[Dict]:
     """
     Get the latest DECISION_TRACE event for each symbol.
     
@@ -977,44 +942,68 @@ def get_latest_traces(limit: int = 1000) -> List[Dict]:
                 'timestamp': e.timestamp.replace(tzinfo=timezone.utc),
                 'details': json.loads(e.details)
             })
-        
+
         return results
 
 
-def get_decision_traces_since(since: datetime) -> List[Dict]:
+def save_intent_hash(intent_hash: str, symbol: str, timestamp: datetime) -> None:
     """
-    Retrieve DECISION_TRACE events since a specific time.
-    
+    Save order intent hash to prevent duplicate orders after restart.
+
     Args:
-        since: Datetime to filter from (inclusive)
-    
-    Returns:
-        Generator yielding event dictionaries with parsed details
+        intent_hash: Unique hash of the order intent
+        symbol: Trading symbol
+        timestamp: Signal timestamp
     """
-    db = get_db()
-    
-    # Ensure timezone awareness
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-        
-    with db.get_session() as session:
-        # Use the composite index (event_type, timestamp)
-        # Use yield_per to stream results in chunks to avoid OOM
-        query = session.query(SystemEventModel).filter(
-            SystemEventModel.event_type == "DECISION_TRACE",
-            SystemEventModel.timestamp >= since
-        ).order_by(SystemEventModel.timestamp.asc())
-        
-        # Stream results in batches of 1000
-        for e in query.yield_per(1000):
-            try:
-                details = json.loads(e.details)
-            except:
-                details = {}
-                
-            yield {
-                "id": e.id,
-                "timestamp": e.timestamp.replace(tzinfo=timezone.utc),
-                "symbol": e.symbol,
-                "details": details
+    from sqlalchemy import text
+    from src.storage.database import get_session
+
+    with get_session() as session:
+        # Store in events table with special event_type
+        session.execute(
+            text("""
+                INSERT INTO events (symbol, timestamp, event_type, details)
+                VALUES (:symbol, :timestamp, 'ORDER_INTENT_HASH', :details)
+            """),
+            {
+                "symbol": symbol,
+                "timestamp": timestamp.replace(tzinfo=timezone.utc),
+                "details": json.dumps({"intent_hash": intent_hash})
             }
+        )
+        session.commit()
+
+
+def load_recent_intent_hashes(lookback_hours: int = 24) -> set:
+    """
+    Load recent order intent hashes from database.
+
+    Args:
+        lookback_hours: How many hours back to load hashes
+
+    Returns:
+        Set of intent hash strings
+    """
+    from sqlalchemy import text
+    from src.storage.database import get_session
+
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    hashes = set()
+
+    with get_session() as session:
+        results = session.execute(
+            text("""
+                SELECT details
+                FROM events
+                WHERE event_type = 'ORDER_INTENT_HASH'
+                  AND timestamp >= :cutoff_time
+            """),
+            {"cutoff_time": cutoff_time}
+        ).fetchall()
+
+        for row in results:
+            details = json.loads(row[0])
+            hashes.add(details["intent_hash"])
+
+    return hashes
+

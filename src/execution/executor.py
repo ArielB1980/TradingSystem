@@ -51,8 +51,9 @@ class Executor:
         
         # Order tracking for idempotency
         self.submitted_orders: Dict[str, Order] = {}  # client_order_id → Order
-        self.order_intents_seen: Set[str] = set()  # intent hash for deduplication
-        
+        self.order_intents_seen: Set[str] = set()  # intent hash for deduplication (memory)
+        self._load_persisted_intent_hashes()  # Load from database on startup
+
         # Per-symbol locks to prevent race conditions in parallel processing
         # Using defaultdict to create locks on demand
         self._symbol_locks = defaultdict(asyncio.Lock)
@@ -235,22 +236,25 @@ class Executor:
                         symbol=futures_symbol,
                         error=str(e)
                     )
-                    
+
+
                 # Check if we have any pending (open) entry orders for this symbol
-                # We check submitted_orders tracking locally to avoid API latency
-                # Check if we have any pending (open) entry orders for this symbol
-                # We check submitted_orders tracking locally to avoid API latency
+                # Block duplicate entry orders - only one entry order per symbol at a time
                 has_pending = any(
-                    self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol) and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
-                    and o.side == order_intent.side # Same side check? Or any side? Generally one order per symbol.
+                    self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol)
+                    and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
+                    and o.side == order_intent.side  # Same side to allow reversal orders
                     for o in self.submitted_orders.values()
                 )
-                
+
                 if has_pending:
                     logger.warning(
                         "Duplicate order guard REJECTED",
                         symbol=futures_symbol,
-                        reason="Pending entry order already exists in local state"
+                        side=order_intent.side.value,
+                        reason="Pending entry order already exists in local state",
+                        local_orders=len([o for o in self.submitted_orders.values()
+                                         if self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol)])
                     )
                     return None
             
@@ -274,7 +278,8 @@ class Executor:
                 # Track order
                 self.submitted_orders[entry_order.client_order_id] = entry_order
                 self.order_intents_seen.add(intent_hash)
-                
+                self._persist_intent_hash(intent_hash, order_intent)  # Persist to survive restarts
+
                 # Register with order monitor for timeout tracking
                 self.order_monitor.track_order(entry_order)
                 
@@ -298,6 +303,7 @@ class Executor:
                 # This prevents rapid retry loops when order placement fails
                 # The hash will expire naturally as signals change over time
                 self.order_intents_seen.add(intent_hash)
+                self._persist_intent_hash(intent_hash, order_intent)  # Persist to survive restarts
                 logger.debug(
                     "Added failed intent to seen set to prevent immediate retry",
                     symbol=order_intent.signal.symbol,
@@ -486,6 +492,24 @@ class Executor:
         except Exception as e:
              logger.error("Emergency close all failed", error=str(e))
 
+    def _load_persisted_intent_hashes(self):
+        """Load recent intent hashes from database on startup to prevent duplicates after restart."""
+        try:
+            from src.storage.repository import load_recent_intent_hashes
+            persisted_hashes = load_recent_intent_hashes(lookback_hours=24)
+            self.order_intents_seen.update(persisted_hashes)
+            logger.info(f"Loaded {len(persisted_hashes)} persisted intent hashes from last 24h")
+        except Exception as e:
+            logger.warning(f"Failed to load persisted intent hashes: {e}")
+
+    def _persist_intent_hash(self, intent_hash: str, intent: OrderIntent):
+        """Persist intent hash to database for duplicate prevention after restart."""
+        try:
+            from src.storage.repository import save_intent_hash
+            save_intent_hash(intent_hash, intent.signal.symbol, intent.signal.timestamp)
+        except Exception as e:
+            logger.warning(f"Failed to persist intent hash: {e}")
+
     def _hash_intent(self, intent: OrderIntent) -> str:
         """Generate hash for order intent deduplication."""
         components = [
@@ -495,7 +519,7 @@ class Executor:
             str(intent.size_notional),
         ]
         return "-".join(components)
-    
+
     def detect_ghost_orders(self, exchange_orders: list[Order]) -> list[str]:
         """
         Detect ghost orders (orders we think exist but exchange doesn't have).
