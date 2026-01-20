@@ -68,7 +68,7 @@ class FuturesAdapter:
             return futures_symbol
             
         # Dynamic Fallback: PF_{BASE}USD
-        # Most V3 tickers follow this pattern (PF_ETHUSD, PF_SOLUSD, etc.)
+        # Most tickers follow this pattern (PF_ETHUSD, PF_SOLUSD, etc.)
         try:
             base = spot_symbol.split('/')[0]
             # Handle special cases if any (BTC is handled in TICKER_MAP)

@@ -191,7 +191,7 @@ def load_all_coins() -> List[CoinSnapshot]:
                     if isinstance(last_update, str):
                         try:
                             last_update = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
-                        except:
+                        except (ValueError, AttributeError):
                             last_update = datetime.now(timezone.utc)
                     elif last_update.tzinfo is None:
                         # Make timezone-aware if naive
@@ -299,7 +299,7 @@ def get_coin_detail(symbol: str) -> Optional[Dict]:
             if isinstance(ts, str):
                 try:
                     return datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                except:
+                except (ValueError, AttributeError):
                     return datetime.now(timezone.utc)
             return ts or datetime.now(timezone.utc)
         

@@ -38,17 +38,17 @@ class SMCEngine:
         """
         self.config = config
         self.indicators = Indicators()
-        
-        # V2: Per-symbol caching for multi-asset support (optimized with tuple keys)
+
+        # Per-symbol caching for multi-asset support (optimized with tuple keys)
         self.indicator_cache: Dict[Tuple[str, datetime], Dict] = {}
         self.cache_max_size = 1000  # Prevent unbounded growth
         self.cache_max_age = timedelta(hours=2)  # Configurable
-        
-        # V2: Fibonacci engine for confluence scoring
+
+        # Fibonacci engine for confluence scoring
         from src.strategy.fibonacci_engine import FibonacciEngine
         self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
-        
-        # V2.1: Signal Scorer
+
+        # Signal quality scoring
         from src.strategy.signal_scorer import SignalScorer
         self.signal_scorer = SignalScorer(config)
         
@@ -123,7 +123,7 @@ class SMCEngine:
         # Step 1: Higher-timeframe bias
         if signal is None:
             bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
-            # V2.1: Neutral bias DOES NOT block immediately - waits for Score Gate
+            # Neutral bias DOES NOT block immediately - waits for Score Gate
             # unless bias determination failed completely (e.g. insufficient data)
             if "Insufficient candles" in reasoning_parts[-1]:
                 signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1] if exec_candles_1h else None)
@@ -599,7 +599,7 @@ class SMCEngine:
         """
         Determine higher-timeframe bias (bullish/bearish/neutral).
         
-        V2.1 Rules:
+        Rules:
         - Price > EMA200 -> Bullish
         - Price < EMA200 -> Bearish
         - abs(Price - EMA200) < configurable bps -> Neutral
@@ -861,7 +861,7 @@ class SMCEngine:
         """
         Calculate Levels: Entry, Stop, TP.
         
-        V2.1 Regime:
+        Regime:
         - tight_smc: Stop = Invalid + 0.3-0.6 ATR, TP = 2.0R min
         - wide_structure: Stop = Invalid + 1.0-1.2 ATR, TP = 1.5R min
         """
@@ -941,7 +941,7 @@ class SMCEngine:
             
         else:
              # Neutral bias - generally no trade unless counter-trend enabled?
-             # For V2.1, neutral can trade if score is high.
+             # Neutral can trade if score is high.
              # Assume logic mirrors bullish/bearish based on structure type
              if structure.get('order_block'):
                  ob = structure['order_block']
@@ -997,7 +997,7 @@ class SMCEngine:
                 take_profit = entry_price - min_tp_dist
 
         reasoning.append(
-            f"✓ V2.1 Levels ({regime}): Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}"
+            f"✓ Levels ({regime}): Entry ${entry_price}, Stop ${stop_loss}, TP ${take_profit}"
         )
         
         class_info = {

@@ -37,7 +37,7 @@ class RiskManager:
         self.daily_pnl = Decimal("0")
         self.daily_start_equity = Decimal("0")
         
-        # V2.1: Regime-specific streak tracking
+        # Regime-specific streak tracking
         self.consecutive_losses_tight = 0
         self.consecutive_losses_wide = 0
         

@@ -1,5 +1,5 @@
 """
-Signal quality scoring system for V2.
+Signal quality scoring system.
 
 Scores each signal on multiple factors to prioritize opportunities.
 Used for dashboard display and future trade selection optimization.
@@ -45,7 +45,7 @@ class SignalScorer:
     
     Philosophy:
     - High scores = better confluence, structure, and efficiency
-    - HARD GATE: Signals below threshold are rejected (V2.1)
+    - HARD GATE: Signals below threshold are rejected
     - Used for prioritization and dashboard display
     """
     
@@ -219,8 +219,8 @@ class SignalScorer:
     def _score_htf_alignment(self, signal: Signal, bias: str) -> float:
         """
         Score HTF alignment (0-20 points).
-        
-        V2.1 Logic:
+
+        Logic:
         - Direction aligned with Bias: +20
         - Bias Neutral: +10
         - Counter-trend: 0
@@ -241,8 +241,8 @@ class SignalScorer:
     def _score_adx_strength(self, adx: float) -> float:
         """
         Score ADX trend strength (0-15 points).
-        
-        Scoring (V2.1 lower thresholds):
+
+        Scoring thresholds:
         - ADX >= 40: 15
         - ADX >= 30: 12
         - ADX >= 25: 10

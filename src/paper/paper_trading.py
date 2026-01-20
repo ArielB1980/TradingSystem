@@ -238,7 +238,6 @@ class PaperTrading:
             leverage=decision.leverage,
             margin_used=decision.margin_required,
             stop_loss_order_id=sl_id,
-            take_profit_order_id=None, # Deprecated in favor of tp_order_ids
             tp_order_ids=tp_ids,
             trailing_active=False,
             break_even_active=False,

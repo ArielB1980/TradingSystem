@@ -627,7 +627,7 @@ def get_active_positions() -> List[Position]:
                 margin_used=Decimal(str(pm.margin_used)),
                 opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
                 updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
-                # V3 Params
+                # Position params
                 initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
                 trade_type=pm.trade_type,
                 tp1_price=Decimal(str(pm.tp1_price)) if pm.tp1_price else None,
@@ -942,6 +942,68 @@ def get_latest_traces(limit: int = 300) -> List[Dict]:
                 'timestamp': e.timestamp.replace(tzinfo=timezone.utc),
                 'details': json.loads(e.details)
             })
-        
+
         return results
+
+
+def save_intent_hash(intent_hash: str, symbol: str, timestamp: datetime) -> None:
+    """
+    Save order intent hash to prevent duplicate orders after restart.
+
+    Args:
+        intent_hash: Unique hash of the order intent
+        symbol: Trading symbol
+        timestamp: Signal timestamp
+    """
+    from sqlalchemy import text
+    from src.storage.database import get_session
+
+    with get_session() as session:
+        # Store in events table with special event_type
+        session.execute(
+            text("""
+                INSERT INTO events (symbol, timestamp, event_type, details)
+                VALUES (:symbol, :timestamp, 'ORDER_INTENT_HASH', :details)
+            """),
+            {
+                "symbol": symbol,
+                "timestamp": timestamp.replace(tzinfo=timezone.utc),
+                "details": json.dumps({"intent_hash": intent_hash})
+            }
+        )
+        session.commit()
+
+
+def load_recent_intent_hashes(lookback_hours: int = 24) -> set:
+    """
+    Load recent order intent hashes from database.
+
+    Args:
+        lookback_hours: How many hours back to load hashes
+
+    Returns:
+        Set of intent hash strings
+    """
+    from sqlalchemy import text
+    from src.storage.database import get_session
+
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    hashes = set()
+
+    with get_session() as session:
+        results = session.execute(
+            text("""
+                SELECT details
+                FROM events
+                WHERE event_type = 'ORDER_INTENT_HASH'
+                  AND timestamp >= :cutoff_time
+            """),
+            {"cutoff_time": cutoff_time}
+        ).fetchall()
+
+        for row in results:
+            details = json.loads(row[0])
+            hashes.add(details["intent_hash"])
+
+    return hashes
 

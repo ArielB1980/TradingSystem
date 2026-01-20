@@ -78,7 +78,7 @@ with st.sidebar:
     st.header("⚙️ System Status")
     
     # Kill switch status
-    from src.monitoring.kill_switch import get_kill_switch
+    from src.utils.kill_switch import get_kill_switch
     ks = get_kill_switch()
     ks_status = ks.get_status()
     
