@@ -136,13 +136,25 @@ class PositionModel(Base):
     
     stop_loss_order_id = Column(String, nullable=True)
     take_profit_order_id = Column(String, nullable=True)
-    
+
     # Active Trade Management fields
     initial_stop_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp1_price = Column(Numeric(precision=20, scale=8), nullable=True)
     tp2_price = Column(Numeric(precision=20, scale=8), nullable=True)
     final_target_price = Column(Numeric(precision=20, scale=8), nullable=True)
-    
+
+    # Additional fields for position tracking
+    trade_type = Column(String, nullable=True)  # "breakout", "pullback", "reversal"
+    partial_close_pct = Column(Numeric(precision=10, scale=4), nullable=True, default=0.5)
+    original_size = Column(Numeric(precision=20, scale=8), nullable=True)
+    tp_order_ids = Column(String, nullable=True)  # JSON array of TP order IDs
+
+    # Basis and funding tracking
+    basis_at_entry = Column(Numeric(precision=10, scale=4), nullable=True)
+    basis_current = Column(Numeric(precision=10, scale=4), nullable=True)
+    funding_rate = Column(Numeric(precision=10, scale=6), nullable=True)
+    cumulative_funding = Column(Numeric(precision=20, scale=2), nullable=True, default=0)
+
     opened_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
