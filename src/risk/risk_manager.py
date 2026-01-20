@@ -94,7 +94,11 @@ class RiskManager:
                 approved=False,
                 rejection_reasons=["Invalid entry price (zero or negative)"],
                 position_notional=Decimal("0"),
-                leverage=Decimal("1")
+                leverage=Decimal("1"),
+                margin_required=Decimal("0"),
+                liquidation_buffer_pct=Decimal("0"),
+                basis_divergence_pct=Decimal("0"),
+                estimated_fees_funding=Decimal("0")
             )
 
         stop_distance_pct = abs(entry_for_risk - stop_for_risk) / entry_for_risk
@@ -110,7 +114,11 @@ class RiskManager:
                 approved=False,
                 rejection_reasons=["Invalid account equity (zero or negative)"],
                 position_notional=Decimal("0"),
-                leverage=Decimal("1")
+                leverage=Decimal("1"),
+                margin_required=Decimal("0"),
+                liquidation_buffer_pct=Decimal("0"),
+                basis_divergence_pct=Decimal("0"),
+                estimated_fees_funding=Decimal("0")
             )
 
         # Calculate leverage setting (Fixed target as per PRD)
