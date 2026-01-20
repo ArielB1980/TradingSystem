@@ -121,8 +121,10 @@ class RiskManager:
                 estimated_fees_funding=Decimal("0")
             )
 
-        # Calculate leverage setting (Fixed target as per PRD)
-        requested_leverage = Decimal(str(self.config.max_leverage))
+        # Calculate leverage setting (use target leverage for sizing)
+        # target_leverage determines actual position leverage (e.g., 7x)
+        # max_leverage is the absolute cap for safety checks (10x)
+        requested_leverage = Decimal(str(getattr(self.config, 'target_leverage', self.config.max_leverage)))
         
         # --- NEW SIZING LOGIC (V4: Adaptive) ---
         sizing_method = getattr(self.config, 'sizing_method', 'fixed')

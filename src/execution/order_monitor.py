@@ -114,18 +114,68 @@ class OrderMonitor:
     def get_expired_orders(self) -> List[TrackedOrder]:
         """
         Get all orders that have exceeded timeout.
-        
+
         Returns:
             List of expired TrackedOrder objects
         """
         expired = []
-        
+
         for tracked in self.tracked_orders.values():
             if tracked.is_expired and tracked.is_pending and not tracked.cancelled:
                 expired.append(tracked)
-        
+
         return expired
-    
+
+    def get_price_invalidated_orders(
+        self,
+        current_prices: Dict[str, Decimal],
+        invalidation_pct: float = 0.03
+    ) -> List[TrackedOrder]:
+        """
+        Get all orders where price has moved away significantly.
+
+        Args:
+            current_prices: Dict of symbol -> current_price
+            invalidation_pct: % threshold (e.g., 0.03 = 3%)
+
+        Returns:
+            List of price-invalidated TrackedOrder objects
+        """
+        invalidated = []
+        threshold = Decimal(str(invalidation_pct))
+
+        for tracked in self.tracked_orders.values():
+            if not tracked.is_pending or tracked.cancelled:
+                continue
+
+            order = tracked.order
+
+            # Only check limit orders with a price
+            if not order.price or order.price == Decimal("0"):
+                continue
+
+            # Get current price for this symbol
+            current_price = current_prices.get(order.symbol)
+            if not current_price or current_price == Decimal("0"):
+                continue
+
+            # Calculate price deviation
+            price_deviation = abs(current_price - order.price) / order.price
+
+            if price_deviation > threshold:
+                logger.warning(
+                    "Order price invalidated by market movement",
+                    order_id=order.order_id,
+                    symbol=order.symbol,
+                    order_price=str(order.price),
+                    current_price=str(current_price),
+                    deviation_pct=f"{price_deviation*100:.2f}%",
+                    threshold_pct=f"{invalidation_pct*100:.1f}%"
+                )
+                invalidated.append(tracked)
+
+        return invalidated
+
     def mark_as_cancelled(self, order_id: str) -> None:
         """
         Mark order as cancelled (prevents re-cancellation).

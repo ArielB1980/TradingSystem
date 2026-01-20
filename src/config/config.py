@@ -47,6 +47,7 @@ class RiskConfig(BaseSettings):
     # Position sizing
     risk_per_trade_pct: float = Field(default=0.005, ge=0.0001, le=0.05)
     max_leverage: float = Field(default=10.0, ge=1.0, le=10.0)
+    target_leverage: float = Field(default=7.0, ge=1.0, le=10.0)  # Actual leverage to use
     max_position_size_usd: float = Field(default=50000.0, ge=1000.0)
 
     # Sizing Method: fixed, kelly, volatility, kelly_volatility
@@ -260,10 +261,11 @@ class ExecutionConfig(BaseSettings):
     trailing_update_min_ticks: int = 2
     trail_tighten_after_tp2: bool = False
     trail_atr_mult_after_tp2: float = 1.6
-    order_timeout_seconds: int = Field(default=30, ge=10, le=120)
+    order_timeout_seconds: int = Field(default=120, ge=10, le=300)
+    order_price_invalidation_pct: float = Field(default=0.03, ge=0.01, le=0.10)  # Cancel if price moves X% away
     max_retries: int = Field(default=3, ge=1, le=10)
     retry_backoff_seconds: int = Field(default=2, ge=1, le=10)
-    
+
     # Pyramiding
     pyramiding_enabled: bool = False  # Default: no adding to positions
 
