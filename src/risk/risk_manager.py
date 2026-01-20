@@ -128,13 +128,26 @@ class RiskManager:
         
         # --- NEW SIZING LOGIC (V4: Adaptive) ---
         sizing_method = getattr(self.config, 'sizing_method', 'fixed')
-        
-        # Base Sizing (Fixed Risk)
-        # Position size = (Equity * Risk%) / Stop_Dist%
-        base_risk_amount = account_equity * Decimal(str(self.config.risk_per_trade_pct))
-        position_notional = base_risk_amount / stop_distance_pct
-        
-        # Kelly Criterion Sizing
+
+        # Leverage-Based Sizing (Simple)
+        # Position size = Equity × Leverage × Risk%
+        if sizing_method == "leverage_based":
+            buying_power = account_equity * requested_leverage
+            position_notional = buying_power * Decimal(str(self.config.risk_per_trade_pct))
+            logger.debug(
+                "Leverage-based sizing",
+                equity=str(account_equity),
+                leverage=str(requested_leverage),
+                risk_pct=str(self.config.risk_per_trade_pct),
+                position_notional=str(position_notional)
+            )
+        else:
+            # Base Sizing (Fixed Risk)
+            # Position size = (Equity * Risk%) / Stop_Dist%
+            base_risk_amount = account_equity * Decimal(str(self.config.risk_per_trade_pct))
+            position_notional = base_risk_amount / stop_distance_pct
+
+        # Kelly Criterion Sizing (skip if leverage_based)
         if sizing_method in ["kelly", "kelly_volatility"]:
             win_prob = Decimal(str(self.config.kelly_win_prob))
             win_loss_ratio = Decimal(str(self.config.kelly_win_loss_ratio))

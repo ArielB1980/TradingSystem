@@ -24,13 +24,13 @@ exchange:
 
 ## Risk Management
 risk:
-  # Position sizing (adaptive based on signal quality)
-  risk_per_trade_pct: 0.015  # 1.5% base risk per trade
+  # Position sizing (leverage-based)
+  risk_per_trade_pct: 0.03  # 3% of buying power per trade
   max_leverage: 10.0  # Maximum leverage allowed (hard cap)
   target_leverage: 7.0  # Target leverage for position sizing (5-10x range)
 
-  # Sizing method: kelly_volatility combines Kelly Criterion with volatility adjustment
-  sizing_method: "kelly_volatility"  # Options: fixed, kelly, volatility, kelly_volatility
+  # Sizing method: leverage_based = (Equity × Leverage × Risk%)
+  sizing_method: "leverage_based"  # Options: fixed, kelly, volatility, kelly_volatility, leverage_based
   
   # Liquidation safety
   min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
