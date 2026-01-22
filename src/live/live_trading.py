@@ -431,7 +431,7 @@ class LiveTrading:
         Optimized for batch processing (Phase 10).
         """
         # 0. Kill Switch Check (HIGHEST PRIORITY)
-        ks = get_kill_switch()
+        ks = self.kill_switch
         
         if ks.is_active():
             logger.critical("Kill switch is active - halting trading")

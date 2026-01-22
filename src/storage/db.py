@@ -1,9 +1,9 @@
 """
 Database engine and session management.
 
-Supports both PostgreSQL and SQLite with SQLAlchemy ORM.
+PostgreSQL only - SQLite is no longer supported.
 """
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from contextlib import contextmanager
 from typing import Generator
@@ -15,61 +15,51 @@ Base = declarative_base()
 
 class Database:
     """Database engine and session manager."""
-    
+
     def __init__(self, database_url: str):
         """
         Initialize database connection.
-        
+
         Args:
-            database_url: Database connection string
+            database_url: PostgreSQL connection string
         """
+        if not database_url.startswith("postgresql"):
+            raise ValueError(
+                f"Only PostgreSQL is supported. Got: {database_url[:30]}... "
+                "Set DATABASE_URL to a postgresql:// connection string."
+            )
+
         self.database_url = database_url
-        
-        # Optimize connection pooling
-        pool_kwargs = {
-            "echo": False,
-            "pool_pre_ping": True,  # Verify connections before using
-        }
-        
-        # Add pooling config for non-SQLite databases
-        if not database_url.startswith("sqlite"):
-            pool_kwargs.update({
-                "pool_size": 10,  # Base connections
-                "max_overflow": 20,  # Additional connections under load
-                "pool_recycle": 3600,  # Recycle connections after 1 hour
-                "pool_timeout": 30,  # Wait up to 30s for connection
-            })
-        
-        self.engine = create_engine(database_url, **pool_kwargs)
-        
-        # Enable foreign key constraints for SQLite
-        if database_url.startswith("sqlite"):
-            @event.listens_for(self.engine, "connect")
-            def set_sqlite_pragma(dbapi_conn, connection_record):
-                cursor = dbapi_conn.cursor()
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.execute("PRAGMA journal_mode=WAL")
-                cursor.execute("PRAGMA synchronous=NORMAL")
-                cursor.close()
-        
+
+        # Optimized connection pooling for PostgreSQL
+        self.engine = create_engine(
+            database_url,
+            echo=False,
+            pool_pre_ping=True,  # Verify connections before using
+            pool_size=10,  # Base connections
+            max_overflow=20,  # Additional connections under load
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            pool_timeout=30,  # Wait up to 30s for connection
+        )
+
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-    
+
     def create_all(self):
         """Create all tables."""
         Base.metadata.create_all(bind=self.engine)
-    
+
     def drop_all(self):
         """Drop all tables (use with caution!)."""
         Base.metadata.drop_all(bind=self.engine)
-    
+
     @contextmanager
     def get_session(self) -> Generator[Session, None, None]:
         """
         Context manager for database sessions.
-        
+
         Yields:
             SQLAlchemy Session
-        
+
         Example:
             with db.get_session() as session:
                 session.add(obj)
@@ -94,7 +84,12 @@ def get_db() -> Database:
     """Get or create the global database instance."""
     global _db_instance
     if _db_instance is None:
-        database_url = os.getenv("DATABASE_URL", "sqlite:///./trading.db")
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL environment variable is required. "
+                "Set it to a postgresql:// connection string."
+            )
         _db_instance = Database(database_url)
         _db_instance.create_all()
     return _db_instance
@@ -103,10 +98,10 @@ def get_db() -> Database:
 def init_db(database_url: str) -> Database:
     """
     Initialize database with specific URL.
-    
+
     Args:
-        database_url: Database connection string
-    
+        database_url: PostgreSQL connection string
+
     Returns:
         Database instance
     """

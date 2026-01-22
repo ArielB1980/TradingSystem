@@ -143,8 +143,8 @@ class Executor:
                     symbol=order_data.get('symbol', ''),
                     side=side,
                     order_type=order_type,
-                    size=Decimal(str(order_data.get('amount', 0))),
-                    price=Decimal(str(order_data.get('price', 0))) if order_data.get('price') else None,
+                    size=Decimal(str(order_data.get('amount') or 0)),
+                    price=Decimal(str(order_data.get('price'))) if order_data.get('price') else None,
                     status=status,
                     reduce_only=order_data.get('reduceOnly', False)
                 )

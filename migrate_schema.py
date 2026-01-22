@@ -8,40 +8,29 @@ load_dotenv(".env.local")
 load_dotenv(".env")
 
 def migrate():
+    """Run PostgreSQL schema migrations."""
     print("Running schema migration...")
-    print(f"Target Database: {os.environ.get('DATABASE_URL', 'default (sqlite)')}")
+    db_url = os.environ.get('DATABASE_URL', 'NOT SET')
+    print(f"Target Database: {db_url[:50]}...")
+
     db = get_db()
     engine = db.engine
-    
-    # We need to alter the columns. SQL alchemy doesn't do this automatically with create_all
-    # Direct SQL is safest for cross-db support, but syntax differs. 
-    # Since we are on Postgres (Production) and SQLite (Local), we check first.
-    
-    with engine.connect() as conn:
-        # Check dialect
-        dialect = engine.dialect.name
-        print(f"Detected database dialect: {dialect}")
-        
-        if dialect == "postgresql":
-            print("Applying PostgreSQL column alterations...")
-            conn.execute(text("ALTER TABLE candles ALTER COLUMN open TYPE NUMERIC(30, 10);"))
-            conn.execute(text("ALTER TABLE candles ALTER COLUMN high TYPE NUMERIC(30, 10);"))
-            conn.execute(text("ALTER TABLE candles ALTER COLUMN low TYPE NUMERIC(30, 10);"))
-            conn.execute(text("ALTER TABLE candles ALTER COLUMN close TYPE NUMERIC(30, 10);"))
-            conn.execute(text("ALTER TABLE candles ALTER COLUMN volume TYPE NUMERIC(30, 10);"))
-            conn.commit()
-            print("Migration complete!")
-        else:
-            print("SQLite does not support direct ALTER COLUMN. Skipping (local dev uses different file mostly).")
-            # For SQLite, it's dynamic typing anyway, so it usually just works, 
-            # or requires a full table rebuild which is overkill for local dev right now.
 
-    # 2. Add new columns to positions table if they don't exist
-    # This block handles adding new columns (safe to run if they exist with safeguards, or just let it fail/catch)
-    with engine.connect() as conn:
-        dialect = engine.dialect.name
+    # Verify PostgreSQL
+    dialect = engine.dialect.name
+    if dialect != "postgresql":
+        raise RuntimeError(f"Expected PostgreSQL, got {dialect}. Update DATABASE_URL.")
 
-        # List of new columns: name, type
+    with engine.connect() as conn:
+        # 1. Alter candle columns for higher precision
+        print("Applying candle column alterations...")
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            conn.execute(text(f"ALTER TABLE candles ALTER COLUMN {col} TYPE NUMERIC(30, 10);"))
+            print(f"  ✓ candles.{col}")
+        conn.commit()
+
+        # 2. Add new columns to positions table if they don't exist
+        print("Adding position columns...")
         new_cols = [
             ("trade_type", "VARCHAR"),
             ("partial_close_pct", "NUMERIC(5, 2)"),
@@ -52,36 +41,15 @@ def migrate():
             ("funding_rate", "NUMERIC(20, 8)"),
             ("cumulative_funding", "NUMERIC(20, 8)"),
         ]
+        for col_name, col_type in new_cols:
+            try:
+                conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                print(f"  ✓ positions.{col_name}")
+            except Exception as e:
+                print(f"  ⚠ positions.{col_name}: {e}")
+        conn.commit()
 
-        if dialect == "postgresql":
-            print("Checking/Adding new columns to positions table (PostgreSQL)...")
-            for col_name, col_type in new_cols:
-                try:
-                    conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
-                    print(f"  ✓ {col_name}")
-                except Exception as e:
-                    print(f"  ⚠ {col_name}: {e}")
-            conn.commit()
-
-        elif dialect == "sqlite":
-            print("Checking/Adding new columns to positions table (SQLite)...")
-            # Get existing columns
-            result = conn.execute(text("PRAGMA table_info(positions)"))
-            existing_cols = {row[1] for row in result.fetchall()}
-            print(f"  Existing columns: {len(existing_cols)}")
-
-            for col_name, col_type in new_cols:
-                if col_name not in existing_cols:
-                    try:
-                        conn.execute(text(f"ALTER TABLE positions ADD COLUMN {col_name} {col_type}"))
-                        conn.commit()
-                        print(f"  ✓ Added {col_name}")
-                    except Exception as e:
-                        print(f"  ⚠ {col_name}: {e}")
-                else:
-                    print(f"  - {col_name} exists")
-
-        print("Column addition complete!")
+    print("Migration complete!")
 
 if __name__ == "__main__":
     migrate()

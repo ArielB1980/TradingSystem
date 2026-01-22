@@ -233,20 +233,15 @@ class KrakenClient:
                 )
                 results.update(tickers)
             except asyncio.TimeoutError:
-                 logger.warning(f"Bulk fetch timed out for chunk {i//chunk_size}")
-                 # Proceed to fallback
+                 logger.debug(f"Bulk fetch timed out for chunk {i//chunk_size}, falling back to individual")
                  pass 
             except Exception as e:
-                # If bulk fetch fails, try individual fetches for the chunk
-                logger.warning(f"Bulk fetch failed for chunk {i//chunk_size}", error=str(e))
-                pass
-            except BaseException as be:
-                logger.critical(f"Critical error in bulk fetch chunk {i//chunk_size}", error=str(be))
-                # Don't re-raise immediately, try to fallback or continue
+                # If bulk fetch fails, it might be due to ONE bad symbol in the chunk
+                logger.debug(f"Bulk fetch failed for chunk {i//chunk_size}, falling back to individual", error=str(e))
                 pass
 
-            # Fallback logic if results were not updated (either timeout or exception)
-            # Check which symbols are missing from results
+            # Fallback logic: check which symbols are missing from results and fetch individually
+            # This handles both timeouts and partial failures (invalid symbols)
             missing = [s for s in chunk if s not in results]
             if missing:
                 for symbol in missing:
@@ -257,7 +252,9 @@ class KrakenClient:
                             timeout=0.5
                         )
                         results[symbol] = ticker
-                    except Exception:
+                    except Exception as e:
+                        # Log as debug to avoid spamming warnings for unsupported coins
+                        logger.debug(f"Individual fetch failed for {symbol}", error=str(e))
                         pass
                     await asyncio.sleep(0) # Yield
         
