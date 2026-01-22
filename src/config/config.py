@@ -397,16 +397,19 @@ class Config(BaseSettings):
             config_dict["environment"] = os.environ["ENVIRONMENT"]
             
         # Default local DB if not provided and not in prod
-        if config_dict.get("environment") != "prod" and not config_dict.get("data", {}).get("database_url"):
-            # Ensure .local directory exists
-            local_dir = Path("./.local")
-            local_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Set default SQLite URL
+        # DATABASE_URL is required (PostgreSQL only)
+        if not config_dict.get("data", {}).get("database_url"):
+            import os
+            db_url = os.getenv("DATABASE_URL")
+            if not db_url:
+                raise ValueError(
+                    "DATABASE_URL is required. Set it in your environment or .env.local file. "
+                    "Example: postgresql://user@localhost/tradingsystem"
+                )
             if "data" not in config_dict:
                 config_dict["data"] = {}
-            config_dict["data"]["database_url"] = "sqlite:///./.local/bot.db"
-            
+            config_dict["data"]["database_url"] = db_url
+
         # Force dry_run if not explicitly set in local/dev
         if config_dict.get("environment") != "prod":
             if "system" not in config_dict:

@@ -368,6 +368,29 @@ def _get_candles_from_db(
         ]
 
 
+def get_latest_candle_timestamp(symbol: str, timeframe: str) -> Optional[datetime]:
+    """
+    Get the timestamp of the latest candle for a symbol and timeframe.
+    
+    Args:
+        symbol: Symbol to check
+        timeframe: Timeframe to check
+        
+    Returns:
+        Timestamp of latest candle or None if no candles exist
+    """
+    db = get_db()
+    with db.get_session() as session:
+        last_ts = session.query(CandleModel.timestamp).filter(
+            CandleModel.symbol == symbol,
+            CandleModel.timeframe == timeframe
+        ).order_by(CandleModel.timestamp.desc()).first()
+        
+        if last_ts:
+            return last_ts[0].replace(tzinfo=timezone.utc)
+        return None
+
+
 def load_candles_map(
     symbols: List[str],
     timeframe: str,
