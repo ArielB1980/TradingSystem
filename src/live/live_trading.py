@@ -15,6 +15,25 @@ from src.execution.executor import Executor
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_manager import PositionManager, ActionType, ManagementAction
+# Production-Grade Position State Machine
+from src.execution.position_state_machine import (
+    ManagedPosition,
+    PositionState,
+    PositionRegistry,
+    ExitReason,
+    OrderEvent,
+    OrderEventType,
+    get_position_registry,
+    reset_position_registry
+)
+from src.execution.position_manager_v2 import (
+    PositionManagerV2,
+    ManagementAction as ManagementActionV2,
+    ActionType as ActionTypeV2
+)
+from src.execution.execution_gateway import ExecutionGateway
+from src.execution.position_persistence import PositionPersistence
+
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
 from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles, get_latest_candle_timestamp
@@ -58,8 +77,49 @@ class LiveTrading:
         self.kill_switch = KillSwitch(self.client)
         self.market_discovery = MarketDiscoveryService(self.client)
         
-        # State
-        # State
+        # ========== POSITION STATE MACHINE V2 ==========
+        # Feature flag for gradual rollout
+        import os
+        self.use_state_machine_v2 = os.getenv("USE_STATE_MACHINE_V2", "false").lower() == "true"
+        self.state_machine_shadow_mode = os.getenv("STATE_MACHINE_SHADOW_MODE", "true").lower() == "true"
+        
+        if self.use_state_machine_v2:
+            logger.critical("🚀 POSITION STATE MACHINE V2 ENABLED")
+            
+            # Initialize the Position Registry (singleton)
+            self.position_registry = get_position_registry()
+            
+            # Initialize Persistence (SQLite)
+            self.position_persistence = PositionPersistence("data/positions.db")
+            
+            # Initialize Position Manager V2
+            self.position_manager_v2 = PositionManagerV2(
+                registry=self.position_registry,
+                shadow_mode=self.state_machine_shadow_mode
+            )
+            
+            # Initialize Execution Gateway - ALL orders flow through here
+            # NOTE: In shadow mode, the gateway logs but doesn't execute
+            self.execution_gateway = ExecutionGateway(
+                exchange_client=self.client,
+                registry=self.position_registry,
+                position_manager=self.position_manager_v2,
+                persistence=self.position_persistence,
+                shadow_mode=self.state_machine_shadow_mode
+            )
+            
+            if self.state_machine_shadow_mode:
+                logger.warning("State Machine V2 running in SHADOW MODE - logging only, not executing")
+            else:
+                logger.critical("State Machine V2 running in LIVE MODE - all orders via gateway")
+        else:
+            # Legacy mode - use old managed_positions dict
+            self.position_registry = None
+            self.position_manager_v2 = None
+            self.execution_gateway = None
+            self.position_persistence = None
+        
+        # State (Legacy - will be deprecated when V2 fully enabled)
         self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
         self.active = False
         
@@ -91,10 +151,13 @@ class LiveTrading:
         self.data_acq = DataAcquisition(
             self.client,
             spot_symbols=self.markets,
-            futures_symbols=config.exchange.futures_markets # This needs expansion too ideally, but for now focus on spot scanning
+            futures_symbols=config.exchange.futures_markets
         )
         
-        logger.info("Live Trading initialized", markets=config.exchange.futures_markets)
+        logger.info("Live Trading initialized", 
+                   markets=config.exchange.futures_markets,
+                   state_machine_v2=self.use_state_machine_v2,
+                   shadow_mode=self.state_machine_shadow_mode if self.use_state_machine_v2 else "N/A")
     
     async def _update_market_universe(self):
         """Discover and update trading universe."""
@@ -186,18 +249,24 @@ class LiveTrading:
                     logger.error("Initial sync failed", error=str(e))
                     if not self.config.system.dry_run:
                         raise
+            
+            # 2.5 Position State Machine V2 Startup Recovery
+            if self.use_state_machine_v2 and self.execution_gateway:
+                try:
+                    logger.info("Starting Position State Machine V2 recovery...")
+                    await self.execution_gateway.startup()
+                    logger.info("Position State Machine V2 recovery complete",
+                               active_positions=len(self.position_registry.get_all_active()) if self.position_registry else 0)
+                except Exception as e:
+                    logger.error("Position State Machine V2 startup failed", error=str(e))
 
             # 3. Fast Startup - Load candles
             logger.info("Loading candles from database...")
             try:
                 # 3. Fast Startup - Load candles via Manager
                 await self.candle_manager.initialize(list(self.markets.keys()))
-                
             except Exception as e:
-                 logger.error("Failed to hydrate candles", error=str(e))
-                     
-            except Exception as e:
-                 logger.error("Failed to hydrate candles", error=str(e))
+                logger.error("Failed to hydrate candles", error=str(e))
 
             # 4. Start Data Acquisition
             await self.data_acq.start()
@@ -794,6 +863,12 @@ class LiveTrading:
         """Process signal through risk and executor."""
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
         
+        # ========== V2 PATH: Position State Machine ==========
+        if self.use_state_machine_v2 and self.position_manager_v2:
+            await self._handle_signal_v2(signal, spot_price, mark_price)
+            return
+        
+        # ========== LEGACY PATH (below) ==========
         # 1. Fetch Account Equity
         # For futures, we need futures balance
         balance = await self.client.get_futures_balance()
@@ -937,6 +1012,142 @@ class LiveTrading:
              logger.info("Position State initialized", symbol=futures_symbol)
              
              # Trade persistence happens on exit defined in Rules 11
+
+    async def _handle_signal_v2(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
+        """
+        Process signal through Position State Machine V2.
+        
+        CRITICAL: All orders flow through ExecutionGateway.
+        No direct exchange calls allowed.
+        """
+        import uuid
+        
+        logger.info("Processing signal via State Machine V2", 
+                   symbol=signal.symbol, 
+                   type=signal.signal_type.value)
+        
+        # 1. Fetch Account Equity
+        balance = await self.client.get_futures_balance()
+        equity, _, _ = await self._calculate_effective_equity(balance)
+        
+        if equity <= 0:
+            logger.error("Insufficient equity for trading", equity=str(equity))
+            return
+        
+        # 2. Risk Validation (Safety Gate)
+        decision = self.risk_manager.validate_trade(signal, equity, spot_price, mark_price)
+        
+        if not decision.approved:
+            logger.warning("Trade rejected by Risk Manager", reasons=decision.rejection_reasons)
+            return
+        
+        # 3. Map to futures symbol
+        futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
+        
+        # 4. Generate entry plan to get TP levels
+        order_intent = self.execution_engine.generate_entry_plan(
+            signal,
+            decision.position_notional,
+            spot_price,
+            mark_price,
+            decision.leverage
+        )
+        
+        tps = order_intent.get('take_profits', [])
+        tp1_price = tps[0]['price'] if len(tps) > 0 else None
+        tp2_price = tps[1]['price'] if len(tps) > 1 else None
+        final_target = tps[-1]['price'] if len(tps) > 2 else None
+        
+        # 5. Calculate position size in contracts
+        # Using the order_intent which has the calculated size
+        position_size = Decimal(str(order_intent.get('size', 0)))
+        if position_size <= 0:
+            position_size = decision.position_notional / mark_price
+        
+        # 6. Evaluate entry via Position Manager V2
+        # This enforces Invariant A (single position) and Invariant E (no reversal without close)
+        action, position = self.position_manager_v2.evaluate_entry(
+            signal=signal,
+            entry_price=mark_price,
+            stop_price=order_intent['metadata']['fut_sl'],
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            final_target=final_target,
+            position_size=position_size,
+            trade_type=signal.regime if hasattr(signal, 'regime') else "tight_smc"
+        )
+        
+        if action.type == ActionTypeV2.REJECT_ENTRY:
+            logger.warning("Entry REJECTED by State Machine", 
+                          symbol=signal.symbol, 
+                          reason=action.reason)
+            return
+        
+        # 7. Handle opportunity cost replacement via V2
+        if decision.should_close_existing and decision.close_symbol:
+            logger.warning("Opportunity cost replacement via V2",
+                          closing=decision.close_symbol,
+                          opening=signal.symbol)
+            
+            # Request reversal close
+            close_actions = self.position_manager_v2.request_reversal(
+                decision.close_symbol,
+                Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
+                mark_price
+            )
+            
+            # Execute close actions via gateway
+            for close_action in close_actions:
+                result = await self.execution_gateway.execute_action(close_action)
+                if not result.success:
+                    logger.error("Failed to close for replacement", error=result.error)
+                    return
+            
+            # Confirm reversal is closed
+            self.position_registry.confirm_reversal_closed(decision.close_symbol)
+        
+        # 8. Register position in state machine
+        # This is done BEFORE order placement to ensure we track the position
+        position.entry_order_id = action.client_order_id
+        position.entry_client_order_id = action.client_order_id
+        
+        try:
+            self.position_registry.register_position(position)
+        except Exception as e:
+            logger.error("Failed to register position", error=str(e))
+            return
+        
+        # 9. Execute entry via Execution Gateway
+        # This is the ONLY way to place orders
+        result = await self.execution_gateway.execute_action(action)
+        
+        if not result.success:
+            logger.error("Entry failed", error=result.error)
+            # Mark position as error
+            position.mark_error(f"Entry failed: {result.error}")
+            return
+        
+        logger.info("Entry order placed via V2",
+                   symbol=futures_symbol,
+                   client_order_id=action.client_order_id,
+                   exchange_order_id=result.exchange_order_id)
+        
+        # 10. Persist position state
+        if self.position_persistence:
+            self.position_persistence.save_position(position)
+            self.position_persistence.log_action(
+                position.position_id,
+                "entry_submitted",
+                {
+                    "signal_type": signal.signal_type.value,
+                    "entry_price": str(mark_price),
+                    "stop_price": str(position.initial_stop_price),
+                    "size": str(position_size)
+                }
+            )
+        
+        # Note: Stop placement happens in the gateway's order event handler
+        # when the entry fill is confirmed
 
 
     async def _update_candles(self, symbol: str):

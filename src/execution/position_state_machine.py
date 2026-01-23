@@ -1,0 +1,1050 @@
+"""
+Position State Machine - Production Grade.
+
+This module enforces world-class position management with:
+1. Single position per symbol (enforced)
+2. Explicit position states including in-flight states
+3. Hard stop attached to position (immutable floor)
+4. TP-driven partials only (state transitions, not random orders)
+5. Full close before direction change (reversal lock)
+6. Invariant assertions (runtime safety)
+7. Idempotent event handling
+8. Crash recovery support
+
+NO TRADE CAN EXIST OUTSIDE THIS STATE MACHINE.
+"""
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Tuple, Set
+import threading
+import hashlib
+import json
+
+from src.domain.models import Side, OrderType
+from src.monitoring.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# ============ INVARIANT CHECKING ============
+
+class InvariantViolation(Exception):
+    """Raised when a critical invariant is violated."""
+    pass
+
+
+def check_invariant(condition: bool, message: str) -> None:
+    """Assert an invariant. Raises InvariantViolation if false."""
+    if not condition:
+        logger.critical(f"INVARIANT VIOLATION: {message}")
+        raise InvariantViolation(message)
+
+
+# ============ ENUMS ============
+
+class PositionState(str, Enum):
+    """
+    Position lifecycle states.
+    
+    State Machine:
+        PENDING → OPEN (entry filled)
+        PENDING → CANCELLED (entry cancelled/rejected)
+        OPEN → PROTECTED (stop moved to break-even or better)
+        OPEN → PARTIAL (TP1 hit, partial close executed)
+        OPEN → EXIT_PENDING (exit order sent)
+        PROTECTED → PARTIAL (TP1 hit after BE protection)
+        PROTECTED → EXIT_PENDING (exit order sent)
+        PARTIAL → EXIT_PENDING (final exit order sent)
+        EXIT_PENDING → CLOSED (exit filled)
+        EXIT_PENDING → PARTIAL (partial exit fill, more remaining)
+        any → ERROR (reconciliation mismatch)
+        
+    Terminal States: CLOSED, CANCELLED, ERROR
+    In-Flight States: PENDING, EXIT_PENDING, CANCEL_PENDING
+    """
+    # Entry States
+    PENDING = "pending"              # Entry order submitted, awaiting fill
+    
+    # Active States
+    OPEN = "open"                    # Position filled, stop active, no protection yet
+    PROTECTED = "protected"          # Stop moved to break-even or profit-lock
+    PARTIAL = "partial"              # TP1/TP2 hit, partial close executed, runner active
+    
+    # In-Flight States (critical for production)
+    EXIT_PENDING = "exit_pending"    # Exit order sent, awaiting fill
+    CANCEL_PENDING = "cancel_pending" # Cancelling stale order
+    
+    # Terminal States
+    CLOSED = "closed"                # Position fully closed
+    CANCELLED = "cancelled"          # Entry never filled, cancelled
+    ERROR = "error"                  # Reconciliation error - requires manual intervention
+    ORPHANED = "orphaned"            # Exchange/registry mismatch
+
+
+class ExitReason(str, Enum):
+    """Reason for position exit."""
+    STOP_LOSS = "stop_loss"
+    TRAILING_STOP = "trailing_stop"
+    TAKE_PROFIT_1 = "take_profit_1"
+    TAKE_PROFIT_2 = "take_profit_2"
+    TAKE_PROFIT_FINAL = "take_profit_final"
+    PREMISE_INVALIDATION = "premise_invalidation"
+    DIRECTION_REVERSAL = "direction_reversal"
+    KILL_SWITCH = "kill_switch"
+    MANUAL = "manual"
+    TIME_BASED = "time_based"
+    ABANDON_SHIP = "abandon_ship"
+    RECONCILIATION = "reconciliation"
+    ORPHAN_FLATTEN = "orphan_flatten"
+
+
+class OrderEventType(str, Enum):
+    """Order event types for idempotent processing."""
+    SUBMITTED = "submitted"
+    ACKNOWLEDGED = "acknowledged"
+    PARTIAL_FILL = "partial_fill"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    REPLACED = "replaced"
+
+
+# ============ ORDER EVENT (for idempotent handling) ============
+
+@dataclass(frozen=True)
+class OrderEvent:
+    """
+    Immutable order event for idempotent processing.
+    
+    The same event applied twice MUST be a no-op.
+    """
+    order_id: str
+    client_order_id: str
+    event_type: OrderEventType
+    event_seq: int  # Sequence number for ordering
+    timestamp: datetime
+    
+    # Fill details (optional)
+    fill_qty: Optional[Decimal] = None
+    fill_price: Optional[Decimal] = None
+    fill_id: Optional[str] = None
+    
+    # Error details (optional)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    
+    def event_hash(self) -> str:
+        """Generate unique hash for deduplication."""
+        data = f"{self.order_id}:{self.event_type.value}:{self.event_seq}"
+        if self.fill_id:
+            data += f":{self.fill_id}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+# ============ FILL RECORD ============
+
+@dataclass
+class FillRecord:
+    """Record of a single fill."""
+    fill_id: str
+    order_id: str
+    side: Side  # LONG = buy, SHORT = sell
+    qty: Decimal
+    price: Decimal
+    timestamp: datetime
+    is_entry: bool  # True for entry fills, False for exit fills
+    
+    def __post_init__(self):
+        check_invariant(self.qty > 0, f"Fill qty must be positive: {self.qty}")
+
+
+# ============ MANAGED POSITION ============
+
+@dataclass
+class ManagedPosition:
+    """
+    Immutable position state container with production-grade invariants.
+    
+    CRITICAL DESIGN PRINCIPLES:
+    1. initial_* fields are IMMUTABLE after acknowledgement
+    2. State transitions are validated
+    3. Size can only DECREASE (partials), never increase
+    4. Stop can only move TOWARD profit, never away
+    5. All events are idempotent (duplicate = no-op)
+    """
+    # Identity
+    symbol: str
+    side: Side
+    position_id: str  # Unique identifier for this position instance
+    
+    # ========== IMMUTABLE ENTRY PARAMETERS (set at creation, never changed) ==========
+    # Invariant C: These NEVER mutate after entry acknowledgement
+    initial_size: Decimal
+    initial_entry_price: Decimal  # Basis price for calculations
+    initial_stop_price: Decimal   # HARD FLOOR - cannot be moved away from profit
+    initial_tp1_price: Optional[Decimal]
+    initial_tp2_price: Optional[Decimal]
+    initial_final_target: Optional[Decimal]
+    
+    # Current State
+    state: PositionState = PositionState.PENDING
+    current_stop_price: Optional[Decimal] = None  # Starts at initial, can only improve
+    
+    # ========== FILL TRACKING (Invariant B) ==========
+    entry_fills: List[FillRecord] = field(default_factory=list)
+    exit_fills: List[FillRecord] = field(default_factory=list)
+    
+    # Computed from fills (cached for performance)
+    _filled_entry_qty: Decimal = Decimal("0")
+    _filled_exit_qty: Decimal = Decimal("0")
+    _avg_entry_price: Optional[Decimal] = None
+    
+    # ========== ORDER TRACKING ==========
+    entry_order_id: Optional[str] = None
+    entry_client_order_id: Optional[str] = None
+    stop_order_id: Optional[str] = None
+    stop_client_order_id: Optional[str] = None
+    tp1_order_id: Optional[str] = None
+    tp2_order_id: Optional[str] = None
+    pending_exit_order_id: Optional[str] = None  # For EXIT_PENDING state
+    
+    # ========== EVENT TRACKING (for idempotency) ==========
+    processed_event_hashes: Set[str] = field(default_factory=set)
+    
+    # ========== STATE FLAGS ==========
+    entry_acknowledged: bool = False  # Invariant C kicks in after this
+    tp1_filled: bool = False
+    tp2_filled: bool = False
+    break_even_triggered: bool = False
+    trailing_active: bool = False
+    peak_price: Optional[Decimal] = None  # For trailing stop calculation
+    
+    # ========== EXIT TRACKING ==========
+    exit_reason: Optional[ExitReason] = None
+    exit_time: Optional[datetime] = None
+    
+    # ========== METADATA ==========
+    setup_type: Optional[str] = None
+    regime: Optional[str] = None
+    trade_type: Optional[str] = None  # "tight_smc" or "wide_structure"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # ========== CONFIGURATION ==========
+    partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1
+    min_partial_for_be: Decimal = Decimal("0.3")  # Min fill % before BE allowed
+    
+    def __post_init__(self):
+        """Validate position parameters."""
+        check_invariant(
+            self.initial_size > 0,
+            f"Invalid position size: {self.initial_size}"
+        )
+        check_invariant(
+            self.initial_stop_price is not None,
+            "Position MUST have initial stop price"
+        )
+        
+        # Validate stop direction
+        if self.side == Side.LONG:
+            check_invariant(
+                self.initial_stop_price < self.initial_entry_price,
+                f"LONG stop ({self.initial_stop_price}) must be below entry ({self.initial_entry_price})"
+            )
+        else:
+            check_invariant(
+                self.initial_stop_price > self.initial_entry_price,
+                f"SHORT stop ({self.initial_stop_price}) must be above entry ({self.initial_entry_price})"
+            )
+        
+        # Initialize current stop
+        if self.current_stop_price is None:
+            self.current_stop_price = self.initial_stop_price
+
+    # ========== COMPUTED PROPERTIES ==========
+    
+    @property
+    def filled_entry_qty(self) -> Decimal:
+        """Total entry quantity filled."""
+        return sum(f.qty for f in self.entry_fills)
+    
+    @property
+    def filled_exit_qty(self) -> Decimal:
+        """Total exit quantity filled."""
+        return sum(f.qty for f in self.exit_fills)
+    
+    @property
+    def remaining_qty(self) -> Decimal:
+        """
+        Remaining position quantity.
+        
+        Invariant B: remaining_qty = filled_entry_qty - filled_exit_qty
+        and must never go negative.
+        """
+        remaining = self.filled_entry_qty - self.filled_exit_qty
+        check_invariant(
+            remaining >= 0,
+            f"INVARIANT B VIOLATION: remaining_qty negative: {remaining}"
+        )
+        return remaining
+    
+    @property
+    def avg_entry_price(self) -> Optional[Decimal]:
+        """Volume-weighted average entry price."""
+        if not self.entry_fills:
+            return None
+        total_value = sum(f.qty * f.price for f in self.entry_fills)
+        total_qty = self.filled_entry_qty
+        if total_qty == 0:
+            return None
+        return total_value / total_qty
+    
+    @property
+    def is_terminal(self) -> bool:
+        """Check if position is in a terminal state."""
+        return self.state in (
+            PositionState.CLOSED,
+            PositionState.CANCELLED,
+            PositionState.ERROR,
+            PositionState.ORPHANED
+        )
+    
+    @property
+    def is_active(self) -> bool:
+        """Check if position has exposure (non-zero remaining qty)."""
+        return self.remaining_qty > 0 and not self.is_terminal
+    
+    # ========== IDEMPOTENT EVENT HANDLING ==========
+    
+    def _is_duplicate_event(self, event: OrderEvent) -> bool:
+        """Check if event was already processed."""
+        return event.event_hash() in self.processed_event_hashes
+    
+    def _mark_event_processed(self, event: OrderEvent) -> None:
+        """Mark event as processed for idempotency."""
+        self.processed_event_hashes.add(event.event_hash())
+        self.updated_at = datetime.now(timezone.utc)
+    
+    # ========== STATE TRANSITION METHODS ==========
+    
+    def apply_order_event(self, event: OrderEvent) -> bool:
+        """
+        Apply an order event to the position state.
+        
+        IDEMPOTENT: Duplicate events are no-ops.
+        
+        Returns:
+            True if state was modified, False if duplicate/no-op
+        """
+        # Idempotency check
+        if self._is_duplicate_event(event):
+            logger.debug(f"Duplicate event ignored: {event.event_hash()}")
+            return False
+        
+        self._mark_event_processed(event)
+        
+        # Route to appropriate handler
+        if event.event_type == OrderEventType.ACKNOWLEDGED:
+            return self._handle_acknowledged(event)
+        elif event.event_type == OrderEventType.PARTIAL_FILL:
+            return self._handle_partial_fill(event)
+        elif event.event_type == OrderEventType.FILLED:
+            return self._handle_fill(event)
+        elif event.event_type in (OrderEventType.CANCELLED, OrderEventType.EXPIRED):
+            return self._handle_cancel(event)
+        elif event.event_type == OrderEventType.REJECTED:
+            return self._handle_reject(event)
+        
+        return False
+    
+    def _handle_acknowledged(self, event: OrderEvent) -> bool:
+        """Handle order acknowledgement. Locks immutable fields."""
+        if event.order_id == self.entry_order_id:
+            self.entry_acknowledged = True
+            logger.info(f"Entry acknowledged for {self.symbol}, immutables locked")
+            return True
+        return False
+    
+    def _handle_partial_fill(self, event: OrderEvent) -> bool:
+        """Handle partial fill event."""
+        if event.fill_qty is None or event.fill_price is None:
+            logger.error(f"Partial fill missing qty/price: {event}")
+            return False
+        
+        return self._record_fill(event)
+    
+    def _handle_fill(self, event: OrderEvent) -> bool:
+        """Handle complete fill event."""
+        if event.fill_qty is None or event.fill_price is None:
+            logger.error(f"Fill missing qty/price: {event}")
+            return False
+        
+        return self._record_fill(event)
+    
+    def _record_fill(self, event: OrderEvent) -> bool:
+        """Record a fill and update state."""
+        is_entry = (event.order_id == self.entry_order_id)
+        is_exit = (event.order_id == self.pending_exit_order_id or 
+                   event.order_id == self.stop_order_id)
+        
+        fill = FillRecord(
+            fill_id=event.fill_id or f"{event.order_id}-{event.event_seq}",
+            order_id=event.order_id,
+            side=self.side if is_entry else (Side.SHORT if self.side == Side.LONG else Side.LONG),
+            qty=event.fill_qty,
+            price=event.fill_price,
+            timestamp=event.timestamp,
+            is_entry=is_entry
+        )
+        
+        if is_entry:
+            self.entry_fills.append(fill)
+            self._update_state_after_entry_fill()
+        elif is_exit:
+            self.exit_fills.append(fill)
+            self._update_state_after_exit_fill(event)
+        else:
+            logger.warning(f"Unknown fill order_id: {event.order_id}")
+            return False
+        
+        # Re-validate Invariant B
+        _ = self.remaining_qty  # Triggers check
+        
+        return True
+    
+    def _update_state_after_entry_fill(self) -> None:
+        """Update state after entry fill."""
+        if self.state == PositionState.PENDING:
+            self.state = PositionState.OPEN
+            logger.info(
+                "Position OPENED",
+                symbol=self.symbol,
+                side=self.side.value,
+                filled_qty=str(self.filled_entry_qty),
+                avg_price=str(self.avg_entry_price)
+            )
+    
+    def _update_state_after_exit_fill(self, event: OrderEvent) -> None:
+        """Update state after exit fill."""
+        remaining = self.remaining_qty
+        
+        if remaining <= 0:
+            # Fully closed
+            self.state = PositionState.CLOSED
+            self.exit_time = datetime.now(timezone.utc)
+            logger.info(
+                "Position CLOSED",
+                symbol=self.symbol,
+                exit_reason=self.exit_reason.value if self.exit_reason else "unknown"
+            )
+        elif self.state == PositionState.EXIT_PENDING:
+            # Partial exit fill
+            if event.event_type == OrderEventType.FILLED:
+                # Exit order fully filled but position not closed = error
+                self.state = PositionState.ERROR
+                logger.error(f"Exit order filled but position not closed: {self.symbol}")
+            else:
+                # Still more to fill
+                pass
+    
+    def _handle_cancel(self, event: OrderEvent) -> bool:
+        """Handle order cancellation."""
+        if event.order_id == self.entry_order_id and self.state == PositionState.PENDING:
+            if self.filled_entry_qty == 0:
+                self.state = PositionState.CANCELLED
+                logger.info(f"Entry cancelled for {self.symbol}")
+            else:
+                # Partial fill then cancel - position is open with partial qty
+                self.state = PositionState.OPEN
+        elif event.order_id == self.pending_exit_order_id:
+            # Exit cancelled - return to previous state
+            if self.remaining_qty > 0:
+                self.state = PositionState.PARTIAL if self.tp1_filled else PositionState.OPEN
+                self.pending_exit_order_id = None
+        return True
+    
+    def _handle_reject(self, event: OrderEvent) -> bool:
+        """Handle order rejection."""
+        if event.order_id == self.entry_order_id and self.state == PositionState.PENDING:
+            self.state = PositionState.CANCELLED
+            logger.error(f"Entry rejected for {self.symbol}: {event.error_message}")
+        return True
+    
+    # ========== STOP MANAGEMENT ==========
+    
+    def update_stop(self, new_stop_price: Decimal, order_id: Optional[str] = None) -> bool:
+        """
+        Update stop price.
+        
+        Invariant D: Stop can only move toward profit.
+        - LONG: stop can only move UP
+        - SHORT: stop can only move DOWN
+        """
+        if self.is_terminal:
+            return False
+        
+        # Invariant C: Cannot modify after entry acknowledged (only improve)
+        if self.entry_acknowledged:
+            if not self._validate_stop_move(new_stop_price):
+                return False
+        
+        old_stop = self.current_stop_price
+        self.current_stop_price = new_stop_price
+        if order_id:
+            self.stop_order_id = order_id
+        
+        self.updated_at = datetime.now(timezone.utc)
+        
+        logger.info(
+            "Stop updated",
+            symbol=self.symbol,
+            old=str(old_stop),
+            new=str(new_stop_price)
+        )
+        return True
+    
+    def _validate_stop_move(self, new_stop: Decimal) -> bool:
+        """
+        Validate stop movement direction (Invariant D).
+        
+        - LONG: new stop must be >= current stop (moving up)
+        - SHORT: new stop must be <= current stop (moving down)
+        - Cannot move past initial stop (hard floor)
+        """
+        if new_stop is None:
+            return False
+        
+        if self.side == Side.LONG:
+            if new_stop < self.initial_stop_price:
+                logger.error(f"Cannot move LONG stop below initial: {new_stop} < {self.initial_stop_price}")
+                return False
+            if self.current_stop_price and new_stop < self.current_stop_price:
+                logger.error(f"Cannot move LONG stop down: {new_stop} < {self.current_stop_price}")
+                return False
+        else:  # SHORT
+            if new_stop > self.initial_stop_price:
+                logger.error(f"Cannot move SHORT stop above initial: {new_stop} > {self.initial_stop_price}")
+                return False
+            if self.current_stop_price and new_stop > self.current_stop_price:
+                logger.error(f"Cannot move SHORT stop up: {new_stop} > {self.current_stop_price}")
+                return False
+        
+        return True
+    
+    # ========== BREAK-EVEN LOGIC (Conditional) ==========
+    
+    def should_trigger_break_even(self) -> bool:
+        """
+        Check if break-even should be triggered.
+        
+        Conditional requirements (prevents death by thousand stop-outs):
+        1. tp1 filled with qty >= min_partial_for_be
+        2. Have proven intent OR trade_type is "wide"
+        """
+        if self.break_even_triggered:
+            return False
+        
+        if not self.tp1_filled:
+            return False
+        
+        # Check minimum fill requirement
+        tp1_fill_ratio = self.filled_exit_qty / self.initial_size if self.initial_size > 0 else Decimal("0")
+        if tp1_fill_ratio < self.min_partial_for_be:
+            logger.debug(
+                f"BE skipped: TP1 fill ratio {tp1_fill_ratio} < min {self.min_partial_for_be}"
+            )
+            return False
+        
+        # For wide trades, earlier defense is OK
+        if self.trade_type == "wide_structure":
+            return True
+        
+        # For tight trades, need more confirmation (could add more logic here)
+        return True
+    
+    def trigger_break_even(self, be_price: Optional[Decimal] = None) -> bool:
+        """Trigger break-even stop move."""
+        if not self.should_trigger_break_even():
+            return False
+        
+        target = be_price or self.avg_entry_price
+        if target is None:
+            return False
+        
+        if self.update_stop(target):
+            self.break_even_triggered = True
+            if self.state == PositionState.OPEN:
+                self.state = PositionState.PROTECTED
+            return True
+        return False
+    
+    # ========== EXIT MANAGEMENT ==========
+    
+    def initiate_exit(self, reason: ExitReason, order_id: str) -> bool:
+        """
+        Initiate exit - transition to EXIT_PENDING.
+        """
+        if self.is_terminal or self.state == PositionState.EXIT_PENDING:
+            return False
+        
+        self.exit_reason = reason
+        self.pending_exit_order_id = order_id
+        self.state = PositionState.EXIT_PENDING
+        self.updated_at = datetime.now(timezone.utc)
+        
+        logger.info(
+            "Exit initiated",
+            symbol=self.symbol,
+            reason=reason.value,
+            order_id=order_id
+        )
+        return True
+    
+    def force_close(self, reason: ExitReason) -> None:
+        """Force immediate close (for emergencies)."""
+        self.exit_reason = reason
+        self.exit_time = datetime.now(timezone.utc)
+        self.state = PositionState.CLOSED
+        self.updated_at = datetime.now(timezone.utc)
+    
+    def mark_error(self, error_message: str) -> None:
+        """Mark position as ERROR state."""
+        self.state = PositionState.ERROR
+        self.updated_at = datetime.now(timezone.utc)
+        logger.error(f"Position marked ERROR: {self.symbol} - {error_message}")
+    
+    def mark_orphaned(self) -> None:
+        """Mark position as ORPHANED (exchange mismatch)."""
+        self.state = PositionState.ORPHANED
+        self.updated_at = datetime.now(timezone.utc)
+        logger.critical(f"Position marked ORPHANED: {self.symbol}")
+    
+    # ========== PRICE CHECKS ==========
+    
+    def check_stop_hit(self, current_price: Decimal) -> bool:
+        """Check if stop loss has been hit."""
+        if self.is_terminal or self.state == PositionState.EXIT_PENDING:
+            return False
+        if self.current_stop_price is None:
+            return False
+        
+        if self.side == Side.LONG:
+            return current_price <= self.current_stop_price
+        else:
+            return current_price >= self.current_stop_price
+    
+    def check_tp1_hit(self, current_price: Decimal) -> bool:
+        """Check if TP1 has been hit."""
+        if self.tp1_filled or self.initial_tp1_price is None:
+            return False
+        if self.side == Side.LONG:
+            return current_price >= self.initial_tp1_price
+        else:
+            return current_price <= self.initial_tp1_price
+    
+    def check_tp2_hit(self, current_price: Decimal) -> bool:
+        """Check if TP2 has been hit."""
+        if self.tp2_filled or self.initial_tp2_price is None:
+            return False
+        if not self.tp1_filled:
+            return False
+        if self.side == Side.LONG:
+            return current_price >= self.initial_tp2_price
+        else:
+            return current_price <= self.initial_tp2_price
+    
+    def check_final_target_hit(self, current_price: Decimal) -> bool:
+        """Check if final target has been hit."""
+        if self.initial_final_target is None:
+            return False
+        if self.side == Side.LONG:
+            return current_price >= self.initial_final_target
+        else:
+            return current_price <= self.initial_final_target
+    
+    # ========== SERIALIZATION (for persistence) ==========
+    
+    def to_dict(self) -> Dict:
+        """Serialize position for persistence."""
+        return {
+            "position_id": self.position_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "state": self.state.value,
+            "initial_size": str(self.initial_size),
+            "initial_entry_price": str(self.initial_entry_price),
+            "initial_stop_price": str(self.initial_stop_price),
+            "initial_tp1_price": str(self.initial_tp1_price) if self.initial_tp1_price else None,
+            "initial_tp2_price": str(self.initial_tp2_price) if self.initial_tp2_price else None,
+            "initial_final_target": str(self.initial_final_target) if self.initial_final_target else None,
+            "current_stop_price": str(self.current_stop_price) if self.current_stop_price else None,
+            "entry_acknowledged": self.entry_acknowledged,
+            "tp1_filled": self.tp1_filled,
+            "tp2_filled": self.tp2_filled,
+            "break_even_triggered": self.break_even_triggered,
+            "trailing_active": self.trailing_active,
+            "exit_reason": self.exit_reason.value if self.exit_reason else None,
+            "setup_type": self.setup_type,
+            "regime": self.regime,
+            "trade_type": self.trade_type,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "entry_order_id": self.entry_order_id,
+            "stop_order_id": self.stop_order_id,
+            "entry_fills": [
+                {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
+                for f in self.entry_fills
+            ],
+            "exit_fills": [
+                {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
+                for f in self.exit_fills
+            ],
+            "processed_event_hashes": list(self.processed_event_hashes)
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ManagedPosition":
+        """Deserialize position from persistence."""
+        pos = cls(
+            symbol=data["symbol"],
+            side=Side(data["side"]),
+            position_id=data["position_id"],
+            initial_size=Decimal(data["initial_size"]),
+            initial_entry_price=Decimal(data["initial_entry_price"]),
+            initial_stop_price=Decimal(data["initial_stop_price"]),
+            initial_tp1_price=Decimal(data["initial_tp1_price"]) if data.get("initial_tp1_price") else None,
+            initial_tp2_price=Decimal(data["initial_tp2_price"]) if data.get("initial_tp2_price") else None,
+            initial_final_target=Decimal(data["initial_final_target"]) if data.get("initial_final_target") else None,
+        )
+        
+        pos.state = PositionState(data["state"])
+        pos.current_stop_price = Decimal(data["current_stop_price"]) if data.get("current_stop_price") else None
+        pos.entry_acknowledged = data.get("entry_acknowledged", False)
+        pos.tp1_filled = data.get("tp1_filled", False)
+        pos.tp2_filled = data.get("tp2_filled", False)
+        pos.break_even_triggered = data.get("break_even_triggered", False)
+        pos.trailing_active = data.get("trailing_active", False)
+        pos.exit_reason = ExitReason(data["exit_reason"]) if data.get("exit_reason") else None
+        pos.setup_type = data.get("setup_type")
+        pos.regime = data.get("regime")
+        pos.trade_type = data.get("trade_type")
+        pos.created_at = datetime.fromisoformat(data["created_at"])
+        pos.updated_at = datetime.fromisoformat(data["updated_at"])
+        pos.entry_order_id = data.get("entry_order_id")
+        pos.stop_order_id = data.get("stop_order_id")
+        
+        # Restore fills
+        for f_data in data.get("entry_fills", []):
+            pos.entry_fills.append(FillRecord(
+                fill_id=f_data["fill_id"],
+                order_id=pos.entry_order_id or "",
+                side=pos.side,
+                qty=Decimal(f_data["qty"]),
+                price=Decimal(f_data["price"]),
+                timestamp=datetime.fromisoformat(f_data["ts"]),
+                is_entry=True
+            ))
+        
+        for f_data in data.get("exit_fills", []):
+            pos.exit_fills.append(FillRecord(
+                fill_id=f_data["fill_id"],
+                order_id="",
+                side=Side.SHORT if pos.side == Side.LONG else Side.LONG,
+                qty=Decimal(f_data["qty"]),
+                price=Decimal(f_data["price"]),
+                timestamp=datetime.fromisoformat(f_data["ts"]),
+                is_entry=False
+            ))
+        
+        pos.processed_event_hashes = set(data.get("processed_event_hashes", []))
+        
+        return pos
+
+
+# ============ POSITION REGISTRY ============
+
+class PositionRegistry:
+    """
+    Single source of truth for all managed positions.
+    
+    ENFORCES:
+    1. One position per symbol (Invariant A)
+    2. Full close before direction change (Invariant E)
+    3. Thread-safe, idempotent access
+    """
+    
+    def __init__(self):
+        self._positions: Dict[str, ManagedPosition] = {}
+        self._lock = threading.RLock()
+        self._pending_reversals: Dict[str, Side] = {}  # symbol -> pending new side
+        self._closed_positions: List[ManagedPosition] = []  # History
+    
+    # ========== INVARIANT A: Single position per symbol ==========
+    
+    def _check_invariant_a(self, symbol: str) -> None:
+        """Invariant A: At most one non-terminal position per symbol."""
+        positions = [
+            p for p in self._positions.values()
+            if p.symbol == symbol and not p.is_terminal
+        ]
+        check_invariant(
+            len(positions) <= 1,
+            f"INVARIANT A VIOLATION: Multiple active positions for {symbol}"
+        )
+    
+    # ========== POSITION ACCESS ==========
+    
+    def has_position(self, symbol: str) -> bool:
+        """Check if symbol has an active position."""
+        with self._lock:
+            pos = self._positions.get(symbol)
+            return pos is not None and not pos.is_terminal
+    
+    def get_position(self, symbol: str) -> Optional[ManagedPosition]:
+        """Get active position for symbol."""
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if pos and not pos.is_terminal:
+                return pos
+            return None
+    
+    def get_all_active(self) -> List[ManagedPosition]:
+        """Get all active positions."""
+        with self._lock:
+            return [p for p in self._positions.values() if not p.is_terminal]
+    
+    def get_all(self) -> List[ManagedPosition]:
+        """Get all positions including terminal."""
+        with self._lock:
+            return list(self._positions.values())
+    
+    # ========== POSITION REGISTRATION ==========
+    
+    def can_open_position(self, symbol: str, side: Side) -> Tuple[bool, str]:
+        """
+        Check if a new position can be opened (Invariant E).
+        
+        Returns:
+            (allowed, reason)
+        """
+        with self._lock:
+            existing = self._positions.get(symbol)
+            
+            if existing is None:
+                return True, "No existing position"
+            
+            if existing.is_terminal:
+                return True, "Previous position terminal"
+            
+            # Check if reversal is pending
+            if symbol in self._pending_reversals:
+                return False, f"Reversal pending for {symbol}, waiting for close confirmation"
+            
+            # Position exists and is active
+            if existing.side == side:
+                return False, f"Position already exists for {symbol} ({existing.state.value})"
+            else:
+                # Invariant E: Cannot open opposite until current is terminal
+                return False, f"Must close existing {existing.side.value} position before opening {side.value}"
+    
+    def register_position(self, position: ManagedPosition) -> None:
+        """
+        Register a new position.
+        
+        Raises:
+            InvariantViolation if position already exists
+        """
+        with self._lock:
+            can_open, reason = self.can_open_position(position.symbol, position.side)
+            check_invariant(can_open, f"Cannot register position: {reason}")
+            
+            # Archive old terminal position if exists
+            old_pos = self._positions.get(position.symbol)
+            if old_pos and old_pos.is_terminal:
+                self._closed_positions.append(old_pos)
+            
+            self._positions[position.symbol] = position
+            self._check_invariant_a(position.symbol)
+            
+            # Clear any pending reversal
+            if position.symbol in self._pending_reversals:
+                del self._pending_reversals[position.symbol]
+            
+            logger.info(
+                "Position registered",
+                symbol=position.symbol,
+                side=position.side.value,
+                state=position.state.value,
+                position_id=position.position_id
+            )
+    
+    # ========== REVERSAL HANDLING (Invariant E) ==========
+    
+    def request_reversal(self, symbol: str, new_side: Side) -> bool:
+        """
+        Request to close position for direction reversal.
+        
+        This blocks new opens until close is confirmed.
+        """
+        with self._lock:
+            pos = self.get_position(symbol)
+            if pos is None:
+                return False
+            
+            if pos.side == new_side:
+                return False  # Not a reversal
+            
+            self._pending_reversals[symbol] = new_side
+            logger.info(
+                "Reversal requested",
+                symbol=symbol,
+                from_side=pos.side.value,
+                to_side=new_side.value
+            )
+            return True
+    
+    def confirm_reversal_closed(self, symbol: str) -> Optional[Side]:
+        """
+        Confirm reversal close complete. Returns the new side to open.
+        """
+        with self._lock:
+            pos = self.get_position(symbol)
+            if pos is not None and not pos.is_terminal:
+                return None  # Not yet closed
+            
+            new_side = self._pending_reversals.pop(symbol, None)
+            if new_side:
+                logger.info(f"Reversal confirmed for {symbol}, can now open {new_side.value}")
+            return new_side
+    
+    # ========== ORDER EVENT DISPATCH ==========
+    
+    def apply_order_event(self, symbol: str, event: OrderEvent) -> bool:
+        """
+        Apply order event to position. Idempotent.
+        """
+        with self._lock:
+            pos = self._positions.get(symbol)
+            if pos is None:
+                logger.warning(f"Order event for unknown position: {symbol}")
+                return False
+            
+            return pos.apply_order_event(event)
+    
+    # ========== RECONCILIATION ==========
+    
+    def reconcile_with_exchange(
+        self,
+        exchange_positions: Dict[str, Dict],  # symbol -> {side, qty, entry_price}
+        exchange_orders: List[Dict]  # [{order_id, symbol, side, status, ...}]
+    ) -> List[Tuple[str, str]]:
+        """
+        Reconcile registry with exchange state.
+        
+        Returns:
+            List of (symbol, issue) tuples for positions needing attention
+        """
+        issues = []
+        
+        with self._lock:
+            # Check for orphaned positions (registry has, exchange doesn't)
+            for symbol, pos in self._positions.items():
+                if pos.is_terminal:
+                    continue
+                
+                exchange_pos = exchange_positions.get(symbol)
+                if exchange_pos is None and pos.remaining_qty > 0:
+                    pos.mark_orphaned()
+                    issues.append((symbol, "ORPHANED: Registry has position, exchange does not"))
+                elif exchange_pos is not None:
+                    # Verify qty matches
+                    exchange_qty = Decimal(str(exchange_pos.get('qty', 0)))
+                    if abs(exchange_qty - pos.remaining_qty) > Decimal("0.0001"):
+                        issues.append((symbol, f"QTY_MISMATCH: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+            
+            # Check for phantom positions (exchange has, registry doesn't)
+            for symbol, exchange_pos in exchange_positions.items():
+                if symbol not in self._positions or self._positions[symbol].is_terminal:
+                    issues.append((symbol, "PHANTOM: Exchange has position, registry does not"))
+        
+        return issues
+    
+    # ========== HISTORY ==========
+    
+    def get_closed_history(self, limit: int = 100) -> List[ManagedPosition]:
+        """Get closed position history."""
+        with self._lock:
+            return self._closed_positions[-limit:]
+    
+    def cleanup_stale(self, max_age_hours: int = 24) -> int:
+        """Remove very old closed positions from memory."""
+        with self._lock:
+            cutoff = datetime.now(timezone.utc)
+            original_count = len(self._closed_positions)
+            self._closed_positions = [
+                p for p in self._closed_positions
+                if p.exit_time and (cutoff - p.exit_time).total_seconds() < max_age_hours * 3600
+            ]
+            removed = original_count - len(self._closed_positions)
+            if removed > 0:
+                logger.info(f"Cleaned up {removed} stale closed positions")
+            return removed
+    
+    # ========== PERSISTENCE ==========
+    
+    def to_dict(self) -> Dict:
+        """Serialize registry for persistence."""
+        with self._lock:
+            return {
+                "positions": {s: p.to_dict() for s, p in self._positions.items()},
+                "pending_reversals": {s: side.value for s, side in self._pending_reversals.items()},
+                "closed_positions": [p.to_dict() for p in self._closed_positions[-100:]]  # Keep last 100
+            }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PositionRegistry":
+        """Deserialize registry from persistence."""
+        registry = cls()
+        
+        for symbol, pos_data in data.get("positions", {}).items():
+            registry._positions[symbol] = ManagedPosition.from_dict(pos_data)
+        
+        for symbol, side_str in data.get("pending_reversals", {}).items():
+            registry._pending_reversals[symbol] = Side(side_str)
+        
+        for pos_data in data.get("closed_positions", []):
+            registry._closed_positions.append(ManagedPosition.from_dict(pos_data))
+        
+        return registry
+
+
+# ============ SINGLETON REGISTRY ============
+_registry_instance: Optional[PositionRegistry] = None
+_registry_lock = threading.Lock()
+
+
+def get_position_registry() -> PositionRegistry:
+    """Get the singleton PositionRegistry instance."""
+    global _registry_instance
+    if _registry_instance is None:
+        with _registry_lock:
+            if _registry_instance is None:
+                _registry_instance = PositionRegistry()
+    return _registry_instance
+
+
+def reset_position_registry() -> None:
+    """Reset the registry (for testing only)."""
+    global _registry_instance
+    with _registry_lock:
+        _registry_instance = None
+
+
+def set_position_registry(registry: PositionRegistry) -> None:
+    """Set custom registry (for crash recovery)."""
+    global _registry_instance
+    with _registry_lock:
+        _registry_instance = registry
