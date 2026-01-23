@@ -560,68 +560,69 @@ class KrakenClient:
             if stop_price:
                 params['stopPrice'] = float(stop_price)
                 
-            # Map symbol if needed (ensure CCXT format usually Ticker:Quote)
-            # But assume caller sends correct CCXT symbol for now or raw symbol
-            # CCXT usually handles 'BTC/USD:USD' style best
-            
             # Map order type 'lmt' -> 'limit' for CCXT if passed as raw kraken string
             type_map = {'lmt': 'limit', 'mkt': 'market', 'stp': 'stop'}
             ccxt_type = type_map.get(order_type, order_type)
             
+            # CRITICAL: Resolve unified symbol format ONCE for all API calls
+            # Kraken Futures uses symbols like PF_XBTUSD but CCXT needs unified format
+            unified_symbol = symbol
+            if not self.futures_exchange.markets:
+                await self.futures_exchange.load_markets()
+            
+            # Find the unified symbol from market ID
+            for m in self.futures_exchange.markets.values():
+                if m['id'] == symbol or m['id'].upper() == symbol.upper():
+                    unified_symbol = m['symbol']
+                    break
+                elif m['symbol'] == symbol:
+                    unified_symbol = symbol  # Already unified
+                    break
+            
             logger.info(
                 "Placing futures order",
                 symbol=symbol,
+                unified_symbol=unified_symbol,
                 side=side,
                 type=ccxt_type,
                 size=str(size),
                 leverage=str(leverage) if leverage else "default",
             )
             
-            # EXPLICITLY set leverage/margin mode if provided
-            # Kraken Futures: Setting leverage implies Isolated Margin. 0 or omitted implies Cross.
-            if leverage:
+            # CRITICAL: Set leverage BEFORE placing order
+            # This is mandatory for correct position sizing
+            leverage_set_success = False
+            if leverage and not reduce_only:  # Only set leverage for entry orders, not protective orders
                 try:
-                    await self.futures_exchange.set_leverage(float(leverage), symbol)
-                    logger.debug("Leverage set to isolated", leverage=leverage, symbol=symbol)
+                    await self.futures_exchange.set_leverage(float(leverage), unified_symbol)
+                    logger.info("Leverage set successfully", leverage=float(leverage), symbol=unified_symbol)
+                    leverage_set_success = True
                 except Exception as lev_err:
-                    # Retry with unified symbol if possible
-                    try:
-                        logger.warning(f"set_leverage failed for {symbol}, trying resolution...", error=str(lev_err))
-                        # Load markets if not loaded
-                        if not self.futures_exchange.markets:
-                            await self.futures_exchange.load_markets()
-                        
-                        # Try to find market by ID (e.g. PF_MONUSD) or other common formats
-                        market = None
-                        
-                        # 1. Exact match by ID
-                        for m in self.futures_exchange.markets.values():
-                            if m['id'] == symbol or m['symbol'] == symbol:
-                                market = m
-                                break
-                        
-                        # 2. Case-insensitive check
-                        if not market:
-                             for m in self.futures_exchange.markets.values():
-                                if m['id'].upper() == symbol.upper():
-                                    market = m
-                                    break
-                        
-                        if market:
-                            unified_symbol = market['symbol']
-                            logger.info(f"Resolved {symbol} -> {unified_symbol} for leverage setting")
-                            await self.futures_exchange.set_leverage(float(leverage), unified_symbol)
-                            logger.info("Leverage set successfully with unified symbol", symbol=unified_symbol)
-                        else:
-                            logger.warning(f"Could not resolve symbol {symbol} for leverage retry")
-                            
-                    except Exception as retry_err:
-                        logger.warning("Failed to set leverage explicitly (retry failed)", error=str(retry_err))
-                    
-                    # Fallback: hope params['leverage'] works or user setting is already correct
+                    error_str = str(lev_err).lower()
+                    # Some exchanges return error if leverage is already set to same value - that's OK
+                    if "already" in error_str or "same" in error_str or "no change" in error_str:
+                        logger.info("Leverage already set to target value", leverage=float(leverage), symbol=unified_symbol)
+                        leverage_set_success = True
+                    else:
+                        logger.error(
+                            "CRITICAL: Failed to set leverage - order will be REJECTED for safety",
+                            symbol=unified_symbol,
+                            target_leverage=float(leverage),
+                            error=str(lev_err)
+                        )
+                        # SAFETY: Do NOT place order if leverage cannot be set
+                        # This prevents placing orders at unintended (likely 1x) leverage
+                        raise Exception(f"Leverage setting failed for {unified_symbol}: {lev_err}. Order rejected for safety.")
+            else:
+                # Reduce-only orders don't need leverage setting
+                leverage_set_success = True
+            
+            # Additional safety: pass leverage in params as backup for some exchange implementations
+            if leverage and not reduce_only:
+                params['leverage'] = float(leverage)
             
             order = await self.futures_exchange.create_order(
-                symbol=symbol,
+                symbol=unified_symbol,
                 type=ccxt_type,
                 side=side,
                 amount=float(size),
@@ -632,7 +633,9 @@ class KrakenClient:
             logger.info(
                 "Futures order placed successfully",
                 order_id=order['id'],
-                symbol=symbol
+                symbol=unified_symbol,
+                leverage=float(leverage) if leverage else "default",
+                leverage_confirmed=leverage_set_success
             )
             
             return order
