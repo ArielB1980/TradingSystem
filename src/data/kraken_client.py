@@ -557,8 +557,6 @@ class KrakenClient:
                 params['reduceOnly'] = True
             if client_order_id:
                 params['cliOrdId'] = client_order_id
-            if stop_price:
-                params['stopPrice'] = float(stop_price)
                 
             # Map order type 'lmt' -> 'limit' for CCXT if passed as raw kraken string
             type_map = {'lmt': 'limit', 'mkt': 'market', 'stp': 'stop'}
@@ -578,6 +576,11 @@ class KrakenClient:
                 elif m['symbol'] == symbol:
                     unified_symbol = symbol  # Already unified
                     break
+            
+            if stop_price:
+                # Round stop price to precision using CCXT
+                rounded_stop = self.futures_exchange.price_to_precision(unified_symbol, float(stop_price))
+                params['stopPrice'] = float(rounded_stop)
             
             logger.info(
                 "Placing futures order",

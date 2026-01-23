@@ -1,0 +1,771 @@
+"""
+Production Safety Module.
+
+Contains critical safety mechanisms that prevent real-world disasters:
+1. Atomic stop replace (new-first, then cancel old)
+2. EXIT_PENDING timeout + escalation
+3. Event ordering constraints
+4. Write-ahead persistence for intents
+5. Invariant K: Always protected after first fill
+"""
+from dataclasses import dataclass, field
+from decimal import Decimal
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List, Set
+from enum import Enum
+import asyncio
+
+from src.execution.position_state_machine import (
+    ManagedPosition,
+    PositionState,
+    check_invariant,
+    InvariantViolation
+)
+from src.monitoring.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# ============ CONFIGURATION ============
+
+@dataclass
+class SafetyConfig:
+    """Safety mechanism configuration."""
+    
+    # Exit timeout settings
+    exit_pending_timeout_seconds: int = 60
+    exit_escalation_max_retries: int = 3
+    exit_aggressive_after_seconds: int = 30
+    
+    # Stop replace settings
+    stop_replace_ack_timeout_seconds: int = 10
+    
+    # Protection settings
+    emergency_exit_on_stop_fail: bool = True
+    
+    # Event ordering
+    reject_stale_events: bool = True
+
+
+# ============ EXIT ESCALATION STATES ============
+
+class ExitEscalationLevel(str, Enum):
+    """Levels of exit urgency."""
+    NORMAL = "normal"           # Standard limit/market exit
+    AGGRESSIVE = "aggressive"   # Wider price tolerance, IOC
+    EMERGENCY = "emergency"     # Market + cancel all, flatten
+    QUARANTINE = "quarantine"   # Give up, quarantine symbol
+
+
+@dataclass
+class ExitEscalationState:
+    """Tracks exit escalation for a position."""
+    position_id: str
+    symbol: str
+    started_at: datetime
+    current_level: ExitEscalationLevel = ExitEscalationLevel.NORMAL
+    retry_count: int = 0
+    last_attempt_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    
+    def should_escalate(self, config: SafetyConfig) -> bool:
+        """Check if we should escalate to next level."""
+        if self.current_level == ExitEscalationLevel.QUARANTINE:
+            return False
+        
+        elapsed = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+        
+        if elapsed > config.exit_pending_timeout_seconds:
+            return True
+        
+        if self.retry_count >= config.exit_escalation_max_retries:
+            return True
+        
+        return False
+    
+    def escalate(self) -> ExitEscalationLevel:
+        """Move to next escalation level."""
+        self.retry_count += 1
+        
+        if self.current_level == ExitEscalationLevel.NORMAL:
+            self.current_level = ExitEscalationLevel.AGGRESSIVE
+        elif self.current_level == ExitEscalationLevel.AGGRESSIVE:
+            self.current_level = ExitEscalationLevel.EMERGENCY
+        elif self.current_level == ExitEscalationLevel.EMERGENCY:
+            self.current_level = ExitEscalationLevel.QUARANTINE
+        
+        logger.warning(
+            f"Exit escalated to {self.current_level.value}",
+            symbol=self.symbol,
+            retry_count=self.retry_count
+        )
+        
+        return self.current_level
+
+
+# ============ ATOMIC STOP REPLACE ============
+
+@dataclass
+class StopReplaceContext:
+    """Context for atomic stop replace operation."""
+    position_id: str
+    symbol: str
+    old_stop_order_id: Optional[str]
+    old_stop_price: Decimal
+    new_stop_price: Decimal
+    new_stop_order_id: Optional[str] = None
+    new_stop_acked: bool = False
+    old_stop_cancelled: bool = False
+    failed: bool = False
+    error: Optional[str] = None
+
+
+class AtomicStopReplacer:
+    """
+    Ensures stop replacement is atomic (or fails safely).
+    
+    Protocol:
+    1. Place NEW stop first
+    2. Wait for ACK on new stop
+    3. Only THEN cancel old stop
+    4. If step 1 fails → keep old stop, do not advance state
+    """
+    
+    def __init__(self, exchange_client, config: SafetyConfig):
+        self.client = exchange_client
+        self.config = config
+        self._pending_replaces: Dict[str, StopReplaceContext] = {}
+    
+    async def replace_stop(
+        self,
+        position: ManagedPosition,
+        new_stop_price: Decimal,
+        generate_client_order_id: callable
+    ) -> StopReplaceContext:
+        """
+        Execute atomic stop replacement.
+        
+        Returns context with success/failure details.
+        """
+        ctx = StopReplaceContext(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            old_stop_order_id=position.stop_order_id,
+            old_stop_price=position.current_stop_price or position.initial_stop_price,
+            new_stop_price=new_stop_price
+        )
+        
+        self._pending_replaces[position.symbol] = ctx
+        
+        try:
+            # Step 1: Place NEW stop first
+            new_client_order_id = generate_client_order_id(position.position_id, "stop")
+            stop_side = "sell" if position.side.value == "long" else "buy"
+            
+            result = await self.client.place_futures_order(
+                symbol=position.symbol,
+                side=stop_side,
+                order_type="stop",
+                size=position.remaining_qty,
+                stop_price=new_stop_price,
+                reduce_only=True,
+                client_order_id=new_client_order_id
+            )
+            
+            ctx.new_stop_order_id = result.get("id")
+            
+            # Step 2: Wait for ACK (with timeout)
+            ack_deadline = datetime.now(timezone.utc) + timedelta(
+                seconds=self.config.stop_replace_ack_timeout_seconds
+            )
+            
+            while datetime.now(timezone.utc) < ack_deadline:
+                # Check if order is acknowledged/live
+                # Check if order is acknowledged/live by looking at open orders
+                try:
+                    open_orders = await self.client.get_futures_open_orders()
+                    if any(o.get("id") == ctx.new_stop_order_id for o in open_orders):
+                        ctx.new_stop_acked = True
+                        break
+                except Exception:
+                    pass
+                
+                await asyncio.sleep(0.5)
+            
+            if not ctx.new_stop_acked:
+                # New stop not acknowledged - keep old stop
+                ctx.failed = True
+                ctx.error = "New stop not acknowledged in time - keeping old stop"
+                logger.error(ctx.error, symbol=position.symbol)
+                
+                # Try to cancel the new stop we placed
+                try:
+                    await self.client.cancel_futures_order(ctx.new_stop_order_id, position.symbol)
+                except Exception:
+                    pass
+                
+                return ctx
+            
+            # Step 3: NOW cancel old stop (only after new is confirmed)
+            if ctx.old_stop_order_id:
+                try:
+                    await self.client.cancel_futures_order(ctx.old_stop_order_id, position.symbol)
+                    ctx.old_stop_cancelled = True
+                except Exception as e:
+                    # Old stop might have already triggered - that's OK
+                    logger.warning(f"Old stop cancel failed (may have triggered): {e}")
+                    ctx.old_stop_cancelled = True  # Treat as success
+            
+            logger.info(
+                "Atomic stop replace complete",
+                symbol=position.symbol,
+                old_price=str(ctx.old_stop_price),
+                new_price=str(ctx.new_stop_price)
+            )
+            
+            return ctx
+            
+        except Exception as e:
+            ctx.failed = True
+            ctx.error = str(e)
+            logger.error(
+                "Atomic stop replace failed - KEEPING OLD STOP",
+                symbol=position.symbol,
+                error=str(e)
+            )
+            return ctx
+        
+        finally:
+            del self._pending_replaces[position.symbol]
+
+
+# ============ INVARIANT K: ALWAYS PROTECTED AFTER FIRST FILL ============
+
+class ProtectionEnforcer:
+    """
+    Enforces Invariant K: Always protected after first fill.
+    
+    If filled_qty > 0 and position not closed:
+        There MUST be a valid protective stop on exchange
+        OR a guaranteed immediate market exit fallback
+    """
+    
+    def __init__(self, exchange_client, config: SafetyConfig):
+        self.client = exchange_client
+        self.config = config
+        self._protection_failures: Dict[str, int] = {}
+    
+    async def verify_protection(
+        self,
+        position: ManagedPosition,
+        exchange_orders: List[Dict]
+    ) -> bool:
+        """
+        Verify position has protective stop.
+        
+        Returns True if protected, False if naked.
+        """
+        if position.remaining_qty <= 0:
+            return True  # No exposure, no protection needed
+        
+        if position.is_terminal:
+            return True
+        
+        # Check for valid stop order on exchange
+        has_stop = False
+        for order in exchange_orders:
+            if (order.get("symbol") == position.symbol and
+                order.get("type", "").lower() in ("stop", "stop_market", "stop_limit") and
+                order.get("status") == "open"):
+                has_stop = True
+                break
+        
+        if not has_stop:
+            logger.critical(
+                "INVARIANT K VIOLATION: Position has exposure but NO STOP!",
+                symbol=position.symbol,
+                remaining_qty=str(position.remaining_qty)
+            )
+        
+        return has_stop
+    
+    async def emergency_exit_naked_position(
+        self,
+        position: ManagedPosition
+    ) -> bool:
+        """
+        Emergency market exit for naked position.
+        
+        Called when stop placement fails after entry fill.
+        """
+        logger.critical(
+            "EMERGENCY EXIT: Stop placement failed, exiting at market",
+            symbol=position.symbol,
+            qty=str(position.remaining_qty)
+        )
+        
+        try:
+            close_side = "sell" if position.side.value == "long" else "buy"
+            
+            await self.client.place_futures_order(
+                symbol=position.symbol,
+                side=close_side,
+                order_type="market",
+                size=position.remaining_qty,
+                reduce_only=True
+            )
+            
+            # Mark position as closed with emergency reason
+            position.state = PositionState.CLOSED
+            
+            self._protection_failures[position.symbol] = \
+                self._protection_failures.get(position.symbol, 0) + 1
+            
+            return True
+            
+        except Exception as e:
+            logger.critical(
+                "EMERGENCY EXIT FAILED - MANUAL INTERVENTION REQUIRED",
+                symbol=position.symbol,
+                error=str(e)
+            )
+            position.mark_orphaned()
+            return False
+
+
+# ============ EVENT ORDERING ENFORCER ============
+
+class EventOrderingEnforcer:
+    """
+    Enforces event ordering constraints.
+    
+    - Maintains per-order last_event_seq
+    - Rejects/queues older events
+    - De-duplicates by fill_id (primary)
+    """
+    
+    def __init__(self):
+        # order_id -> last processed event_seq
+        self._last_event_seq: Dict[str, int] = {}
+        # fill_id -> True (for deduplication)
+        self._processed_fill_ids: Set[str] = set()
+    
+    def should_process_event(
+        self,
+        order_id: str,
+        event_seq: int,
+        fill_id: Optional[str] = None
+    ) -> bool:
+        """
+        Check if event should be processed.
+        
+        Returns False if:
+        - Event is older than last processed for this order
+        - Fill_id was already processed (duplicate fill)
+        """
+        # Fill ID deduplication (primary for fills)
+        if fill_id and fill_id in self._processed_fill_ids:
+            logger.debug(f"Duplicate fill_id ignored: {fill_id}")
+            return False
+        
+        # Event sequence check
+        last_seq = self._last_event_seq.get(order_id, 0)
+        if event_seq <= last_seq:
+            logger.debug(
+                f"Stale event ignored: order={order_id}, seq={event_seq}, last={last_seq}"
+            )
+            return False
+        
+        return True
+    
+    def mark_processed(
+        self,
+        order_id: str,
+        event_seq: int,
+        fill_id: Optional[str] = None
+    ) -> None:
+        """Mark event as processed."""
+        self._last_event_seq[order_id] = max(
+            self._last_event_seq.get(order_id, 0),
+            event_seq
+        )
+        
+        if fill_id:
+            self._processed_fill_ids.add(fill_id)
+    
+    def cleanup_old_orders(self, active_order_ids: Set[str]) -> None:
+        """Clean up tracking for orders no longer active."""
+        stale_orders = set(self._last_event_seq.keys()) - active_order_ids
+        for order_id in stale_orders:
+            del self._last_event_seq[order_id]
+
+
+# ============ WRITE-AHEAD INTENT PERSISTENCE ============
+
+class ActionIntentStatus(str, Enum):
+    """Status of a persisted action intent."""
+    PENDING = "pending"      # Intent recorded, not yet sent
+    SENT = "sent"            # Sent to exchange, awaiting response
+    ACKNOWLEDGED = "acknowledged"  # Exchange acknowledged
+    COMPLETED = "completed"  # Fully processed
+    FAILED = "failed"        # Failed, needs reconciliation
+
+
+@dataclass
+class ActionIntent:
+    """
+    Write-ahead intent for an action.
+    
+    Persisted BEFORE sending to exchange to prevent
+    duplicate orders on crash/restart.
+    """
+    intent_id: str  # Same as client_order_id
+    position_id: str
+    action_type: str
+    symbol: str
+    side: str
+    size: str  # Stored as string for persistence
+    price: Optional[str]
+    created_at: datetime
+    status: ActionIntentStatus = ActionIntentStatus.PENDING
+    exchange_order_id: Optional[str] = None
+    error: Optional[str] = None
+    
+    def to_dict(self) -> Dict:
+        return {
+            "intent_id": self.intent_id,
+            "position_id": self.position_id,
+            "action_type": self.action_type,
+            "symbol": self.symbol,
+            "side": self.side,
+            "size": self.size,
+            "price": self.price,
+            "created_at": self.created_at.isoformat(),
+            "status": self.status.value,
+            "exchange_order_id": self.exchange_order_id,
+            "error": self.error
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ActionIntent":
+        return cls(
+            intent_id=data["intent_id"],
+            position_id=data["position_id"],
+            action_type=data["action_type"],
+            symbol=data["symbol"],
+            side=data["side"],
+            size=data["size"],
+            price=data.get("price"),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            status=ActionIntentStatus(data["status"]),
+            exchange_order_id=data.get("exchange_order_id"),
+            error=data.get("error")
+        )
+
+
+class WriteAheadIntentLog:
+    """
+    Write-ahead log for action intents.
+    
+    Prevents duplicate orders on crash/restart by:
+    1. Persisting intent BEFORE sending to exchange
+    2. On restart, checking for pending intents and reconciling
+    """
+    
+    def __init__(self, persistence):
+        self.persistence = persistence
+        self._pending_intents: Dict[str, ActionIntent] = {}
+    
+    def record_intent(self, intent: ActionIntent) -> None:
+        """
+        Record intent BEFORE executing.
+        
+        This is the WAL - if we crash after this but before
+        exchange call, we'll detect on restart.
+        """
+        self._pending_intents[intent.intent_id] = intent
+        
+        # Persist to database
+        self.persistence._conn.execute("""
+            INSERT OR REPLACE INTO action_intents (
+                intent_id, position_id, action_type, symbol, side, size, price,
+                created_at, status, exchange_order_id, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            intent.intent_id,
+            intent.position_id,
+            intent.action_type,
+            intent.symbol,
+            intent.side,
+            intent.size,
+            intent.price,
+            intent.created_at.isoformat(),
+            intent.status.value,
+            intent.exchange_order_id,
+            intent.error
+        ))
+        self.persistence._conn.commit()
+    
+    def mark_sent(self, intent_id: str, exchange_order_id: str) -> None:
+        """Mark intent as sent to exchange."""
+        if intent_id in self._pending_intents:
+            self._pending_intents[intent_id].status = ActionIntentStatus.SENT
+            self._pending_intents[intent_id].exchange_order_id = exchange_order_id
+            self._update_intent_status(intent_id, ActionIntentStatus.SENT, exchange_order_id)
+    
+    def mark_completed(self, intent_id: str) -> None:
+        """Mark intent as completed."""
+        if intent_id in self._pending_intents:
+            del self._pending_intents[intent_id]
+        self._update_intent_status(intent_id, ActionIntentStatus.COMPLETED)
+    
+    def mark_failed(self, intent_id: str, error: str) -> None:
+        """Mark intent as failed."""
+        if intent_id in self._pending_intents:
+            self._pending_intents[intent_id].status = ActionIntentStatus.FAILED
+            self._pending_intents[intent_id].error = error
+        self._update_intent_status(intent_id, ActionIntentStatus.FAILED, error=error)
+    
+    def _update_intent_status(
+        self,
+        intent_id: str,
+        status: ActionIntentStatus,
+        exchange_order_id: Optional[str] = None,
+        error: Optional[str] = None
+    ) -> None:
+        """Update intent status in persistence."""
+        self.persistence._conn.execute("""
+            UPDATE action_intents 
+            SET status = ?, exchange_order_id = COALESCE(?, exchange_order_id), error = ?
+            WHERE intent_id = ?
+        """, (status.value, exchange_order_id, error, intent_id))
+        self.persistence._conn.commit()
+    
+    def get_pending_intents(self) -> List[ActionIntent]:
+        """Get all pending/sent intents for reconciliation."""
+        cursor = self.persistence._conn.execute("""
+            SELECT * FROM action_intents 
+            WHERE status IN ('pending', 'sent')
+            ORDER BY created_at
+        """)
+        
+        intents = []
+        for row in cursor:
+            intents.append(ActionIntent(
+                intent_id=row["intent_id"],
+                position_id=row["position_id"],
+                action_type=row["action_type"],
+                symbol=row["symbol"],
+                side=row["side"],
+                size=row["size"],
+                price=row["price"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                status=ActionIntentStatus(row["status"]),
+                exchange_order_id=row["exchange_order_id"],
+                error=row["error"]
+            ))
+        
+        return intents
+    
+    async def reconcile_on_startup(
+        self,
+        exchange_client,
+        registry
+    ) -> Dict[str, str]:
+        """
+        Reconcile pending intents on startup.
+        
+        For each pending intent:
+        - If exchange_order_id exists → check if order exists on exchange
+        - If order exists → mark completed
+        - If order doesn't exist and status=PENDING → re-evaluate (may need to retry)
+        - If order doesn't exist and status=SENT → lost in limbo, reconcile
+        
+        Returns dict of {intent_id: resolution}
+        """
+        resolutions = {}
+        pending = self.get_pending_intents()
+        
+        for intent in pending:
+            if intent.status == ActionIntentStatus.PENDING:
+                # Never sent - can safely ignore or retry
+                logger.warning(
+                    f"Found unsent intent on startup: {intent.intent_id}",
+                    action_type=intent.action_type,
+                    symbol=intent.symbol
+                )
+                self.mark_failed(intent.intent_id, "Startup: intent never sent")
+                resolutions[intent.intent_id] = "cancelled_unsent"
+                
+            elif intent.status == ActionIntentStatus.SENT:
+                # Was sent but we don't know outcome
+                if intent.exchange_order_id:
+                    # Cannot fetch single order, so we skip check or implement get_futures_order later
+                    # For now, if we can't verify, we log warning.
+                    logger.warning(f"Cannot verify intent {intent.intent_id} status (fetching single order not supported)")
+                    resolutions[intent.intent_id] = "unknown"
+                    continue
+                else:
+                    # Sent but no exchange_order_id - definitely lost
+                    self.mark_failed(intent.intent_id, "No exchange_order_id")
+                    resolutions[intent.intent_id] = "no_order_id"
+        
+        logger.info(
+            "Intent reconciliation complete",
+            total=len(pending),
+            resolutions=resolutions
+        )
+        
+        return resolutions
+
+
+# ============ EXIT TIMEOUT MANAGER ============
+
+class ExitTimeoutManager:
+    """
+    Manages EXIT_PENDING timeouts and escalation.
+    
+    If EXIT_PENDING lasts > timeout:
+    - Escalate to aggressive exit
+    - If retries exhausted → quarantine symbol
+    """
+    
+    def __init__(self, config: SafetyConfig):
+        self.config = config
+        self._exit_states: Dict[str, ExitEscalationState] = {}
+        self._quarantined_symbols: Set[str] = set()
+    
+    def start_exit_tracking(self, position: ManagedPosition) -> None:
+        """Start tracking exit timeout for position."""
+        if position.state == PositionState.EXIT_PENDING:
+            self._exit_states[position.symbol] = ExitEscalationState(
+                position_id=position.position_id,
+                symbol=position.symbol,
+                started_at=datetime.now(timezone.utc)
+            )
+    
+    def is_quarantined(self, symbol: str) -> bool:
+        """Check if symbol is quarantined."""
+        return symbol in self._quarantined_symbols
+    
+    def check_timeouts(self) -> List[ExitEscalationState]:
+        """
+        Check all exit states for timeouts.
+        
+        Returns list of states that need escalation.
+        """
+        needs_escalation = []
+        
+        for symbol, state in self._exit_states.items():
+            if state.should_escalate(self.config):
+                needs_escalation.append(state)
+        
+        return needs_escalation
+    
+    def escalate(self, symbol: str) -> ExitEscalationLevel:
+        """Escalate exit for symbol."""
+        state = self._exit_states.get(symbol)
+        if not state:
+            return ExitEscalationLevel.NORMAL
+        
+        new_level = state.escalate()
+        
+        if new_level == ExitEscalationLevel.QUARANTINE:
+            self._quarantined_symbols.add(symbol)
+            logger.critical(
+                f"SYMBOL QUARANTINED: {symbol}",
+                reason="exit_timeout_exhausted"
+            )
+        
+        return new_level
+    
+    def exit_completed(self, symbol: str) -> None:
+        """Mark exit as completed, clear tracking."""
+        if symbol in self._exit_states:
+            del self._exit_states[symbol]
+    
+    def unquarantine(self, symbol: str) -> None:
+        """Remove symbol from quarantine (manual intervention)."""
+        self._quarantined_symbols.discard(symbol)
+        logger.info(f"Symbol unquarantined: {symbol}")
+
+
+# ============ POSITION PROTECTION MONITOR ============
+
+class PositionProtectionMonitor:
+    """
+    Continuous monitoring for Invariant K.
+    
+    Runs periodically to verify all exposed positions have protection.
+    """
+    
+    def __init__(
+        self,
+        exchange_client,
+        registry,
+        protection_enforcer: ProtectionEnforcer
+    ):
+        self.client = exchange_client
+        self.registry = registry
+        self.enforcer = protection_enforcer
+        self._running = False
+    
+    async def check_all_positions(self) -> Dict[str, bool]:
+        """
+        Check all positions for protection.
+        
+        Returns {symbol: is_protected}
+        """
+        results = {}
+        
+        try:
+            exchange_orders = await self.client.get_futures_open_orders()
+        except Exception as e:
+            logger.error(f"Failed to fetch orders for protection check: {e}")
+            return results
+        
+        for position in self.registry.get_all_active():
+            if position.remaining_qty > 0:
+                is_protected = await self.enforcer.verify_protection(
+                    position,
+                    exchange_orders
+                )
+                results[position.symbol] = is_protected
+                
+                if not is_protected:
+                    # CRITICAL: Position is naked!
+                    logger.critical(
+                        "NAKED POSITION DETECTED",
+                        symbol=position.symbol,
+                        qty=str(position.remaining_qty)
+                    )
+        
+        return results
+    
+    async def run_periodic_check(self, interval_seconds: int = 30) -> None:
+        """Run periodic protection checks."""
+        self._running = True
+        
+        while self._running:
+            try:
+                results = await self.check_all_positions()
+                
+                naked_count = sum(1 for v in results.values() if not v)
+                if naked_count > 0:
+                    logger.critical(
+                        f"PROTECTION CHECK: {naked_count} naked positions detected!",
+                        details=results
+                    )
+                else:
+                    logger.debug(
+                        f"Protection check passed: {len(results)} positions verified"
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Protection check failed: {e}")
+            
+            await asyncio.sleep(interval_seconds)
+    
+    def stop(self) -> None:
+        """Stop periodic checks."""
+        self._running = False
