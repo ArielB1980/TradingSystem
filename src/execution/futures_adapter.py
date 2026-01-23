@@ -212,3 +212,18 @@ class FuturesAdapter:
             )
             raise
 
+    async def cancel_order(self, order_id: str, symbol: str) -> None:
+        """
+        Cancel a futures order.
+        
+        Args:
+            order_id: Order ID to cancel
+            symbol: Futures symbol
+        """
+        try:
+            await self.kraken_client.cancel_futures_order(order_id, symbol)
+            logger.info("Order cancelled via adapter", order_id=order_id, symbol=symbol)
+        except Exception as e:
+            logger.error("Failed to cancel order via adapter", order_id=order_id, symbol=symbol, error=str(e))
+            raise
+
