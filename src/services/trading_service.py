@@ -476,8 +476,8 @@ class TradingService:
                      # or rely on an account_state cache. For safety, let's fetch fresh.
                      try:
                          balance = await self.kraken.get_futures_balance()
-                         base_currency = getattr(self.config.exchange, "base_currency", "USD")
-                         equity = Decimal(str(balance.get('total', {}).get(base_currency, 0)))
+                         # Use robust equity calculation (handles Flex accounts)
+                         equity, _, _ = await self._calculate_effective_equity(balance)
                      except Exception as e:
                          logger.error(f"Failed to fetch balance for risk check: {e}")
                          return
