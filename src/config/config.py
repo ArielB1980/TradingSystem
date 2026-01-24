@@ -34,6 +34,9 @@ class ExchangeConfig(BaseSettings):
     spot_markets: List[str] = ["BTC/USD", "ETH/USD"]
     futures_markets: List[str] = ["BTCUSD-PERP", "ETHUSD-PERP"]
     
+    # Skip OHLCV fetch for these spot symbols (delisted, unsupported, or consistently failing)
+    spot_ohlcv_blocklist: List[str] = Field(default_factory=lambda: ["2Z/USD", "ANIME/USD"], description="Excluded from OHLCV")
+    
     # Credentials (loaded from env or yaml)
     api_key: Optional[str] = None
     api_secret: Optional[str] = None

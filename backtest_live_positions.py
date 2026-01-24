@@ -15,17 +15,12 @@ logger = get_logger(__name__)
 
 async def backtest_coin(symbol: str, config, start_date, end_date):
     """Run backtest for a single coin."""
+    print(f"\n{'='*80}")
+    print(f"Running backtest for {symbol}...")
+    print("="*80)
+    engine = BacktestEngine(config, symbol=symbol)
     try:
-        print(f"\n{'='*80}")
-        print(f"Running backtest for {symbol}...")
-        print("="*80)
-
-        engine = BacktestEngine(config, symbol=symbol)
         metrics = await engine.run(start_date=start_date, end_date=end_date)
-
-        # Close client properly
-        await engine.client.close()
-
         return {
             'symbol': symbol,
             'success': True,
@@ -38,6 +33,9 @@ async def backtest_coin(symbol: str, config, start_date, end_date):
             'success': False,
             'error': str(e)
         }
+    finally:
+        if getattr(engine, "client", None):
+            await engine.client.close()
 
 
 async def run_live_positions_backtest():

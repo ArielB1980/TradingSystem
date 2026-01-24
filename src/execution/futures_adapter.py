@@ -113,7 +113,7 @@ class FuturesAdapter:
         Place order on Kraken Futures.
         
         Args:
-            symbol: Futures symbol (e.g., "BTCUSD-PERP")
+            symbol: Futures symbol (e.g., "PF_XBTUSD" on Kraken)
             side: Order side (LONG/SHORT)
             size_notional: Position size in USD notional
             leverage: Leverage to use (capped at max_leverage)

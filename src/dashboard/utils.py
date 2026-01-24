@@ -192,9 +192,7 @@ def get_all_positions() -> List[Dict[str, Any]]:
 def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
     """
     Get latest state snapshot for all coins.
-    
-    TODO: This will be populated by MultiAssetOrchestrator emitting events.
-    For now, build from available data.
+    Placeholder: built from DB traces/positions. MultiAssetOrchestrator not yet implemented.
     """
     config = load_config()
     symbols = _get_monitored_symbols(config)
@@ -237,7 +235,7 @@ def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
             signal=latest['details'].get('signal', 'HOLD') if latest else 'HOLD',
             setup_quality=float(latest['details'].get('setup_quality', 0)) if latest else 0.0,
             score_breakdown=latest['details'].get('score_breakdown', {}) if latest else {},
-            next_action="WAIT",  # TODO: Calculate from state
+            next_action="WAIT",  # N/A until state machine / orchestrator wired
             block_reason_codes=[r['details'].get('rejection_reasons', ['UNKNOWN'])[0] for r in rejections[:1]],
         )
         
