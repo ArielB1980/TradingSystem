@@ -471,22 +471,18 @@ class TestInvariantK_AlwaysProtected:
         assert pos.state == PositionState.CLOSED
 
 
-class TestShadowModeTruthSource:
+class TestApplyOrderEventTruthSource:
     """
-    Test 5: Shadow mode truth source validation.
-    
-    Both live and shadow should use same event format.
+    Test 5: apply_order_event truth source.
+    State transitions happen via event application, not direct mutation.
     """
     
-    def test_shadow_mode_uses_same_apply_order_event(self):
-        """
-        Both live and shadow decisions should go through
-        same apply_order_event() interface.
-        """
+    def test_apply_order_event_transitions_state(self):
+        """apply_order_event drives state transition (ACK -> OPEN on fill)."""
         pos = ManagedPosition(
             symbol="BTC/USD:USD",
             side=Side.LONG,
-            position_id="test-shadow",
+            position_id="test-apply-event",
             initial_size=Decimal("0.1"),
             initial_entry_price=Decimal("50000"),
             initial_stop_price=Decimal("49000"),
@@ -496,7 +492,6 @@ class TestShadowModeTruthSource:
         )
         pos.entry_order_id = "entry-1"
         
-        # Create event in canonical format
         event = OrderEvent(
             order_id="entry-1",
             client_order_id="client-1",
@@ -508,14 +503,10 @@ class TestShadowModeTruthSource:
             fill_id="fill-1"
         )
         
-        # Both live and shadow use same apply_order_event
         result = pos.apply_order_event(event)
         
         assert result is True
         assert pos.state == PositionState.OPEN
-        
-        # Shadow mode would create same event and apply to shadow position
-        # Verification: state change happens via event, not via direct mutation
 
 
 class TestIntegrationScenarios:

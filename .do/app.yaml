@@ -63,8 +63,28 @@ services:
         value: "true"
         scope: RUN_TIME
         type: GENERAL
-      - key: STATE_MACHINE_SHADOW_MODE
+      - key: DRY_RUN
+        value: "0"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: SYSTEM_DRY_RUN
         value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: TRADING_NEW_ENTRIES_ENABLED
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: TRADING_REVERSALS_ENABLED
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: TRADING_PARTIALS_ENABLED
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: TRADING_TRAILING_ENABLED
+        value: "true"
         scope: RUN_TIME
         type: GENERAL
 

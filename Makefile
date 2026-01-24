@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy audit audit-cancel audit-orphaned check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live audit audit-cancel audit-orphaned check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -16,6 +16,7 @@ help:
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
 	@echo "  make pre-deploy    Run all pre-deployment tests (REQUIRED before push to main)"
+	@echo "  make deploy-live   Enable live flags on DO tradingbot, track deploy, health-check (needs DO_API_TOKEN)"
 	@echo "  make audit           Audit open futures orders (read-only)"
 	@echo "  make audit-cancel    Audit + cancel redundant stop orders"
 	@echo "  make audit-orphaned  Audit + cancel orphaned stops (when 0 positions)"
@@ -113,6 +114,16 @@ integration:
 		echo "❌ .env.local not found. Run 'make validate' first."; \
 		exit 1; \
 	fi
+
+deploy-live:
+	@echo "Enable live trading on DO (tradingbot), track deployment, health-check..."
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	if [ -z "$$DO_API_TOKEN" ] && [ -z "$$DIGITALOCEAN_API_TOKEN" ]; then \
+		echo "Set DO_API_TOKEN or DIGITALOCEAN_API_TOKEN (e.g. in .env.local)"; exit 1; \
+	fi; \
+	$(PYTHON) scripts/enable_live_trading_do.py && \
+	$(PYTHON) scripts/do_track_and_logs.py --track && \
+	$(PYTHON) scripts/do_track_and_logs.py --check-health
 
 pre-deploy:
 	@echo "=========================================="

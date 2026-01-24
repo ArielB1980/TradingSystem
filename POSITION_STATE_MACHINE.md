@@ -183,8 +183,8 @@ result = await exchange.create_order(...)  # Then execute
 wal.mark_sent(intent_id, result.order_id)
 ```
 
-### 5. Shadow Mode Truth Source
-Both live and shadow must use identical event format:
+### 5. Event Truth Source
+State transitions use canonical event format:
 - Canonical `OrderEvent` structure
 - Same `apply_order_event()` interface
 
@@ -413,29 +413,18 @@ The Position State Machine V2 has been fully integrated into `LiveTrading`. Acti
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `USE_STATE_MACHINE_V2` | `false` | Enable the Position State Machine V2 |
-| `STATE_MACHINE_SHADOW_MODE` | `true` | Log decisions but don't execute orders |
 
 ### Activation Modes
 
-1. **Shadow Mode (Recommended First)**
+1. **V2 Mode (all orders via ExecutionGateway)**
    ```bash
    export USE_STATE_MACHINE_V2=true
-   export STATE_MACHINE_SHADOW_MODE=true
-   python -m src.live.main
-   ```
-   
-   This logs all V2 decisions without executing. Compare with actual orders.
-
-2. **Live Mode**
-   ```bash
-   export USE_STATE_MACHINE_V2=true
-   export STATE_MACHINE_SHADOW_MODE=false
    python -m src.live.main
    ```
    
    All orders flow through ExecutionGateway. No bypass paths.
 
-3. **Legacy Mode (Default)**
+2. **Legacy Mode (Default)**
    ```bash
    # USE_STATE_MACHINE_V2 not set or "false"
    python -m src.live.main
@@ -449,7 +438,7 @@ When `USE_STATE_MACHINE_V2=true`:
 
 1. `PositionRegistry` singleton is initialized
 2. `PositionPersistence` loads from `data/positions.db`
-3. `PositionManagerV2` is created with shadow mode setting
+3. `PositionManagerV2` is created
 4. `ExecutionGateway` is created as single order flow point
 5. On `run()`, `ExecutionGateway.startup()` is called:
    - Loads persisted positions
@@ -499,5 +488,4 @@ _handle_signal()
 **Implementation Status**: ✅ Complete (Invariants A-K + 6 Safety Mechanisms)  
 **Tests Status**: ✅ 73/73 Passing  
 **Integration Status**: ✅ Complete (feature-flagged)  
-**Ready for Shadow Mode**: ✅ Yes  
-**Production Ready**: After shadow mode validation
+**Production Ready**: ✅ Yes (V2 always executes when enabled)

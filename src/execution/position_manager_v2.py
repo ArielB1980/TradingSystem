@@ -94,7 +94,7 @@ class ManagementAction:
     # Priority (higher = execute first)
     priority: int = 0
     
-    # Metadata for shadow mode
+    # Metadata for decision tracking
     decision_timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
     def __post_init__(self):
@@ -105,7 +105,7 @@ class ManagementAction:
 @dataclass
 class DecisionTick:
     """
-    Record of a single decision tick for shadow mode comparison.
+    Record of a single decision tick for metrics / debugging.
     """
     timestamp: datetime
     symbol: str
@@ -142,28 +142,18 @@ class PositionManagerV2:
     4. Execution Gateway places orders with client_order_id linking to position_id
     5. Order events reported back via apply_order_event()
     6. State transitions are driven by acknowledged fills, not intent
-    
-    SHADOW MODE:
-    - Records all decisions for comparison
-    - Does not execute, only logs
     """
     
-    def __init__(
-        self,
-        registry: Optional[PositionRegistry] = None,
-        shadow_mode: bool = False
-    ):
+    def __init__(self, registry: Optional[PositionRegistry] = None):
         """
         Initialize with optional custom registry.
         
         Args:
             registry: Position registry (uses singleton if not provided)
-            shadow_mode: If True, only log decisions, don't emit actions
         """
         self.registry = registry or get_position_registry()
-        self.shadow_mode = shadow_mode
         
-        # Decision history for shadow mode
+        # Decision history for metrics / debugging
         self.decision_history: List[DecisionTick] = []
         self.max_history = 10000
         
@@ -723,7 +713,7 @@ class PositionManagerV2:
         
         return actions
     
-    # ========== SHADOW MODE ==========
+    # ========== DECISION HISTORY ==========
     
     def _record_decision(
         self,
@@ -733,7 +723,7 @@ class PositionManagerV2:
         actions: List[ManagementAction],
         reason_codes: List[str]
     ) -> None:
-        """Record decision tick for shadow mode comparison."""
+        """Record decision tick for metrics / debugging."""
         tick = DecisionTick(
             timestamp=datetime.now(timezone.utc),
             symbol=symbol,
@@ -751,17 +741,9 @@ class PositionManagerV2:
         # Trim history
         if len(self.decision_history) > self.max_history:
             self.decision_history = self.decision_history[-self.max_history:]
-        
-        if self.shadow_mode and actions:
-            logger.info(
-                "[SHADOW] Would execute",
-                symbol=symbol,
-                actions=[a.type.value for a in actions],
-                reasons=reason_codes
-            )
     
-    def get_shadow_metrics(self) -> Dict:
-        """Get metrics from shadow mode for comparison."""
+    def get_decision_metrics(self) -> Dict:
+        """Get metrics from decision history (counts, state distribution)."""
         return {
             "total_decisions": len(self.decision_history),
             "metrics": self.metrics.copy(),
