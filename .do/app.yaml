@@ -36,7 +36,7 @@ services:
     github:
       repo: ArielB1980/TradingSystem
       branch: main
-    run_command: python run.py live --force
+    run_command: python migrate_schema.py && python run.py live --force --with-health
     instance_count: 1
     instance_size_slug: basic-xs
     envs:
@@ -57,6 +57,14 @@ services:
         type: SECRET
       - key: ENVIRONMENT
         value: prod
+        scope: RUN_TIME
+        type: GENERAL
+      - key: USE_STATE_MACHINE_V2
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: STATE_MACHINE_SHADOW_MODE
+        value: "false"
         scope: RUN_TIME
         type: GENERAL
 

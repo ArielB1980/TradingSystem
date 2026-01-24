@@ -33,6 +33,11 @@ from src.execution.position_manager_v2 import (
 )
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.position_persistence import PositionPersistence
+from src.execution.production_safety import (
+    SafetyConfig,
+    ProtectionEnforcer,
+    PositionProtectionMonitor,
+)
 
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
@@ -115,12 +120,16 @@ class LiveTrading:
                 logger.warning("State Machine V2 running in SHADOW MODE - logging only, not executing")
             else:
                 logger.critical("State Machine V2 running in LIVE MODE - all orders via gateway")
+            self._protection_monitor = None
+            self._protection_task = None
         else:
             # Legacy mode - use old managed_positions dict
             self.position_registry = None
             self.position_manager_v2 = None
             self.execution_gateway = None
             self.position_persistence = None
+            self._protection_monitor = None
+            self._protection_task = None
         
         # State (Legacy - will be deprecated when V2 fully enabled)
         self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
@@ -291,6 +300,26 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Position State Machine V2 startup failed", error=str(e))
 
+            # 2.6 PositionProtectionMonitor (Invariant K) - periodic check when V2 live
+            if (
+                self.use_state_machine_v2
+                and self.execution_gateway
+                and not self.state_machine_shadow_mode
+                and self.position_registry
+            ):
+                try:
+                    cfg = SafetyConfig()
+                    enforcer = ProtectionEnforcer(self.client, cfg)
+                    self._protection_monitor = PositionProtectionMonitor(
+                        self.client, self.position_registry, enforcer
+                    )
+                    self._protection_task = asyncio.create_task(
+                        self._protection_monitor.run_periodic_check(interval_seconds=30)
+                    )
+                    logger.info("PositionProtectionMonitor started (interval=30s)")
+                except Exception as e:
+                    logger.error("Failed to start PositionProtectionMonitor", error=str(e))
+
             # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt unprotected)
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
                 try:
@@ -406,6 +435,14 @@ class LiveTrading:
             raise
         finally:
             self.active = False
+            if getattr(self, "_protection_monitor", None):
+                self._protection_monitor.stop()
+            if getattr(self, "_protection_task", None) and not self._protection_task.done():
+                self._protection_task.cancel()
+                try:
+                    await self._protection_task
+                except asyncio.CancelledError:
+                    pass
             await self.data_acq.stop()
             await self.client.close()
             logger.info("Live trading shutdown complete")

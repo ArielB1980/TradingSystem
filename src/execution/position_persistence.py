@@ -97,6 +97,7 @@ class PositionPersistence:
                     setup_type TEXT,
                     regime TEXT,
                     trade_type TEXT,
+                    intent_confirmed INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     
@@ -164,6 +165,13 @@ class PositionPersistence:
                 CREATE INDEX IF NOT EXISTS idx_intents_status ON action_intents(status);
                 CREATE INDEX IF NOT EXISTS idx_intents_position ON action_intents(position_id);
             """)
+            try:
+                self._conn.execute(
+                    "ALTER TABLE positions ADD COLUMN intent_confirmed INTEGER DEFAULT 0"
+                )
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     
     # ========== POSITION CRUD ==========
     
@@ -179,10 +187,10 @@ class PositionPersistence:
                     tp1_filled, tp2_filled, break_even_triggered, trailing_active,
                     exit_reason, exit_time,
                     entry_order_id, stop_order_id, pending_exit_order_id,
-                    setup_type, regime, trade_type,
+                    setup_type, regime, trade_type, intent_confirmed,
                     created_at, updated_at,
                     processed_event_hashes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position.position_id,
                 position.symbol,
@@ -208,6 +216,7 @@ class PositionPersistence:
                 position.setup_type,
                 position.regime,
                 position.trade_type,
+                1 if position.intent_confirmed else 0,
                 position.created_at.isoformat(),
                 position.updated_at.isoformat(),
                 json.dumps(list(position.processed_event_hashes))
@@ -312,6 +321,7 @@ class PositionPersistence:
             pos.setup_type = row.get("setup_type")
             pos.regime = row.get("regime")
             pos.trade_type = row.get("trade_type")
+            pos.intent_confirmed = bool(row.get("intent_confirmed", 0))
             pos.created_at = datetime.fromisoformat(row["created_at"])
             pos.updated_at = datetime.fromisoformat(row["updated_at"])
             

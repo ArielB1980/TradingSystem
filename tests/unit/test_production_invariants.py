@@ -591,8 +591,14 @@ class TestInvariantJ_ConditionalBreakEven:
             min_partial_for_be=Decimal("0.3")  # 30% minimum
         )
         pos.entry_order_id = "entry-1"
-        
-        # Fill entry
+        ack_event = OrderEvent(
+            order_id="entry-1",
+            client_order_id="client-1",
+            event_type=OrderEventType.ACKNOWLEDGED,
+            event_seq=0,
+            timestamp=datetime.now(timezone.utc),
+        )
+        pos.apply_order_event(ack_event)
         entry_fill = OrderEvent(
             order_id="entry-1",
             client_order_id="client-1",
@@ -604,7 +610,6 @@ class TestInvariantJ_ConditionalBreakEven:
             fill_id="fill-1"
         )
         pos.apply_order_event(entry_fill)
-        
         # Mark TP1 as filled
         pos.tp1_filled = True
         
@@ -652,6 +657,15 @@ class TestInvariantJ_ConditionalBreakEven:
         
         assert pos.should_trigger_break_even() is True
     
+    def test_be_not_triggered_tight_without_intent_confirmed(self):
+        """BE should NOT trigger for tight_smc if intent_confirmed is False."""
+        pos = self._create_position_with_tp1_partial(
+            tp1_fill_pct=Decimal("0.5"),
+            trade_type="tight_smc"
+        )
+        pos.intent_confirmed = False  # Simulate no ack / no BOS confirmation
+        assert pos.should_trigger_break_even() is False
+
     def test_be_not_triggered_if_not_tp1_filled(self):
         """BE requires TP1 to be filled first."""
         pos = ManagedPosition(

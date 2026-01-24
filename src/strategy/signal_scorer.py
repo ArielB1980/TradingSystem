@@ -191,9 +191,8 @@ class SignalScorer:
         if fib_levels.ote_low <= entry <= fib_levels.ote_high:
             score = 15.0
         else:
-            # Check proximity to standard levels
-            tolerance = Decimal("0.002")  # 0.2%
-            
+            # Check proximity to standard levels (from config)
+            tolerance = Decimal(str(self.config.fib_proximity_bps)) / Decimal("10000")
             levels = [
                 fib_levels.fib_0_382,
                 fib_levels.fib_0_618,

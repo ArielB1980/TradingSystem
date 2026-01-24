@@ -230,6 +230,7 @@ class ManagedPosition:
     setup_type: Optional[str] = None
     regime: Optional[str] = None
     trade_type: Optional[str] = None  # "tight_smc" or "wide_structure"
+    intent_confirmed: bool = False  # BE gate for tight: requires True or wide_structure
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
@@ -364,6 +365,7 @@ class ManagedPosition:
         """Handle order acknowledgement. Locks immutable fields."""
         if event.order_id == self.entry_order_id:
             self.entry_acknowledged = True
+            self.intent_confirmed = True  # BE gate: tight trades may trigger BE after TP1
             logger.info(f"Entry acknowledged for {self.symbol}, immutables locked")
             return True
         return False
@@ -562,8 +564,8 @@ class ManagedPosition:
         if self.trade_type == "wide_structure":
             return True
         
-        # For tight trades, need more confirmation (could add more logic here)
-        return True
+        # For tight trades, require intent_confirmed (e.g. set on entry ack / BOS confirmation)
+        return bool(self.intent_confirmed)
     
     def trigger_break_even(self, be_price: Optional[Decimal] = None) -> bool:
         """Trigger break-even stop move."""
@@ -690,6 +692,7 @@ class ManagedPosition:
             "setup_type": self.setup_type,
             "regime": self.regime,
             "trade_type": self.trade_type,
+            "intent_confirmed": self.intent_confirmed,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "entry_order_id": self.entry_order_id,
@@ -731,6 +734,7 @@ class ManagedPosition:
         pos.setup_type = data.get("setup_type")
         pos.regime = data.get("regime")
         pos.trade_type = data.get("trade_type")
+        pos.intent_confirmed = data.get("intent_confirmed", False)
         pos.created_at = datetime.fromisoformat(data["created_at"])
         pos.updated_at = datetime.fromisoformat(data["updated_at"])
         pos.entry_order_id = data.get("entry_order_id")

@@ -9,6 +9,7 @@ Usage:
   python scripts/do_track_and_logs.py --logs --follow      # stream live RUN logs (WebSocket)
   python scripts/do_track_and_logs.py --track --logs       # deployment + logs
   python scripts/do_track_and_logs.py --logs --component worker --tail 200
+  python scripts/do_track_and_logs.py --check-health   # GET /api, /api/health, /dashboard
 
 App is on App Platform (not a droplet). Default app name: tradingbot.
 """
@@ -78,6 +79,53 @@ def component_names(app: dict[str, Any]) -> list[str]:
             if n:
                 names.append(n)
     return names
+
+
+def check_health(app_id: str, headers: dict[str, str]) -> bool:
+    """GET worker / and /health (run.py live --with-health); optional /api, /api/health, /dashboard.
+    Returns True if worker health (/ and /health) ok."""
+    full = get_app(app_id, headers)
+    base = full.get("default_ingress") or full.get("live_url") or full.get("live_domain")
+    if not base:
+        print("No default_ingress/live_url/live_domain on app; cannot check health.")
+        return False
+    base = base.rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    print(f"  Base: {base}")
+    ok = True
+    # Worker health (run.py live --with-health): GET / and /health
+    for path in ("/", "/health"):
+        url = base + path
+        try:
+            r = requests.get(url, timeout=15)
+            status = "ok" if 200 <= r.status_code < 300 else "fail"
+            if r.status_code >= 400:
+                ok = False
+            print(f"  {path or '/'}: {r.status_code} ({status})")
+            if path == "/health" and r.status_code == 200:
+                try:
+                    j = r.json()
+                    for k in ("uptime_seconds", "environment", "service"):
+                        if k in j:
+                            print(f"    {k}: {j[k]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"  {path or '/'}: error – {e}")
+            ok = False
+    # Optional: web /api, /api/health, /dashboard (404 if app is worker-only)
+    for path in ("/api", "/api/health", "/dashboard"):
+        url = base + path
+        try:
+            r = requests.get(url, timeout=10)
+            status = "ok" if 200 <= r.status_code < 300 else "skip" if r.status_code == 404 else "fail"
+            print(f"  {path}: {r.status_code} ({status})")
+            if r.status_code >= 500:
+                ok = False
+        except Exception as e:
+            print(f"  {path}: error – {e}")
+    return ok
 
 
 def track_deployment(app_id: str, headers: dict[str, str], poll_interval: int = 10) -> bool:
@@ -195,6 +243,7 @@ def main() -> None:
     ap.add_argument("--tail", type=int, default=500, help="Tail lines (default: 500)")
     ap.add_argument("--save", help="Append logs to this file (with --follow)")
     ap.add_argument("--poll-interval", type=int, default=10, help="Seconds between deployment polls (default: 10)")
+    ap.add_argument("--check-health", action="store_true", help="GET /api, /api/health, /dashboard and report status")
     args = ap.parse_args()
 
     token = get_token(args)
@@ -210,6 +259,11 @@ def main() -> None:
     app_id = app["id"]
     spec_name = (app.get("spec") or {}).get("name", "")
     print(f"App: {spec_name} (id: {app_id})")
+
+    if args.check_health:
+        print("Health check (web / dashboard):")
+        h_ok = check_health(app_id, headers)
+        sys.exit(0 if h_ok else 1)
 
     if args.track:
         ok = track_deployment(app_id, headers, poll_interval=args.poll_interval)
