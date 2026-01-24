@@ -1,8 +1,9 @@
 """
 Main entry point: DataService + TradingService with embedded health API.
 
-NOT the production runtime. Production uses run.py live → LiveTrading, and
-src.health for the web service. See docs/PRODUCTION_RUNTIME.md.
+DEPRECATED for production. Production uses run.py live → LiveTrading and
+src.health for the web service. Exits with code 1 if ENVIRONMENT=prod.
+See docs/PRODUCTION_RUNTIME.md.
 """
 import asyncio
 import time
@@ -313,8 +314,7 @@ def main():
             "Use run.py live + src.health. Set worker run_command to: "
             "python migrate_schema.py && python run.py live --force"
         )
-        # Log only; do not exit. Exiting breaks deploy when DO still runs this.
-        # Remove this block entirely after worker is switched to run.py live.
+        sys.exit(1)
     # Start FastAPI in background thread
     api_thread = threading.Thread(target=run_fastapi, daemon=True)
     api_thread.start()

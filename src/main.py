@@ -1,7 +1,7 @@
 """
 Architecture v3: DataService + TradingService (single-process async).
 
-NOT the production live path. Production uses `run.py live` → LiveTrading.
+DEPRECATED for production. Use `run.py live` → LiveTrading for live trading.
 See docs/PRODUCTION_RUNTIME.md.
 """
 import asyncio

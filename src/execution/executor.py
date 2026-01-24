@@ -294,20 +294,27 @@ class Executor:
                 return entry_order
                 
             except Exception as e:
-                logger.error(
-                    "Failed to submit entry order",
-                    symbol=order_intent.signal.symbol,
-                    error=str(e),
-                )
+                err = str(e)
+                insufficient = "insufficient" in err.lower() or "insufficientavailablefunds" in err.lower()
+                if insufficient:
+                    logger.warning(
+                        "Insufficient funds, skipping entry",
+                        symbol=order_intent.signal.symbol,
+                        error=err[:200],
+                    )
+                else:
+                    logger.error(
+                        "Failed to submit entry order",
+                        symbol=order_intent.signal.symbol,
+                        error=err,
+                    )
                 # CRITICAL: Add intent_hash even on failure to prevent immediate retry
-                # This prevents rapid retry loops when order placement fails
-                # The hash will expire naturally as signals change over time
                 self.order_intents_seen.add(intent_hash)
-                self._persist_intent_hash(intent_hash, order_intent)  # Persist to survive restarts
+                self._persist_intent_hash(intent_hash, order_intent)
                 logger.debug(
                     "Added failed intent to seen set to prevent immediate retry",
                     symbol=order_intent.signal.symbol,
-                    intent_hash=intent_hash
+                    intent_hash=intent_hash,
                 )
                 return None
     

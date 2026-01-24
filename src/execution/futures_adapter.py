@@ -25,7 +25,8 @@ class FuturesAdapter:
     Maps spot tickers to futures contracts and handles order placement.
     """
     
-    # Spot → Futures mapping (Kraken uses PF_ prefix for perpetuals, e.g. PF_XBTUSD)
+    # Spot → Futures mapping (Kraken uses PF_ prefix for perpetuals, e.g. PF_XBTUSD).
+    # Covers common pairs; market discovery supplies spot_to_futures_override for the full universe.
     TICKER_MAP = {
         "BTC/USD": "PF_XBTUSD",
         "ETH/USD": "PF_ETHUSD",
