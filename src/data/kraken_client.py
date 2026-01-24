@@ -725,7 +725,44 @@ class KrakenClient:
         except Exception as e:
             logger.error("Futures order placement failed", error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
-    
+
+    async def create_order(
+        self,
+        symbol: str,
+        type: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        CCXT-style create_order for ExecutionGateway compatibility.
+        Delegates to place_futures_order.
+        """
+        p = params or {}
+        client_order_id = p.get("clientOrderId") or p.get("cliOrdId")
+        reduce_only = bool(p.get("reduceOnly", False))
+        stop_price = p.get("stopPrice")
+        if stop_price is not None:
+            stop_price = Decimal(str(stop_price))
+        elif type in ("stop", "stop_loss") and price is not None:
+            stop_price = Decimal(str(price))
+        leverage = Decimal("7") if not reduce_only else None
+        order_type = "stop" if type in ("stop", "stop_loss") else type
+        size = Decimal(str(amount))
+        price_dec = Decimal(str(price)) if price is not None else None
+        return await self.place_futures_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            size=size,
+            price=price_dec,
+            stop_price=stop_price,
+            reduce_only=reduce_only,
+            leverage=leverage,
+            client_order_id=client_order_id,
+        )
+
     @retry_on_transient_errors(max_retries=3, base_delay=1.0)
     async def get_futures_balance(self) -> Dict[str, Any]:
         """
@@ -784,6 +821,10 @@ class KrakenClient:
         except Exception as e:
             logger.error("Failed to cancel futures order", order_id=order_id, error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
+
+    async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """CCXT-style cancel_order for ExecutionGateway. Delegates to cancel_futures_order."""
+        return await self.cancel_futures_order(order_id, symbol)
 
     async def cancel_all_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """
