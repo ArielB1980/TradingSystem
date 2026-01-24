@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from collections import defaultdict
 
 from src.monitoring.logger import get_logger
@@ -10,12 +10,39 @@ from src.storage.repository import load_candles_map, save_candles_bulk, get_late
 
 logger = get_logger(__name__)
 
+
+def _candles_with_symbol(candles: List[Candle], symbol: str) -> List[Candle]:
+    """Return new Candles with symbol overwritten (for futures fallback stored under spot)."""
+    out: List[Candle] = []
+    for c in candles:
+        out.append(Candle(
+            timestamp=c.timestamp,
+            symbol=symbol,
+            timeframe=c.timeframe,
+            open=c.open,
+            high=c.high,
+            low=c.low,
+            close=c.close,
+            volume=c.volume,
+        ))
+    return out
+
+
 class CandleManager:
     """
     Manages fetching, caching, and persistence of candle data.
+    When spot OHLCV is unavailable, can use futures OHLCV for signal analysis (use_futures_fallback).
     """
-    def __init__(self, client: KrakenClient):
+    def __init__(
+        self,
+        client: KrakenClient,
+        spot_to_futures: Optional[Callable[[str], str]] = None,
+        use_futures_fallback: bool = False,
+    ):
         self.client = client
+        self.spot_to_futures = spot_to_futures
+        self.use_futures_fallback = use_futures_fallback
+        self._futures_fallback_symbols: set = set()  # Symbols that used futures OHLCV (cleared each summary)
         # Storage: timeframe -> symbol -> list[Candle]
         self.candles: Dict[str, Dict[str, List[Candle]]] = {
             "15m": {},
@@ -100,69 +127,80 @@ class CandleManager:
         """Get cached candles."""
         return self.candles.get(timeframe, {}).get(symbol, [])
 
+    def get_futures_fallback_count(self) -> int:
+        """Return number of symbols that used futures OHLCV since last pop (no clear)."""
+        return len(self._futures_fallback_symbols)
+
+    def pop_futures_fallback_count(self) -> int:
+        """Return number of symbols that used futures OHLCV since last call, then clear."""
+        n = len(self._futures_fallback_symbols)
+        self._futures_fallback_symbols.clear()
+        return n
+
     async def update_candles(self, symbol: str):
-        """Update candles for a symbol (Incremental)."""
+        """Update candles for a symbol (Incremental). Uses spot OHLCV; if unavailable and use_futures_fallback, uses futures OHLCV."""
         now = datetime.now(timezone.utc)
         if symbol not in self.last_candle_update:
             self.last_candle_update[symbol] = {}
 
         async def fetch_tf(tf: str, interval_min: int):
-            # Check cache
             last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
             if (now - last_update).total_seconds() < (interval_min * 60):
-                return # Cache hit
-            
+                return
             buffer = self.candles[tf]
-            
-            # Determine fetch start time
-            # Prioritize in-memory buffer (most recent), then DB
             last_ts = None
             existing = buffer.get(symbol, [])
-            
             if existing:
                 last_ts = existing[-1].timestamp
             else:
-                 # Check DB
-                 last_ts = await asyncio.to_thread(get_latest_candle_timestamp, symbol, tf)
-                 
-            since_ms = None
-            if last_ts:
-                # Use timestamp (ms) for since
-                since_ms = int(last_ts.replace(tzinfo=timezone.utc).timestamp() * 1000)
-            
-            # Fetch (Incremental)
-            candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
+                last_ts = await asyncio.to_thread(get_latest_candle_timestamp, symbol, tf)
+            since_ms = int(last_ts.replace(tzinfo=timezone.utc).timestamp() * 1000) if last_ts else None
+
+            candles: List[Candle] = []
+            used_futures = False
+
+            try:
+                candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
+            except Exception:
+                candles = []
+
+            if not candles and self.use_futures_fallback and self.spot_to_futures:
+                try:
+                    fsym = self.spot_to_futures(symbol)
+                    raw = await self.client.get_futures_ohlcv(fsym, tf, since=since_ms, limit=300)
+                    if raw:
+                        candles = _candles_with_symbol(raw, symbol)
+                        used_futures = True
+                except Exception:
+                    pass
+
             if not candles:
-                logger.warning(f"Fetched EMPTY candles for {symbol} {tf}", since_ms=since_ms, limit=300)
+                if not used_futures:
+                    logger.warning(f"No candles for {symbol} {tf} (spot failed, futures fallback skipped or empty)")
                 return
-            
-            # Update Cache
+
+            if used_futures:
+                self._futures_fallback_symbols.add(symbol)
+                logger.debug(f"Using futures OHLCV for {symbol} {tf}", count=len(candles))
+
             self.last_candle_update[symbol][tf] = now
-            
-            # Smart Merge into Buffer
             if not existing:
                 buffer[symbol] = candles
             else:
-                 # Append only new ones
-                 last_buffer_ts = existing[-1].timestamp
-                 new_candles = [c for c in candles if c.timestamp > last_buffer_ts]
-                 if new_candles:
-                      buffer[symbol].extend(new_candles)
-                 
-                 # Prune buffer (Keep up to 2,000 in memory for HTF analysis)
-                 if len(buffer[symbol]) > 2000:
-                     buffer[symbol] = buffer[symbol][-2000:]
-            
-            # Queue for DB Persistence 
-            # We queue all fetched candles. Repository handles deduplication (Upsert).
+                last_buffer_ts = existing[-1].timestamp
+                new_candles = [c for c in candles if c.timestamp > last_buffer_ts]
+                if new_candles:
+                    buffer[symbol].extend(new_candles)
+                if len(buffer[symbol]) > 2000:
+                    buffer[symbol] = buffer[symbol][-2000:]
             if candles:
                 self.pending_candles.extend(candles)
-            
+
         await asyncio.gather(
             fetch_tf("15m", 1),
             fetch_tf("1h", 5),
             fetch_tf("4h", 15),
-            fetch_tf("1d", 60)
+            fetch_tf("1d", 60),
         )
 
     async def flush_pending(self):

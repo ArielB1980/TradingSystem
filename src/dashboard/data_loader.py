@@ -172,15 +172,16 @@ def load_all_coins() -> tuple[List[CoinSnapshot], Dict[str, int]]:
     try:
         from src.config.config import load_config
         from src.dashboard.utils import _get_monitored_symbols
-        from src.storage.repository import get_recent_events, count_candles
+        from src.storage.repository import get_recent_events, get_last_signal_per_symbol, count_candles
         
         # Get all configured symbols (should be 250 coins)
         config = load_config()
         all_symbols = _get_monitored_symbols(config)
         
         # Get latest DECISION_TRACE for each symbol (creates a dict for quick lookup)
-        traces = get_latest_traces(limit=1000) # Increased to cover full universe
-        traces_by_symbol = {trace.get('symbol'): trace for trace in traces if trace.get('symbol')}
+        traces = get_latest_traces(limit=1000)  # Increased to cover full universe
+        traces_by_symbol = {trace.get("symbol"): trace for trace in traces if trace.get("symbol")}
+        last_signal_ts = get_last_signal_per_symbol(limit_events=2000)  # last LONG/SHORT per symbol
         
         # Get latest DISCOVERY_UPDATE (Robust source)
         discovery_list = []
@@ -255,41 +256,40 @@ def load_all_coins() -> tuple[List[CoinSnapshot], Dict[str, int]]:
                     symbol=symbol,
                     price=spot_price,
                     change_24h=calculate_24h_change(symbol, spot_price) if spot_price > 0 else 0.0,
-                    regime=details.get('regime', 'unknown'),
-                    bias=details.get('bias', 'neutral'),
-                    signal=details.get('signal', 'NO_SIGNAL'),
+                    regime=details.get("regime", "unknown"),
+                    bias=details.get("bias", "neutral"),
+                    signal=details.get("signal", "NO_SIGNAL"),
                     quality=calculate_quality_score(details),
-                    adx=float(details.get('adx', 0.0)) if details.get('adx') is not None else 0.0,
-                    atr=float(details.get('atr', 0.0)) if details.get('atr') is not None else 0.0,
-                    ema200_slope=details.get('ema200_slope', 'flat'),
+                    adx=float(details.get("adx", 0.0)) if details.get("adx") is not None else 0.0,
+                    atr=float(details.get("atr", 0.0)) if details.get("atr") is not None else 0.0,
+                    ema200_slope=details.get("ema200_slope", "flat"),
                     score_breakdown=score_breakdown if isinstance(score_breakdown, dict) else {},
                     last_update=last_update or now,
-                    last_signal=None,  # TODO: Query for last non-NO_SIGNAL
+                    last_signal=last_signal_ts.get(symbol),
                     status=status,
                     candle_count=candle_count,
-                    structure=details.get('structure', {}),
-                    meta=details.get('meta', {})
+                    structure=details.get("structure", {}),
+                    meta=details.get("meta", {}),
                 )
             else:
                 # No trace yet - create default snapshot
-                # Use a very old timestamp to indicate no data
                 no_data_timestamp = datetime.min.replace(tzinfo=timezone.utc)
                 snapshot = CoinSnapshot(
                     symbol=symbol,
                     price=0.0,
                     change_24h=0.0,
-                    regime='unknown',
-                    bias='neutral',
-                    signal='NO_SIGNAL',
+                    regime="unknown",
+                    bias="neutral",
+                    signal="NO_SIGNAL",
                     quality=0.0,
                     adx=0.0,
                     atr=0.0,
-                    ema200_slope='flat',
+                    ema200_slope="flat",
                     score_breakdown={},
                     last_update=no_data_timestamp,
-                    last_signal=None,
-                    status='dead',  # No data yet
-                    candle_count=count_candles(symbol, "15m"), # Check DB just in case
+                    last_signal=last_signal_ts.get(symbol),
+                    status="dead",
+                    candle_count=count_candles(symbol, "15m"),
                     structure={},
                     meta={}
                 )

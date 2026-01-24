@@ -867,6 +867,34 @@ def get_recent_events(limit: int = 50, event_type: Optional[str] = None, symbol:
             for e in events
         ]
 
+
+def get_last_signal_per_symbol(limit_events: int = 2000) -> Dict[str, datetime]:
+    """
+    Latest LONG/SHORT DECISION_TRACE timestamp per symbol.
+    Used for dashboard last_signal (last non-NO_SIGNAL).
+    """
+    events = get_recent_events(limit=limit_events, event_type="DECISION_TRACE")
+    out: Dict[str, datetime] = {}
+    for ev in events:
+        sym = ev.get("symbol")
+        if not sym:
+            continue
+        details = ev.get("details") or {}
+        sig = (details.get("signal") or "").strip().upper()
+        if sig not in ("LONG", "SHORT"):
+            continue
+        ts_str = ev.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if sym not in out or ts > out[sym]:
+            out[sym] = ts
+    return out
+
+
 def get_event_stats(symbol: str) -> Dict[str, Any]:
     """Get statistics for system events for a specific symbol."""
     db = get_db()

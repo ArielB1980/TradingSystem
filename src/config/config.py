@@ -36,6 +36,9 @@ class ExchangeConfig(BaseSettings):
     
     # Skip OHLCV fetch for these spot symbols (delisted, unsupported, or consistently failing)
     spot_ohlcv_blocklist: List[str] = Field(default_factory=lambda: ["2Z/USD", "ANIME/USD"], description="Excluded from OHLCV")
+
+    # When spot OHLCV unavailable (BadSymbol, no data), use futures OHLCV for signal analysis
+    use_futures_ohlcv_fallback: bool = Field(default=True, description="Use futures candles when spot has 0")
     
     # Credentials (loaded from env or yaml)
     api_key: Optional[str] = None

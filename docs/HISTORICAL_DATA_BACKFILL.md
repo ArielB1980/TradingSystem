@@ -107,6 +107,26 @@ This is perfect because:
 
 The system already fetches new candles continuously via `DataAcquisition`. The backfill is only needed once to populate historical data.
 
+### Periodic backfill (cron)
+
+To backfill **new** symbols (e.g. after market discovery adds pairs) or **gaps** (e.g. missing days), run the script periodically. With `skip_existing=True` (default), it only fetches for symbols with &lt;200 daily candles.
+
+**Cron-friendly wrapper**: `scripts/run_backfill_cron.sh`
+
+```bash
+# Make executable once: chmod +x scripts/run_backfill_cron.sh
+# Example: Sundays at 03:00
+0 3 * * 0 cd /path/to/TradingSystem && ./scripts/run_backfill_cron.sh
+```
+
+The script sources `.env.local`, uses `.venv`, and runs `backfill_historical_data.py` with default options (`skip_existing=True`, 250 days). Or run the backfill script directly:
+
+```bash
+cd /path/to/TradingSystem && set -a && [ -f .env.local ] && source .env.local; set +a && .venv/bin/python scripts/backfill_historical_data.py
+```
+
+Use the same `DATABASE_URL` as the worker so the live system hydrates from the updated DB.
+
 ## Timeline
 
 1. **Now**: Backfill script created, ready to run

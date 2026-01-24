@@ -2,23 +2,63 @@
 Health check endpoint for App Platform.
 Simple HTTP server to respond to health checks.
 
-worker_health_app: minimal app for run.py live --with-health (worker container).
-Serves GET / and GET /health only; no DB. Use for readiness when LiveTrading is the worker.
+worker_health_app: run.py live --with-health (worker container).
+Serves /, /health, /api, /api/health, /api/debug/signals, /debug/signals.
+Default app URL (tradingbot-*.ondigitalocean.app) routes to worker, so these
+debug endpoints live on the worker health server.
 """
 from datetime import datetime, timezone
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 import os
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 app = FastAPI(title="Trading System Health Check")
 
 _worker_start = time.time()
 
 
+def _metrics_json() -> Tuple[dict, int]:
+    """Shared logic for /api/metrics. Returns (content, status_code)."""
+    try:
+        from src.storage.repository import get_latest_metrics_snapshot
+        snap = get_latest_metrics_snapshot()
+        out = snap if snap is not None else {}
+        return ({"source": "worker_snapshot", "metrics": out}, 200)
+    except Exception as e:
+        return ({"source": "worker_snapshot", "metrics": {}, "error": str(e)[:100]}, 200)
+
+
+def _metrics_prometheus() -> Tuple[str, int]:
+    """Shared logic for /metrics (Prometheus-style). Returns (body, status_code)."""
+    try:
+        from src.storage.repository import get_latest_metrics_snapshot
+        snap = get_latest_metrics_snapshot()
+        if not snap:
+            return ("", 200)
+        lines = ["# Worker metrics (latest snapshot)"]
+        for k, v in sorted(snap.items()):
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                lines.append(f"trading_{k} {v}")
+            elif isinstance(v, str) and k == "last_tick_at":
+                lines.append(f'trading_{k}_iso "{v}"')
+            else:
+                continue
+        return ("\n".join(lines) + "\n", 200)
+    except Exception as e:
+        return (f"# error: {e}\n", 200)
+
+
 def get_worker_health_app() -> FastAPI:
-    """Minimal health app for worker running run.py live --with-health. GET / and /health only."""
+    """
+    Health app for worker (run.py live --with-health).
+    Serves /, /health. Also /api, /api/health, /api/debug/signals, /debug/signals
+    so the default app URL (which routes to worker) can serve debug endpoints.
+    """
+
     w = FastAPI(title="Worker Health")
 
     @w.get("/")
@@ -35,6 +75,50 @@ def get_worker_health_app() -> FastAPI:
             },
             status_code=200,
         )
+
+    @w.get("/api")
+    async def api_root():
+        return {"status": "ok", "service": "trading-worker"}
+
+    @w.get("/api/health")
+    async def api_health():
+        """Quick health: DB ping, environment."""
+        out = {"status": "healthy", "database": "unknown", "environment": os.getenv("ENVIRONMENT", "unknown")}
+        if os.getenv("DATABASE_URL"):
+            out["database"] = "configured"
+            try:
+                from src.storage.db import get_db
+                from sqlalchemy import text
+                db = get_db()
+                with db.get_session() as session:
+                    session.execute(text("SELECT 1;"))
+                out["database"] = "connected"
+            except Exception as e:
+                out["database"] = f"error: {str(e)[:80]}"
+                out["status"] = "unhealthy"
+        else:
+            out["status"] = "unhealthy"
+        return JSONResponse(content=out, status_code=200 if out["status"] == "healthy" else 503)
+
+    @w.get("/api/debug/signals")
+    async def api_debug_signals(symbol: Optional[str] = None):
+        data = _debug_signals_impl(symbol_filter=symbol)
+        return JSONResponse(content=data, status_code=200)
+
+    @w.get("/debug/signals")
+    async def debug_signals(symbol: Optional[str] = None):
+        data = _debug_signals_impl(symbol_filter=symbol)
+        return JSONResponse(content=data, status_code=200)
+
+    @w.get("/api/metrics")
+    async def api_metrics():
+        content, status = _metrics_json()
+        return JSONResponse(content=content, status_code=status)
+
+    @w.get("/metrics")
+    async def metrics_prometheus():
+        body, status = _metrics_prometheus()
+        return PlainTextResponse(body, status_code=status)
 
     return w
 
@@ -112,17 +196,16 @@ async def ready():
 
 @app.get("/api/metrics")
 async def metrics():
-    """Observability: latest metrics snapshot from worker (DB). Includes last_tick_at, signals_last_min, api_fetch_latency_ms, markets_count. Returns {} if none."""
-    try:
-        from src.storage.repository import get_latest_metrics_snapshot
-        snap = get_latest_metrics_snapshot()
-        out = snap if snap is not None else {}
-        return JSONResponse(content={"source": "worker_snapshot", "metrics": out})
-    except Exception as e:
-        return JSONResponse(
-            content={"source": "worker_snapshot", "metrics": {}, "error": str(e)[:100]},
-            status_code=200,
-        )
+    """Observability: latest metrics snapshot from worker (DB). Includes last_tick_at, signals_last_min, api_fetch_latency_ms, markets_count, coins_futures_fallback_used."""
+    content, status = _metrics_json()
+    return JSONResponse(content=content, status_code=status)
+
+
+@app.get("/metrics")
+async def metrics_prometheus():
+    """Prometheus-style plain text metrics from latest worker snapshot."""
+    body, status = _metrics_prometheus()
+    return PlainTextResponse(body, status_code=status)
 
 
 @app.get("/api/dashboard")

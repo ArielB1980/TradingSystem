@@ -509,7 +509,7 @@ class TestConditionalBreakEven:
         assert pos.should_trigger_break_even() is False
     
     def test_be_triggers_with_sufficient_fill(self):
-        """BE triggers with sufficient fill percentage."""
+        """BE triggers with sufficient fill and market confirmation (intent confirmed)."""
         pos = self._create_filled_position()
         pos.tp1_filled = True
         pos.min_partial_for_be = Decimal("0.3")
@@ -528,6 +528,7 @@ class TestConditionalBreakEven:
         pos.pending_exit_order_id = "exit-1"
         pos.apply_order_event(exit_event)
         
+        pos.confirm_intent()  # Market confirmation (BOS/level crossed) required for tight BE
         assert pos.should_trigger_break_even() is True
         assert pos.trigger_break_even() is True
         assert pos.break_even_triggered is True

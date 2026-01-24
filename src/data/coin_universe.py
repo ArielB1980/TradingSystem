@@ -183,36 +183,59 @@ class CoinClassifier:
         base = spot_symbol.split("/")[0]
         return f"{base}USD-PERP"
     
+    def _spot_to_kraken_pair(self, symbol: str) -> Optional[str]:
+        """Map symbol (e.g. BTC/USD) to Kraken REST pair (e.g. XBTUSD)."""
+        base_map = {"BTC": "XBT", "USD": "USD"}
+        try:
+            base, quote = symbol.upper().split("/")
+            base = base_map.get(base, base)
+            if quote != "USD":
+                return None
+            return base + "USD"
+        except Exception:
+            return None
+
     def _get_spot_volume(self, symbol: str) -> Optional[Decimal]:
         """
-        Get 24h spot volume from Kraken (or mock for now).
-        
-        Args:
-            symbol: Spot pair
+        Get 24h spot volume from Kraken public Ticker API.
         
         Returns:
-            24h volume in USD, or None if unavailable
+            24h volume in USD (approx: base_volume_24h * last_price), or None if unavailable.
         """
-        # TODO: Integrate with real Kraken API
-        # For now, return mock data for configured symbols
-        
-        mock_volumes = {
-            "BTC/USD": Decimal("500000000"),  # $500M
-            "ETH/USD": Decimal("200000000"),  # $200M
-            "SOL/USD": Decimal("80000000"),   # $80M
-            "LINK/USD": Decimal("30000000"),  # $30M
-            "AVAX/USD": Decimal("25000000"),  # $25M
-            "MATIC/USD": Decimal("15000000"), # $15M
-        }
-        
-        volume = mock_volumes.get(symbol)
-        
-        if volume:
-            logger.debug("Spot volume retrieved", symbol=symbol, volume_usd=str(volume))
-        else:
-            logger.warning("No volume data available", symbol=symbol)
-        
-        return volume
+        pair = self._spot_to_kraken_pair(symbol)
+        if not pair:
+            return None
+        try:
+            r = requests.get(
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": pair},
+                timeout=5,
+            )
+            r.raise_for_status()
+            data = r.json()
+            err = data.get("error")
+            if err:
+                logger.debug("Kraken Ticker error", symbol=symbol, pair=pair, error=err)
+                return None
+            result = data.get("result") or {}
+            # Kraken returns keys like XXBTZUSD; we requested XBTUSD – use first key
+            tk = next(iter(result.values())) if result else None
+            if not tk or not isinstance(tk, dict):
+                return None
+            v = tk.get("v")  # [vol today, vol last 24h]
+            c = tk.get("c")  # [last price, last lot]
+            if not v or not c or len(v) < 2 or len(c) < 1:
+                return None
+            vol_24h = float(v[1])
+            last_pr = float(c[0])
+            if vol_24h <= 0 or last_pr <= 0:
+                return None
+            usd = Decimal(str(vol_24h * last_pr))
+            logger.debug("Spot volume retrieved", symbol=symbol, volume_usd=str(usd))
+            return usd
+        except Exception as e:
+            logger.debug("Spot volume fetch failed", symbol=symbol, error=str(e))
+            return None
     
     def disable_coin(self, symbol: str, reason: str):
         """
