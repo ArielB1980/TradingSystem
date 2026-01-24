@@ -15,7 +15,7 @@ from decimal import Decimal
 from src.data.kraken_client import KrakenClient, KrakenWebSocket
 from src.data.orderbook import OrderBook
 from src.domain.models import Candle
-from src.storage.repository import save_candle
+from src.storage.repository import save_candles_bulk
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -149,10 +149,9 @@ class DataAcquisition:
                 # Validate no gaps
                 self._validate_candles(candles, timeframe)
                 
-                # Store candles
-                for candle in candles:
-                    save_candle(candle)
-                    all_candles.append(candle)
+                # Store via bulk upsert (idempotent for backfill / retries)
+                save_candles_bulk(candles)
+                all_candles.extend(candles)
                 
                 # Update current time for next chunk
                 current_time = candles[-1].timestamp + timedelta(minutes=self._timeframe_to_minutes(timeframe))
