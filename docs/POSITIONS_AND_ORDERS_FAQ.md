@@ -102,6 +102,23 @@ See also [CANDLE_DATA_AND_SUFFICIENT_COINS](CANDLE_DATA_AND_SUFFICIENT_COINS.md)
 
 ---
 
+## "Positions open but no SL or TP – why?"
+
+**Cause:** SL/TP are placed only **after** we confirm the **entry fill** via order-status updates. We never processed those updates, so we never ran the "place stop" follow-up.
+
+1. **Order-status polling** – We now poll pending entry orders (e.g. every 12s), fetch status, and call `process_order_update`. When an entry is **filled**, we emit a `PLACE_STOP` action and place the stop (and optionally TPs) via the gateway.
+2. **Futures symbol for stops** – Stops (and close/partial) use `position.futures_symbol` (e.g. `X/USD:USD`) when set, so Kraken Futures receives the correct symbol.
+
+**Existing naked positions (e.g. 27+ with no SL/TP):** Those were opened **before** the poller existed. We never got fill events, so we never placed stops. **Going forward**, new entries will get SL/TP once the poller sees the fill. For **existing** naked positions, use the **place-missing-stops** tool:
+
+```bash
+make place-missing-stops              # Dry-run: list naked positions and would-be stops
+make place-missing-stops-live         # Place stops (default 2% from entry)
+make place-missing-stops STOP_PCT=1.5 # Use 1.5% distance (dry-run)
+```
+
+---
+
 ## Summary
 
 | Question | Short answer |
@@ -109,3 +126,4 @@ See also [CANDLE_DATA_AND_SUFFICIENT_COINS](CANDLE_DATA_AND_SUFFICIENT_COINS.md)
 | **Closed all – intentional or bug?** | Could be either. Check logs (exit reasons, kill switch, reconciliation, flatten) and exchange history. “Zombie” / “orphan” handling does **not** send close orders. |
 | **Remaining orders from new signals?** | Only **entry** orders are from new signals. Stops/TPs with **0** positions are usually **stale**; run `make audit` / `make audit-cancel` to verify and clean up. |
 | **Signals but no trades?** | Confirm: futures ticker, risk approval, no state-machine reject, kill switch off. Check logs per table above. |
+| **Positions open but no SL/TP?** | We now poll entry order status and place SL (and TP) after fill. Existing naked positions need manual stops or a place‑missing‑stops tool. |

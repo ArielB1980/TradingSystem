@@ -113,6 +113,7 @@ class LiveTrading:
             logger.critical("State Machine V2 running - all orders via gateway")
             self._protection_monitor = None
             self._protection_task = None
+            self._order_poll_task = None
         else:
             # Legacy mode - use old managed_positions dict
             self.position_registry = None
@@ -121,6 +122,7 @@ class LiveTrading:
             self.position_persistence = None
             self._protection_monitor = None
             self._protection_task = None
+            self._order_poll_task = None
         
         # State (Legacy - will be deprecated when V2 fully enabled)
         self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
@@ -313,6 +315,16 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Failed to start PositionProtectionMonitor", error=str(e))
 
+            # 2.6b Order-status polling: detect entry fills, trigger PLACE_STOP (SL/TP)
+            if self.use_state_machine_v2 and self.execution_gateway:
+                try:
+                    self._order_poll_task = asyncio.create_task(
+                        self._run_order_polling(interval_seconds=12)
+                    )
+                    logger.info("Order-status polling started (interval=12s)")
+                except Exception as e:
+                    logger.error("Failed to start order poller", error=str(e))
+
             # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt unprotected)
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
                 try:
@@ -437,6 +449,12 @@ class LiveTrading:
                     await self._protection_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_order_poll_task", None) and not self._order_poll_task.done():
+                self._order_poll_task.cancel()
+                try:
+                    await self._order_poll_task
+                except asyncio.CancelledError:
+                    pass
             await self.data_acq.stop()
             await self.client.close()
             logger.info("Live trading shutdown complete")
@@ -445,6 +463,23 @@ class LiveTrading:
         from src.execution.equity import calculate_effective_equity
         base = getattr(self.config.exchange, "base_currency", "USD")
         return await calculate_effective_equity(balance, base_currency=base, kraken_client=self.client)
+
+    async def _run_order_polling(self, interval_seconds: int = 12) -> None:
+        """Poll pending entry order status, process fills, trigger PLACE_STOP (SL/TP)."""
+        while self.active:
+            await asyncio.sleep(interval_seconds)
+            if not self.active:
+                break
+            if not self.execution_gateway:
+                continue
+            try:
+                n = await self.execution_gateway.poll_and_process_order_updates()
+                if n > 0:
+                    logger.info("Order poll processed updates", count=n)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Order poll failed", error=str(e))
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
@@ -1205,6 +1240,7 @@ class LiveTrading:
         # This is done BEFORE order placement to ensure we track the position
         position.entry_order_id = action.client_order_id
         position.entry_client_order_id = action.client_order_id
+        position.futures_symbol = futures_symbol  # For PLACE_STOP / UPDATE_STOP exchange calls
         
         try:
             self.position_registry.register_position(position)

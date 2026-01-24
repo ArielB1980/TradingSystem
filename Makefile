@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live audit audit-cancel audit-orphaned check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -20,6 +20,8 @@ help:
 	@echo "  make audit           Audit open futures orders (read-only)"
 	@echo "  make audit-cancel    Audit + cancel redundant stop orders"
 	@echo "  make audit-orphaned  Audit + cancel orphaned stops (when 0 positions)"
+	@echo "  make place-missing-stops     List naked positions, dry-run place stops (STOP_PCT=2)"
+	@echo "  make place-missing-stops-live Place missing stops for naked positions (STOP_PCT=2)"
 	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
 	@echo "  make test          Run unit tests"
 	@echo "  make logs          Tail run logs"
@@ -164,6 +166,26 @@ audit-orphaned:
 	@if [ -f .env.local ]; then \
 		set -a; source .env.local; set +a; \
 		$(PYTHON) -m src.tools.audit_open_orders --cancel-orphaned-stops; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+STOP_PCT ?= 2.0
+
+place-missing-stops:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.place_missing_stops --dry-run --stop-pct $(STOP_PCT); \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+place-missing-stops-live:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.place_missing_stops --stop-pct $(STOP_PCT); \
 	else \
 		echo "❌ .env.local not found. Run 'make validate' first."; \
 		exit 1; \

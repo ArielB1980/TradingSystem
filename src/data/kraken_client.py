@@ -799,7 +799,33 @@ class KrakenClient:
         except Exception as e:
             logger.error("Failed to fetch futures open orders", error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
-    
+
+    async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single order by id (open or closed).
+        Returns dict with id, status, filled, remaining, average, trades, clientOrderId
+        for process_order_update, or None if not found / error.
+        """
+        if not self.futures_exchange:
+            return None
+        try:
+            raw = await self.futures_exchange.fetch_order(order_id, symbol)
+            if not raw:
+                return None
+            info = raw.get("info") or {}
+            return {
+                "id": raw.get("id"),
+                "status": (raw.get("status") or "").lower(),
+                "filled": raw.get("filled", 0),
+                "remaining": raw.get("remaining", 0),
+                "average": raw.get("average") or raw.get("price") or 0,
+                "trades": raw.get("trades") or [],
+                "clientOrderId": raw.get("clientOrderId") or info.get("cliOrdId") or info.get("clientOrderId"),
+            }
+        except Exception as e:
+            logger.debug("fetch_order failed", order_id=order_id, symbol=symbol, error=str(e))
+            return None
+
     async def cancel_futures_order(self, order_id: str, symbol: Optional[str] = None) -> Dict[str, Any]:
         """
         Cancel a futures order using CCXT.

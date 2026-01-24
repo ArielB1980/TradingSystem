@@ -71,6 +71,7 @@ class PendingOrder:
     exchange_order_id: Optional[str] = None
     status: str = "pending"
     last_event_seq: int = 0
+    exchange_symbol: Optional[str] = None  # Futures symbol for fetch_order (e.g. X/USD:USD)
     
 
 @dataclass
@@ -245,7 +246,7 @@ class ExecutionGateway:
         self.metrics["orders_submitted"] += 1
         exchange_symbol = order_symbol if order_symbol is not None else action.symbol
 
-        # Track pending order
+        # Track pending order (store exchange_symbol for order-status polling)
         pending = PendingOrder(
             client_order_id=action.client_order_id,
             position_id=action.position_id,
@@ -255,7 +256,8 @@ class ExecutionGateway:
             size=action.size,
             price=action.price,
             order_type=action.order_type,
-            submitted_at=datetime.now(timezone.utc)
+            submitted_at=datetime.now(timezone.utc),
+            exchange_symbol=exchange_symbol,
         )
         self._pending_orders[action.client_order_id] = pending
 
@@ -334,6 +336,7 @@ class ExecutionGateway:
         if position:
             position.initiate_exit(action.exit_reason, action.client_order_id)
             self.persistence.save_position(position)
+        exchange_symbol = (getattr(position, "futures_symbol", None) if position else None) or action.symbol
         
         self._wal_record_intent(action, "close")
         try:
@@ -341,7 +344,7 @@ class ExecutionGateway:
             close_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 type="market",
                 side=close_side,
                 amount=float(action.size),
@@ -359,7 +362,7 @@ class ExecutionGateway:
             
             logger.info(
                 "Close order submitted",
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 reason=action.exit_reason.value if action.exit_reason else "unknown"
             )
             
@@ -380,8 +383,10 @@ class ExecutionGateway:
             )
     
     async def _execute_partial_close(self, action: ManagementAction) -> ExecutionResult:
-        """Execute partial position close."""
+        """Execute partial position close. Use position.futures_symbol for exchange when set."""
         self.metrics["orders_submitted"] += 1
+        position = self.registry.get_position(action.symbol)
+        exchange_symbol = (getattr(position, "futures_symbol", None) if position else None) or action.symbol
         
         pending = PendingOrder(
             client_order_id=action.client_order_id,
@@ -401,7 +406,7 @@ class ExecutionGateway:
             close_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 type="market",
                 side=close_side,
                 amount=float(action.size),
@@ -432,8 +437,10 @@ class ExecutionGateway:
             )
     
     async def _execute_place_stop(self, action: ManagementAction) -> ExecutionResult:
-        """Place stop loss order."""
+        """Place stop loss order. Use position.futures_symbol for exchange when set."""
         self.metrics["orders_submitted"] += 1
+        position = self.registry.get_position(action.symbol)
+        exchange_symbol = (getattr(position, "futures_symbol", None) if position else None) or action.symbol
         
         pending = PendingOrder(
             client_order_id=action.client_order_id,
@@ -453,7 +460,7 @@ class ExecutionGateway:
             stop_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 type="stop",
                 side=stop_side,
                 amount=float(action.size),
@@ -478,7 +485,7 @@ class ExecutionGateway:
             
             logger.info(
                 "Stop order placed",
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 price=str(action.price)
             )
             
@@ -705,6 +712,41 @@ class ExecutionGateway:
             await self.execute_action(action)
         
         return follow_up
+
+    async def poll_and_process_order_updates(self) -> int:
+        """
+        Poll order status for pending entry orders, process fills, and trigger PLACE_STOP.
+        Returns number of orders processed (fill/cancel/reject).
+        """
+        fetch_order = getattr(self.client, "fetch_order", None)
+        if not fetch_order:
+            return 0
+        processed = 0
+        for pending in list(self._pending_orders.values()):
+            if pending.purpose != OrderPurpose.ENTRY:
+                continue
+            if pending.status not in ("pending", "submitted"):
+                continue
+            oid = pending.exchange_order_id
+            if not oid:
+                continue
+            sym = pending.exchange_symbol or pending.symbol
+            try:
+                order_data = await fetch_order(oid, sym)
+            except Exception as e:
+                logger.debug("poll order fetch failed", order_id=oid, symbol=sym, error=str(e))
+                continue
+            if not order_data:
+                continue
+            if not order_data.get("clientOrderId"):
+                order_data["clientOrderId"] = pending.client_order_id
+            try:
+                follow_up = await self.process_order_update(order_data)
+                if follow_up:
+                    processed += 1
+            except Exception as e:
+                logger.warning("process_order_update failed", order_id=oid, error=str(e))
+        return processed
     
     # ========== BATCH OPERATIONS ==========
     
