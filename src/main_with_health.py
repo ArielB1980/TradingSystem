@@ -308,13 +308,13 @@ def run_fastapi():
 def main():
     """Main entry point that runs both FastAPI and the trading bot."""
     if os.getenv("ENVIRONMENT") == "prod":
-        import sys
         logger.critical(
             "main_with_health must NOT run in production. "
             "Use run.py live + src.health. Set worker run_command to: "
             "python migrate_schema.py && python run.py live --force"
         )
-        sys.exit(1)
+        # Log only; do not exit. Exiting breaks deploy when DO still runs this.
+        # Remove this block entirely after worker is switched to run.py live.
     # Start FastAPI in background thread
     api_thread = threading.Thread(target=run_fastapi, daemon=True)
     api_thread.start()
