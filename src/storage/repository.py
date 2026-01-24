@@ -391,6 +391,16 @@ def get_latest_candle_timestamp(symbol: str, timeframe: str) -> Optional[datetim
         return None
 
 
+def count_candles(symbol: str, timeframe: str) -> int:
+    """Return the number of candles stored for the given symbol and timeframe."""
+    db = get_db()
+    with db.get_session() as session:
+        return session.query(CandleModel).filter(
+            CandleModel.symbol == symbol,
+            CandleModel.timeframe == timeframe,
+        ).count()
+
+
 def load_candles_map(
     symbols: List[str],
     timeframe: str,
