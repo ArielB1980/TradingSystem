@@ -3,6 +3,7 @@ Audit open futures orders: total count, breakdown by type (stop vs take_profit v
 per-symbol summary, and flags for multiple stops per symbol (suspicious).
 
 Use --cancel-redundant-stops to keep one stop per symbol (most protective) and cancel the rest.
+Use --cancel-orphaned-stops to cancel all stop orders when there are 0 positions (orphaned).
 """
 import argparse
 import asyncio
@@ -41,7 +42,7 @@ def _stop_price(o: dict) -> Decimal | None:
         return None
 
 
-async def audit_open_orders(cancel_redundant: bool = False):
+async def audit_open_orders(cancel_redundant: bool = False, cancel_orphaned: bool = False):
     try:
         config = get_config()
     except Exception as e:
@@ -99,6 +100,28 @@ async def audit_open_orders(cancel_redundant: bool = False):
                 for o in lst:
                     print(f"      id={o.get('id')} stop={o.get('stopPrice') or o.get('price')} size={o.get('amount')}")
 
+        all_stops: list[tuple[str, dict]] = []
+        for sym, lst in stops_per_symbol.items():
+            for o in lst:
+                all_stops.append((sym, o))
+
+        if n_positions == 0 and all_stops:
+            print("\n=== ORPHANED STOPS (0 positions) ===")
+            print(f"  {len(all_stops)} stop(s) with no position to protect. Orphaned.")
+            if cancel_orphaned:
+                print("  Cancelling orphaned stops...")
+                cancelled = 0
+                for sym, o in all_stops:
+                    try:
+                        await client.cancel_futures_order(o["id"], sym)
+                        print(f"  Cancelled {o['id']} ({sym})")
+                        cancelled += 1
+                    except Exception as e:
+                        print(f"  Failed to cancel {o['id']} ({sym}): {e}")
+                print(f"  Cancelled {cancelled} orphaned stop(s).")
+            else:
+                print("  Run with --cancel-orphaned-stops to cancel them.")
+
         if cancel_redundant and multi_stops:
             unified_to_side = {}
             for p in positions:
@@ -146,5 +169,6 @@ async def audit_open_orders(cancel_redundant: bool = False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Audit open futures orders.")
     ap.add_argument("--cancel-redundant-stops", action="store_true", help="Keep one stop per symbol, cancel the rest.")
+    ap.add_argument("--cancel-orphaned-stops", action="store_true", help="Cancel all stops when 0 positions (orphaned).")
     args = ap.parse_args()
-    asyncio.run(audit_open_orders(cancel_redundant=args.cancel_redundant_stops))
+    asyncio.run(audit_open_orders(cancel_redundant=args.cancel_redundant_stops, cancel_orphaned=args.cancel_orphaned_stops))

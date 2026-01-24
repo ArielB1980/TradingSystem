@@ -609,11 +609,28 @@ class LiveTrading:
         try:
             import time
             _t0 = time.perf_counter()
-            map_spot_tickers = await self.client.get_spot_tickers_bulk(self._market_symbols())
+            market_symbols = self._market_symbols()
+            map_spot_tickers = await self.client.get_spot_tickers_bulk(market_symbols)
             map_futures_tickers = await self.client.get_futures_tickers_bulk()
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
+            # Ticker coverage: we only process & fetch candles for symbols with tickers
+            symbols_with_tickers = len([s for s in market_symbols if s in map_spot_tickers])
+            symbols_without_tickers = len(market_symbols) - symbols_with_tickers
+            self._last_ticker_with = symbols_with_tickers
+            self._last_ticker_without = symbols_without_tickers
+            if symbols_without_tickers > 0:
+                self._last_ticker_skip_log = getattr(self, "_last_ticker_skip_log", datetime.min.replace(tzinfo=timezone.utc))
+                if (datetime.now(timezone.utc) - self._last_ticker_skip_log).total_seconds() >= 300:
+                    logger.warning(
+                        "Ticker coverage: some symbols skipped (no spot ticker)",
+                        total=len(market_symbols),
+                        with_ticker=symbols_with_tickers,
+                        without_ticker=symbols_without_tickers,
+                        hint="Skipped symbols never get candle updates; check discovery vs Kraken spot support.",
+                    )
+                    self._last_ticker_skip_log = datetime.now(timezone.utc)
         except Exception as e:
             logger.error("Failed batch data fetch", error=str(e))
             return
@@ -814,14 +831,17 @@ class LiveTrading:
                 )
                 coins_with_traces = len([s for s in self.markets if s in self.last_trace_log])
                 
-                logger.info(
-                    "Coin processing status summary",
-                    total_coins=total_coins,
-                    coins_with_sufficient_candles=coins_with_candles,
-                    coins_processed_recently=coins_processed_recently,
-                    coins_with_traces=coins_with_traces,
-                    coins_waiting_for_candles=total_coins - coins_with_candles
-                )
+                summary = {
+                    "total_coins": total_coins,
+                    "coins_with_sufficient_candles": coins_with_candles,
+                    "coins_processed_recently": coins_processed_recently,
+                    "coins_with_traces": coins_with_traces,
+                    "coins_waiting_for_candles": total_coins - coins_with_candles,
+                }
+                if getattr(self, "_last_ticker_with", None) is not None:
+                    summary["symbols_with_ticker"] = self._last_ticker_with
+                    summary["symbols_without_ticker"] = getattr(self, "_last_ticker_without", 0)
+                logger.info("Coin processing status summary", **summary)
                 self.last_status_summary = now
             except Exception as e:
                 logger.error("Failed to log status summary", error=str(e))
