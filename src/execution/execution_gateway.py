@@ -184,15 +184,19 @@ class ExecutionGateway:
     
     # ========== ORDER SUBMISSION ==========
     
-    async def execute_action(self, action: ManagementAction) -> ExecutionResult:
+    async def execute_action(
+        self, action: ManagementAction, order_symbol: Optional[str] = None
+    ) -> ExecutionResult:
         """
         Execute a management action.
-        
-        This is the ONLY way to place orders.
+
+        order_symbol: optional futures symbol (e.g. X/USD:USD) for exchange orders.
+        When provided for OPEN_POSITION, used instead of action.symbol (spot) so
+        Kraken Futures receives the correct unified symbol.
         """
         try:
             if action.type == ActionType.OPEN_POSITION:
-                return await self._execute_entry(action)
+                return await self._execute_entry(action, order_symbol=order_symbol)
             
             elif action.type == ActionType.CLOSE_FULL:
                 return await self._execute_close(action)
@@ -234,10 +238,13 @@ class ExecutionGateway:
                 error=str(e)
             )
     
-    async def _execute_entry(self, action: ManagementAction) -> ExecutionResult:
-        """Execute entry order."""
+    async def _execute_entry(
+        self, action: ManagementAction, order_symbol: Optional[str] = None
+    ) -> ExecutionResult:
+        """Execute entry order. order_symbol: futures symbol for exchange (e.g. X/USD:USD)."""
         self.metrics["orders_submitted"] += 1
-        
+        exchange_symbol = order_symbol if order_symbol is not None else action.symbol
+
         # Track pending order
         pending = PendingOrder(
             client_order_id=action.client_order_id,
@@ -253,13 +260,13 @@ class ExecutionGateway:
         self._pending_orders[action.client_order_id] = pending
 
         self._wal_record_intent(action, "open")
-        
-        # Submit to exchange
+
+        # Submit to exchange (use futures symbol; action.symbol is spot)
         try:
             order_side = "buy" if action.side == Side.LONG else "sell"
-            
+
             result = await self.client.create_order(
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 type=action.order_type.value,
                 side=order_side,
                 amount=float(action.size),
@@ -274,7 +281,7 @@ class ExecutionGateway:
             
             logger.info(
                 "Entry order submitted",
-                symbol=action.symbol,
+                symbol=exchange_symbol,
                 client_order_id=action.client_order_id,
                 exchange_order_id=exchange_order_id
             )
