@@ -14,8 +14,8 @@ logger = get_logger(__name__)
 
 async def backtest_coin(symbol: str, config, start_date, end_date):
     """Run backtest for a single coin."""
+    engine = BacktestEngine(config, symbol=symbol)
     try:
-        engine = BacktestEngine(config, symbol=symbol)
         metrics = await engine.run(start_date=start_date, end_date=end_date)
         return {
             'symbol': symbol,
@@ -29,6 +29,9 @@ async def backtest_coin(symbol: str, config, start_date, end_date):
             'success': False,
             'error': str(e)
         }
+    finally:
+        if getattr(engine, "client", None):
+            await engine.client.close()
 
 
 async def run_quick_backtest():

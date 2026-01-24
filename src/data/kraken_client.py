@@ -316,7 +316,17 @@ class KrakenClient:
             return candles
             
         except Exception as e:
-            logger.error("Failed to fetch spot OHLCV", symbol=symbol, error=str(e))
+            err_detail = str(e)
+            err_type = type(e).__name__
+            resp = getattr(e, "response", None)
+            if resp is not None and hasattr(resp, "text"):
+                err_detail = f"{err_detail}; response={resp.text[:200]!r}"
+            logger.error(
+                "Failed to fetch spot OHLCV",
+                symbol=symbol,
+                error=err_detail,
+                error_type=err_type,
+            )
             raise
     
     async def get_futures_position(self, symbol: str) -> Optional[Dict]:

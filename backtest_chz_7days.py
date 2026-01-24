@@ -39,8 +39,8 @@ async def run_chz_backtest():
     print("-"*80)
 
     # Run backtest
+    engine = BacktestEngine(config, symbol="CHZ/USD")
     try:
-        engine = BacktestEngine(config, symbol="CHZ/USD")
         metrics = await engine.run(start_date=start_date, end_date=end_date)
 
         # Print results
@@ -80,9 +80,6 @@ async def run_chz_backtest():
             print(f"  End: ${float(metrics.equity_curve[-1]):,.2f}")
             print(f"  Peak: ${float(metrics.peak_equity):,.2f}")
 
-        # Close client properly
-        await engine.client.close()
-
         return metrics
 
     except Exception as e:
@@ -90,6 +87,9 @@ async def run_chz_backtest():
         import traceback
         traceback.print_exc()
         return None
+    finally:
+        if getattr(engine, "client", None):
+            await engine.client.close()
 
 
 if __name__ == "__main__":

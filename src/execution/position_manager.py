@@ -180,9 +180,8 @@ class PositionManager:
                     order_type=OrderType.MARKET
                 )
         
-        # Priority 2: Check against dynamic/trailing stop if tracked
-        # (Requires current_stop detection which is TODO)
-        
+        # Priority 2: Check against dynamic/trailing stop if tracked.
+        # current_stop detection not yet implemented; trailing moves are handled elsewhere.
         return None
 
     def _validate_stop_move(self, position: Position, new_price: Decimal) -> tuple[bool, str]:

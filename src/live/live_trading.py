@@ -169,10 +169,19 @@ class LiveTrading:
                    shadow_mode=self.state_machine_shadow_mode if self.use_state_machine_v2 else "N/A")
 
     def _market_symbols(self) -> List[str]:
-        """Return list of spot symbols. Handles both list (initial) and dict (after discovery)."""
+        """Return list of spot symbols. Handles both list (initial) and dict (after discovery). Excludes blocklist."""
+        blocklist = set(
+            s.strip().upper() for s in getattr(
+                self.config.exchange, "spot_ohlcv_blocklist", []
+            ) or []
+        )
         if isinstance(self.markets, dict):
-            return list(self.markets.keys())
-        return list(self.markets)
+            raw = list(self.markets.keys())
+        else:
+            raw = list(self.markets)
+        if not blocklist:
+            return raw
+        return [s for s in raw if (s.strip().upper() if s else "") not in blocklist]
     
     async def _update_market_universe(self):
         """Discover and update trading universe."""
@@ -281,6 +290,16 @@ class LiveTrading:
                                active_positions=len(self.position_registry.get_all_active()) if self.position_registry else 0)
                 except Exception as e:
                     logger.error("Position State Machine V2 startup failed", error=str(e))
+
+            # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt unprotected)
+            if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
+                try:
+                    logger.info("Running startup reconciliation...")
+                    recon = Reconciler(self.client)
+                    await recon.reconcile_all()
+                    self.last_recon_time = datetime.now(timezone.utc)
+                except Exception as ex:
+                    logger.warning("Startup reconciliation failed", error=str(ex))
 
             # 3. Fast Startup - Load candles
             logger.info("Loading candles from database...")

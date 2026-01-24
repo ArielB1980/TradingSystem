@@ -14,7 +14,7 @@ exchange:
   futures_markets:
     - "BTCUSD-PERP"
     - "ETHUSD-PERP"
-    
+  # spot_ohlcv_blocklist: ["2Z/USD", "ANIME/USD"]  # Optional: exclude delisted/failing pairs
   # Credentials
   api_key: "${KRAKEN_API_KEY}"
   api_secret: "${KRAKEN_API_SECRET}"

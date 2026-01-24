@@ -279,7 +279,7 @@ async def get_market_registry() -> Dict[str, Any]:
     - Discovery timestamp
     - Filter settings
     """
-    # TODO: This will be populated by MarketRegistry
+    # Placeholder: MarketRegistry not yet implemented. Uses config spot_markets.
     return {
         "eligible_pairs": [
             {
