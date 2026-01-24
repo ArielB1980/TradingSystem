@@ -163,6 +163,22 @@ class TradingService:
             
         logger.info("Trading Service Shutting Down...")
 
+    @staticmethod
+    def _position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bool:
+        """
+        Position uses Kraken native (PF_ADAUSD); orders use CCXT unified (ADA/USD:USD).
+        Return True if they refer to the same market.
+        """
+        if not position_symbol or not order_symbol:
+            return False
+        if position_symbol == order_symbol:
+            return True
+        if position_symbol.startswith("PF_") and position_symbol.endswith("USD"):
+            base = position_symbol[3:-3]  # drop PF_ and USD
+            unified = f"{base}/USD:USD"
+            return order_symbol == unified
+        return False
+
     async def _fetch_stop_loss_for_position(self, symbol: str, side: Side) -> Optional[Decimal]:
         """
         Fetch existing stop loss order price for a position from exchange.
@@ -173,20 +189,21 @@ class TradingService:
         try:
             open_orders = await self.kraken.get_futures_open_orders()
             for order in open_orders:
-                if order.get('symbol') == symbol:
-                    # Check if it's a stop loss order (reduce-only, opposite side)
-                    order_side = order.get('side', '').lower()
-                    is_reduce_only = order.get('reduceOnly', order.get('reduce_only', False))
-                    order_type = order.get('type', '').lower()
-                    
-                    # Stop loss should be opposite side and reduce-only
-                    expected_side = 'sell' if side == Side.LONG else 'buy'
-                    if (order_side == expected_side and 
-                        is_reduce_only and 
-                        ('stop' in order_type or 'stop_loss' in order_type or order_type == 'stop')):
-                        price = order.get('price') or order.get('stopPrice') or order.get('triggerPrice')
-                        if price:
-                            return Decimal(str(price))
+                if not self._position_symbol_matches_order(symbol, order.get("symbol") or ""):
+                    continue
+                # Check if it's a stop loss order (reduce-only, opposite side)
+                order_side = order.get('side', '').lower()
+                is_reduce_only = order.get('reduceOnly', order.get('reduce_only', False))
+                order_type = (order.get('type') or order.get('info', {}).get('orderType') or '').lower()
+                if 'take_profit' in order_type or 'take-profit' in order_type:
+                    continue
+                expected_side = 'sell' if side == Side.LONG else 'buy'
+                if (order_side == expected_side and
+                    is_reduce_only and
+                    ('stop' in order_type or 'stop_loss' in order_type or order_type == 'stop')):
+                    price = order.get('price') or order.get('stopPrice') or order.get('triggerPrice')
+                    if price:
+                        return Decimal(str(price))
         except Exception as e:
             logger.error(f"Failed to fetch stop loss for {symbol}", error=str(e))
         return None
