@@ -102,7 +102,8 @@ def _fetch_worker_log_lines(tail: int, stream_seconds: int) -> list[str]:
         print("No worker component found.")
         sys.exit(1)
     url = f"{BASE_URL}/apps/{app_id}/deployments/{deployment_id}/components/{worker}/logs"
-    r = requests.get(url, headers=headers, params={"type": "RUN", "follow": "true", "tail_lines": tail}, timeout=60)
+    params: dict[str, Any] = {"type": "RUN", "follow": "false", "tail_lines": min(tail, 500)}
+    r = requests.get(url, headers=headers, params=params, timeout=60)
     r.raise_for_status()
     data: dict[str, Any] = r.json()
     lines: list[str] = []
@@ -113,7 +114,7 @@ def _fetch_worker_log_lines(tail: int, stream_seconds: int) -> list[str]:
     if lines:
         return lines
     live_url = data.get("live_url")
-    if live_url:
+    if live_url and stream_seconds > 0:
         ws_url = live_url.replace("https://", "wss://")
         print(f"Historic logs unavailable. Streaming live for {stream_seconds}s...", file=sys.stderr)
         lines = asyncio.run(_collect_live_logs(ws_url, stream_seconds))
