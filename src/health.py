@@ -1,14 +1,45 @@
 """
 Health check endpoint for App Platform.
 Simple HTTP server to respond to health checks.
+
+worker_health_app: minimal app for run.py live --with-health (worker container).
+Serves GET / and GET /health only; no DB. Use for readiness when LiveTrading is the worker.
 """
 from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import os
+import time
 from typing import Optional
 
 app = FastAPI(title="Trading System Health Check")
+
+_worker_start = time.time()
+
+
+def get_worker_health_app() -> FastAPI:
+    """Minimal health app for worker running run.py live --with-health. GET / and /health only."""
+    w = FastAPI(title="Worker Health")
+
+    @w.get("/")
+    async def root():
+        return {"status": "ok", "service": "trading-worker"}
+
+    @w.get("/health")
+    async def health():
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "uptime_seconds": int(time.time() - _worker_start),
+                "environment": os.getenv("ENVIRONMENT", "unknown"),
+            },
+            status_code=200,
+        )
+
+    return w
+
+
+worker_health_app = get_worker_health_app()
 
 
 @app.get("/api")

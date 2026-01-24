@@ -311,8 +311,8 @@ def main():
     if os.getenv("ENVIRONMENT") == "prod":
         logger.critical(
             "main_with_health must NOT run in production. "
-            "Use run.py live + src.health. Set worker run_command to: "
-            "python migrate_schema.py && python run.py live --force"
+            "Use run.py live --with-health. Set worker run_command to: "
+            "python migrate_schema.py && python run.py live --force --with-health"
         )
         sys.exit(1)
     # Start FastAPI in background thread

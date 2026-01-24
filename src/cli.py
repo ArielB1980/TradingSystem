@@ -3,6 +3,7 @@ CLI entrypoint for the Kraken Futures SMC Trading System.
 
 Provides commands for backtest, paper, live, status, and kill-switch.
 """
+import os
 import typer
 from typing import Optional
 from pathlib import Path
@@ -138,6 +139,7 @@ def paper(
 def live(
     config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
     force: bool = typer.Option(False, "--force", help="Force live trading (bypass safety gates)"),
+    with_health: bool = typer.Option(False, "--with-health", help="Start minimal HTTP health server on PORT/8080 (for App Platform worker readiness)"),
     log_file: Optional[Path] = typer.Option(None, "--log-file", help="Path to log file"),
 ):
     """
@@ -194,15 +196,27 @@ def live(
         raise typer.Abort()
     
     logger.warning("Live trading started - REAL CAPITAL AT RISK")
-    
+
+    # Optional: minimal health server for App Platform worker (readiness on :8080)
+    if with_health:
+        import threading
+        import uvicorn
+        from src.health import worker_health_app
+        port = int(os.environ.get("PORT", "8080"))
+        def _run_health():
+            uvicorn.run(worker_health_app, host="0.0.0.0", port=port, log_level="warning")
+        t = threading.Thread(target=_run_health, daemon=True)
+        t.start()
+        logger.info("Worker health server started on port %s", port)
+
     # Initialize live trading engine
     import asyncio
     from src.live.live_trading import LiveTrading
-    
+
     async def run_live():
         engine = LiveTrading(config)
         await engine.run()
-        
+
     try:
         asyncio.run(run_live())
     except KeyboardInterrupt:

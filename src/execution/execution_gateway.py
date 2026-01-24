@@ -617,7 +617,7 @@ class ExecutionGateway:
         """
         # Get exchange state
         positions = await self.client.get_all_futures_positions()
-        orders = await self.client.fetch_open_orders()
+        orders = await self.client.get_futures_open_orders()
         
         # Convert to reconciliation format
         exchange_positions = {
