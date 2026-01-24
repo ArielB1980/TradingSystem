@@ -62,6 +62,7 @@ async def health():
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
                 age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+                checks["last_tick_age_seconds"] = round(age_sec, 1)
                 checks["worker_stale"] = age_sec > 300
             except Exception:
                 checks["worker_stale"] = None
@@ -80,7 +81,7 @@ async def ready():
 
 @app.get("/api/metrics")
 async def metrics():
-    """Observability: latest metrics snapshot from worker (DB). Returns {} if none."""
+    """Observability: latest metrics snapshot from worker (DB). Includes last_tick_at, signals_last_min, api_fetch_latency_ms, markets_count. Returns {} if none."""
     try:
         from src.storage.repository import get_latest_metrics_snapshot
         snap = get_latest_metrics_snapshot()

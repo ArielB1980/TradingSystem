@@ -181,7 +181,8 @@ class PositionManager:
                 )
         
         # Priority 2: Check against dynamic/trailing stop if tracked.
-        # current_stop detection not yet implemented; trailing moves are handled elsewhere.
+        # NOTE: current_stop (live SL price on exchange) is not yet derived here.
+        # Trailing moves are handled elsewhere (Executor/ExecutionEngine).
         return None
 
     def _validate_stop_move(self, position: Position, new_price: Decimal) -> tuple[bool, str]:
