@@ -2,6 +2,7 @@
 Health check endpoint for App Platform.
 Simple HTTP server to respond to health checks.
 """
+from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import os
@@ -18,22 +19,55 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    """Health check endpoint for App Platform."""
-    # Check if critical environment variables are set
+    """Health check. Pings DB; reports kill switch and worker liveness from metrics."""
     checks = {
         "status": "healthy",
         "database": "unknown",
         "environment": os.getenv("ENVIRONMENT", "unknown"),
+        "kill_switch_active": False,
+        "worker_last_tick_at": None,
+        "worker_stale": None,
     }
-    
-    # Check database connection
     database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        checks["database"] = "configured"
-    else:
+    if not database_url:
         checks["database"] = "missing"
         checks["status"] = "unhealthy"
-    
+    else:
+        checks["database"] = "configured"
+        try:
+            from src.storage.db import get_db
+            from sqlalchemy import text
+            db = get_db()
+            with db.get_session() as session:
+                session.execute(text("SELECT 1;"))
+            checks["database"] = "connected"
+        except Exception as e:
+            checks["database"] = f"error: {str(e)[:80]}"
+            checks["status"] = "unhealthy"
+
+    try:
+        from src.utils.kill_switch import read_kill_switch_state
+        ks = read_kill_switch_state()
+        checks["kill_switch_active"] = bool(ks.get("active"))
+    except Exception:
+        pass
+
+    try:
+        from src.storage.repository import get_latest_metrics_snapshot
+        snap = get_latest_metrics_snapshot()
+        if snap and snap.get("last_tick_at"):
+            checks["worker_last_tick_at"] = snap["last_tick_at"]
+            try:
+                ts = datetime.fromisoformat(snap["last_tick_at"].replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+                checks["worker_stale"] = age_sec > 300
+            except Exception:
+                checks["worker_stale"] = None
+    except Exception:
+        pass
+
     status_code = 200 if checks["status"] == "healthy" else 503
     return JSONResponse(content=checks, status_code=status_code)
 
@@ -42,6 +76,21 @@ async def health():
 async def ready():
     """Readiness probe endpoint."""
     return {"status": "ready"}
+
+
+@app.get("/api/metrics")
+async def metrics():
+    """Observability: latest metrics snapshot from worker (DB). Returns {} if none."""
+    try:
+        from src.storage.repository import get_latest_metrics_snapshot
+        snap = get_latest_metrics_snapshot()
+        out = snap if snap is not None else {}
+        return JSONResponse(content={"source": "worker_snapshot", "metrics": out})
+    except Exception as e:
+        return JSONResponse(
+            content={"source": "worker_snapshot", "metrics": {}, "error": str(e)[:100]},
+            status_code=200,
+        )
 
 
 @app.get("/api/dashboard")

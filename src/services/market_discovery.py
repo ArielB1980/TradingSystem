@@ -91,10 +91,10 @@ class MarketDiscoveryService:
                 sample=sorted_spots[:5]
             )
             
-            # Persist for dashboard/debug (File)
-            self._save_to_disk(sorted_spots)
-            
-            # Persist to DB for Dashboard (Container-safe)
+            # Persist for dashboard/debug (File + full mapping)
+            self._save_to_disk(sorted_spots, mapping)
+
+            # Persist to DB for Dashboard (Container-safe), including mapping
             try:
                 from src.storage.repository import async_record_event
                 await async_record_event(
@@ -103,31 +103,32 @@ class MarketDiscoveryService:
                     details={
                         "count": len(sorted_spots),
                         "markets": sorted_spots,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
+                        "mapping": mapping,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                    timestamp=datetime.now(timezone.utc)
+                    timestamp=datetime.now(timezone.utc),
                 )
             except Exception as e:
                 logger.error("Failed to record discovery event", error=str(e))
-            
+
             return mapping
-            
+
         except Exception as e:
             logger.error("Failed to discover markets", error=str(e))
-            # Fallback to loading from disk (only returns spot list usually, so might be partial)
-            # Todo: persist full mapping? For now just re-raise or return empty
             raise
 
-    def _save_to_disk(self, symbols: List[str]):
-        """Save discovered list to disk."""
+    def _save_to_disk(self, symbols: List[str], mapping: Optional[Dict[str, str]] = None):
+        """Save discovered list and optional spot->futures mapping to disk."""
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
                 "discovered_at": datetime.now(timezone.utc).isoformat(),
                 "count": len(symbols),
-                "markets": symbols
+                "markets": symbols,
             }
-            with open(MARKETS_FILE, 'w') as f:
+            if mapping:
+                data["mapping"] = mapping
+            with open(MARKETS_FILE, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error("Failed to save markets to disk", error=str(e))

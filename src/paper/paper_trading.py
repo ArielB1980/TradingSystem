@@ -430,7 +430,9 @@ class PaperTrading:
             net_pnl=net_pnl,
             entered_at=position.opened_at,
             exited_at=datetime.now(timezone.utc),
-            holding_period_hours=Decimal("0"), # TODO
+            holding_period_hours=Decimal(
+                str(round((datetime.now(timezone.utc) - position.opened_at).total_seconds() / 3600, 4))
+            ),
             exit_reason=reason,
             setup_type=position.setup_type,
             regime=position.regime

@@ -115,3 +115,17 @@ The system is **fully operational** and ready for:
 3. Production deployment (after paper trading validation)
 
 All V2 features are integrated and working correctly.
+
+---
+
+## Post–"What's Next" Implementation (2026-01-23)
+
+**Scope:** Fix intent-hash DB usage, wire `multi_tp`, shared equity, production docs, health/metrics, integration tests.
+
+### Tests run
+- **`pytest tests/integration/test_live_trading_tick.py`**: 3/3 passed (tick mocked, `_market_symbols` list/dict).
+- **`pytest tests/integration/ tests/failure_modes/ tests/unit/`**: 69 passed, 14 failed (async tests need `pytest-asyncio`; some unit tests need real DB).
+- **Smoke:** `ENVIRONMENT=dev DATABASE_URL=... MAX_LOOPS=1 run.py live --force` — startup OK, market discovery, multi_tp and intent-hash fixes active; run timed out after one loop (expected).
+
+### Not pushed
+Changes are local only; **do not push to main** until you’re ready.

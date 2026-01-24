@@ -36,8 +36,11 @@ from src.execution.position_persistence import PositionPersistence
 
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, load_candles_map, get_candles, get_latest_candle_timestamp
+from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, record_metrics_snapshot, load_candles_map, get_candles, get_latest_candle_timestamp
 from src.storage.maintenance import DatabasePruner
+from src.live.startup_validator import ensure_all_coins_have_traces
+from src.live.maintenance import periodic_data_maintenance
+from src.reconciliation.reconciler import Reconciler
 
 logger = get_logger(__name__)
 
@@ -129,6 +132,12 @@ class LiveTrading:
         self.last_trace_log: Dict[str, datetime] = {} # Dashboard update throttling
         self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
         self.last_maintenance_run = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_data_maintenance = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_recon_time = datetime.min.replace(tzinfo=timezone.utc)
+        self.last_metrics_emit = datetime.min.replace(tzinfo=timezone.utc)
+        self.ticks_since_emit = 0
+        self.signals_since_emit = 0
+        self.last_fetch_latency_ms: Optional[int] = None
         self.db_pruner = DatabasePruner()
         
         # Coin processing tracking
@@ -158,6 +167,12 @@ class LiveTrading:
                    markets=config.exchange.futures_markets,
                    state_machine_v2=self.use_state_machine_v2,
                    shadow_mode=self.state_machine_shadow_mode if self.use_state_machine_v2 else "N/A")
+
+    def _market_symbols(self) -> List[str]:
+        """Return list of spot symbols. Handles both list (initial) and dict (after discovery)."""
+        if isinstance(self.markets, dict):
+            return list(self.markets.keys())
+        return list(self.markets)
     
     async def _update_market_universe(self):
         """Discover and update trading universe."""
@@ -174,7 +189,8 @@ class LiveTrading:
             
             # Update internal state (Maintain Spot -> Futures mapping)
             self.markets = mapping
-            
+            self.futures_adapter.set_spot_to_futures_override(mapping)
+
             # Update Data Acquisition
             new_spot_symbols = list(mapping.keys())
             new_futures_symbols = list(mapping.values())
@@ -236,6 +252,12 @@ class LiveTrading:
             else:
                 self.last_discovery_time = datetime.min.replace(tzinfo=timezone.utc)
 
+            # 1.6 Startup: ensure all monitored coins have DECISION_TRACE (dashboard coverage)
+            try:
+                await ensure_all_coins_have_traces(self._market_symbols())
+            except Exception as e:
+                logger.error("Startup trace validation failed", error=str(e))
+
             # 2. Sync State (skip in dry run if no keys)
             if self.config.system.dry_run and not self.client.has_valid_futures_credentials():
                  logger.warning("Dry Run Mode: No Futures credentials found. Skipping account sync.")
@@ -264,7 +286,7 @@ class LiveTrading:
             logger.info("Loading candles from database...")
             try:
                 # 3. Fast Startup - Load candles via Manager
-                await self.candle_manager.initialize(list(self.markets.keys()))
+                await self.candle_manager.initialize(self._market_symbols())
             except Exception as e:
                 logger.error("Failed to hydrate candles", error=str(e))
 
@@ -312,8 +334,37 @@ class LiveTrading:
                          # Potential API failure - check if we should trigger kill switch
                          pass
                 
+                self.ticks_since_emit += 1
+                now = datetime.now(timezone.utc)
+                if (now - self.last_metrics_emit).total_seconds() >= 60.0:
+                    try:
+                        record_metrics_snapshot({
+                            "last_tick_at": now.isoformat(),
+                            "ticks_last_min": self.ticks_since_emit,
+                            "signals_last_min": self.signals_since_emit,
+                            "markets_count": len(self._market_symbols()),
+                            "api_fetch_latency_ms": getattr(self, "last_fetch_latency_ms", None),
+                        })
+                        self.last_metrics_emit = now
+                        self.ticks_since_emit = 0
+                        self.signals_since_emit = 0
+                    except Exception as ex:
+                        logger.warning("Failed to emit metrics snapshot", error=str(ex))
+
+                # Periodic reconciliation (positions: system vs exchange)
+                recon_interval = getattr(
+                    self.config.reconciliation, "periodic_interval_seconds", 15
+                )
+                if (now - self.last_recon_time).total_seconds() >= recon_interval:
+                    try:
+                        recon = Reconciler(self.client)
+                        await recon.reconcile_all()
+                        self.last_recon_time = now
+                    except Exception as ex:
+                        logger.warning("Reconciliation failed", error=str(ex))
+
                 # Dynamic sleep to align with 1m intervals
-                elapsed = (datetime.now(timezone.utc) - loop_start).total_seconds()
+                elapsed = (now - loop_start).total_seconds()
                 sleep_time = max(5.0, 60.0 - elapsed)
                 await asyncio.sleep(sleep_time)
             
@@ -341,72 +392,9 @@ class LiveTrading:
             logger.info("Live trading shutdown complete")
             
     async def _calculate_effective_equity(self, balance: Dict) -> tuple[Decimal, Decimal, Decimal]:
-        """
-        Calculate effective equity/margin from balance dict.
-        Handlers:
-        1. Multi-Collateral (Flex) - Using 'info' from Kraken
-        2. Single-Collateral (Inverse) - Valuing crypto collateral manually
-        3. Standard - Using base currency balance
-        
-        Returns:
-            (equity, available_margin, margin_used)
-        """
-        # Default to standard CCXT total['USD']
-        base_currency = getattr(self.config.exchange, "base_currency", "USD")
-        total = balance.get('total', {})
-        
-        equity = Decimal(str(total.get(base_currency, 0)))
-        avail_margin = Decimal(str(balance.get('free', {}).get(base_currency, 0)))
-        margin_used = Decimal(str(balance.get('used', {}).get(base_currency, 0)))
-        
-        # 2. Check for Kraken Futures Multi-Collateral ("flex")
-        info = balance.get('info', {})
-        if info and 'accounts' in info and 'flex' in info['accounts']:
-            flex = info['accounts']['flex']
-            
-            pv = flex.get('portfolioValue')
-            am = flex.get('availableMargin')
-            im = flex.get('initialMargin')
-            
-            if pv is not None:
-                equity = Decimal(str(pv))
-            if am is not None:
-                avail_margin = Decimal(str(am))
-            if im is not None:
-                margin_used = Decimal(str(im))
-                
-            return equity, avail_margin, margin_used
-        
-        # 3. Logic for Single-Collateral (Inverse) or incomplete Flex data
-        # If Equity is suspiciously low (< 10 USD) but we have crypto balance, calculate approximate equity
-        if equity < 10:
-            # Check for XBT/BTC/ETH
-            for asset in ['XBT', 'BTC', 'ETH', 'SOL', 'USDT', 'USDC']:
-                if asset == base_currency: 
-                    continue
-                    
-                asset_qty = Decimal(str(total.get(asset, 0)))
-                if asset_qty > 0:
-                    try:
-                        # Fetch price for valuation
-                        ticker_symbol = f"{asset}/USD"
-                        if asset == 'XBT': ticker_symbol = "BTC/USD"
-                        
-                        ticker = await self.client.get_ticker(ticker_symbol)
-                        price = Decimal(str(ticker['last']))
-                        
-                        asset_equity = asset_qty * price
-                        
-                        equity += asset_equity
-                        # Approximate available margin if strictly 0 (risky but better than 0)
-                        if avail_margin == 0:
-                            avail_margin += asset_equity
-                            
-                        logger.info(f"Valued non-USD collateral: {asset_qty} {asset} (~${asset_equity:,.2f})")
-                    except Exception as ex:
-                         logger.warning(f"Could not value collateral {asset}", error=str(ex))
-                         
-        return equity, avail_margin, margin_used
+        from src.execution.equity import calculate_effective_equity
+        base = getattr(self.config.exchange, "base_currency", "USD")
+        return await calculate_effective_equity(balance, base_currency=base, kraken_client=self.client)
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
@@ -563,15 +551,13 @@ class LiveTrading:
 
         # 3. Batch Data Fetching (Optimization)
         try:
-            # Fetch ALL spot tickers (chunked inside client)
-            map_spot_tickers = await self.client.get_spot_tickers_bulk(list(self.markets.keys()))
-            
-            # Fetch ALL futures mark prices
+            import time
+            _t0 = time.perf_counter()
+            map_spot_tickers = await self.client.get_spot_tickers_bulk(self._market_symbols())
             map_futures_tickers = await self.client.get_futures_tickers_bulk()
-            
-            # Map positions by symbol for O(1) loopup
-            map_positions = {p['symbol']: p for p in all_raw_positions}
-            
+            _t1 = time.perf_counter()
+            self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
+            map_positions = {p["symbol"]: p for p in all_raw_positions}
         except Exception as e:
             logger.error("Failed batch data fetch", error=str(e))
             return
@@ -732,8 +718,7 @@ class LiveTrading:
                                 "score_breakdown": signal.score_breakdown or {},
                                 "status": "active",
                                 "candle_count": candle_count,
-                                "candle_count": candle_count,
-                                "reason": signal.reasoning, # CAPTURE REASON
+                                "reason": signal.reasoning,  # CAPTURE REASON
                                 "structure": signal.structure_info,
                                 "meta": signal.meta_info
                             }
@@ -801,6 +786,14 @@ class LiveTrading:
             except Exception as e:
                 logger.error("Daily maintenance failed", error=str(e))
 
+        # 8. Periodic data maintenance (hourly): stale/missing trace recovery
+        if (now - self.last_data_maintenance).total_seconds() > 3600:
+            try:
+                await periodic_data_maintenance(self._market_symbols(), max_age_hours=6.0)
+                self.last_data_maintenance = now
+            except Exception as e:
+                logger.error("Periodic data maintenance failed", error=str(e))
+
     # _background_hydration_task removed (Replaced by CandleManager.initialize)
 
     async def _sync_account_state(self):
@@ -842,25 +835,45 @@ class LiveTrading:
                     # CRITICAL CHECK: Stop loss must be set
                     if not managed_pos.initial_stop_price:
                         logger.critical(
-                            f"🚨 UNPROTECTED POSITION: {symbol} has NO STOP LOSS!",
-                            size=str(pos['size']),
-                            entry=str(pos['entry_price']),
-                            unrealized_pnl=str(pos.get('unrealized_pnl', 0))
+                            "UNPROTECTED POSITION: no stop loss",
+                            symbol=symbol,
+                            size=str(pos["size"]),
+                            entry=str(pos["entry_price"]),
+                            unrealized_pnl=str(pos.get("unrealized_pnl", 0)),
                         )
-                        # TODO: Emergency stop loss placement could go here
-                        # For now, just alert loudly
+                        try:
+                            from src.monitoring.alerts import get_alert_system
+                            get_alert_system().send_alert(
+                                "critical",
+                                "Unprotected position – no stop loss",
+                                f"{symbol}: size={pos['size']} entry={pos['entry_price']}. Place stop manually or restart with protection.",
+                                metadata={"symbol": symbol, "size": str(pos["size"])},
+                            )
+                        except Exception as ex:
+                            logger.warning("Failed to send unprotected-position alert", error=str(ex))
                 else:
-                    # Position exists but not in managed_positions - this is also critical
                     logger.critical(
-                        f"🚨 UNMANAGED POSITION: {symbol} exists but not tracked!",
-                        size=str(pos['size']),
-                        entry=str(pos['entry_price'])
+                        "UNMANAGED POSITION: exchange position not tracked",
+                        symbol=symbol,
+                        size=str(pos["size"]),
+                        entry=str(pos["entry_price"]),
                     )
+                    try:
+                        from src.monitoring.alerts import get_alert_system
+                        get_alert_system().send_alert(
+                            "critical",
+                            "Unmanaged position on exchange",
+                            f"{symbol} exists on exchange but not in managed_positions. Review and sync.",
+                            metadata={"symbol": symbol},
+                        )
+                    except Exception as ex:
+                        logger.warning("Failed to send unmanaged-position alert", error=str(ex))
         except Exception as e:
             logger.error("Failed to validate position protection", error=str(e))
     
     async def _handle_signal(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
         """Process signal through risk and executor."""
+        self.signals_since_emit += 1
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
         
         # ========== V2 PATH: Position State Machine ==========
@@ -1325,7 +1338,7 @@ class LiveTrading:
         actions = []
         
         # 1. Abandon Ship (Bias Flip)
-        if hasattr(self.config, 'abandon_ship_enabled') and self.config.abandon_ship_enabled:
+        if getattr(self.config.strategy, 'abandon_ship_enabled', False):
             # Bias direction map
             bias = signal.higher_tf_bias # "bullish", "bearish", "neutral"
             
@@ -1350,7 +1363,7 @@ class LiveTrading:
         # 2. Time-Based Exit
         # If position held > X bars and we haven't hit TP1 yet (or just held too long)
         # Using 15m bars approx
-        time_limit_bars = getattr(self.config, 'time_based_exit_bars', 0)
+        time_limit_bars = getattr(self.config.strategy, 'time_based_exit_bars', 0)
         if time_limit_bars > 0:
             # Calculate bars held
             # Approximate using timestamps

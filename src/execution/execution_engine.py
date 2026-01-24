@@ -23,10 +23,18 @@ class ExecutionEngine:
     def __init__(self, config: Config):
         self.config = config.execution
         self.strategy_config = config.strategy
-        
-        # Cache precision (could be dynamic per symbol in future)
-        self.price_precision = Decimal("0.1")  # Default tick size
-        self.qty_precision = Decimal("0.001")   # Default lot size
+        mtp = getattr(config, "multi_tp", None)
+
+        if mtp and getattr(mtp, "enabled", False):
+            self._tp_splits = [mtp.tp1_close_pct, mtp.tp2_close_pct, mtp.runner_pct]
+            self._rr_fallback_multiples = [mtp.tp1_r_multiple, mtp.tp2_r_multiple, 3.0]
+            logger.info("ExecutionEngine using multi_tp config", tp_splits=self._tp_splits, rr_multiples=self._rr_fallback_multiples)
+        else:
+            self._tp_splits = list(self.config.tp_splits)
+            self._rr_fallback_multiples = list(self.config.rr_fallback_multiples)
+
+        self.price_precision = Decimal("0.1")
+        self.qty_precision = Decimal("0.001")
         
     def generate_entry_plan(
         self, 
@@ -212,8 +220,7 @@ class ExecutionEngine:
         risk = abs(fut_entry - fut_sl)
         if risk == 0: risk = Decimal("1") # Edge case protection or config error
         
-        # Generate generic RR fallbacks
-        multiples = self.config.rr_fallback_multiples
+        multiples = self._rr_fallback_multiples
         fallbacks = []
         for m in multiples:
             m = Decimal(str(m))
@@ -274,7 +281,7 @@ class ExecutionEngine:
 
     def _split_quantities(self, total_qty: Decimal, num_tps: int) -> List[Decimal]:
         """Split quantities according to config splits."""
-        splits = self.config.tp_splits
+        splits = self._tp_splits
         # Ensure splits match num_tps
         if len(splits) != num_tps:
             # Fallback

@@ -193,7 +193,7 @@ class Executor:
             )
             return None
         
-        futures_symbol = FuturesAdapter.map_spot_to_futures(order_intent.signal.symbol)
+        futures_symbol = self.futures_adapter.map_spot_to_futures(order_intent.signal.symbol)
         
         # CRITICAL: Acquire per-symbol lock to prevent race conditions
         # This ensures only one order can be processed for a symbol at a time
@@ -413,13 +413,12 @@ class Executor:
                 if current_sl_id:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
                 
-                # Fetch position size for correct notional (simplified, should use exact size)
-                # In live, we should fetch actual position size from adapter here.
-                # For now, we assume size is managed or use a 'flatten' intent
+                # Reduce-only SL: size_notional=0 may mean "close full position" on some APIs.
+                # Ideal: fetch actual position size from exchange/managed state and pass it.
                 sl_order = await self.futures_adapter.place_order(
                     symbol=symbol,
                     side=protective_side,
-                    size_notional=Decimal("0"), # Placeholder for 'reduce-only' logic if adapter supports it
+                    size_notional=Decimal("0"),
                     leverage=Decimal("1"),
                     order_type=OrderType.STOP_LOSS,
                     price=new_sl_price,

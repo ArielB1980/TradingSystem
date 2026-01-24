@@ -681,72 +681,9 @@ class TradingService:
                 logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))
 
     async def _calculate_effective_equity(self, balance: Dict) -> tuple[Decimal, Decimal, Decimal]:
-        """
-        Calculate effective equity/margin from balance dict.
-        Handlers:
-        1. Multi-Collateral (Flex) - Using 'info' from Kraken
-        2. Single-Collateral (Inverse) - Valuing crypto collateral manually
-        3. Standard - Using base currency balance
-        
-        Returns:
-            (equity, available_margin, margin_used)
-        """
-        # Default to standard CCXT total['USD']
-        base_currency = getattr(self.config.exchange, "base_currency", "USD")
-        total = balance.get('total', {})
-        
-        equity = Decimal(str(total.get(base_currency, 0)))
-        avail_margin = Decimal(str(balance.get('free', {}).get(base_currency, 0)))
-        margin_used = Decimal(str(balance.get('used', {}).get(base_currency, 0)))
-        
-        # 2. Check for Kraken Futures Multi-Collateral ("flex")
-        info = balance.get('info', {})
-        if info and 'accounts' in info and 'flex' in info['accounts']:
-            flex = info['accounts']['flex']
-            
-            pv = flex.get('portfolioValue')
-            am = flex.get('availableMargin')
-            im = flex.get('initialMargin')
-            
-            if pv is not None:
-                equity = Decimal(str(pv))
-            if am is not None:
-                avail_margin = Decimal(str(am))
-            if im is not None:
-                margin_used = Decimal(str(im))
-                
-            return equity, avail_margin, margin_used
-        
-        # 3. Logic for Single-Collateral (Inverse) or incomplete Flex data
-        # If Equity is suspiciously low (< 10 USD) but we have crypto balance, calculate approximate equity
-        if equity < 10:
-            # Check for XBT/BTC/ETH
-            for asset in ['XBT', 'BTC', 'ETH', 'SOL', 'USDT', 'USDC']:
-                if asset == base_currency: 
-                    continue
-                    
-                asset_qty = Decimal(str(total.get(asset, 0)))
-                if asset_qty > 0:
-                    try:
-                        # Fetch price for valuation
-                        ticker_symbol = f"{asset}/USD"
-                        if asset == 'XBT': ticker_symbol = "BTC/USD"
-                        
-                        ticker = await self.kraken.get_ticker(ticker_symbol)
-                        price = Decimal(str(ticker['last']))
-                        
-                        asset_equity = asset_qty * price
-                        
-                        equity += asset_equity
-                        # Approximate available margin if strictly 0 (risky but better than 0)
-                        if avail_margin == 0:
-                            avail_margin += asset_equity
-                            
-                        logger.info(f"Valued non-USD collateral: {asset_qty} {asset} (~${asset_equity:,.2f})")
-                    except Exception as ex:
-                         logger.warning(f"Could not value collateral {asset}", error=str(ex))
-                         
-        return equity, avail_margin, margin_used
+        from src.execution.equity import calculate_effective_equity
+        base = getattr(self.config.exchange, "base_currency", "USD")
+        return await calculate_effective_equity(balance, base_currency=base, kraken_client=self.kraken)
 
     async def _sync_account_state(self):
         """Update account balance and equity in DB."""
