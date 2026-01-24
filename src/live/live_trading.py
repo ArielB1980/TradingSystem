@@ -1213,9 +1213,9 @@ class LiveTrading:
             return
         
         # 9. Execute entry via Execution Gateway
-        # This is the ONLY way to place orders
+        # This is the ONLY way to place orders. Use futures symbol for exchange (Kraken expects X/USD:USD).
         logger.info("Submitting entry to gateway", symbol=futures_symbol, client_order_id=action.client_order_id)
-        result = await self.execution_gateway.execute_action(action)
+        result = await self.execution_gateway.execute_action(action, order_symbol=futures_symbol)
         
         if not result.success:
             logger.error("Entry failed", error=result.error)
