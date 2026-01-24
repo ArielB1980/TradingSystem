@@ -161,9 +161,10 @@ class AtomicStopReplacer:
             # Step 1: Place NEW stop first
             new_client_order_id = generate_client_order_id(position.position_id, "stop")
             stop_side = "sell" if position.side.value == "long" else "buy"
+            exchange_symbol = getattr(position, "futures_symbol", None) or position.symbol
             
             result = await self.client.place_futures_order(
-                symbol=position.symbol,
+                symbol=exchange_symbol,
                 side=stop_side,
                 order_type="stop",
                 size=position.remaining_qty,
@@ -200,7 +201,7 @@ class AtomicStopReplacer:
                 
                 # Try to cancel the new stop we placed
                 try:
-                    await self.client.cancel_futures_order(ctx.new_stop_order_id, position.symbol)
+                    await self.client.cancel_futures_order(ctx.new_stop_order_id, exchange_symbol)
                 except Exception:
                     pass
                 
@@ -209,7 +210,7 @@ class AtomicStopReplacer:
             # Step 3: NOW cancel old stop (only after new is confirmed)
             if ctx.old_stop_order_id:
                 try:
-                    await self.client.cancel_futures_order(ctx.old_stop_order_id, position.symbol)
+                    await self.client.cancel_futures_order(ctx.old_stop_order_id, exchange_symbol)
                     ctx.old_stop_cancelled = True
                 except Exception as e:
                     # Old stop might have already triggered - that's OK
@@ -306,9 +307,9 @@ class ProtectionEnforcer:
         
         try:
             close_side = "sell" if position.side.value == "long" else "buy"
-            
+            exchange_symbol = getattr(position, "futures_symbol", None) or position.symbol
             await self.client.place_futures_order(
-                symbol=position.symbol,
+                symbol=exchange_symbol,
                 side=close_side,
                 order_type="market",
                 size=position.remaining_qty,

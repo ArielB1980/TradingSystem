@@ -231,6 +231,7 @@ class ManagedPosition:
     regime: Optional[str] = None
     trade_type: Optional[str] = None  # "tight_smc" or "wide_structure"
     intent_confirmed: bool = False  # BE gate for tight: set on market confirmation (BOS/level), not entry ACK
+    futures_symbol: Optional[str] = None  # Exchange symbol (e.g. X/USD:USD) for order placement
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
