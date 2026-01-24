@@ -64,6 +64,17 @@ class CandleManager:
                 "1d": self.candles["1d"].get(symbol, [])[-1].timestamp if self.candles["1d"].get(symbol) else datetime.min.replace(tzinfo=timezone.utc),
             }
 
+        # Hydration summary: helps explain "only N coins with sufficient candles"
+        sufficient_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) >= 50)
+        zero_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) == 0)
+        logger.info(
+            "Hydration complete",
+            total=len(markets),
+            with_sufficient_15m=sufficient_15m,
+            with_zero_15m=zero_15m,
+            hint="Run backfill against this DB if most have zero; ensure universe matches live discovery.",
+        )
+
     def _merge_candles(self, symbol: str, timeframe: str, new_candles: List[Candle]):
         """Helper to merge candles into cache, avoiding duplicates."""
         buffer = self.candles[timeframe]

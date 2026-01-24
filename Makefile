@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy audit audit-cancel clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy audit audit-cancel audit-orphaned check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -16,8 +16,10 @@ help:
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
 	@echo "  make pre-deploy    Run all pre-deployment tests (REQUIRED before push to main)"
-	@echo "  make audit         Audit open futures orders (read-only)"
-	@echo "  make audit-cancel  Audit + cancel redundant stop orders"
+	@echo "  make audit           Audit open futures orders (read-only)"
+	@echo "  make audit-cancel    Audit + cancel redundant stop orders"
+	@echo "  make audit-orphaned  Audit + cancel orphaned stops (when 0 positions)"
+	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
 	@echo "  make test          Run unit tests"
 	@echo "  make logs          Tail run logs"
 	@echo "  make smoke-logs    Tail smoke logs"
@@ -144,6 +146,24 @@ audit-cancel:
 		$(PYTHON) -m src.tools.audit_open_orders --cancel-redundant-stops; \
 	else \
 		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+audit-orphaned:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.audit_open_orders --cancel-orphaned-stops; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+check-signals:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) scripts/check_signal_scanning.py; \
+	else \
+		echo "❌ .env.local not found. Add DO_API_TOKEN for remote log fetch."; \
 		exit 1; \
 	fi
 

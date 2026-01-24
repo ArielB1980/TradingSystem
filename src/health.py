@@ -243,101 +243,87 @@ async def test_system():
 
 
 
+def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
+    """Shared logic for /api/debug/signals and /debug/signals."""
+    import json
+
+    try:
+        from src.storage.repository import get_recent_events
+
+        limit = 20 if symbol_filter else 50
+        events = get_recent_events(
+            limit=limit,
+            event_type="DECISION_TRACE",
+            symbol=symbol_filter,
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": type(e).__name__,
+            "last_signal": None,
+            "checked_events": 0,
+            "recent_decisions": [],
+        }
+
+    results: dict = {
+        "status": "success",
+        "last_signal": None,
+        "checked_events": 0,
+        "recent_decisions": [],
+    }
+
+    for ev in events:
+        results["checked_events"] += 1
+        ts = ev.get("timestamp", "")
+        sym = ev.get("symbol", "")
+        data = ev.get("details") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                data = {"error": "failed to parse details"}
+        signal = data.get("signal", "NONE")
+        quality = data.get("setup_quality", 0)
+        reasoning = data.get("reasoning", [])
+        reasoning_tip = reasoning[-1] if isinstance(reasoning, list) and reasoning else "No reasoning logged"
+
+        results["recent_decisions"].append({
+            "time": ts,
+            "symbol": sym,
+            "signal": signal,
+            "quality": quality,
+            "reasoning": reasoning_tip,
+        })
+
+        if signal and str(signal).upper() in ("LONG", "SHORT") and results["last_signal"] is None:
+            results["last_signal"] = {
+                "timestamp": ts,
+                "symbol": sym,
+                "signal": signal,
+                "quality": quality,
+                "details": data,
+                "reasoning": reasoning,
+            }
+
+    return results
+
+
 @app.get("/api/debug/signals")
 async def debug_signals(symbol: Optional[str] = None):
     """
     Debug endpoint to find the last generated signal.
-    Queries the system_events table directly.
+    Uses system_events DECISION_TRACE. Optional ?symbol=... to filter.
     """
-    try:
-        from src.storage.db import get_db
-        from sqlalchemy import text
-        import json
-        
-        db = get_db()
-        results = {
-            "status": "success",
-            "last_signal": None,
-            "checked_events": 0,
-            "recent_decisions": []
-        }
-        
-        with db.get_session() as session:
-            # Get last 50 decision traces
-            if symbol:
-                query = text("""
-                    SELECT timestamp, details, symbol
-                    FROM system_events 
-                    WHERE event_type = 'DECISION_TRACE' AND symbol = :symbol
-                    ORDER BY timestamp DESC 
-                    LIMIT 20
-                """)
-                params = {"symbol": symbol}
-            else:
-                query = text("""
-                    SELECT timestamp, details, symbol
-                    FROM system_events 
-                    WHERE event_type = 'DECISION_TRACE' 
-                    ORDER BY timestamp DESC 
-                    LIMIT 50
-                """)
-                params = {}
-            
-            rows = session.execute(query, params)
-            
-            for row in rows:
-                timestamp = row[0]
-                details_raw = row[1]
-                symbol = row[2]
-                
-                results["checked_events"] += 1
-                
-                # Parse details
-                try:
-                    if isinstance(details_raw, str):
-                        data = json.loads(details_raw)
-                    else:
-                        data = details_raw
-                except:
-                    data = {"error": "failed to parse details"}
-                
-                signal = data.get('signal', 'NONE')
-                quality = data.get('setup_quality', 0)
-                reasoning = data.get('reasoning', [])
-                
-                # Add to recent list (summary)
-                results["recent_decisions"].append({
-                    "time": str(timestamp),
-                    "symbol": symbol,
-                    "signal": signal,
-                    "quality": quality,
-                    "reasoning": reasoning[-1] if reasoning else "No reasoning logged"
-                })
-                
-                # Check if it's a valid signal
-                if signal and signal.upper() in ['LONG', 'SHORT']:
-                    if results["last_signal"] is None:
-                        results["last_signal"] = {
-                            "timestamp": str(timestamp),
-                            "symbol": symbol,
-                            "signal": signal,
-                            "quality": quality,
-                            "details": data,
-                            "reasoning": reasoning
-                        }
-                        break
-            
-            return JSONResponse(content=results)
-            
-    except Exception as e:
-        return JSONResponse(
-            content={
-                "status": "error",
-                "message": str(e),
-                "type": type(e).__name__
-            },
-            status_code=500
-        )
+    data = _debug_signals_impl(symbol_filter=symbol)
+    return JSONResponse(content=data, status_code=200)
+
+
+@app.get("/debug/signals")
+async def debug_signals_no_api(symbol: Optional[str] = None):
+    """Same as /api/debug/signals, for deployments that strip /api prefix."""
+    data = _debug_signals_impl(symbol_filter=symbol)
+    return JSONResponse(content=data, status_code=200)
 
 
 if __name__ == "__main__":
