@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
 from src.domain.models import Position
-from src.storage.repository import update_position, get_active_positions
+from src.storage.repository import get_active_positions, delete_position
 
 logger = get_logger(__name__)
 
@@ -48,39 +48,61 @@ class Reconciler:
             raise
 
     async def _fetch_exchange_positions(self) -> Dict[str, Dict]:
-        """Fetch all open positions from exchange."""
-        # Note: In a real implementation this would iterate all symbols
-        # For now we might just check known symbols or use an 'openpositions' endpoint without symbol
-        # Kraken Futures 'openpositions' returns all.
+        """Fetch all open positions from exchange via Kraken Futures API."""
         try:
-            # We need to call client with a generic catch-all or iterate.
-            # Assuming client has a method to get ALL positions or we know the whitelist.
-            # Let's assume we iterate known active symbols for now + a discovery call if available.
-            return {} # Placeholder for actual API call which requires specific endpoint knowledge
-        except Exception:
+            if not self.client.has_valid_futures_credentials():
+                return {}
+            raw = await self.client.get_all_futures_positions()
+            out: Dict[str, Dict] = {}
+            for p in raw:
+                sym = p.get("symbol")
+                if sym and (p.get("size") or 0) != 0:
+                    out[str(sym)] = p
+            return out
+        except Exception as e:
+            logger.warning("Failed to fetch exchange positions for reconciliation", error=str(e))
             return {}
 
     async def _reconcile_positions(self, exchange_pos: Dict[str, Dict], system_pos: List[Position]):
-        """Compare and alert on discrepancies."""
+        """Compare and alert on discrepancies. Alerts on ghosts; deletes zombies from DB."""
+        from src.monitoring.alerts import get_alert_system
+
         exchange_symbols = set(exchange_pos.keys())
-        system_symbols = set(p.symbol for p in system_pos)
-        
-        # Ghost Positions (Exchange only)
+        system_symbols = {p.symbol for p in system_pos}
+
+        # Ghost Positions (Exchange has it, we don't) -> alert only
         ghosts = exchange_symbols - system_symbols
         if ghosts:
             logger.critical("GHOST POSITIONS DETECTED", symbols=list(ghosts))
-            # Action: Alert User / Emergency Close?
-            
-        # Zombie Positions (System only)
+            try:
+                get_alert_system().send_alert(
+                    "critical",
+                    "Reconciliation: Ghost Positions",
+                    f"Exchange has positions we do not track: {sorted(ghosts)}. Review and sync or close manually.",
+                    metadata={"symbols": list(ghosts)},
+                )
+            except Exception as e:
+                logger.warning("Failed to send ghost-position alert", error=str(e))
+
+        # Zombie Positions (We have it, exchange doesn't) -> delete from DB + alert
         zombies = system_symbols - exchange_symbols
         if zombies:
             logger.critical("ZOMBIE POSITIONS DETECTED", symbols=list(zombies))
-            # Action: Mark system position as closed (since it's gone on exchange)
             for z in zombies:
-                # Find the position
-                pos = next(p for p in system_pos if p.symbol == z)
-                logger.warning("Closing zombie position in system", symbol=z)
-                # update_position(pos.id, status="closed_by_reconciler")
+                try:
+                    delete_position(z)
+                    logger.info("Removed zombie position from DB", symbol=z)
+                except Exception as e:
+                    logger.warning("Failed to delete zombie position", symbol=z, error=str(e))
+            try:
+                get_alert_system().send_alert(
+                    "critical",
+                    "Reconciliation: Zombie Positions Closed",
+                    f"Positions removed from system (missing on exchange): {sorted(zombies)}.",
+                    metadata={"symbols": list(zombies)},
+                )
+            except Exception as e:
+                logger.warning("Failed to send zombie-position alert", error=str(e))
 
     async def verify_order_alignment(self, position: Position):
         """Verify that a specific position has the correct orders open."""

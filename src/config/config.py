@@ -48,7 +48,6 @@ class RiskConfig(BaseSettings):
     risk_per_trade_pct: float = Field(default=0.005, ge=0.0001, le=0.05)
     max_leverage: float = Field(default=10.0, ge=1.0, le=10.0)
     target_leverage: float = Field(default=7.0, ge=1.0, le=10.0)  # Actual leverage to use
-    max_position_size_usd: float = Field(default=50000.0, ge=1000.0)
 
     # Sizing Method: fixed, kelly, volatility, kelly_volatility, leverage_based
     sizing_method: Literal["fixed", "kelly", "volatility", "kelly_volatility", "leverage_based"] = "fixed"
@@ -235,6 +234,19 @@ class LiquidityFilters(BaseSettings):
     min_price_usd: Decimal = Field(default=Decimal("0.01"))  # Avoid dust coins
 
 
+class MultiTPConfig(BaseSettings):
+    """Multi-TP configuration (YAML multi_tp section). When enabled, overrides execution TP splits and RR multiples."""
+    enabled: bool = False
+    tp1_r_multiple: float = Field(default=1.0, ge=0.5, le=5.0)
+    tp1_close_pct: float = Field(default=0.40, ge=0.1, le=0.6)
+    tp2_r_multiple: float = Field(default=2.5, ge=1.0, le=10.0)
+    tp2_close_pct: float = Field(default=0.40, ge=0.1, le=0.6)
+    runner_pct: float = Field(default=0.20, ge=0.05, le=0.5)
+    move_sl_to_be_after_tp1: bool = True
+    trailing_stop_enabled: bool = True
+    trailing_stop_atr_multiplier: float = Field(default=1.5, ge=1.0, le=3.0)
+
+
 class ExecutionConfig(BaseSettings):
     """Execution settings configuration."""
     # Price conversion
@@ -302,6 +314,8 @@ class MonitoringConfig(BaseSettings):
     
     # Alert delivery
     alert_methods: List[str] = ["log"]
+    slack_webhook_url: Optional[str] = None
+    discord_webhook_url: Optional[str] = None
 
 
 class BacktestConfig(BaseSettings):
@@ -360,6 +374,7 @@ class Config(BaseSettings):
     coin_universe: CoinUniverseConfig = Field(default_factory=CoinUniverseConfig) # NEW
     liquidity_filters: LiquidityFilters = Field(default_factory=LiquidityFilters)  # NEW
     execution: ExecutionConfig
+    multi_tp: Optional[MultiTPConfig] = None
     data: DataConfig
     reconciliation: ReconciliationConfig
     monitoring: MonitoringConfig

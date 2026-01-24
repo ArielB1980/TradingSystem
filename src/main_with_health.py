@@ -1,6 +1,8 @@
 """
-Main entry point that runs the trading bot with integrated health check endpoints.
-This allows the worker to be converted to a web service on App Platform.
+Main entry point: DataService + TradingService with embedded health API.
+
+NOT the production runtime. Production uses run.py live → LiveTrading, and
+src.health for the web service. See docs/PRODUCTION_RUNTIME.md.
 """
 import asyncio
 import time
@@ -212,6 +214,10 @@ async def main_async():
     global data_service_ref, trading_service_ref
 
     setup_logging()
+    logger.warning(
+        "main_with_health is NOT the production runtime. "
+        "Use run.py live + src.health. See docs/PRODUCTION_RUNTIME.md."
+    )
     logger.info("Initializing Trading Bot with Health Endpoints...")
 
     # Load Config

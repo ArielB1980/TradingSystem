@@ -8,7 +8,7 @@ Handles:
 - Order submission
 """
 from decimal import Decimal
-from typing import Optional
+from typing import Dict, Optional
 from datetime import datetime, timezone
 from src.domain.models import Order, OrderType, OrderStatus, Side
 from src.data.kraken_client import KrakenClient
@@ -25,59 +25,79 @@ class FuturesAdapter:
     Maps spot tickers to futures contracts and handles order placement.
     """
     
-    # Spot → Futures mapping (Kraken uses PF_ prefix for perpetuals)
+    # Spot → Futures mapping (Kraken uses PF_ prefix for perpetuals, e.g. PF_XBTUSD)
     TICKER_MAP = {
-        "BTC/USD": "PF_XBTUSD",  # Kraken Futures BTC perpetual
-        "ETH/USD": "PF_ETHUSD",   # Kraken Futures ETH perpetual
+        "BTC/USD": "PF_XBTUSD",
+        "ETH/USD": "PF_ETHUSD",
         "SOL/USD": "PF_SOLUSD",
         "LINK/USD": "PF_LINKUSD",
         "AVAX/USD": "PF_AVAXUSD",
         "MATIC/USD": "PF_MATICUSD",
+        "XRP/USD": "PF_XRPUSD",
+        "DOGE/USD": "PF_DOGEUSD",
+        "ADA/USD": "PF_ADAUSD",
+        "DOT/USD": "PF_DOTUSD",
+        "UNI/USD": "PF_UNIUSD",
+        "ATOM/USD": "PF_ATOMUSD",
+        "LTC/USD": "PF_LTCUSD",
+        "BCH/USD": "PF_BCHUSD",
+        "ETC/USD": "PF_ETCUSD",
+        "XLM/USD": "PF_XLMUSD",
+        "ALGO/USD": "PF_ALGOUSD",
+        "FIL/USD": "PF_FILUSD",
+        "TRX/USD": "PF_TRXUSD",
+        "APT/USD": "PF_APTUSD",
+        "ARB/USD": "PF_ARBUSD",
+        "OP/USD": "PF_OPUSD",
+        "SUI/USD": "PF_SUIUSD",
+        "SEI/USD": "PF_SEIUSD",
+        "NEAR/USD": "PF_NEARUSD",
+        "INJ/USD": "PF_INJUSD",
+        "PEPE/USD": "PF_PEPEUSD",
     }
-    
-    def __init__(self, kraken_client: KrakenClient, max_leverage: float = 10.0):
+
+    def __init__(
+        self,
+        kraken_client: KrakenClient,
+        max_leverage: float = 10.0,
+        spot_to_futures_override: Optional[Dict[str, str]] = None,
+    ):
         """
         Initialize futures adapter.
-        
+
         Args:
             kraken_client: Kraken client for API calls
             max_leverage: Maximum leverage cap (hard limit)
+            spot_to_futures_override: Optional mapping from market discovery (spot -> futures). Used first.
         """
         self.kraken_client = kraken_client
         self.max_leverage = max_leverage
-        
-        logger.info("Futures Adapter initialized", max_leverage=max_leverage)
-    
-    @staticmethod
-    def map_spot_to_futures(spot_symbol: str) -> str:
+        self.spot_to_futures_override = spot_to_futures_override or {}
+        logger.info(
+            "Futures Adapter initialized",
+            max_leverage=max_leverage,
+            override_size=len(self.spot_to_futures_override),
+        )
+
+    def set_spot_to_futures_override(self, mapping: Dict[str, str]) -> None:
+        """Update mapping from market discovery (spot -> futures)."""
+        self.spot_to_futures_override = mapping or {}
+
+    def map_spot_to_futures(self, spot_symbol: str) -> str:
         """
         Map spot symbol to futures symbol.
-        
-        Args:
-            spot_symbol: Spot symbol (e.g., "BTC/USD")
-        
-        Returns:
-            Futures symbol (e.g., "BTCUSD-PERP")
-        
-        Raises:
-            ValueError: If symbol not supported
+        Uses override (e.g. from market discovery) first, then TICKER_MAP, then PF_{BASE}USD.
         """
-        futures_symbol = FuturesAdapter.TICKER_MAP.get(spot_symbol)
-        
-        if futures_symbol:
-            return futures_symbol
-            
-        # Dynamic Fallback: PF_{BASE}USD
-        # Most tickers follow this pattern (PF_ETHUSD, PF_SOLUSD, etc.)
+        s = self.spot_to_futures_override.get(spot_symbol) or FuturesAdapter.TICKER_MAP.get(spot_symbol)
+        if s:
+            return s
         try:
-            base = spot_symbol.split('/')[0]
-            # Handle special cases if any (BTC is handled in TICKER_MAP)
-            dynamic_symbol = f"PF_{base}USD"
-            return dynamic_symbol
+            base = spot_symbol.split("/")[0]
+            if base == "XBT":
+                base = "BTC"
+            return f"PF_{base}USD"
         except IndexError:
             raise ValueError(f"Invalid spot symbol format: {spot_symbol}")
-        
-        return futures_symbol
     
     async def place_order(
         self,

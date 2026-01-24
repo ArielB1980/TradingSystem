@@ -88,9 +88,15 @@ with st.sidebar:
     else:
         st.success("✅ System Operational")
         
-    # Active Alerts (Placeholder)
-    # st.subheader("🔔 Recent Alerts")
-    # ...
+    st.subheader("🔔 Recent Events")
+    try:
+        from src.dashboard.utils import get_event_feed
+        alerts = get_event_feed(limit=15)
+        for a in alerts[:10]:
+            st.caption(f"{a.get('timestamp', '')[:19]} [{a.get('type', '')}] {a.get('symbol', '')}")
+            st.text(a.get('message', ''))
+    except Exception as e:
+        st.caption(f"Could not load events: {e}")
 
 
 # Header

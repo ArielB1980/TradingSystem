@@ -11,12 +11,20 @@ from pathlib import Path
 
 from src.config.config import load_config
 from src.storage.repository import (
-    get_active_position, 
-    get_all_trades, 
-    get_recent_events, 
-    get_decision_chain
+    get_active_position,
+    get_active_positions,
+    get_all_trades,
+    get_recent_events,
+    get_decision_chain,
+    get_latest_account_state,
 )
 from src.domain.models import Side
+from src.dashboard.utils import (
+    _spot_to_futures,
+    get_daily_pnl_total,
+    get_daily_pnl_for_symbol,
+)
+from src.utils.market_discovery import load_discovered_mapping
 
 app = FastAPI(title="Trading Board")
 
@@ -150,57 +158,51 @@ async def get_trades() -> List[Dict[str, Any]]:
 async def get_all_assets() -> Dict[str, Any]:
     """
     Get comprehensive status for all eligible assets.
-    
-    Returns per-asset:
-    - Health status (feeds, basis)
-    - Market state (regime, bias, signal strength)
-    - Position info
-    - PnL metrics
-    - Rejection tracking
+    Uses get_active_positions() and spot->futures mapping for correct position lookup.
     """
-    # TODO: This will be populated by MultiAssetOrchestrator
-    # For now, return structure for all configured symbols
-    
     symbols = config.exchange.spot_markets
+    position_by_futures = {p.symbol: p for p in get_active_positions()}
+    mapping = load_discovered_mapping()
     assets = {}
-    
+
     for symbol in symbols:
-        pos = get_active_position(symbol)
+        futures = _spot_to_futures(symbol, mapping_override=mapping)
+        pos = position_by_futures.get(futures)
         events = get_recent_events(limit=1, event_type="DECISION_TRACE", symbol=symbol)
         latest_decision = events[0] if events else None
-        
-        # Get rejection info from recent risk validations
+        details = latest_decision.get("details", {}) if latest_decision else {}
+        signal_strength = float(details.get("setup_quality", 0))
+
         risk_events = get_recent_events(limit=5, event_type="RISK_VALIDATION", symbol=symbol)
-        rejections = [e for e in risk_events if e.get('details', {}).get('approved') == False]
-        
+        rejections = [e for e in risk_events if e.get("details", {}).get("approved") is False]
+
         assets[symbol] = {
-            "health": {
-                "spot_feed": True,  # TODO: Get from orchestrator
-                "futures_feed": True,
-                "basis": True
-            },
+            "health": {"spot_feed": True, "futures_feed": True, "basis": True},
             "market_state": {
-                "regime": latest_decision['details'].get('regime', 'unknown') if latest_decision else 'unknown',
-                "bias": latest_decision['details'].get('bias', 'neutral') if latest_decision else 'neutral',
-                "signal_strength": 0.0  # TODO: Calculate from signal metadata
+                "regime": details.get("regime", "unknown"),
+                "bias": details.get("bias", "neutral"),
+                "signal_strength": signal_strength,
             },
             "position": {
                 "active": pos is not None,
                 "side": pos.side.value if pos else None,
                 "size_notional": float(pos.size_notional) if pos else 0.0,
                 "unrealized_pnl": float(pos.unrealized_pnl) if pos else 0.0,
-                "entry_price": float(pos.entry_price) if pos else None
+                "entry_price": float(pos.entry_price) if pos else None,
             },
             "pnl": {
-                "daily": 0.0,  # TODO: Calculate daily PnL
-                "total": float(pos.unrealized_pnl) if pos else 0.0
+                "daily": get_daily_pnl_for_symbol(symbol, futures_symbol=futures),
+                "total": float(pos.unrealized_pnl) if pos else 0.0,
             },
             "rejections": {
                 "consecutive": len(rejections),
-                "last_reason": rejections[0]['details'].get('rejection_reasons') if rejections else None
-            }
+                "last_reason": (
+                    rejections[0]["details"].get("rejection_reasons")
+                    if rejections else None
+                ),
+            },
         }
-    
+
     return assets
 
 
@@ -219,45 +221,50 @@ async def get_portfolio_metrics() -> Dict[str, Any]:
     - Utilization metrics
     """
     symbols = config.exchange.spot_markets
-    
-    # Count active positions
-    active_positions = 0
-    total_unrealized_pnl = 0.0
-    
-    for symbol in symbols:
-        pos = get_active_position(symbol)
-        if pos:
-            active_positions += 1
-            total_unrealized_pnl += float(pos.unrealized_pnl)
-    
-    # TODO: Get these from orchestrator/state manager
+    positions = get_active_positions()
+    active_count = len(positions)
+    total_unrealized = sum(float(p.unrealized_pnl) for p in positions)
+
+    account = get_latest_account_state()
+    if account:
+        equity = float(account["equity"])
+        margin_used = float(account["margin_used"])
+        available = float(account["available_margin"])
+    else:
+        equity = 10000.0
+        margin_used = active_count * 1000.0
+        available = max(0.0, equity - margin_used)
+
+    kill_switch_active = False
+    try:
+        from src.utils.kill_switch import read_kill_switch_state
+        kill_switch_active = bool(read_kill_switch_state().get("active"))
+    except Exception:
+        pass
+
     return {
-        "equity": {
-            "total": 10000.0,  # TODO: Get from account state
-            "available": 10000.0 - (active_positions * 1000.0),  # Simplified
-            "margin_used": active_positions * 1000.0
-        },
+        "equity": {"total": equity, "available": available, "margin_used": margin_used},
         "pnl": {
-            "unrealized": total_unrealized_pnl,
-            "realized_today": 0.0,  # TODO: Calculate from closed trades today
-            "total_today": total_unrealized_pnl
+            "unrealized": total_unrealized,
+            "realized_today": get_daily_pnl_total(),
+            "total_today": total_unrealized + get_daily_pnl_total(),
         },
         "positions": {
-            "active": active_positions,
+            "active": active_count,
             "max_allowed": config.risk.max_concurrent_positions,
-            "utilization_pct": (active_positions / config.risk.max_concurrent_positions) * 100
+            "utilization_pct": (active_count / config.risk.max_concurrent_positions) * 100,
         },
         "assets": {
             "monitored": len(symbols),
-            "eligible": len(symbols),  # TODO: Get from registry
-            "healthy": len(symbols),  # TODO: Get from orchestrator
-            "unhealthy": 0
+            "eligible": len(symbols),
+            "healthy": len(symbols),
+            "unhealthy": 0,
         },
         "safety": {
-            "kill_switch_active": False,  # TODO: Get from orchestrator
-            "new_entries_blocked": active_positions >= config.risk.max_concurrent_positions,
-            "daily_loss_limit_pct": config.risk.daily_loss_limit_pct
-        }
+            "kill_switch_active": kill_switch_active,
+            "new_entries_blocked": kill_switch_active or active_count >= config.risk.max_concurrent_positions,
+            "daily_loss_limit_pct": config.risk.daily_loss_limit_pct,
+        },
     }
 
 

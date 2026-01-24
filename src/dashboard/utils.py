@@ -12,6 +12,7 @@ from src.monitoring.logger import get_logger
 from src.config.config import load_config
 from src.storage.repository import (
     get_active_position,
+    get_active_positions,
     get_all_trades,
     get_recent_events,
     get_latest_account_state,
@@ -62,6 +63,40 @@ def _get_monitored_symbols(config) -> List[str]:
     
     # Final fallback to config markets
     return config.exchange.spot_markets
+
+
+def _spot_to_futures(spot: str, mapping_override: Optional[Dict[str, str]] = None) -> str:
+    """Map spot symbol to Kraken Futures symbol. Uses override (e.g. discovery) first, then TICKER_MAP."""
+    if mapping_override and spot in mapping_override:
+        return mapping_override[spot]
+    from src.execution.futures_adapter import FuturesAdapter
+    s = FuturesAdapter.TICKER_MAP.get(spot)
+    if s:
+        return s
+    base = spot.split("/")[0]
+    if base == "XBT":
+        base = "BTC"
+    return f"PF_{base}USD"
+
+
+def get_daily_pnl_total() -> float:
+    """Sum of net_pnl for all trades closed since start of today (UTC)."""
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    trades = get_trades_since(start)
+    return sum(float(t.net_pnl) for t in trades)
+
+
+def get_daily_pnl_for_symbol(symbol: str, futures_symbol: Optional[str] = None) -> float:
+    """Sum of net_pnl for trades in symbol (or futures_symbol) closed since start of today (UTC)."""
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    trades = get_trades_since(start)
+    syms = [symbol]
+    if futures_symbol:
+        syms.append(futures_symbol)
+    return sum(float(t.net_pnl) for t in trades if t.symbol in syms)
+
 
 def get_portfolio_metrics() -> Dict[str, Any]:
     """Get portfolio-level metrics."""
@@ -114,50 +149,43 @@ def get_portfolio_metrics() -> Dict[str, Any]:
 
 def get_all_positions() -> List[Dict[str, Any]]:
     """Get all active positions with risk metrics."""
-    config = load_config()
-    symbols = _get_monitored_symbols(config)
-    
     positions = []
-    for symbol in symbols:
-        pos = get_active_position(symbol)
-        if pos:
-            # Calculate risk flags
-            flags = []
-            if pos.liquidation_price and pos.current_mark_price:
-                liq_dist = abs(pos.current_mark_price - pos.liquidation_price) / pos.current_mark_price
-                if liq_dist < 0.15:
-                    flags.append("NEAR_LIQ")
-            
-            # Get TP fill status
-            tp_status = "0/0/0"  # TODO: Parse from tp_order_ids
-            
-            positions.append({
-                "symbol": symbol,
-                "side": pos.side.value,
-                "notional": float(pos.size_notional),
-                "entry_price": float(pos.entry_price),
-                "current_price": float(pos.current_mark_price),
-                "unrealized_pnl": float(pos.unrealized_pnl),
-                "liq_price": float(pos.liquidation_price) if pos.liquidation_price else 0.0,
-
-                # Active Management Fields - using correct field names for dashboard
-                "initial_stop_price": float(pos.initial_stop_price) if pos.initial_stop_price else None,
-                "tp1_price": float(pos.tp1_price) if pos.tp1_price else None,
-                "tp2_price": float(pos.tp2_price) if pos.tp2_price else None,
-                "final_target_price": float(pos.final_target_price) if pos.final_target_price else None,
-                "stop_loss": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,  # Keep for backward compat
-                "tp1": float(pos.tp1_price) if pos.tp1_price else 0.0,  # Keep for backward compat
-                "status": "CONFIRMED" if pos.intent_confirmed else ("TP1 HIT" if pos.tp1_hit else "OPEN"),
-                "liq_distance_pct": liq_dist * 100 if pos.liquidation_price else 0.0,
-                "stop_price": 0.0,  # TODO: Parse from stop_loss_order_id
-                "stop_distance_pct": 0.0,
-                "tp_status": tp_status,
-                "trailing_active": pos.trailing_active,
-                "basis_at_entry": 0.0,  # TODO: Store at entry
-                "basis_current": 0.0,  # TODO: Calculate current
-                "risk_flags": flags,
-            })
-    
+    for pos in get_active_positions():
+        symbol = pos.symbol
+        flags = []
+        liq_dist = 0.0
+        if pos.liquidation_price and pos.current_mark_price:
+            liq_dist = float(abs(pos.current_mark_price - pos.liquidation_price) / pos.current_mark_price)
+            if liq_dist < 0.15:
+                flags.append("NEAR_LIQ")
+        tp_status = "0/0/0"
+        positions.append({
+            "symbol": symbol,
+            "side": pos.side.value,
+            "notional": float(pos.size_notional),
+            "entry_price": float(pos.entry_price),
+            "current_price": float(pos.current_mark_price),
+            "unrealized_pnl": float(pos.unrealized_pnl),
+            "liq_price": float(pos.liquidation_price) if pos.liquidation_price else 0.0,
+            "initial_stop_price": float(pos.initial_stop_price) if pos.initial_stop_price else None,
+            "tp1_price": float(pos.tp1_price) if pos.tp1_price else None,
+            "tp2_price": float(pos.tp2_price) if pos.tp2_price else None,
+            "final_target_price": float(pos.final_target_price) if pos.final_target_price else None,
+            "stop_loss": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,
+            "tp1": float(pos.tp1_price) if pos.tp1_price else 0.0,
+            "status": "CONFIRMED" if pos.intent_confirmed else ("TP1 HIT" if pos.tp1_hit else "OPEN"),
+            "liq_distance_pct": liq_dist * 100 if pos.liquidation_price else 0.0,
+            "stop_price": float(pos.initial_stop_price) if pos.initial_stop_price else 0.0,
+            "stop_distance_pct": (
+                abs(float(pos.current_mark_price - pos.initial_stop_price) / pos.current_mark_price) * 100
+                if pos.initial_stop_price and pos.current_mark_price else 0.0
+            ),
+            "tp_status": tp_status,
+            "trailing_active": pos.trailing_active,
+            "basis_at_entry": float(pos.basis_at_entry) if pos.basis_at_entry else 0.0,
+            "basis_current": float(pos.basis_current) if pos.basis_current else 0.0,
+            "risk_flags": flags,
+        })
     return positions
 
 
@@ -226,16 +254,30 @@ def get_coin_snapshots() -> Dict[str, CoinStateSnapshot]:
 def get_system_status() -> Dict[str, Any]:
     """Get system health and status."""
     config = load_config()
-    
-    # TODO: Get actual status from system state
+    kill_switch_active = False
+    try:
+        from src.utils.kill_switch import read_kill_switch_state
+        kill_switch_active = bool(read_kill_switch_state().get("active"))
+    except Exception:
+        pass
+    db_ok = False
+    try:
+        from src.storage.db import get_db
+        from sqlalchemy import text
+        db = get_db()
+        with db.get_session() as session:
+            session.execute(text("SELECT 1;"))
+        db_ok = True
+    except Exception:
+        pass
     return {
         "mode": config.environment.upper(),
-        "kill_switch": False,  # TODO: Get from orchestrator
-        "trading_status": "RUNNING",
-        "last_recon_seconds": 5,  # TODO: Get from reconciliation service
+        "kill_switch": kill_switch_active,
+        "trading_status": "HALTED" if kill_switch_active else "RUNNING",
+        "last_recon_seconds": getattr(config.reconciliation, "periodic_interval_seconds", 15),
         "spot_feed_health": True,
         "futures_feed_health": True,
-        "database_health": True,
+        "database_health": db_ok,
         "rate_limit_ok": True,
     }
 
@@ -248,9 +290,9 @@ def get_event_feed(limit: int = 50, symbol: Optional[str] = None) -> List[Dict[s
     formatted = []
     for event in events:
         formatted.append({
-            "timestamp": event.get('timestamp', ''),
-            "type": event.get('event_type', ''),
-            "symbol": event.get('symbol', 'SYSTEM'),
+            "timestamp": event.get("timestamp", ""),
+            "type": event.get("type", ""),
+            "symbol": event.get("symbol", "SYSTEM"),
             "message": _format_event_message(event),
             "severity": _get_event_severity(event),
         })

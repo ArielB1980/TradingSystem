@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import List, Optional, Dict, Tuple, Any
 import json
 from src.storage.db import Base, get_db
-from src.domain.models import Candle, Trade, Position
+from src.domain.models import Candle, Trade, Position, Side
 
 
 # Query Cache
@@ -624,7 +624,6 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
             leverage=Decimal(str(pm.leverage)),
             margin_used=Decimal(str(pm.margin_used)),
             opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
-            updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
             # Management Params
             initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
             trade_type=pm.trade_type,
@@ -661,7 +660,6 @@ def get_active_positions() -> List[Position]:
                 leverage=Decimal(str(pm.leverage)),
                 margin_used=Decimal(str(pm.margin_used)),
                 opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
-                updated_at=pm.updated_at.replace(tzinfo=timezone.utc),
                 # Position params
                 initial_stop_price=Decimal(str(pm.initial_stop_price)) if pm.initial_stop_price else None,
                 trade_type=pm.trade_type,
@@ -880,6 +878,30 @@ def get_event_stats(symbol: str) -> Dict[str, Any]:
             "last_event": last_ts.replace(tzinfo=timezone.utc) if last_ts else None
         }
 
+def record_metrics_snapshot(details: Dict) -> None:
+    """Write a metrics snapshot to system_events for /api/metrics. Worker calls this periodically."""
+    record_event("METRICS_SNAPSHOT", "system", details)
+
+
+def get_latest_metrics_snapshot() -> Optional[Dict]:
+    """Return the latest METRICS_SNAPSHOT details, or None if none found."""
+    db = get_db()
+    with db.get_session() as session:
+        e = (
+            session.query(SystemEventModel)
+            .filter(SystemEventModel.event_type == "METRICS_SNAPSHOT")
+            .order_by(SystemEventModel.timestamp.desc())
+            .limit(1)
+            .first()
+        )
+        if not e:
+            return None
+        try:
+            return json.loads(e.details)
+        except json.JSONDecodeError:
+            return None
+
+
 def get_decision_chain(decision_id: str) -> List[Dict]:
     """Get all events related to a decision ID."""
     db = get_db()
@@ -984,29 +1006,20 @@ def get_latest_traces(limit: int = 300) -> List[Dict]:
 def save_intent_hash(intent_hash: str, symbol: str, timestamp: datetime) -> None:
     """
     Save order intent hash to prevent duplicate orders after restart.
+    Uses system_events table via record_event.
 
     Args:
         intent_hash: Unique hash of the order intent
         symbol: Trading symbol
         timestamp: Signal timestamp
     """
-    from sqlalchemy import text
-    from src.storage.database import get_session
-
-    with get_session() as session:
-        # Store in events table with special event_type
-        session.execute(
-            text("""
-                INSERT INTO events (symbol, timestamp, event_type, details)
-                VALUES (:symbol, :timestamp, 'ORDER_INTENT_HASH', :details)
-            """),
-            {
-                "symbol": symbol,
-                "timestamp": timestamp.replace(tzinfo=timezone.utc),
-                "details": json.dumps({"intent_hash": intent_hash})
-            }
-        )
-        session.commit()
+    ts = timestamp.replace(tzinfo=timezone.utc) if timestamp and getattr(timestamp, "tzinfo", None) is None else timestamp
+    record_event(
+        event_type="ORDER_INTENT_HASH",
+        symbol=symbol,
+        details={"intent_hash": intent_hash},
+        timestamp=ts,
+    )
 
 
 def load_recent_intent_hashes(lookback_hours: int = 24) -> set:
@@ -1019,26 +1032,27 @@ def load_recent_intent_hashes(lookback_hours: int = 24) -> set:
     Returns:
         Set of intent hash strings
     """
-    from sqlalchemy import text
-    from src.storage.database import get_session
+    from sqlalchemy import and_
 
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     hashes = set()
-
-    with get_session() as session:
-        results = session.execute(
-            text("""
-                SELECT details
-                FROM events
-                WHERE event_type = 'ORDER_INTENT_HASH'
-                  AND timestamp >= :cutoff_time
-            """),
-            {"cutoff_time": cutoff_time}
-        ).fetchall()
-
-        for row in results:
-            details = json.loads(row[0])
-            hashes.add(details["intent_hash"])
-
+    db = get_db()
+    with db.get_session() as session:
+        events = (
+            session.query(SystemEventModel)
+            .filter(
+                and_(
+                    SystemEventModel.event_type == "ORDER_INTENT_HASH",
+                    SystemEventModel.timestamp >= cutoff_time,
+                )
+            )
+            .all()
+        )
+        for e in events:
+            try:
+                details = json.loads(e.details)
+                hashes.add(details["intent_hash"])
+            except (json.JSONDecodeError, KeyError):
+                continue
     return hashes
 

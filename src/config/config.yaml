@@ -194,9 +194,10 @@ monitoring:
   # Alert delivery (configure as needed)
   alert_methods:
     - "log"  # Always log alerts
-    # - "email"
-    # - "telegram"
     # - "slack"
+    # - "discord"
+  # slack_webhook_url: "https://hooks.slack.com/..."
+  # discord_webhook_url: "https://discord.com/api/webhooks/..."
 
 ## Backtesting
 backtest:

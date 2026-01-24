@@ -7,6 +7,10 @@ Sends notifications for:
 - System errors
 - Kill switch activation
 """
+import json
+import os
+import urllib.request
+import urllib.error
 from decimal import Decimal
 from typing import Optional
 from datetime import datetime, timezone
@@ -22,34 +26,73 @@ class AlertLevel:
     CRITICAL = "critical"
 
 
+def _send_slack_webhook(url: str, level: str, title: str, message: str, metadata: Optional[dict] = None) -> None:
+    """POST to Slack incoming webhook."""
+    try:
+        payload = {
+            "text": f"[{level.upper()}] {title}",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{message}"}},
+            ],
+        }
+        if metadata:
+            payload["blocks"].append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": json.dumps(metadata)[:2000]}],
+            })
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as _:
+            pass
+    except Exception as e:
+        logger.warning("Slack webhook failed", error=str(e))
+
+
+def _send_discord_webhook(url: str, level: str, title: str, message: str, metadata: Optional[dict] = None) -> None:
+    """POST to Discord webhook."""
+    try:
+        color = {"info": 0x3498DB, "warning": 0xF39C12, "critical": 0xE74C3C}.get(level, 0x95A5A6)
+        embed = {
+            "title": title,
+            "description": message[:4000],
+            "color": color,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if metadata:
+            embed["fields"] = [{"name": k, "value": str(v)[:1024], "inline": False} for k, v in list(metadata.items())[:5]]
+        payload = {"embeds": [embed]}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as _:
+            pass
+    except Exception as e:
+        logger.warning("Discord webhook failed", error=str(e))
+
+
 class AlertSystem:
     """
     Alert system for critical events.
-    
-    Currently logs alerts. Can be extended to send:
-    - Email via SMTP
-    - SMS via Twilio
-    - Slack/Discord webhooks
-    - Push notifications
+
+    Logs all alerts. Also supports Slack and Discord webhooks when configured.
     """
-    
+
     def __init__(self, config: Optional[dict] = None):
-        """
-        Initialize alert system.
-        
-        Args:
-            config: Alert configuration (email, SMS, etc.)
-        """
         self.config = config or {}
         self.enabled = self.config.get("enabled", True)
-        
-        # Thresholds
         self.max_position_size_usd = self.config.get("max_position_size_usd", 10000)
         self.max_daily_loss_pct = self.config.get("max_daily_loss_pct", 5.0)
         self.max_single_loss_pct = self.config.get("max_single_loss_pct", 2.0)
-        
-        logger.info("Alert system initialized", enabled=self.enabled)
-    
+        self.alert_methods = self.config.get("alert_methods", ["log"])
+        self.slack_webhook_url = self.config.get("slack_webhook_url") or os.getenv("SLACK_WEBHOOK_URL")
+        self.discord_webhook_url = self.config.get("discord_webhook_url") or os.getenv("DISCORD_WEBHOOK_URL")
+        logger.info(
+            "Alert system initialized",
+            enabled=self.enabled,
+            methods=self.alert_methods,
+            slack=bool(self.slack_webhook_url),
+            discord=bool(self.discord_webhook_url),
+        )
+
     def send_alert(
         self,
         level: str,
@@ -57,38 +100,19 @@ class AlertSystem:
         message: str,
         metadata: Optional[dict] = None
     ) -> None:
-        """
-        Send alert notification.
-        
-        Args:
-            level: Alert level (info, warning, critical)
-            title: Alert title
-            message: Alert message
-            metadata: Additional context
-        """
         if not self.enabled:
             return
-        
-        # Log alert
         log_method = {
             AlertLevel.INFO: logger.info,
             AlertLevel.WARNING: logger.warning,
             AlertLevel.CRITICAL: logger.critical,
         }.get(level, logger.info)
-        
-        log_method(
-            f"🔔 ALERT: {title}",
-            message=message,
-            level=level,
-            metadata=metadata or {}
-        )
-        
-        # TODO: Implement actual notification channels
-        # - Email via SMTP
-        # - SMS via Twilio
-        # - Slack webhook
-        # - Discord webhook
-        # - Push notification
+        log_method(f"🔔 ALERT: {title}", message=message, level=level, metadata=metadata or {})
+        md = metadata or {}
+        if "slack" in self.alert_methods and self.slack_webhook_url:
+            _send_slack_webhook(self.slack_webhook_url, level, title, message, md)
+        if "discord" in self.alert_methods and self.discord_webhook_url:
+            _send_discord_webhook(self.discord_webhook_url, level, title, message, md)
     
     def check_position_size_violation(
         self,
@@ -194,13 +218,26 @@ class AlertSystem:
         )
 
 
-# Global instance
-_alert_system = None
+_alert_system: Optional[AlertSystem] = None
 
 
 def get_alert_system(config: Optional[dict] = None) -> AlertSystem:
-    """Get global alert system instance."""
+    """Get global alert system instance. If config is None, loads from Config.monitoring."""
     global _alert_system
     if _alert_system is None:
+        if config is None:
+            try:
+                from src.config.config import load_config
+                cfg = load_config()
+                config = {
+                    "enabled": True,
+                    "alert_methods": list(getattr(cfg.monitoring, "alert_methods", ["log"])),
+                    "slack_webhook_url": getattr(cfg.monitoring, "slack_webhook_url", None),
+                    "discord_webhook_url": getattr(cfg.monitoring, "discord_webhook_url", None),
+                    "max_position_size_usd": getattr(cfg.risk, "max_position_size_usd", 10000),
+                    "max_daily_loss_pct": getattr(cfg.risk, "daily_loss_limit_pct", 5.0) * 100,
+                }
+            except Exception:
+                config = {}
         _alert_system = AlertSystem(config)
     return _alert_system

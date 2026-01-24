@@ -240,3 +240,26 @@ _kill_switch = KillSwitch()
 def get_kill_switch() -> KillSwitch:
     """Get global kill switch instance."""
     return _kill_switch
+
+
+def read_kill_switch_state() -> dict:
+    """
+    Read persisted kill switch state from file (no KillSwitch instance).
+    Use from health/dashboard to check status without loading full module.
+    """
+    import json
+    import os
+    out = {"active": False, "latched": False, "reason": None, "activated_at": None}
+    path = os.path.join(os.getcwd(), ".kill_switch_state")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r") as f:
+            state = json.load(f)
+        out["active"] = state.get("active", False)
+        out["latched"] = state.get("latched", False)
+        out["reason"] = state.get("reason")
+        out["activated_at"] = state.get("activated_at")
+    except Exception:
+        pass
+    return out

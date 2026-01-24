@@ -13,6 +13,18 @@ logger = get_logger(__name__)
 MARKETS_FILE = Path(__file__).parent.parent.parent / "data" / "discovered_markets.json"
 
 
+def load_discovered_mapping() -> Optional[dict]:
+    """Load spot->futures mapping from discovered_markets.json. Returns None if missing."""
+    if not MARKETS_FILE.exists():
+        return None
+    try:
+        with open(MARKETS_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("mapping")
+    except Exception:
+        return None
+
+
 def load_discovered_markets() -> Optional[List[str]]:
     """
     Load discovered markets from the daily discovery process.

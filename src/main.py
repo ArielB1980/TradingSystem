@@ -1,3 +1,9 @@
+"""
+Architecture v3: DataService + TradingService (single-process async).
+
+NOT the production live path. Production uses `run.py live` → LiveTrading.
+See docs/PRODUCTION_RUNTIME.md.
+"""
 import asyncio
 import time
 import sys
@@ -15,6 +21,10 @@ logger = get_logger("Main")
 
 async def main_async():
     setup_logging()
+    logger.warning(
+        "main.py (DataService+TradingService) is NOT the production runtime. "
+        "Production uses run.py live → LiveTrading. See docs/PRODUCTION_RUNTIME.md."
+    )
     logger.info("Initializing Architecture v3 (Single Process Async)...")
     
     # Load Config
