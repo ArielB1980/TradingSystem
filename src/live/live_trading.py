@@ -609,20 +609,29 @@ class LiveTrading:
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
-            # Ticker coverage: we only process & fetch candles for symbols with tickers
-            symbols_with_tickers = len([s for s in market_symbols if s in map_spot_tickers])
-            symbols_without_tickers = len(market_symbols) - symbols_with_tickers
-            self._last_ticker_with = symbols_with_tickers
-            self._last_ticker_without = symbols_without_tickers
-            if symbols_without_tickers > 0:
+            symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
+            symbols_with_futures = len([
+                s for s in market_symbols
+                if self.futures_adapter.map_spot_to_futures(s) in map_futures_tickers
+            ])
+            symbols_with_neither = len([
+                s for s in market_symbols
+                if s not in map_spot_tickers
+                and self.futures_adapter.map_spot_to_futures(s) not in map_futures_tickers
+            ])
+            self._last_ticker_with = symbols_with_spot
+            self._last_ticker_without = len(market_symbols) - symbols_with_spot
+            self._last_futures_count = symbols_with_futures
+            if symbols_with_neither > 0 or symbols_with_futures < len(market_symbols):
                 self._last_ticker_skip_log = getattr(self, "_last_ticker_skip_log", datetime.min.replace(tzinfo=timezone.utc))
                 if (datetime.now(timezone.utc) - self._last_ticker_skip_log).total_seconds() >= 300:
                     logger.warning(
-                        "Ticker coverage: some symbols skipped (no spot ticker)",
+                        "Ticker coverage: spot/futures",
                         total=len(market_symbols),
-                        with_ticker=symbols_with_tickers,
-                        without_ticker=symbols_without_tickers,
-                        hint="Skipped symbols never get candle updates; check discovery vs Kraken spot support.",
+                        with_spot=symbols_with_spot,
+                        with_futures=symbols_with_futures,
+                        with_neither=symbols_with_neither,
+                        hint="Trading requires futures ticker; ensure bulk API keys match discovery (CCXT vs PF_*).",
                     )
                     self._last_ticker_skip_log = datetime.now(timezone.utc)
         except Exception as e:
@@ -747,9 +756,16 @@ class LiveTrading:
                     
                     # Pass context to signal for execution (mark price for futures)
                     # Signal is spot-based, execution is futures-based.
-                    
-                    if signal.signal_type != SignalType.NO_SIGNAL and is_tradable:
-                         await self._handle_signal(signal, spot_price, mark_price)
+                    if signal.signal_type != SignalType.NO_SIGNAL:
+                        if not is_tradable:
+                            logger.warning(
+                                "Signal skipped (no futures ticker)",
+                                symbol=spot_symbol,
+                                signal=signal.signal_type.value,
+                                futures_symbol=futures_symbol,
+                            )
+                        else:
+                            await self._handle_signal(signal, spot_price, mark_price)
                     
                     # V4: Dynamic Exits (Abandon Ship & Time-Based)
                     # We check this AFTER signal generation because we need the fresh Bias
@@ -826,6 +842,8 @@ class LiveTrading:
                 if getattr(self, "_last_ticker_with", None) is not None:
                     summary["symbols_with_ticker"] = self._last_ticker_with
                     summary["symbols_without_ticker"] = getattr(self, "_last_ticker_without", 0)
+                if getattr(self, "_last_futures_count", None) is not None:
+                    summary["symbols_with_futures"] = self._last_futures_count
                 fc = self.candle_manager.pop_futures_fallback_count()
                 if fc > 0:
                     summary["coins_futures_fallback_used"] = fc
@@ -1115,9 +1133,10 @@ class LiveTrading:
         decision = self.risk_manager.validate_trade(signal, equity, spot_price, mark_price)
         
         if not decision.approved:
-            logger.warning("Trade rejected by Risk Manager", reasons=decision.rejection_reasons)
+            logger.warning("Trade rejected by Risk Manager", symbol=signal.symbol, reasons=decision.rejection_reasons)
             return
-        
+        logger.info("Risk approved", symbol=signal.symbol, notional=str(decision.position_notional))
+
         # 3. Map to futures symbol
         futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
         
@@ -1155,11 +1174,10 @@ class LiveTrading:
         )
         
         if action.type == ActionTypeV2.REJECT_ENTRY:
-            logger.warning("Entry REJECTED by State Machine", 
-                          symbol=signal.symbol, 
-                          reason=action.reason)
+            logger.warning("Entry REJECTED by State Machine", symbol=signal.symbol, reason=action.reason)
             return
-        
+        logger.info("State machine accepted entry", symbol=signal.symbol, client_order_id=action.client_order_id)
+
         # 7. Handle opportunity cost replacement via V2
         if decision.should_close_existing and decision.close_symbol:
             logger.warning("Opportunity cost replacement via V2",
@@ -1196,6 +1214,7 @@ class LiveTrading:
         
         # 9. Execute entry via Execution Gateway
         # This is the ONLY way to place orders
+        logger.info("Submitting entry to gateway", symbol=futures_symbol, client_order_id=action.client_order_id)
         result = await self.execution_gateway.execute_action(action)
         
         if not result.success:

@@ -532,11 +532,11 @@ class KrakenClient:
     async def get_futures_tickers_bulk(self) -> Dict[str, Decimal]:
         """
         Get ALL futures mark prices in one call.
-        Returns mapped dict: {futures_symbol: mark_price}
+        Returns dict keyed by both Kraken raw (e.g. PF_XBTUSD) and CCXT unified (e.g. XBT/USD:USD)
+        so callers can look up using either format (e.g. discovery uses CCXT, TICKER_MAP uses PF_*).
         """
         await self.public_limiter.wait_for_token()
         try:
-            # Fetch all tickers from API endpoint
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             timeout = aiohttp.ClientTimeout(total=30)
@@ -544,24 +544,35 @@ class KrakenClient:
                 async with session.get(url) as response:
                     if response.status != 200:
                         raise Exception(f"Futures API error: {await response.text()}")
-                    
                     data = await response.json()
-                    
-                    # Map results
-                    results = {}
-                    for ticker in data.get('tickers', []):
-                        # Kraken returns weird symbols like 'PF_XBTUSD'
-                        # We need to map them back to our 'BTCUSD-PERP' or keep as is and map later.
-                        # For now, we store keyed by the raw symbol AND mapped versions if possible.
-                        # Better strategy: Return the raw map, let caller handle mapping or map common ones.
-                        
-                        raw_symbol = ticker.get('symbol')
-                        mark = ticker.get('markPrice')
-                        if raw_symbol and mark:
-                            results[raw_symbol] = Decimal(str(mark))
-                            
-                    return results
-                    
+
+            results: Dict[str, Decimal] = {}
+            for ticker in data.get("tickers", []):
+                raw_symbol = ticker.get("symbol")
+                mark = ticker.get("markPrice")
+                if raw_symbol and mark:
+                    results[raw_symbol] = Decimal(str(mark))
+
+            # Add CCXT unified keys so discovery override (spot -> CCXT symbol) lookups succeed
+            if self.futures_exchange:
+                try:
+                    if not self.futures_exchange.markets:
+                        await self.futures_exchange.load_markets()
+                    for raw, val in list(results.items()):
+                        raw_upper = str(raw).upper()
+                        for m in self.futures_exchange.markets.values():
+                            mid = m.get("id")
+                            if not mid:
+                                continue
+                            if str(mid).upper() == raw_upper:
+                                unified = m.get("symbol")
+                                if unified and unified not in results:
+                                    results[unified] = val
+                                break
+                except Exception as e:
+                    logger.debug("Could not add CCXT keys to bulk futures tickers", error=str(e))
+
+            return results
         except Exception as e:
             logger.error("Failed to fetch bulk futures tickers", error=str(e))
             raise
