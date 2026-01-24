@@ -230,7 +230,7 @@ class ManagedPosition:
     setup_type: Optional[str] = None
     regime: Optional[str] = None
     trade_type: Optional[str] = None  # "tight_smc" or "wide_structure"
-    intent_confirmed: bool = False  # BE gate for tight: requires True or wide_structure
+    intent_confirmed: bool = False  # BE gate for tight: set on market confirmation (BOS/level), not entry ACK
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
@@ -365,7 +365,6 @@ class ManagedPosition:
         """Handle order acknowledgement. Locks immutable fields."""
         if event.order_id == self.entry_order_id:
             self.entry_acknowledged = True
-            self.intent_confirmed = True  # BE gate: tight trades may trigger BE after TP1
             logger.info(f"Entry acknowledged for {self.symbol}, immutables locked")
             return True
         return False
@@ -536,6 +535,20 @@ class ManagedPosition:
         
         return True
     
+    # ========== INTENT CONFIRMATION (market confirmation, not entry ACK) ==========
+    
+    def confirm_intent(self) -> bool:
+        """
+        Set intent_confirmed when market confirms (e.g. BOS/confirmation level crossed).
+        Idempotent; returns True iff state changed.
+        """
+        if self.intent_confirmed:
+            return False
+        self.intent_confirmed = True
+        self.updated_at = datetime.now(timezone.utc)
+        logger.info(f"Intent confirmed for {self.symbol} (market confirmation)")
+        return True
+    
     # ========== BREAK-EVEN LOGIC (Conditional) ==========
     
     def should_trigger_break_even(self) -> bool:
@@ -564,7 +577,7 @@ class ManagedPosition:
         if self.trade_type == "wide_structure":
             return True
         
-        # For tight trades, require intent_confirmed (e.g. set on entry ack / BOS confirmation)
+        # For tight trades, require intent_confirmed (set when price crosses BOS/confirmation level or structure confirms)
         return bool(self.intent_confirmed)
     
     def trigger_break_even(self, be_price: Optional[Decimal] = None) -> bool:

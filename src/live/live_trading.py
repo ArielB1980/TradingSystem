@@ -136,7 +136,11 @@ class LiveTrading:
         self.active = False
         
         # Candle data managed by dedicated service
-        self.candle_manager = CandleManager(self.client)
+        self.candle_manager = CandleManager(
+            self.client,
+            spot_to_futures=self.futures_adapter.map_spot_to_futures,
+            use_futures_fallback=getattr(config.exchange, "use_futures_ohlcv_fallback", True),
+        )
         
         self.last_trace_log: Dict[str, datetime] = {} # Dashboard update throttling
         self.last_account_sync = datetime.min.replace(tzinfo=timezone.utc)
@@ -392,6 +396,7 @@ class LiveTrading:
                             "signals_last_min": self.signals_since_emit,
                             "markets_count": len(self._market_symbols()),
                             "api_fetch_latency_ms": getattr(self, "last_fetch_latency_ms", None),
+                            "coins_futures_fallback_used": self.candle_manager.get_futures_fallback_count(),
                         })
                         self.last_metrics_emit = now
                         self.ticks_since_emit = 0
@@ -642,36 +647,27 @@ class LiveTrading:
         async def process_coin(spot_symbol: str):
             async with sem:
                 try:
-                    # Context
                     futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
-                    
-                    # Get Data from Bulk Cache
-                    if spot_symbol not in map_spot_tickers:
-                        return # Skip if no data
-                        
-                    spot_ticker = map_spot_tickers[spot_symbol]
-                    spot_price = Decimal(str(spot_ticker['last']))
-                    
-                    # Resolve futures mark price
-                    # Try direct match or mapped match
-                    mark_price = None
-                    if futures_symbol in map_futures_tickers:
-                        mark_price = map_futures_tickers[futures_symbol]
-                    else:
-                        # Try logic lookup (e.g. PF_XBTUSD)
-                        # Quick dirty check for specific mapping if known keys differ
-                        # For now rely on exact or adapter map
-                        pass
-                        
-                    if not mark_price:
-                        # Fallback for analysis-only mode (spot tokens without futures)
-                        # We use spot price as mark price proxy for SMC analysis, but disable execution
-                        mark_price = spot_price
-                        is_tradable = False
-                    else:
-                        is_tradable = True
+                    has_spot = spot_symbol in map_spot_tickers
+                    has_futures = futures_symbol in map_futures_tickers
+                    if not has_spot and not has_futures:
+                        return  # Skip if no ticker (spot or futures)
 
-                    # Update Candles (This still does I/O but is parallelized now)
+                    if has_spot:
+                        spot_ticker = map_spot_tickers[spot_symbol]
+                        spot_price = Decimal(str(spot_ticker["last"]))
+                    else:
+                        spot_price = None
+                    mark_price = map_futures_tickers.get(futures_symbol) if has_futures else None
+                    if not mark_price:
+                        mark_price = spot_price
+                    if not mark_price:
+                        return
+                    if spot_price is None:
+                        spot_price = mark_price  # Use futures mark when no spot ticker (futures-only)
+                    is_tradable = bool(has_futures)
+
+                    # Update Candles (spot first; futures fallback when spot unavailable)
                     await self._update_candles(spot_symbol)
                     
                     # Position Management
@@ -841,6 +837,9 @@ class LiveTrading:
                 if getattr(self, "_last_ticker_with", None) is not None:
                     summary["symbols_with_ticker"] = self._last_ticker_with
                     summary["symbols_without_ticker"] = getattr(self, "_last_ticker_without", 0)
+                fc = self.candle_manager.pop_futures_fallback_count()
+                if fc > 0:
+                    summary["coins_futures_fallback_used"] = fc
                 logger.info("Coin processing status summary", **summary)
                 self.last_status_summary = now
             except Exception as e:

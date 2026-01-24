@@ -8,10 +8,13 @@ The worker reports `coins_with_sufficient_candles` (symbols with ≥50 × 15m ca
    Candles are stored in the DB. At startup, **hydration** loads 14d of 15m, 60d of 1h, etc. into the in-memory cache for all tracked symbols.
 
 2. **Live fetch (incremental)**  
-   Each tick, we call Kraken for new candles **only for symbols we have a spot ticker for**. We **skip** symbols without a ticker → they never get `update_candles` → no new candles.
+   Each tick we update candles for symbols we have a **spot** or **futures** ticker for. We **skip** only when neither exists.
 
-3. **“Sufficient”**  
-   We need **≥50 × 15m** candles for SMC. That comes from **hydration (DB)** and/or **live fetches**. If both are missing for a symbol, it stays insufficient.
+3. **Futures OHLCV fallback**  
+   When **spot** OHLCV is unavailable (e.g. Kraken `BadSymbol`, no spot market), we **fall back to futures OHLCV** for that coin if `use_futures_ohlcv_fallback` is enabled (default: true). Signals then use futures-sourced candles, stored under the spot symbol. This lets the 60+ “no spot” coins still be analysed and traded.
+
+4. **“Sufficient”**  
+   We need **≥50 × 15m** candles for SMC. That comes from **hydration (DB)** and/or **live fetches** (spot or futures fallback). If both are missing for a symbol, it stays insufficient.
 
 ## Likely causes of “only 2 (or few) sufficient”
 
@@ -32,16 +35,16 @@ See [HISTORICAL_DATA_BACKFILL.md](HISTORICAL_DATA_BACKFILL.md).
 
 ### 2. Ticker coverage: many symbols skipped
 
-- We **only process** symbols that appear in `get_spot_tickers_bulk(...)`.
-- If Kraken returns **tickers for only a few** of our symbols (e.g. discovery uses pairs Kraken spot doesn’t support, or format mismatch), we **skip** the rest.
-- Skipped symbols **never** get `update_candles` → no live data → always 0 candles.
+- We process symbols that have **either** a **spot** ticker (`get_spot_tickers_bulk`) **or** a **futures** ticker. We **skip** only when **neither** exists.
+- If Kraken returns neither spot nor futures tickers for many symbols, we skip them → no `update_candles` → no live data.
+- `symbols_with_ticker` counts **spot** only; symbols with **futures-only** are still processed (and may use futures OHLCV fallback).
 
 **Check logs for:**
 
-- `"Ticker coverage: some symbols skipped"` → `with_ticker` vs `without_ticker`.
-- `"Coin processing status summary"` → `symbols_with_ticker` / `symbols_without_ticker` (if present).
+- `"Ticker coverage: some symbols skipped"` → `with_ticker` vs `without_ticker` (spot).
+- `"Coin processing status summary"` → `symbols_with_ticker` / `symbols_without_ticker`, `coins_futures_fallback_used` (if present).
 
-If `symbols_without_ticker` is large, that explains why most symbols never accumulate candles.
+If `symbols_without_ticker` is large but you have futures tickers, many coins may still be processed via futures-only path.
 
 ### 3. Universe mismatch (backfill vs live)
 
@@ -59,7 +62,7 @@ If `symbols_without_ticker` is large, that explains why most symbols never accum
 
 - **`Coin processing status summary`** (every 5 min)  
   - `coins_with_sufficient_candles`, `coins_waiting_for_candles`  
-  - `symbols_with_ticker` / `symbols_without_ticker` (if logged)  
+  - `symbols_with_ticker` / `symbols_without_ticker` (spot), `coins_futures_fallback_used` (if any)  
   - Tells you ticker coverage and how many symbols are “ready” for SMC.
 
 - **`Ticker coverage: some symbols skipped`** (when any missing, throttled)  
@@ -71,7 +74,7 @@ If `symbols_without_ticker` is large, that explains why most symbols never accum
 | Observation | Likely cause |
 |------------|----------------|
 | `with_zero_15m` ≈ total at hydration | DB has no history → **run backfill against prod DB** |
-| `symbols_without_ticker` large | Most symbols skipped → **check discovery vs Kraken spot** |
+| `symbols_without_ticker` large | Many lack spot ticker; **futures-only** coins still processed if they have futures ticker |
 | `with_sufficient_15m` small but `symbols_with_ticker` large | DB empty + live fetch still ramping or failing for most → **backfill + inspect fetch errors** |
 
 Running **backfill** against the **production** DB for the **live** universe, and then checking **ticker coverage** and **hydration** logs, usually resolves “only 2 coins with sufficient data.”

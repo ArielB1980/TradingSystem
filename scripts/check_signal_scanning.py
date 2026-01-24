@@ -130,6 +130,7 @@ SCAN_OK = [
     (r"Active Portfolio: \d+ positions", "position sync"),
     (r"Hydration complete", "hydration summary (DB candle load)"),
     (r"Ticker coverage:.*skipped", "ticker coverage (symbols with/without spot ticker)"),
+    (r"coins_futures_fallback_used", "futures OHLCV fallback used for some symbols"),
 ]
 # Patterns that indicate problems (tick blocked or unhealthy)
 SCAN_BAD = [

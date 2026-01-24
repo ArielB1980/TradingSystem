@@ -263,7 +263,8 @@ def main() -> None:
     if args.check_health:
         print("Health check (web / dashboard):")
         h_ok = check_health(app_id, headers)
-        sys.exit(0 if h_ok else 1)
+        if not (args.track or args.logs or args.deploy_logs):
+            sys.exit(0 if h_ok else 1)
 
     if args.track:
         ok = track_deployment(app_id, headers, poll_interval=args.poll_interval)

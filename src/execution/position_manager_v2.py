@@ -322,7 +322,9 @@ class PositionManagerV2:
         symbol: str,
         current_price: Decimal,
         current_atr: Optional[Decimal] = None,
-        premise_invalidated: bool = False
+        premise_invalidated: bool = False,
+        confirmation_condition_met: bool = False,
+        confirmation_price: Optional[Decimal] = None
     ) -> List[ManagementAction]:
         """
         Evaluate all rules for an active position.
@@ -335,6 +337,11 @@ class PositionManagerV2:
         5. TP1 HIT → Partial close + conditional BE
         6. TRAILING STOP UPDATE → Move stop toward profit
         7. NO ACTION
+        
+        Intent confirmation (BE gate for tight trades):
+        Set intent_confirmed when confirmation_condition_met=True or when
+        current_price crosses confirmation_price (BOS level, prior swing, etc.).
+        Caller should compute this from structure/candles.
         
         Returns:
             Prioritized list of actions (execute in order)
@@ -356,6 +363,18 @@ class PositionManagerV2:
         
         if position.is_terminal:
             return []
+        
+        # ========== INTENT CONFIRMATION (market confirmation, not entry ACK) ==========
+        if not position.intent_confirmed:
+            price_crossed = False
+            if confirmation_price is not None:
+                if position.side == Side.LONG:
+                    price_crossed = current_price >= confirmation_price
+                else:
+                    price_crossed = current_price <= confirmation_price
+            if confirmation_condition_met or price_crossed:
+                if position.confirm_intent():
+                    reason_codes.append("INTENT_CONFIRMED")
         
         # ========== RULE 2: STOP HIT (ABSOLUTE PRIORITY) ==========
         if position.check_stop_hit(current_price):

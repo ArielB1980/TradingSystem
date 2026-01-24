@@ -6,13 +6,15 @@
 
 - **Entrypoint:** `run.py live` (or `python -m src.cli live`)
 - **Engine:** `LiveTrading` in `src/live/live_trading.py`
-- **Procfile worker:** `python migrate_schema.py && python run.py live --force`
+- **Procfile worker:** `python migrate_schema.py && python run.py live --force` (or `... live --force --with-health` if the worker serves HTTP health)
 
-Data acquisition, strategy (SMC), risk, and execution all run inside the `LiveTrading` loop. The dashboard and health service run as separate App Platform components.
+**Production = `run.py live` → `LiveTrading`. Not `main.py` or `main_with_health`.**
+
+Data acquisition, strategy (SMC), risk, and execution all run inside the `LiveTrading` loop. The dashboard and health service run as separate App Platform components (or, for worker-only apps, the worker runs `run.py live --with-health` and serves `/`, `/health`, `/api/metrics`, etc.).
 
 **DigitalOcean / App Platform:** Set the worker `run_command` to  
-`python migrate_schema.py && python run.py live --force`  
-and the web component to `python -m src.health`. Do **not** use `main_with_health` for the worker.
+`python migrate_schema.py && python run.py live --force --with-health`  
+so the worker satisfies HTTP health checks. Use `python -m src.health` for a dedicated web component. Do **not** use `main_with_health` for the worker.
 
 ## Deprecated / non-production
 

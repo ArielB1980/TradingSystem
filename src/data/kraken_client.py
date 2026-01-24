@@ -329,6 +329,64 @@ class KrakenClient:
             )
             raise
     
+    async def get_futures_ohlcv(
+        self,
+        futures_symbol: str,
+        timeframe: str,
+        since: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> List[Candle]:
+        """
+        Fetch OHLCV from Kraken Futures. Used when spot OHLCV is unavailable.
+
+        Args:
+            futures_symbol: Kraken futures symbol (e.g. PF_XBTUSD)
+            timeframe: 15m, 1h, 4h, 1d
+            since: Unix ms (optional)
+            limit: Max candles (default 300)
+
+        Returns:
+            List of Candle (symbol set to futures_symbol; caller may overwrite for storage).
+        """
+        if not self.futures_exchange:
+            logger.warning("Futures exchange not configured; cannot fetch futures OHLCV")
+            return []
+        limit = limit or 300
+        await self.public_limiter.wait_for_token()
+        try:
+            if not self.futures_exchange.markets:
+                await self.futures_exchange.load_markets()
+            unified = futures_symbol
+            for m in self.futures_exchange.markets.values():
+                if m.get("id") and str(m["id"]).upper() == str(futures_symbol).upper():
+                    unified = m["symbol"]
+                    break
+                if m.get("symbol") == futures_symbol:
+                    break
+            ohlcv = await asyncio.wait_for(
+                self.futures_exchange.fetch_ohlcv(unified, timeframe, since=since, limit=limit),
+                timeout=10.0,
+            )
+            candles = []
+            for row in ohlcv:
+                ts_ms, o, h, l, c, v = row
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                candles.append(Candle(
+                    timestamp=ts,
+                    symbol=futures_symbol,
+                    timeframe=timeframe,
+                    open=Decimal(str(o)),
+                    high=Decimal(str(h)),
+                    low=Decimal(str(l)),
+                    close=Decimal(str(c)),
+                    volume=Decimal(str(v)),
+                ))
+            logger.debug("Fetched futures OHLCV", symbol=futures_symbol, timeframe=timeframe, count=len(candles))
+            return candles
+        except Exception as e:
+            logger.debug("Futures OHLCV fetch failed", symbol=futures_symbol, timeframe=timeframe, error=str(e))
+            return []
+
     async def get_futures_position(self, symbol: str) -> Optional[Dict]:
         """
         Get current futures position from Kraken Futures API.

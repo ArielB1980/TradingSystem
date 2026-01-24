@@ -640,12 +640,12 @@ class TestInvariantJ_ConditionalBreakEven:
         assert pos.should_trigger_break_even() is False
     
     def test_be_triggered_if_fill_above_minimum(self):
-        """BE should trigger if TP1 fill meets minimum threshold."""
+        """BE should trigger if TP1 fill meets minimum and intent confirmed (market confirmation)."""
         pos = self._create_position_with_tp1_partial(
             tp1_fill_pct=Decimal("0.5"),  # 50% > 30% min
             trade_type="tight_smc"
         )
-        
+        pos.confirm_intent()  # Simulate market confirmation (BOS/level crossed)
         assert pos.should_trigger_break_even() is True
     
     def test_be_triggered_for_wide_trade_with_smaller_fill(self):

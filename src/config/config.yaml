@@ -15,6 +15,7 @@ exchange:
     - "BTCUSD-PERP"
     - "ETHUSD-PERP"
   # spot_ohlcv_blocklist: ["2Z/USD", "ANIME/USD"]  # Optional: exclude delisted/failing pairs
+  use_futures_ohlcv_fallback: true   # Use futures OHLCV when spot unavailable (e.g. BadSymbol)
   # Credentials
   api_key: "${KRAKEN_API_KEY}"
   api_secret: "${KRAKEN_API_SECRET}"
