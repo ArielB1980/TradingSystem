@@ -89,7 +89,6 @@ class LiveTrading:
         # Feature flag for gradual rollout
         import os
         self.use_state_machine_v2 = os.getenv("USE_STATE_MACHINE_V2", "false").lower() == "true"
-        self.state_machine_shadow_mode = os.getenv("STATE_MACHINE_SHADOW_MODE", "true").lower() == "true"
         
         if self.use_state_machine_v2:
             logger.critical("🚀 POSITION STATE MACHINE V2 ENABLED")
@@ -101,25 +100,17 @@ class LiveTrading:
             self.position_persistence = PositionPersistence("data/positions.db")
             
             # Initialize Position Manager V2
-            self.position_manager_v2 = PositionManagerV2(
-                registry=self.position_registry,
-                shadow_mode=self.state_machine_shadow_mode
-            )
+            self.position_manager_v2 = PositionManagerV2(registry=self.position_registry)
             
             # Initialize Execution Gateway - ALL orders flow through here
-            # NOTE: In shadow mode, the gateway logs but doesn't execute
             self.execution_gateway = ExecutionGateway(
                 exchange_client=self.client,
                 registry=self.position_registry,
                 position_manager=self.position_manager_v2,
                 persistence=self.position_persistence,
-                shadow_mode=self.state_machine_shadow_mode
             )
             
-            if self.state_machine_shadow_mode:
-                logger.warning("State Machine V2 running in SHADOW MODE - logging only, not executing")
-            else:
-                logger.critical("State Machine V2 running in LIVE MODE - all orders via gateway")
+            logger.critical("State Machine V2 running - all orders via gateway")
             self._protection_monitor = None
             self._protection_task = None
         else:
@@ -178,8 +169,7 @@ class LiveTrading:
         
         logger.info("Live Trading initialized", 
                    markets=config.exchange.futures_markets,
-                   state_machine_v2=self.use_state_machine_v2,
-                   shadow_mode=self.state_machine_shadow_mode if self.use_state_machine_v2 else "N/A")
+                   state_machine_v2=self.use_state_machine_v2)
 
     def _market_symbols(self) -> List[str]:
         """Return list of spot symbols. Handles both list (initial) and dict (after discovery). Excludes blocklist."""
@@ -308,7 +298,6 @@ class LiveTrading:
             if (
                 self.use_state_machine_v2
                 and self.execution_gateway
-                and not self.state_machine_shadow_mode
                 and self.position_registry
             ):
                 try:

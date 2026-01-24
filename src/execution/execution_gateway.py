@@ -105,7 +105,6 @@ class ExecutionGateway:
         registry: Optional[PositionRegistry] = None,
         position_manager: Optional[PositionManagerV2] = None,
         persistence: Optional[PositionPersistence] = None,
-        shadow_mode: bool = False,
         safety_config: Optional[SafetyConfig] = None,
         use_safety: bool = True,
     ):
@@ -117,15 +116,13 @@ class ExecutionGateway:
             registry: Position registry (uses singleton if not provided)
             position_manager: Position manager (creates new if not provided)
             persistence: Persistence layer (optional, creates default if not provided)
-            shadow_mode: If True, log but don't actually execute
             safety_config: Config for AtomicStopReplacer, etc. (default SafetyConfig())
             use_safety: If True, wire AtomicStopReplacer, WAL, EventOrderingEnforcer
         """
         self.client = exchange_client
         self.registry = registry or get_position_registry()
-        self.position_manager = position_manager or PositionManagerV2(self.registry, shadow_mode)
+        self.position_manager = position_manager or PositionManagerV2(self.registry)
         self.persistence = persistence or PositionPersistence()
-        self.shadow_mode = shadow_mode
         self._safety_config = safety_config or SafetyConfig()
         self._use_safety = use_safety
 
@@ -158,8 +155,8 @@ class ExecutionGateway:
         size: Optional[Decimal] = None,
         price: Optional[Decimal] = None,
     ) -> None:
-        """Record write-ahead intent before exchange call. No-op if no WAL or shadow."""
-        if not self._wal or self.shadow_mode:
+        """Record write-ahead intent before exchange call. No-op if no WAL."""
+        if not self._wal:
             return
         intent = ActionIntent(
             intent_id=action.client_order_id,
@@ -193,19 +190,6 @@ class ExecutionGateway:
         
         This is the ONLY way to place orders.
         """
-        if self.shadow_mode:
-            logger.info(
-                "[SHADOW] Would execute action",
-                type=action.type.value,
-                symbol=action.symbol,
-                reason=action.reason
-            )
-            return ExecutionResult(
-                success=True,
-                client_order_id=action.client_order_id,
-                error="Shadow mode - not executed"
-            )
-        
         try:
             if action.type == ActionType.OPEN_POSITION:
                 return await self._execute_entry(action)
@@ -522,7 +506,7 @@ class ExecutionGateway:
                 error="Update stop requires price"
             )
 
-        if self._stop_replacer and not self.shadow_mode:
+        if self._stop_replacer:
             self._wal_record_intent(action, "update_stop", price=action.price)
             def _gen_cid(_pid: str, _: str) -> str:
                 return action.client_order_id
@@ -556,7 +540,7 @@ class ExecutionGateway:
                 exchange_order_id=ctx.new_stop_order_id
             )
         else:
-            # Legacy: cancel then place (e.g. shadow mode or use_safety=False)
+            # Legacy: cancel then place when use_safety=False
             if position.stop_order_id:
                 try:
                     await self.client.cancel_order(position.stop_order_id, action.symbol)
