@@ -457,7 +457,14 @@ class TestConditionalBreakEven:
             trade_type=trade_type
         )
         pos.entry_order_id = "entry-1"
-        
+        ack_event = OrderEvent(
+            order_id="entry-1",
+            client_order_id="client-1",
+            event_type=OrderEventType.ACKNOWLEDGED,
+            event_seq=0,
+            timestamp=datetime.now(timezone.utc),
+        )
+        pos.apply_order_event(ack_event)
         fill_event = OrderEvent(
             order_id="entry-1",
             client_order_id="client-1",
@@ -469,7 +476,6 @@ class TestConditionalBreakEven:
             fill_id="fill-1"
         )
         pos.apply_order_event(fill_event)
-        
         return pos
     
     def test_be_requires_tp1_filled(self):

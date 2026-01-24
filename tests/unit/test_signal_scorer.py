@@ -76,3 +76,25 @@ def test_fib_confluence_scoring(scorer):
     
     score = scorer._score_fib_confluence(signal, fibs)
     assert score == 10.0
+
+
+def test_fib_confluence_uses_config_tolerance():
+    """_score_fib_confluence uses config.fib_proximity_bps for tolerance."""
+    config = StrategyConfig()
+    config.fib_proximity_bps = 10.0  # 0.1%
+    scorer = SignalScorer(config)
+    signal = Mock(spec=Signal)
+    signal.entry_price = Decimal("50000")
+    fibs = Mock(spec=FibonacciLevels)
+    fibs.ote_low = Decimal("10000")
+    fibs.ote_high = Decimal("11000")
+    fibs.fib_0_382 = Decimal("50075")   # 0.15% away from 50000
+    fibs.fib_0_618 = fibs.fib_0_500 = fibs.fib_0_786 = Decimal("10000")
+    fibs.fib_1_272 = fibs.fib_1_618 = Decimal("10000")
+    # 0.15% > 0.1% tolerance -> no match
+    score = scorer._score_fib_confluence(signal, fibs)
+    assert score == 0.0
+    config.fib_proximity_bps = 20.0  # 0.2%
+    scorer.config = config
+    score = scorer._score_fib_confluence(signal, fibs)
+    assert score == 10.0

@@ -389,6 +389,7 @@ class ProductionTakeover:
         
         # Isolate Invariant C: Immutables. entry_acknowledged = True immediately
         pos.entry_acknowledged = True
+        pos.intent_confirmed = True  # BE gate: takeover positions treated as confirmed
         pos.state = PositionState.OPEN # Or PROTECTED
         pos.current_stop_price = stop_price
         pos.setup_type = "TAKEOVER"

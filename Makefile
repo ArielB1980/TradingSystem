@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy audit audit-cancel clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -16,6 +16,8 @@ help:
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
 	@echo "  make pre-deploy    Run all pre-deployment tests (REQUIRED before push to main)"
+	@echo "  make audit         Audit open futures orders (read-only)"
+	@echo "  make audit-cancel  Audit + cancel redundant stop orders"
 	@echo "  make test          Run unit tests"
 	@echo "  make logs          Tail run logs"
 	@echo "  make smoke-logs    Tail smoke logs"
@@ -126,6 +128,24 @@ pre-deploy:
 	@echo "=========================================="
 	@echo ""
 	@echo "Safe to push to main and deploy to production."
+
+audit:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.audit_open_orders; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+audit-cancel:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.audit_open_orders --cancel-redundant-stops; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
 
 test:
 	@echo "Running unit tests..."

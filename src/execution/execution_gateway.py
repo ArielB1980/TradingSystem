@@ -31,6 +31,14 @@ from src.execution.position_manager_v2 import (
     ActionType
 )
 from src.execution.position_persistence import PositionPersistence
+from src.execution.production_safety import (
+    SafetyConfig,
+    AtomicStopReplacer,
+    WriteAheadIntentLog,
+    EventOrderingEnforcer,
+    ActionIntent,
+    ActionIntentStatus,
+)
 from src.domain.models import Side, OrderType
 from src.monitoring.logger import get_logger
 
@@ -97,7 +105,9 @@ class ExecutionGateway:
         registry: Optional[PositionRegistry] = None,
         position_manager: Optional[PositionManagerV2] = None,
         persistence: Optional[PositionPersistence] = None,
-        shadow_mode: bool = False
+        shadow_mode: bool = False,
+        safety_config: Optional[SafetyConfig] = None,
+        use_safety: bool = True,
     ):
         """
         Initialize the execution gateway.
@@ -108,12 +118,24 @@ class ExecutionGateway:
             position_manager: Position manager (creates new if not provided)
             persistence: Persistence layer (optional, creates default if not provided)
             shadow_mode: If True, log but don't actually execute
+            safety_config: Config for AtomicStopReplacer, etc. (default SafetyConfig())
+            use_safety: If True, wire AtomicStopReplacer, WAL, EventOrderingEnforcer
         """
         self.client = exchange_client
         self.registry = registry or get_position_registry()
         self.position_manager = position_manager or PositionManagerV2(self.registry, shadow_mode)
         self.persistence = persistence or PositionPersistence()
         self.shadow_mode = shadow_mode
+        self._safety_config = safety_config or SafetyConfig()
+        self._use_safety = use_safety
+
+        self._stop_replacer: Optional[AtomicStopReplacer] = None
+        self._wal: Optional[WriteAheadIntentLog] = None
+        self._event_enforcer: Optional[EventOrderingEnforcer] = None
+        if use_safety:
+            self._stop_replacer = AtomicStopReplacer(exchange_client, self._safety_config)
+            self._wal = WriteAheadIntentLog(self.persistence)
+            self._event_enforcer = EventOrderingEnforcer()
         
         # Pending order tracking
         self._pending_orders: Dict[str, PendingOrder] = {}  # client_order_id -> PendingOrder
@@ -128,6 +150,40 @@ class ExecutionGateway:
             "events_processed": 0,
             "errors": 0
         }
+
+    def _wal_record_intent(
+        self,
+        action: ManagementAction,
+        action_type: str,
+        size: Optional[Decimal] = None,
+        price: Optional[Decimal] = None,
+    ) -> None:
+        """Record write-ahead intent before exchange call. No-op if no WAL or shadow."""
+        if not self._wal or self.shadow_mode:
+            return
+        intent = ActionIntent(
+            intent_id=action.client_order_id,
+            position_id=action.position_id or "",
+            action_type=action_type,
+            symbol=action.symbol,
+            side=action.side.value,
+            size=str(size if size is not None else action.size),
+            price=str(price) if price is not None else (str(action.price) if action.price else None),
+            created_at=datetime.now(timezone.utc),
+        )
+        self._wal.record_intent(intent)
+
+    def _wal_mark_sent(self, intent_id: str, exchange_order_id: str) -> None:
+        if self._wal:
+            self._wal.mark_sent(intent_id, exchange_order_id)
+
+    def _wal_mark_completed(self, intent_id: str) -> None:
+        if self._wal:
+            self._wal.mark_completed(intent_id)
+
+    def _wal_mark_failed(self, intent_id: str, error: str) -> None:
+        if self._wal:
+            self._wal.mark_failed(intent_id, error)
     
     # ========== ORDER SUBMISSION ==========
     
@@ -211,6 +267,8 @@ class ExecutionGateway:
             submitted_at=datetime.now(timezone.utc)
         )
         self._pending_orders[action.client_order_id] = pending
+
+        self._wal_record_intent(action, "open")
         
         # Submit to exchange
         try:
@@ -236,6 +294,7 @@ class ExecutionGateway:
                 client_order_id=action.client_order_id,
                 exchange_order_id=exchange_order_id
             )
+            self._wal_mark_sent(action.client_order_id, exchange_order_id)
             
             # Log action to persistence
             self.persistence.log_action(
@@ -253,6 +312,7 @@ class ExecutionGateway:
         except Exception as e:
             pending.status = "failed"
             self.metrics["orders_rejected"] += 1
+            self._wal_mark_failed(action.client_order_id, str(e))
             logger.error(f"Entry order failed: {e}")
             return ExecutionResult(
                 success=False,
@@ -284,6 +344,7 @@ class ExecutionGateway:
             position.initiate_exit(action.exit_reason, action.client_order_id)
             self.persistence.save_position(position)
         
+        self._wal_record_intent(action, "close")
         try:
             # Close via reduce-only market order
             close_side = "sell" if action.side == Side.LONG else "buy"
@@ -303,6 +364,7 @@ class ExecutionGateway:
             pending.exchange_order_id = exchange_order_id
             pending.status = "submitted"
             self._order_id_map[exchange_order_id] = action.client_order_id
+            self._wal_mark_sent(action.client_order_id, exchange_order_id)
             
             logger.info(
                 "Close order submitted",
@@ -318,6 +380,7 @@ class ExecutionGateway:
             
         except Exception as e:
             pending.status = "failed"
+            self._wal_mark_failed(action.client_order_id, str(e))
             logger.error(f"Close order failed: {e}")
             return ExecutionResult(
                 success=False,
@@ -342,6 +405,7 @@ class ExecutionGateway:
         )
         self._pending_orders[action.client_order_id] = pending
         
+        self._wal_record_intent(action, "partial_close")
         try:
             close_side = "sell" if action.side == Side.LONG else "buy"
             
@@ -359,6 +423,7 @@ class ExecutionGateway:
             exchange_order_id = result.get("id")
             pending.exchange_order_id = exchange_order_id
             self._order_id_map[exchange_order_id] = action.client_order_id
+            self._wal_mark_sent(action.client_order_id, exchange_order_id)
             
             return ExecutionResult(
                 success=True,
@@ -367,6 +432,7 @@ class ExecutionGateway:
             )
             
         except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
             logger.error(f"Partial close failed: {e}")
             return ExecutionResult(
                 success=False,
@@ -391,6 +457,7 @@ class ExecutionGateway:
         )
         self._pending_orders[action.client_order_id] = pending
         
+        self._wal_record_intent(action, "place_stop", price=action.price)
         try:
             stop_side = "sell" if action.side == Side.LONG else "buy"
             
@@ -410,6 +477,7 @@ class ExecutionGateway:
             exchange_order_id = result.get("id")
             pending.exchange_order_id = exchange_order_id
             self._order_id_map[exchange_order_id] = action.client_order_id
+            self._wal_mark_sent(action.client_order_id, exchange_order_id)
             
             # Update position with stop order ID
             position = self.registry.get_position(action.symbol)
@@ -430,6 +498,7 @@ class ExecutionGateway:
             )
             
         except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
             logger.error(f"Stop placement failed: {e}")
             return ExecutionResult(
                 success=False,
@@ -438,7 +507,7 @@ class ExecutionGateway:
             )
     
     async def _execute_update_stop(self, action: ManagementAction) -> ExecutionResult:
-        """Update stop loss order (cancel + replace)."""
+        """Update stop loss order. Uses AtomicStopReplacer (new-first then cancel old) when use_safety."""
         position = self.registry.get_position(action.symbol)
         if not position:
             return ExecutionResult(
@@ -446,26 +515,62 @@ class ExecutionGateway:
                 client_order_id=action.client_order_id,
                 error="Position not found"
             )
-        
-        # Cancel existing stop
-        if position.stop_order_id:
-            try:
-                await self.client.cancel_order(position.stop_order_id, action.symbol)
-                self.metrics["orders_cancelled"] += 1
-            except Exception as e:
-                logger.warning(f"Failed to cancel old stop: {e}")
-        
-        # Update position stop price
-        if not position.update_stop(action.price):
+        if not action.price:
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
-                error="Stop update rejected by state machine"
+                error="Update stop requires price"
             )
-        
-        # Place new stop at updated price
-        action.size = position.remaining_qty
-        return await self._execute_place_stop(action)
+
+        if self._stop_replacer and not self.shadow_mode:
+            self._wal_record_intent(action, "update_stop", price=action.price)
+            def _gen_cid(_pid: str, _: str) -> str:
+                return action.client_order_id
+            ctx = await self._stop_replacer.replace_stop(
+                position, action.price, _gen_cid
+            )
+            if ctx.failed:
+                self.metrics["errors"] += 1
+                self._wal_mark_failed(action.client_order_id, ctx.error or "Atomic stop replace failed")
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error=ctx.error or "Atomic stop replace failed"
+                )
+            if not position.update_stop(action.price):
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error="Stop update rejected by state machine"
+                )
+            if ctx.new_stop_order_id:
+                position.stop_order_id = ctx.new_stop_order_id
+            self.persistence.save_position(position)
+            self.metrics["orders_submitted"] += 1
+            if ctx.old_stop_cancelled:
+                self.metrics["orders_cancelled"] += 1
+            self._wal_mark_sent(action.client_order_id, ctx.new_stop_order_id or "")
+            return ExecutionResult(
+                success=True,
+                client_order_id=action.client_order_id,
+                exchange_order_id=ctx.new_stop_order_id
+            )
+        else:
+            # Legacy: cancel then place (e.g. shadow mode or use_safety=False)
+            if position.stop_order_id:
+                try:
+                    await self.client.cancel_order(position.stop_order_id, action.symbol)
+                    self.metrics["orders_cancelled"] += 1
+                except Exception as e:
+                    logger.warning(f"Failed to cancel old stop: {e}")
+            if not position.update_stop(action.price):
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error="Stop update rejected by state machine"
+                )
+            action.size = position.remaining_qty
+            return await self._execute_place_stop(action)
     
     async def _execute_cancel_stop(self, action: ManagementAction) -> ExecutionResult:
         """Cancel stop loss order."""
@@ -476,15 +581,17 @@ class ExecutionGateway:
                 client_order_id=action.client_order_id,
                 error="No stop to cancel"
             )
-        
+        self._wal_record_intent(action, "cancel_stop", size=position.remaining_qty)
         try:
             await self.client.cancel_order(position.stop_order_id, action.symbol)
             self.metrics["orders_cancelled"] += 1
+            self._wal_mark_completed(action.client_order_id)
             return ExecutionResult(
                 success=True,
                 client_order_id=action.client_order_id
             )
         except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -494,22 +601,26 @@ class ExecutionGateway:
     async def _execute_flatten_orphan(self, action: ManagementAction) -> ExecutionResult:
         """Flatten orphan position on exchange."""
         logger.critical(f"FLATTENING ORPHAN POSITION: {action.symbol}")
-        
+        self._wal_record_intent(action, "flatten_orphan")
         try:
             # Use exchange's close_position command
             result = await self.client.close_position(action.symbol)
-            
+            oid = (result or {}).get("id") if isinstance(result, dict) else None
+            if oid:
+                self._wal_mark_sent(action.client_order_id, str(oid))
+            else:
+                self._wal_mark_completed(action.client_order_id)
             self.persistence.log_action(
                 action.position_id or "unknown",
                 "orphan_flattened",
                 {"symbol": action.symbol, "result": str(result)}
             )
-            
             return ExecutionResult(
                 success=True,
                 client_order_id=action.client_order_id
             )
         except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
             logger.error(f"Failed to flatten orphan: {e}")
             return ExecutionResult(
                 success=False,
@@ -557,26 +668,37 @@ class ExecutionGateway:
         else:
             return []  # No meaningful event
         
-        # Create event
-        pending.last_event_seq += 1
+        next_seq = pending.last_event_seq + 1
+        trades = order_data.get("trades") or []
+        raw_fill_id = trades[0].get("id") if trades and isinstance(trades[0], dict) else None
+        fill_id = str(raw_fill_id) if raw_fill_id is not None else None
+
+        if self._event_enforcer and not self._event_enforcer.should_process_event(
+            exchange_order_id, next_seq, fill_id
+        ):
+            return []
+
         event = OrderEvent(
             order_id=exchange_order_id,
             client_order_id=client_order_id,
             event_type=event_type,
-            event_seq=pending.last_event_seq,
+            event_seq=next_seq,
             timestamp=datetime.now(timezone.utc),
             fill_qty=filled if event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL) else None,
             fill_price=Decimal(str(order_data.get("average", 0))) if filled > 0 else None,
-            fill_id=order_data.get("trades", [{}])[0].get("id") if order_data.get("trades") else None
+            fill_id=fill_id,
         )
         
-        # Route to position manager
         follow_up = self.position_manager.handle_order_event(pending.symbol, event)
         
-        # Update pending status
+        if self._event_enforcer:
+            self._event_enforcer.mark_processed(exchange_order_id, next_seq, fill_id)
+        pending.last_event_seq = next_seq
+        
         if event_type == OrderEventType.FILLED:
             pending.status = "filled"
             self.metrics["orders_filled"] += 1
+            self._wal_mark_completed(client_order_id)
         elif event_type == OrderEventType.CANCELLED:
             pending.status = "cancelled"
             self.metrics["orders_cancelled"] += 1
@@ -584,12 +706,10 @@ class ExecutionGateway:
             pending.status = "rejected"
             self.metrics["orders_rejected"] += 1
         
-        # Persist position state
         position = self.registry.get_position(pending.symbol)
         if position:
             self.persistence.save_position(position)
         
-        # Execute follow-up actions
         for action in follow_up:
             await self.execute_action(action)
         
