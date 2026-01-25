@@ -159,14 +159,22 @@ async def recover_sl_order_ids():
                 tp_order_ids=pos_data_dict['tp_order_ids'],
             )
             
-            # Check if we need to recover order ID
+            # Check if we need to recover order ID or update protection status
             current_order_id = pos.stop_loss_order_id
             needs_recovery = (
                 current_order_id is None or 
                 str(current_order_id).startswith('unknown')
             )
             
-            if not needs_recovery:
+            # Also update protection status if position has valid SL but is_protected is False
+            needs_protection_update = (
+                pos.initial_stop_price is not None and
+                current_order_id is not None and
+                not str(current_order_id).startswith('unknown') and
+                not pos.is_protected
+            )
+            
+            if not needs_recovery and not needs_protection_update:
                 continue
             
             # Try to find SL order on exchange
@@ -177,23 +185,32 @@ async def recover_sl_order_ids():
                 stop_price = sl_order.get('stopPrice') or sl_order.get('price')
                 
                 if order_id:
-                    # Update position with recovered order ID
-                    pos.stop_loss_order_id = order_id
-                    if stop_price and not pos.initial_stop_price:
-                        pos.initial_stop_price = Decimal(str(stop_price))
+                    # Update position with recovered order ID (if needed)
+                    if needs_recovery:
+                        pos.stop_loss_order_id = order_id
+                        if stop_price and not pos.initial_stop_price:
+                            pos.initial_stop_price = Decimal(str(stop_price))
+                        recovered_count += 1
+                        logger.info(
+                            "Recovered SL order ID",
+                            symbol=symbol,
+                            order_id=order_id,
+                            sl_price=str(pos.initial_stop_price)
+                        )
                     
-                    # Mark as protected
-                    pos.is_protected = (pos.initial_stop_price is not None and pos.stop_loss_order_id is not None)
+                    # Mark as protected (always update if we found the order)
+                    pos.is_protected = (pos.initial_stop_price is not None and pos.stop_loss_order_id is not None and not str(pos.stop_loss_order_id).startswith('unknown'))
                     pos.protection_reason = None if pos.is_protected else "SL_ORDER_MISSING"
                     
                     save_position(pos)
-                    recovered_count += 1
-                    logger.info(
-                        "Recovered SL order ID",
-                        symbol=symbol,
-                        order_id=order_id,
-                        sl_price=str(pos.initial_stop_price)
-                    )
+                    if needs_protection_update:
+                        updated_count += 1
+                        logger.info(
+                            "Updated protection status",
+                            symbol=symbol,
+                            is_protected=pos.is_protected,
+                            order_id=pos.stop_loss_order_id
+                        )
                 else:
                     logger.warning("SL order found but no order ID", symbol=symbol)
             else:
