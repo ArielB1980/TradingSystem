@@ -750,10 +750,17 @@ async def cleanup_duplicate_orders(
         )
         print(f"  Found: {len(exact_duplicate_candidates)} exact duplicates")
         
-        # Step 4: Find redundant SL orders
+        # Track orders marked for cancellation so far
+        cancelled_order_ids = orphan_order_ids.copy()
+        cancelled_order_ids.update({c["order"].get("id") for c in exact_duplicate_candidates})
+        
+        # Filter out already-cancelled orders for Step 4
+        orders_for_sl_check = [o for o in active_orders if o.get("id") not in cancelled_order_ids]
+        
+        # Step 4: Find redundant SL orders (only consider orders not already marked for cancellation)
         print("\nStep 4: Finding redundant SL orders...")
         redundant_sl_candidates = find_redundant_sl_orders(
-            active_orders,
+            orders_for_sl_check,
             positions,
             db_metadata,
             price_tolerance_pct,
@@ -761,10 +768,16 @@ async def cleanup_duplicate_orders(
         )
         print(f"  Found: {len(redundant_sl_candidates)} redundant SL orders")
         
-        # Step 5: Find redundant TP orders
+        # Update cancelled order IDs
+        cancelled_order_ids.update({c["order"].get("id") for c in redundant_sl_candidates})
+        
+        # Filter out already-cancelled orders for Step 5
+        orders_for_tp_check = [o for o in active_orders if o.get("id") not in cancelled_order_ids]
+        
+        # Step 5: Find redundant TP orders (only consider orders not already marked for cancellation)
         print("\nStep 5: Finding redundant TP orders...")
         redundant_tp_candidates = find_redundant_tp_orders(
-            active_orders,
+            orders_for_tp_check,
             positions,
             db_metadata,
             price_tolerance_pct,
