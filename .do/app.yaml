@@ -1,5 +1,9 @@
 name: tradingsystem
 region: nyc
+envs:
+  - key: DATABASE_URL
+    scope: RUN_TIME
+    type: SECRET
 services:
   - name: worker
     github:
