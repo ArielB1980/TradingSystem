@@ -46,7 +46,7 @@ risk:
   auction_mode_enabled: true  # Enable auction-based portfolio allocation
   auction_max_positions: 25  # Maximum positions in portfolio
   auction_max_margin_util: 0.90  # Maximum margin utilization (90%)
-  auction_max_per_cluster: 25  # Maximum positions per cluster
+  auction_max_per_cluster: 8  # Maximum positions per cluster (balanced for 25 positions)
   auction_max_per_symbol: 1  # Maximum positions per symbol
   auction_swap_threshold: 10.0  # Minimum score advantage to replace position
   auction_min_hold_minutes: 15  # Minimum hold time before position can be kicked
@@ -164,6 +164,15 @@ execution:
   
   # Pyramiding
   pyramiding_enabled: false  # Default: no adding to positions
+  
+  # TP Backfill / Reconciliation
+  tp_backfill_enabled: true  # Enable TP backfill reconciliation
+  tp_backfill_cooldown_minutes: 10  # Cooldown between backfill attempts per symbol
+  tp_price_tolerance: 0.002  # TP price tolerance (0.2%)
+  min_tp_distance_pct: 0.003  # Minimum TP distance from current price (0.3%)
+  min_tp_orders_expected: 2  # Minimum expected TP orders in ladder
+  min_hold_seconds: 30  # Minimum hold time before backfill (avoid racing fills)
+  require_sl_for_tp_backfill: true  # Require stop loss price before backfilling TPs (safety guard)
 
 ## Multi-TP Configuration (V2)
 multi_tp:

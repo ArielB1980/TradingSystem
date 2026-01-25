@@ -294,7 +294,7 @@ class SMCEngine:
                     )
                     
                     # V4: RSI Divergence Check (Gate before Reconfirmation)
-                    if self.config.rsi_divergence_check:
+                    if self.config.rsi_divergence_enabled:
                          rsi_values = self.indicators.calculate_rsi(exec_candles_1h, self.config.rsi_period)
                          divergence = self.indicators.detect_rsi_divergence(exec_candles_1h, rsi_values, self.config.rsi_divergence_lookback)
                          

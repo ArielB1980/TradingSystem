@@ -142,7 +142,7 @@ def get_portfolio_metrics() -> Dict[str, Any]:
         "unrealized_pnl": total_unrealized_pnl,
         "daily_pnl": daily_pnl,
         "active_positions": active_positions,
-        "max_positions": config.risk.max_concurrent_positions,
+        "max_positions": config.risk.auction_max_positions if config.risk.auction_mode_enabled else config.risk.max_concurrent_positions,
         "effective_leverage": total_margin_used / equity if equity > 0 else 0.0,
     }
 

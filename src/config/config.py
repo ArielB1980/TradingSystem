@@ -84,7 +84,7 @@ class RiskConfig(BaseSettings):
     auction_mode_enabled: bool = Field(default=False, description="Enable auction-based portfolio allocation")
     auction_max_positions: int = Field(default=50, ge=1, le=100)
     auction_max_margin_util: float = Field(default=0.90, ge=0.50, le=0.95)
-    auction_max_per_cluster: int = Field(default=12, ge=1, le=50)
+    auction_max_per_cluster: int = Field(default=8, ge=1, le=50)  # Balanced for 25 positions (was 12)
     auction_max_per_symbol: int = Field(default=1, ge=1, le=5)
     auction_swap_threshold: float = Field(default=10.0, ge=0.0, le=50.0)
     auction_min_hold_minutes: int = Field(default=15, ge=0, le=60)
@@ -165,7 +165,7 @@ class StrategyConfig(BaseSettings):
     
     rsi_period: int = Field(default=14, ge=7, le=30)
 
-    rsi_divergence_enabled: bool = False
+    rsi_divergence_enabled: bool = False  # Single flag for RSI divergence (removed duplicate rsi_divergence_check)
     
     # SMC Parameters
     orderblock_lookback: int = Field(default=50, ge=20, le=200)
@@ -203,8 +203,7 @@ class StrategyConfig(BaseSettings):
     max_confirmation_candles: int = 5
     min_confirmation_candles: int = 2
     
-    # RSI Divergence
-    rsi_divergence_check: bool = True
+    # RSI Divergence (using rsi_divergence_enabled above, removed duplicate rsi_divergence_check)
     rsi_divergence_lookback: int = 20
 
     # Exits
@@ -283,6 +282,16 @@ class ExecutionConfig(BaseSettings):
     
     # Dynamic Management
     break_even_trigger: Literal["tp1_fill"] = "tp1_fill"
+    
+    # TP Backfill / Reconciliation
+    tp_backfill_enabled: bool = Field(default=True, description="Enable TP backfill reconciliation")
+    tp_backfill_cooldown_minutes: int = Field(default=10, ge=1, le=60, description="Cooldown between backfill attempts per symbol")
+    tp_price_tolerance: float = Field(default=0.002, ge=0.0001, le=0.01, description="TP price tolerance (0.2% default)")
+    min_tp_distance_pct: float = Field(default=0.003, ge=0.001, le=0.01, description="Minimum TP distance from current price (0.3% default)")
+    max_tp_distance_pct: Optional[float] = Field(default=None, ge=0.01, le=0.50, description="Maximum TP distance clamp (optional)")
+    min_tp_orders_expected: int = Field(default=2, ge=1, le=5, description="Minimum expected TP orders in ladder")
+    min_hold_seconds: int = Field(default=30, ge=0, le=300, description="Minimum hold time before backfill (avoid racing fills)")
+    require_sl_for_tp_backfill: bool = Field(default=True, description="Require stop loss price before backfilling TPs (safety guard)")
     break_even_offset_ticks: int = 2
     
     trailing_enabled: bool = True

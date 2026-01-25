@@ -173,6 +173,9 @@ class LiveTrading:
         self.last_fetch_latency_ms: Optional[int] = None
         self.db_pruner = DatabasePruner()
         
+        # TP Backfill cooldown tracking (symbol -> last_backfill_time)
+        self.tp_backfill_cooldowns: Dict[str, datetime] = {}
+        
         # Coin processing tracking
         self.coin_processing_stats: Dict[str, Dict] = {}  # Track processing stats per coin
         self.last_status_summary = datetime.min.replace(tzinfo=timezone.utc)
@@ -666,6 +669,26 @@ class LiveTrading:
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
+            
+            # 2.5. TP Backfill / Reconciliation (after position sync and price data fetch)
+            try:
+                # Build current prices map for backfill logic (use futures ticker data)
+                current_prices_map = {}
+                for pos_data in all_raw_positions:
+                    symbol = pos_data.get('symbol')
+                    if symbol:
+                        # Prefer futures ticker mark price, fallback to position mark price, then entry
+                        futures_ticker = map_futures_tickers.get(symbol, {})
+                        mark_price = futures_ticker.get('last') or futures_ticker.get('mark')
+                        if mark_price:
+                            current_prices_map[symbol] = Decimal(str(mark_price))
+                        else:
+                            current_prices_map[symbol] = Decimal(str(pos_data.get('markPrice', pos_data.get('mark_price', pos_data.get('entryPrice', 0)))))
+                
+                await self._reconcile_protective_orders(all_raw_positions, current_prices_map)
+            except Exception as e:
+                logger.error("TP backfill reconciliation failed", error=str(e))
+                # Don't return - continue with trading loop
             symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
             symbols_with_futures = len([
                 s for s in market_symbols
@@ -735,9 +758,17 @@ class LiveTrading:
                              self.managed_positions[symbol] = self._init_managed_position(position_data, mark_price)
                         
                         managed_pos = self.managed_positions[symbol]
+                        old_size = managed_pos.size
                         managed_pos.current_mark_price = mark_price
                         managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealized_pnl', 0))) # Key corrected from raw API
                         managed_pos.size = Decimal(str(position_data['size']))
+                        
+                        # Update position in DB when size/margin changes (after reconciliation)
+                        if old_size != managed_pos.size or managed_pos.margin_used != Decimal(str(position_data.get('margin_used', 0))):
+                            managed_pos.margin_used = Decimal(str(position_data.get('margin_used', 0)))
+                            from src.storage.repository import save_position
+                            await asyncio.to_thread(save_position, managed_pos)
+                            logger.debug("Position updated after reconciliation", symbol=symbol, size=str(managed_pos.size))
                         
                         actions = self.position_manager.evaluate(managed_pos, mark_price)
                         if actions:
@@ -1131,35 +1162,38 @@ class LiveTrading:
         if entry_order:
              logger.info("Entry order placed", order_id=entry_order.order_id)
              
-             # 5. Place Protective Orders (Immediate Safety)
-             # We place SL immediately to prevent naked positions.
-             tps = order_intent.get('take_profits', [])
-             tp1 = tps[0]['price'] if len(tps) > 0 else None
-             tp2 = tps[1]['price'] if len(tps) > 1 else None
+             # 5. Place Protective Orders (Full TP Ladder) - After Entry Fill
+             # Split SL and TP placement so failures don't mask each other
+             futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
+             tps = [o["price"] for o in order_intent.get("take_profits", []) if o.get("price")]
              
-             sl_order, tp_order = await self.executor.place_protective_orders(
-                 entry_order,
-                 intent_model.stop_loss_futures,
-                 take_profit_price=tp1 # Primary TP on exchange
+             # Extract TP prices for position state
+             tp1 = tps[0] if len(tps) > 0 else None
+             tp2 = tps[1] if len(tps) > 1 else None
+             
+             # Use update_protective_orders to place full TP ladder (TP1/TP2/TP3)
+             # This replaces the single-TP call and places all TPs at once
+             new_sl_id, new_tp_ids = await self.executor.update_protective_orders(
+                 symbol=entry_order.symbol,
+                 side=entry_order.side,
+                 current_sl_id=None,  # New position, no existing SL
+                 new_sl_price=intent_model.stop_loss_futures,
+                 current_tp_ids=[],  # New position, no existing TPs
+                 new_tp_prices=tps,  # Full ladder: TP1, TP2, TP3
              )
              
-             sl_id = sl_order.order_id if sl_order else None
-             if sl_id:
-                 logger.info("Protective SL placed", order_id=sl_id)
+             if new_sl_id:
+                 logger.info("Protective SL placed", order_id=new_sl_id)
              else:
                  logger.critical("FAILED TO PLACE STOP LOSS", symbol=signal.symbol)
              
-             tp_ids = []
-             if tp_order:
-                 tp_ids.append(tp_order.order_id)
+             if new_tp_ids:
+                 logger.info("TP ladder placed", tp_count=len(new_tp_ids), tp_ids=new_tp_ids)
+             else:
+                 logger.warning("Failed to place TP ladder", symbol=signal.symbol)
              
              # Initialize Active Trade Management State
              # We optimisticly track the position with its immutable intents
-             futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
-             tps = order_intent['take_profits']
-             tp1 = tps[0]['price'] if len(tps) > 0 else None
-             tp2 = tps[1]['price'] if len(tps) > 1 else None
-             
              position_state = Position(
                  symbol=futures_symbol,
                  side=intent_model.side,
@@ -1181,14 +1215,17 @@ class LiveTrading:
                  partial_close_pct=Decimal("0.5"), # Default config
                  
                  # ID Linking
-                 stop_loss_order_id=sl_id, 
-                 tp_order_ids=tp_ids
+                 stop_loss_order_id=new_sl_id, 
+                 tp_order_ids=new_tp_ids
              )
              
              self.managed_positions[futures_symbol] = position_state
              logger.info("Position State initialized", symbol=futures_symbol)
              
-             # Trade persistence happens on exit defined in Rules 11
+             # NEW: persist position state immediately (so TP/SL survives restarts)
+             from src.storage.repository import save_position
+             await asyncio.to_thread(save_position, position_state)
+             logger.info("Position persisted to database", symbol=futures_symbol)
 
     async def _handle_signal_v2(
         self, signal: Signal, spot_price: Decimal, mark_price: Decimal
@@ -1393,8 +1430,39 @@ class LiveTrading:
                     exit_price = position.current_mark_price
                     exit_reason = action.reason or "unknown"
                     
+                    # A) On SL fill → cancel all TP orders and clear local state
+                    if exit_reason == "stop_loss" or "stop_loss" in exit_reason.lower():
+                        # Cancel all TP orders
+                        for tp_id in (position.tp_order_ids or []):
+                            try:
+                                await self.futures_adapter.cancel_order(tp_id, symbol)
+                                logger.info("Cancelled TP order on SL fill", order_id=tp_id, symbol=symbol)
+                            except Exception as e:
+                                logger.warning("Failed to cancel TP order", order_id=tp_id, symbol=symbol, error=str(e))
+                        
+                        # Also cancel any single take_profit_order_id if used anywhere
+                        if position.take_profit_order_id:
+                            try:
+                                await self.futures_adapter.cancel_order(position.take_profit_order_id, symbol)
+                                logger.info("Cancelled legacy TP order on SL fill", order_id=position.take_profit_order_id, symbol=symbol)
+                            except Exception as e:
+                                logger.warning("Failed to cancel legacy TP order", order_id=position.take_profit_order_id, symbol=symbol, error=str(e))
+                    
+                    # B) On final TP fill (position size == 0) → cancel SL order
+                    if exit_reason in ("take_profit", "tp1", "tp2", "tp3") and position.size == 0:
+                        if position.stop_loss_order_id:
+                            try:
+                                await self.futures_adapter.cancel_order(position.stop_loss_order_id, symbol)
+                                logger.info("Cancelled SL order on final TP fill", order_id=position.stop_loss_order_id, symbol=symbol)
+                            except Exception as e:
+                                logger.warning("Failed to cancel SL order on final TP", order_id=position.stop_loss_order_id, symbol=symbol, error=str(e))
+                    
                     # Market Close
                     await self.client.close_position(symbol)
+                    
+                    # Mark closed in DB
+                    from src.storage.repository import delete_position
+                    await asyncio.to_thread(delete_position, symbol)
                     
                     # Save to trade history
                     await self._save_trade_history(position, exit_price, exit_reason)
@@ -1713,3 +1781,314 @@ class LiveTrading:
 
         if actions:
             await self._execute_management_actions(symbol, actions, position)
+
+    async def _reconcile_protective_orders(self, raw_positions: List[Dict], current_prices: Dict[str, Decimal]):
+        """
+        TP Backfill / Reconciliation loop that repairs positions missing TP coverage.
+        
+        Runs after position sync to ensure all open positions have proper TP ladder.
+        """
+        if not self.config.execution.tp_backfill_enabled:
+            return
+        
+        from src.storage.repository import get_active_position, save_position, async_record_event
+        
+        for pos_data in raw_positions:
+            symbol = pos_data.get('symbol')
+            if not symbol or pos_data.get('size', 0) == 0:
+                continue
+            
+            try:
+                # Get persisted position state
+                db_pos = await asyncio.to_thread(get_active_position, symbol)
+                if not db_pos:
+                    # Position not in DB yet - skip (will be created on next entry)
+                    continue
+                
+                # Get current market price
+                current_price = current_prices.get(symbol)
+                if not current_price:
+                    continue
+                
+                # Step 4: Safety checks - skip if unsafe
+                if await self._should_skip_tp_backfill(symbol, pos_data, db_pos, current_price):
+                    continue
+                
+                # Get open orders for this symbol
+                open_orders = await self.client.get_futures_open_orders()
+                symbol_orders = [o for o in open_orders if o.get('symbol') == symbol]
+                
+                # Step 1: Determine if TP coverage is missing
+                needs_backfill = self._needs_tp_backfill(db_pos, symbol_orders)
+                
+                if not needs_backfill:
+                    continue
+                
+                # Step 2: Get or compute TP plan
+                tp_plan = await self._compute_tp_plan(symbol, pos_data, db_pos, current_price)
+                
+                if not tp_plan:
+                    await async_record_event(
+                        "TP_BACKFILL_SKIPPED",
+                        symbol,
+                        {
+                            "reason": "failed_to_compute_plan",
+                            "entry": str(pos_data.get('entry_price', 0)),
+                            "sl": str(db_pos.initial_stop_price) if db_pos.initial_stop_price else None
+                        }
+                    )
+                    continue
+                
+                # Step 3: Place / repair TP orders
+                await self._place_tp_backfill(symbol, pos_data, db_pos, tp_plan, symbol_orders, current_price)
+                
+            except Exception as e:
+                logger.error("TP backfill failed", symbol=symbol, error=str(e))
+                await async_record_event(
+                    "TP_BACKFILL_SKIPPED",
+                    symbol,
+                    {"reason": f"error: {str(e)}"}
+                )
+
+    async def _should_skip_tp_backfill(
+        self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal
+    ) -> bool:
+        """Step 4: Don't backfill when it's unsafe."""
+        # Check cooldown
+        last_backfill = self.tp_backfill_cooldowns.get(symbol)
+        if last_backfill:
+            elapsed = (datetime.now(timezone.utc) - last_backfill).total_seconds()
+            cooldown_seconds = self.config.execution.tp_backfill_cooldown_minutes * 60
+            if elapsed < cooldown_seconds:
+                return True
+        
+        # Position size <= 0
+        if pos_data.get('size', 0) <= 0:
+            return True
+        
+        # SL is missing (with safety guard)
+        if self.config.execution.require_sl_for_tp_backfill and not db_pos.initial_stop_price:
+            return True
+        
+        # Position is within MIN_HOLD_SECONDS after entry
+        if db_pos.opened_at:
+            elapsed = (datetime.now(timezone.utc) - db_pos.opened_at).total_seconds()
+            if elapsed < self.config.execution.min_hold_seconds:
+                return True
+        
+        return False
+
+    def _needs_tp_backfill(self, db_pos: Position, symbol_orders: List[Dict]) -> bool:
+        """Step 1: Determine if TP coverage is missing."""
+        # Check if db_pos has TP plan or order IDs
+        has_tp_plan = (db_pos.tp1_price is not None) or (db_pos.tp2_price is not None)
+        has_tp_ids = bool(db_pos.tp_order_ids and len(db_pos.tp_order_ids) > 0)
+        
+        # Check for open TP orders on exchange
+        open_tp_orders = [
+            o for o in symbol_orders
+            if o.get('reduceOnly', False) and 
+            o.get('type', '').lower() in ('take_profit', 'take-profit', 'limit') and
+            # For LONG positions, TP orders are SELL (opposite side)
+            # For SHORT positions, TP orders are BUY (opposite side)
+            ((db_pos.side == Side.LONG and o.get('side', '').lower() == 'sell') or
+             (db_pos.side == Side.SHORT and o.get('side', '').lower() == 'buy'))
+        ]
+        
+        # Needs backfill if:
+        # 1. No TP plan and no TP order IDs in DB
+        if not has_tp_plan and not has_tp_ids:
+            return True
+        
+        # 2. No open TP orders on exchange
+        if len(open_tp_orders) == 0:
+            return True
+        
+        # 3. Fewer TP orders than expected
+        min_expected = self.config.execution.min_tp_orders_expected
+        if len(open_tp_orders) < min_expected:
+            return True
+        
+        return False
+
+    async def _compute_tp_plan(
+        self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal
+    ) -> Optional[List[Decimal]]:
+        """Step 2: Get or compute a TP plan."""
+        # Prefer stored plan
+        tp_plan = []
+        if db_pos.tp1_price:
+            tp_plan.append(db_pos.tp1_price)
+        if db_pos.tp2_price:
+            tp_plan.append(db_pos.tp2_price)
+        if db_pos.final_target_price:
+            tp_plan.append(db_pos.final_target_price)
+        
+        if len(tp_plan) >= 2:  # We have a stored plan
+            return tp_plan
+        
+        # Compute deterministically using R-multiples
+        entry = Decimal(str(pos_data.get('entry_price', 0)))
+        sl = db_pos.initial_stop_price
+        
+        if not entry or not sl or entry == 0:
+            return None
+        
+        risk = abs(entry - sl)
+        if risk == 0:
+            return None
+        
+        # Determine side sign
+        side_sign = Decimal("1") if db_pos.side == Side.LONG else Decimal("-1")
+        
+        # Compute TP ladder: 1R, 2R, 3R
+        tp1 = entry + side_sign * Decimal("1.0") * risk
+        tp2 = entry + side_sign * Decimal("2.0") * risk
+        tp3 = entry + side_sign * Decimal("3.0") * risk
+        
+        tp_plan = [tp1, tp2, tp3]
+        
+        # Emit planned event
+        from src.storage.repository import async_record_event
+        await async_record_event(
+            "TP_BACKFILL_PLANNED",
+            symbol,
+            {
+                "side": db_pos.side.value,
+                "entry": str(entry),
+                "sl": str(sl),
+                "risk": str(risk),
+                "tp_plan": [str(tp) for tp in tp_plan],
+                "reason": "computed_from_r_multiples"
+            }
+        )
+        
+        # Sanity guards
+        min_distance = current_price * Decimal(str(self.config.execution.min_tp_distance_pct))
+        
+        if db_pos.side == Side.LONG:
+            # For LONG: require tp1 > current_price * (1 + min_tp_distance_pct)
+            if tp1 <= current_price + min_distance:
+                logger.warning("TP1 too close to current price (LONG)", symbol=symbol, tp1=str(tp1), current=str(current_price))
+                return None
+        else:  # SHORT
+            # For SHORT: require tp1 < current_price * (1 - min_tp_distance_pct)
+            if tp1 >= current_price - min_distance:
+                logger.warning("TP1 too close to current price (SHORT)", symbol=symbol, tp1=str(tp1), current=str(current_price))
+                return None
+        
+        # Optional: clamp extreme TPs
+        if self.config.execution.max_tp_distance_pct:
+            max_distance = current_price * Decimal(str(self.config.execution.max_tp_distance_pct))
+            if db_pos.side == Side.LONG:
+                tp_plan = [min(tp, current_price + max_distance) for tp in tp_plan]
+            else:
+                tp_plan = [max(tp, current_price - max_distance) for tp in tp_plan]
+        
+        return tp_plan
+
+    async def _place_tp_backfill(
+        self, symbol: str, pos_data: Dict, db_pos: Position, tp_plan: List[Decimal],
+        symbol_orders: List[Dict], current_price: Decimal
+    ):
+        """Step 3: Place / repair TP orders on exchange."""
+        from src.storage.repository import save_position, async_record_event
+        
+        # Get existing TP order IDs
+        existing_tp_ids = db_pos.tp_order_ids or []
+        
+        # Check if existing TPs match plan (within tolerance)
+        existing_tp_orders = [
+            o for o in symbol_orders
+            if o.get('id') in existing_tp_ids or
+            (o.get('reduceOnly', False) and o.get('type', '').lower() in ('take_profit', 'take-profit', 'limit'))
+        ]
+        
+        needs_replace = False
+        if existing_tp_orders:
+            # Check if prices match (within tolerance)
+            tolerance = Decimal(str(self.config.execution.tp_price_tolerance))
+            for existing_order in existing_tp_orders:
+                existing_price = Decimal(str(existing_order.get('price', 0)))
+                if existing_price == 0:
+                    continue
+                
+                # Find closest planned TP
+                closest_planned = min(tp_plan, key=lambda tp: abs(tp - existing_price))
+                price_diff_pct = abs(existing_price - closest_planned) / closest_planned
+                
+                if price_diff_pct > tolerance:
+                    needs_replace = True
+                    break
+        else:
+            needs_replace = True
+        
+        if not needs_replace:
+            await async_record_event(
+                "TP_BACKFILL_SKIPPED",
+                symbol,
+                {"reason": "tp_orders_match_plan", "tp_count": len(existing_tp_orders)}
+            )
+            return
+        
+        # Cancel existing TPs if replacing
+        for tp_id in existing_tp_ids:
+            try:
+                await self.futures_adapter.cancel_order(tp_id, symbol)
+                logger.debug("Cancelled existing TP for backfill", order_id=tp_id, symbol=symbol)
+            except Exception as e:
+                logger.warning("Failed to cancel existing TP", order_id=tp_id, symbol=symbol, error=str(e))
+        
+        # Place new TP ladder
+        try:
+            new_sl_id, new_tp_ids = await self.executor.update_protective_orders(
+                symbol=symbol,
+                side=db_pos.side,
+                current_sl_id=db_pos.stop_loss_order_id,
+                new_sl_price=db_pos.initial_stop_price,  # Keep SL unchanged
+                current_tp_ids=existing_tp_ids,
+                new_tp_prices=tp_plan,
+            )
+            
+            # Update position state
+            db_pos.tp_order_ids = new_tp_ids
+            db_pos.tp1_price = tp_plan[0] if len(tp_plan) > 0 else None
+            db_pos.tp2_price = tp_plan[1] if len(tp_plan) > 1 else None
+            db_pos.final_target_price = tp_plan[2] if len(tp_plan) > 2 else None
+            
+            # Persist
+            await asyncio.to_thread(save_position, db_pos)
+            
+            # Update cooldown
+            self.tp_backfill_cooldowns[symbol] = datetime.now(timezone.utc)
+            
+            # Emit event
+            await async_record_event(
+                "TP_BACKFILL_PLACED" if not existing_tp_orders else "TP_BACKFILL_REPLACED",
+                symbol,
+                {
+                    "side": db_pos.side.value,
+                    "size": str(pos_data.get('size', 0)),
+                    "entry": str(pos_data.get('entry_price', 0)),
+                    "sl": str(db_pos.initial_stop_price),
+                    "tp_plan": [str(tp) for tp in tp_plan],
+                    "tp_order_ids": new_tp_ids,
+                    "existing_tp_prices": [str(Decimal(str(o.get('price', 0)))) for o in existing_tp_orders] if existing_tp_orders else [],
+                    "reason": "backfill_repair" if existing_tp_orders else "backfill_new"
+                }
+            )
+            
+            logger.info(
+                "TP backfill completed",
+                symbol=symbol,
+                action="replaced" if existing_tp_orders else "placed",
+                tp_count=len(new_tp_ids)
+            )
+            
+        except Exception as e:
+            logger.error("Failed to place TP backfill", symbol=symbol, error=str(e))
+            await async_record_event(
+                "TP_BACKFILL_SKIPPED",
+                symbol,
+                {"reason": f"placement_failed: {str(e)}"}
+            )

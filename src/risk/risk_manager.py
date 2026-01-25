@@ -359,7 +359,10 @@ class RiskManager:
         should_close_existing = False
         close_symbol = None
         
-        if len(self.current_positions) >= self.config.max_concurrent_positions:
+        # If auction mode is enabled, ignore max_concurrent_positions and use auction_max_positions instead
+        position_limit = self.config.auction_max_positions if self.config.auction_mode_enabled else self.config.max_concurrent_positions
+        
+        if len(self.current_positions) >= position_limit:
             # OPPORTUNITY COST LOGIC (Phase 7)
             # Check if this new trade is significantly better (>2x R:R) than the weakest existing position
             
@@ -401,7 +404,7 @@ class RiskManager:
                 )
             else:
                 rejection_reasons.append(
-                    f"Max concurrent positions ({self.config.max_concurrent_positions}) reached"
+                    f"Max concurrent positions ({position_limit}) reached"
                 )
         
         # Daily loss limit
