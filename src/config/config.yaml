@@ -172,7 +172,7 @@ execution:
   min_tp_distance_pct: 0.003  # Minimum TP distance from current price (0.3%)
   min_tp_orders_expected: 2  # Minimum expected TP orders in ladder
   min_hold_seconds: 30  # Minimum hold time before backfill (avoid racing fills)
-  require_sl_for_tp_backfill: true  # Require stop loss price before backfilling TPs (safety guard)
+  require_sl_for_tp_backfill: false  # Temporarily disabled to allow TP backfill for positions without SL in DB
 
 ## Multi-TP Configuration (V2)
 multi_tp:
