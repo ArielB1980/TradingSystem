@@ -1,12 +1,18 @@
 """
 Health check endpoint for App Platform.
-Simple HTTP server to respond to health checks.
 
-worker_health_app: run.py live --with-health (worker container).
-Serves /, /health, /api, /api/health, /api/debug/signals, /debug/signals.
-Also serves Streamlit dashboard at /dashboard when enabled.
-Default app URL (tradingbot-*.ondigitalocean.app) routes to worker, so these
-debug endpoints live on the worker health server.
+Two FastAPI apps are provided:
+1. `app` - Standalone health server (for `python -m src.health`)
+   - Used by old "web" service (now removed, but kept for backwards compatibility)
+   - Comprehensive health checks with kill switch and worker liveness
+   
+2. `worker_health_app` - Worker-integrated health server (for `run.py live --with-health`)
+   - Used by worker service with --with-health flag
+   - Includes Streamlit dashboard proxy at /dashboard
+   - Simpler health checks optimized for worker context
+
+Production uses: worker_health_app (via run.py live --with-health)
+Legacy/standalone: app (via python -m src.health)
 """
 import html as html_module
 from datetime import datetime, timezone
@@ -21,6 +27,7 @@ import sys
 from typing import Optional, Tuple
 import httpx
 
+# Standalone health app (for python -m src.health - legacy, kept for backwards compatibility)
 app = FastAPI(title="Trading System Health Check")
 
 _worker_start = time.time()
@@ -332,14 +339,14 @@ async def metrics_prometheus():
 
 @app.get("/api/dashboard")
 async def dashboard_routing_debug():
-    """Debug endpoint to identify routing issues."""
+    """Debug endpoint - dashboard is now served by worker_health_app."""
     return JSONResponse(
         status_code=404,
         content={
-            "error": "Routing Error",
-            "message": "You have reached the WEB service (on /api/dashboard), not the DASHBOARD service.",
-            "detail": "If you see this, DigitalOcean App Platform is correctly routing /api to this container, but /dashboard should go to the dashboard service.",
-            "service": "web"
+            "error": "Dashboard not available",
+            "message": "Dashboard is served by worker service via worker_health_app.",
+            "detail": "Use worker service with --with-health flag to access dashboard at /dashboard",
+            "service": "standalone-health"
         }
     )
 
