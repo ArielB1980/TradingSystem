@@ -3,15 +3,31 @@ from sqlalchemy import text
 import os
 from dotenv import load_dotenv
 
-# Load environment variables (try .env.local first, then .env)
-load_dotenv(".env.local")
-load_dotenv(".env")
+# Load environment variables from files only if they exist (for local dev)
+# In production (DigitalOcean), env vars are already set in the runtime environment
+if os.path.exists(".env.local"):
+    load_dotenv(".env.local")
+elif os.path.exists(".env"):
+    load_dotenv(".env")
 
 def migrate():
     """Run PostgreSQL schema migrations."""
     print("Running schema migration...")
-    db_url = os.environ.get('DATABASE_URL', 'NOT SET')
-    print(f"Target Database: {db_url[:50]}...")
+    db_url = os.environ.get('DATABASE_URL')
+    
+    if not db_url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "In production, this should be set by DigitalOcean App Platform. "
+            "For local development, ensure .env.local or .env contains DATABASE_URL."
+        )
+    
+    # Mask sensitive parts of the URL for logging
+    if '@' in db_url:
+        masked = db_url.split('@')[0].split('://')[0] + '://***@' + '@'.join(db_url.split('@')[1:])
+        print(f"Target Database: {masked[:80]}...")
+    else:
+        print(f"Target Database: {db_url[:80]}...")
 
     db = get_db()
     engine = db.engine
