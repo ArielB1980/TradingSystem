@@ -2216,7 +2216,21 @@ class LiveTrading:
         - Potential position flips if reduce-only isn't honored correctly
         """
         # Build set of symbols that currently have open positions
-        open_syms = {p.get("symbol") for p in raw_positions if p.get("size", 0) != 0 and p.get("symbol")}
+        # Normalize both position symbols and order symbols for comparison
+        open_syms = set()
+        for p in raw_positions:
+            pos_sym = p.get("symbol")
+            if pos_sym and p.get("size", 0) != 0:
+                open_syms.add(pos_sym)
+                # Also add normalized versions for comparison
+                # Positions use "PF_BLURUSD", orders might use "BLUR/USD:USD"
+                if pos_sym.startswith("PF_"):
+                    # Convert PF_BLURUSD -> BLUR/USD:USD for comparison
+                    base = pos_sym[3:-3]  # Remove "PF_" and "USD"
+                    if base == "XBT":
+                        base = "BTC"
+                    normalized = f"{base}/USD:USD"
+                    open_syms.add(normalized)
         
         try:
             orders = await self.client.get_futures_open_orders()
@@ -2242,8 +2256,18 @@ class LiveTrading:
                 if not sym or not oid:
                     continue
                 
-                # If symbol has an open position, keep the order
-                if sym in open_syms:
+                # Normalize order symbol for comparison
+                # Orders might be "BLUR/USD:USD", convert to "PF_BLURUSD" for comparison
+                normalized_order_sym = sym
+                if "/" in sym and ":" in sym:
+                    # Format: "BLUR/USD:USD" -> "PF_BLURUSD"
+                    base = sym.split("/")[0]
+                    if base == "BTC":
+                        base = "XBT"
+                    normalized_order_sym = f"PF_{base}USD"
+                
+                # If symbol (or normalized version) has an open position, keep the order
+                if sym in open_syms or normalized_order_sym in open_syms:
                     continue
                 
                 # Position is closed but order remains - cancel it
