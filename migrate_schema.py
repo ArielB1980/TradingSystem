@@ -20,7 +20,7 @@ def migrate():
     db_url = os.environ.get('DATABASE_URL')
     
     # Check if DATABASE_URL is set and not empty
-    if not db_url or db_url.strip() == '':
+    if not db_url or (isinstance(db_url, str) and db_url.strip() == ''):
         # In production, secrets might not be available during build phase
         # Log a warning but don't fail - migration can be run manually later if needed
         print("⚠️  WARNING: DATABASE_URL is not set or empty.")
