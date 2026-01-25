@@ -251,8 +251,8 @@ async def get_portfolio_metrics() -> Dict[str, Any]:
         },
         "positions": {
             "active": active_count,
-            "max_allowed": config.risk.max_concurrent_positions,
-            "utilization_pct": (active_count / config.risk.max_concurrent_positions) * 100,
+            "max_allowed": config.risk.auction_max_positions if config.risk.auction_mode_enabled else config.risk.max_concurrent_positions,
+            "utilization_pct": (active_count / (config.risk.auction_max_positions if config.risk.auction_mode_enabled else config.risk.max_concurrent_positions)) * 100,
         },
         "assets": {
             "monitored": len(symbols),
@@ -262,7 +262,7 @@ async def get_portfolio_metrics() -> Dict[str, Any]:
         },
         "safety": {
             "kill_switch_active": kill_switch_active,
-            "new_entries_blocked": kill_switch_active or active_count >= config.risk.max_concurrent_positions,
+            "new_entries_blocked": kill_switch_active or active_count >= (config.risk.auction_max_positions if config.risk.auction_mode_enabled else config.risk.max_concurrent_positions),
             "daily_loss_limit_pct": config.risk.daily_loss_limit_pct,
         },
     }

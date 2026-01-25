@@ -179,7 +179,7 @@ class Position:
     
     # Associated orders
     stop_loss_order_id: Optional[str] = None
-    take_profit_order_id: Optional[str] = None
+    take_profit_order_id: Optional[str] = None  # Legacy single TP (deprecated, use tp_order_ids)
     tp_order_ids: list[str] = field(default_factory=list)  # Multi-TP ladder
     
     # Execution State
@@ -196,10 +196,6 @@ class Position:
     final_target_price: Optional[Decimal] = None  # Final TP target
     partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1
     original_size: Optional[Decimal] = None  # Original position size before any closes
-    
-    # Order IDs for tracking
-    stop_loss_order_id: Optional[str] = None
-    tp_order_ids: Optional[list[str]] = None
     
     # Basis and Funding Tracking
     basis_at_entry: Optional[Decimal] = None  # Futures - Spot at entry (bps)

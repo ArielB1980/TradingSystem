@@ -506,6 +506,9 @@ def save_position(position: Position) -> None:
             position_model.tp1_price = position.tp1_price
             position_model.tp2_price = position.tp2_price
             position_model.final_target_price = position.final_target_price
+            # Store tp_order_ids as JSON array
+            import json
+            position_model.tp_order_ids = json.dumps(position.tp_order_ids) if position.tp_order_ids else None
             position_model.updated_at = datetime.utcnow()
         else:
             # Create new
@@ -527,6 +530,8 @@ def save_position(position: Position) -> None:
                 tp1_price=position.tp1_price,
                 tp2_price=position.tp2_price,
                 final_target_price=position.final_target_price,
+                # Store tp_order_ids as JSON array
+                tp_order_ids=json.dumps(position.tp_order_ids) if position.tp_order_ids else None,
                 opened_at=position.opened_at,
             )
             session.add(position_model)
@@ -579,6 +584,8 @@ def sync_active_positions(positions: List[Position]) -> None:
                 pm.tp1_price = pos.tp1_price
                 pm.tp2_price = pos.tp2_price
                 pm.final_target_price = pos.final_target_price
+                # Store tp_order_ids as JSON array
+                pm.tp_order_ids = json.dumps(pos.tp_order_ids) if pos.tp_order_ids else None
                 pm.updated_at = datetime.utcnow()
             else:
                 # Create
@@ -600,6 +607,8 @@ def sync_active_positions(positions: List[Position]) -> None:
                     tp1_price=pos.tp1_price,
                     tp2_price=pos.tp2_price,
                     final_target_price=pos.final_target_price,
+                    # Store tp_order_ids as JSON array
+                    tp_order_ids=json.dumps(pos.tp_order_ids) if pos.tp_order_ids else None,
                     opened_at=pos.opened_at,
                 )
                 session.add(pm)
