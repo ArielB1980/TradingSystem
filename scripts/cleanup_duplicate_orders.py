@@ -638,33 +638,33 @@ def post_plan_safety_check(
     for candidate in orders_to_cancel:
         kept_id = candidate.get("kept_order_id")
         if kept_id:
-            # Only count as kept if the kept order itself is not being cancelled
-            if kept_id not in cancel_order_ids:
-                kept_order_ids.add(kept_id)
+            kept_order_ids.add(kept_id)
     
     # Count SL orders per position after cancellation
+    # An order remains if:
+    # 1. It's not in the cancellation list, OR
+    # 2. It's a kept order (preserved from duplicate cluster)
     sl_orders_by_symbol = defaultdict(list)
     for order in all_orders:
         if classify_order(order) != "SL":
             continue
         
         order_id = order.get("id")
+        if not order_id:
+            continue
+        
         symbol = order.get("symbol")
         if not symbol:
             continue
         
         symbol_norm = normalize_symbol_for_comparison(symbol)
         
-        # If order is being cancelled, skip it (unless it's a kept order)
-        if order_id in cancel_order_ids:
-            if order_id in kept_order_ids:
-                # This is a kept order, count it
-                sl_orders_by_symbol[symbol_norm].append(order)
-            # Otherwise, skip (being cancelled)
-            continue
-        
-        # Order is not being cancelled, count it
-        sl_orders_by_symbol[symbol_norm].append(order)
+        # Count if not being cancelled, or if it's a kept order
+        if order_id not in cancel_order_ids:
+            sl_orders_by_symbol[symbol_norm].append(order)
+        elif order_id in kept_order_ids:
+            # Kept order - count it even though it might be in cancellation list
+            sl_orders_by_symbol[symbol_norm].append(order)
     
     # Check each position (use set to avoid duplicate warnings for same position)
     checked_positions = set()
