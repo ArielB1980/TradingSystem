@@ -1850,7 +1850,10 @@ class LiveTrading:
                 needs_backfill = self._needs_tp_backfill(db_pos, symbol_orders)
                 
                 if not needs_backfill:
+                    logger.debug("TP backfill not needed", symbol=symbol, has_tp_plan=bool(db_pos.tp1_price or db_pos.tp2_price), has_tp_ids=bool(db_pos.tp_order_ids), open_tp_count=len([o for o in symbol_orders if o.get('reduceOnly', False)]))
                     continue
+                
+                logger.info("TP backfill needed", symbol=symbol, has_tp_plan=bool(db_pos.tp1_price or db_pos.tp2_price), has_tp_ids=bool(db_pos.tp_order_ids), open_tp_count=len([o for o in symbol_orders if o.get('reduceOnly', False)]))
                 
                 # Step 2: Get or compute TP plan
                 tp_plan = await self._compute_tp_plan(symbol, pos_data, db_pos, current_price)
@@ -1888,20 +1891,24 @@ class LiveTrading:
             elapsed = (datetime.now(timezone.utc) - last_backfill).total_seconds()
             cooldown_seconds = self.config.execution.tp_backfill_cooldown_minutes * 60
             if elapsed < cooldown_seconds:
+                logger.debug("TP backfill skipped: cooldown", symbol=symbol, elapsed=elapsed, cooldown=cooldown_seconds)
                 return True
         
         # Position size <= 0
         if pos_data.get('size', 0) <= 0:
+            logger.debug("TP backfill skipped: zero size", symbol=symbol)
             return True
         
         # SL is missing (with safety guard)
         if self.config.execution.require_sl_for_tp_backfill and not db_pos.initial_stop_price:
+            logger.warning("TP backfill skipped: missing SL", symbol=symbol, has_sl=bool(db_pos.initial_stop_price))
             return True
         
         # Position is within MIN_HOLD_SECONDS after entry
         if db_pos.opened_at:
             elapsed = (datetime.now(timezone.utc) - db_pos.opened_at).total_seconds()
             if elapsed < self.config.execution.min_hold_seconds:
+                logger.debug("TP backfill skipped: too new", symbol=symbol, elapsed=elapsed, min_hold=self.config.execution.min_hold_seconds)
                 return True
         
         return False
