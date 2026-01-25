@@ -938,85 +938,29 @@ async def cleanup_duplicate_orders(
             orders_raw
         )
         
-        # If safety check fails, reduce candidates until it passes
-        # Remove candidates that would leave positions without SL
+        # If safety check fails, remove ALL candidates for positions that would be left with 0 SL
+        # This is a conservative approach - better to cancel fewer orders than leave positions unprotected
         if not safe:
-            print("  ⚠️  Safety check failed - removing unsafe candidates...")
+            print("  ⚠️  Safety check failed - removing ALL candidates for unsafe positions...")
             unsafe_positions = {w.split()[1] for w in warnings}  # Extract position symbols from warnings
             
-            # Build map of positions to their SL orders
-            pos_sl_orders = defaultdict(set)
-            for order in orders_raw:
-                if classify_order(order) == "SL":
-                    symbol = order.get("symbol")
-                    if symbol:
-                        symbol_norm = normalize_symbol_for_comparison(symbol)
-                        for pos in positions:
-                            pos_sym = pos.get("symbol")
-                            if pos_sym and float(pos.get("size", 0)) != 0:
-                                pos_variants = get_all_symbol_variants(pos_sym)
-                                if symbol_norm in pos_variants:
-                                    pos_sl_orders[pos_sym].add(order.get("id"))
+            # Build map of unsafe position symbols (all variants)
+            unsafe_symbol_variants = set()
+            for pos_sym in unsafe_positions:
+                unsafe_symbol_variants.update(get_all_symbol_variants(pos_sym))
             
-            # Remove candidates that would leave unsafe positions with 0 SL
+            # Remove ALL candidates for unsafe positions
             safe_candidates = []
-            sl_cancelled_by_pos = defaultdict(set)
-            kept_by_pos = defaultdict(set)
-            
-            # Build kept orders map
             for candidate in candidates_to_process:
-                if candidate.get("kept_order_id") and candidate["class"] == "SL":
-                    symbol_norm = candidate["symbol_norm"]
-                    for pos in positions:
-                        pos_sym = pos.get("symbol")
-                        if pos_sym and float(pos.get("size", 0)) != 0:
-                            pos_variants = get_all_symbol_variants(pos_sym)
-                            if symbol_norm in pos_variants:
-                                kept_by_pos[pos_sym].add(candidate["kept_order_id"])
-            
-            for candidate in candidates_to_process:
-                order = candidate["order"]
-                order_id = order.get("id")
-                order_class = candidate["class"]
                 symbol_norm = candidate["symbol_norm"]
-                
-                # Check if this candidate would leave any position with 0 SL
-                would_be_unsafe = False
-                if order_class == "SL":
-                    for pos in positions:
-                        pos_sym = pos.get("symbol")
-                        if pos_sym and float(pos.get("size", 0)) != 0:
-                            pos_variants = get_all_symbol_variants(pos_sym)
-                            if symbol_norm in pos_variants and pos_sym in unsafe_positions:
-                                # This position is already unsafe
-                                total_sl = pos_sl_orders.get(pos_sym, set())
-                                already_cancelled = sl_cancelled_by_pos[pos_sym]
-                                kept = kept_by_pos.get(pos_sym, set())
-                                
-                                would_cancel = already_cancelled.copy()
-                                would_cancel.add(order_id)
-                                
-                                remaining = total_sl - would_cancel
-                                for kept_id in kept:
-                                    if kept_id in total_sl:
-                                        remaining.add(kept_id)
-                                
-                                if len(remaining) <= 0:
-                                    would_be_unsafe = True
-                                    break
-                
-                if not would_be_unsafe:
+                # Keep candidate only if it's not for an unsafe position
+                if symbol_norm not in unsafe_symbol_variants:
                     safe_candidates.append(candidate)
-                    if order_class == "SL":
-                        for pos in positions:
-                            pos_sym = pos.get("symbol")
-                            if pos_sym and float(pos.get("size", 0)) != 0:
-                                pos_variants = get_all_symbol_variants(pos_sym)
-                                if symbol_norm in pos_variants:
-                                    sl_cancelled_by_pos[pos_sym].add(order_id)
             
+            removed_count = len(candidates_to_process) - len(safe_candidates)
             candidates_to_process = safe_candidates
-            print(f"  Reduced to {len(candidates_to_process)} safe candidates")
+            if removed_count > 0:
+                print(f"  Removed {removed_count} candidates for unsafe positions, {len(candidates_to_process)} remain")
             
             # Re-run safety check
             safe, warnings = post_plan_safety_check(
