@@ -209,6 +209,10 @@ class Position:
     tp1_hit: bool = False
     tp2_hit: bool = False
     
+    # Protection Status
+    is_protected: bool = False  # True if both initial_stop_price and stop_loss_order_id exist
+    protection_reason: Optional[str] = None  # Why protection status (e.g., "SL_ORDER_MISSING", "SL_PRICE_MISSING", "NO_SL_ORDER_OR_PRICE")
+    
     # Metadata
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     

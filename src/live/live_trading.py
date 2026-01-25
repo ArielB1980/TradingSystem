@@ -379,7 +379,19 @@ class LiveTrading:
             # 4. Start Data Acquisition
             await self.data_acq.start()
             
-
+            # 4.5. Run first tick to hydrate managed_positions
+            if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
+                try:
+                    await self._tick()
+                    logger.info("Initial tick completed - positions hydrated")
+                except Exception as e:
+                    logger.error("Initial tick failed", error=str(e))
+            
+            # 4.6. Validate position protection (startup safety gate)
+            try:
+                await self._validate_position_protection()
+            except Exception as e:
+                logger.error("Position protection validation failed", error=str(e))
             
             # 5. Main Loop
             while self.active:
@@ -595,6 +607,61 @@ class LiveTrading:
         
         return raw_positions
 
+    async def _validate_position_protection(self):
+        """
+        Validate all positions have protection (startup safety gate).
+        
+        Checks both DB positions and managed_positions for unprotected positions.
+        Emits alerts and optionally pauses trading.
+        """
+        from src.storage.repository import get_active_positions, async_record_event
+        
+        unprotected = []
+        
+        # Check managed_positions (in-memory state)
+        for symbol, pos in self.managed_positions.items():
+            if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
+                unprotected.append({
+                    'symbol': symbol,
+                    'source': 'managed_positions',
+                    'reason': pos.protection_reason or 'UNKNOWN',
+                    'has_sl_price': pos.initial_stop_price is not None,
+                    'has_sl_order': pos.stop_loss_order_id is not None,
+                    'is_protected': pos.is_protected
+                })
+        
+        # Also check DB positions (for positions not yet in managed_positions)
+        db_positions = await asyncio.to_thread(get_active_positions)
+        for pos in db_positions:
+            if pos.symbol not in self.managed_positions:
+                if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
+                    unprotected.append({
+                        'symbol': pos.symbol,
+                        'source': 'database',
+                        'reason': pos.protection_reason or 'UNKNOWN',
+                        'has_sl_price': pos.initial_stop_price is not None,
+                        'has_sl_order': pos.stop_loss_order_id is not None,
+                        'is_protected': pos.is_protected
+                    })
+        
+        if unprotected:
+            logger.critical(
+                "UNPROTECTED positions detected",
+                count=len(unprotected),
+                positions=unprotected
+            )
+            # Emit alert events
+            for up in unprotected:
+                await async_record_event(
+                    "UNPROTECTED_POSITION",
+                    up['symbol'],
+                    up
+                )
+            # Optional: Pause new opens (uncomment if desired)
+            # self.trading_paused = True
+        else:
+            logger.info("All positions are protected", total_positions=len(self.managed_positions) + len(db_positions))
+
     async def _tick(self):
         """
         Single iteration of live trading logic.
@@ -679,6 +746,19 @@ class LiveTrading:
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
+            
+            # 2.4. Fetch open orders once, index by symbol (for position hydration)
+            orders_by_symbol: Dict[str, List[Dict]] = {}
+            try:
+                open_orders = await self.client.get_futures_open_orders()
+                for order in open_orders:
+                    sym = order.get('symbol')
+                    if sym:
+                        if sym not in orders_by_symbol:
+                            orders_by_symbol[sym] = []
+                        orders_by_symbol[sym].append(order)
+            except Exception as e:
+                logger.warning("Failed to fetch open orders for hydration", error=str(e))
             
             # 2.5. TP Backfill / Reconciliation (after position sync and price data fetch)
             try:
@@ -765,7 +845,17 @@ class LiveTrading:
                         symbol = position_data['symbol']
                          # Ensure tracked
                         if symbol not in self.managed_positions:
-                             self.managed_positions[symbol] = self._init_managed_position(position_data, mark_price)
+                            # Load from DB first to preserve initial_stop_price
+                            from src.storage.repository import get_active_position
+                            db_pos = await asyncio.to_thread(get_active_position, symbol)
+                            orders_for_symbol = orders_by_symbol.get(symbol, [])
+                            
+                            self.managed_positions[symbol] = self._init_managed_position(
+                                position_data,
+                                mark_price,
+                                db_pos=db_pos,
+                                orders_for_symbol=orders_for_symbol
+                            )
                         
                         managed_pos = self.managed_positions[symbol]
                         old_size = managed_pos.size
@@ -1205,6 +1295,10 @@ class LiveTrading:
              
              # Initialize Active Trade Management State
              # We optimisticly track the position with its immutable intents
+             # Compute protection status
+             is_protected = (intent_model.stop_loss_futures is not None and new_sl_id is not None)
+             protection_reason = None if is_protected else ("SL_ORDER_MISSING" if intent_model.stop_loss_futures and not new_sl_id else "NO_SL_ORDER_OR_PRICE")
+             
              position_state = Position(
                  symbol=futures_symbol,
                  side=intent_model.side,
@@ -1227,7 +1321,11 @@ class LiveTrading:
                  
                  # ID Linking
                  stop_loss_order_id=new_sl_id, 
-                 tp_order_ids=new_tp_ids
+                 tp_order_ids=new_tp_ids,
+                 
+                 # Protection Status
+                 is_protected=is_protected,
+                 protection_reason=protection_reason
              )
              
              self.managed_positions[futures_symbol] = position_state
@@ -1399,21 +1497,83 @@ class LiveTrading:
         """Update local candle caches from acquisition with throttling."""
         await self.candle_manager.update_candles(symbol)
 
-    def _init_managed_position(self, exchange_data: Dict, mark_price: Decimal) -> Position:
-        """Hydrate Position object from exchange data (for recovery)."""
-        logger.warning(f"Hydrating position for {exchange_data['symbol']} (Recovery)")
+    def _init_managed_position(
+        self,
+        exchange_data: Dict,
+        mark_price: Decimal,
+        db_pos: Optional[Position] = None,
+        orders_for_symbol: Optional[List[Dict]] = None
+    ) -> Position:
+        """
+        Hydrate Position object from exchange data (for recovery).
+        
+        CRITICAL: Deterministic SL recovery with exact precedence:
+        1. DB active position has initial_stop_price → use it
+        2. Else, parse open reduce-only stop order → extract stop price
+        3. Else → mark as UNPROTECTED (no fabrication)
+        """
+        symbol = exchange_data.get('symbol')
+        if not symbol:
+            raise ValueError("Missing 'symbol' in exchange data")
+        
+        logger.warning(f"Hydrating position for {symbol} (Recovery)")
         
         # Defensive: Ensure required keys exist
         if 'entry_price' not in exchange_data:
-            logger.error(f"Missing 'entry_price' in exchange data for {exchange_data.get('symbol', 'UNKNOWN')}", data_keys=list(exchange_data.keys()))
+            logger.error(f"Missing 'entry_price' in exchange data for {symbol}", data_keys=list(exchange_data.keys()))
             raise ValueError(f"Cannot hydrate position: missing entry_price")
         
+        # Determine side from signed size (safest, handles all Kraken formats)
+        size_raw = Decimal(str(exchange_data.get('size', 0)))
+        side = Side.LONG if size_raw > 0 else Side.SHORT
+        
+        # Recover initial_stop_price with exact precedence
+        initial_sl = None
+        sl_order_id = None
+        protection_reason = None
+        
+        # 1. Try DB first (best case - preserved from previous session)
+        if db_pos and db_pos.initial_stop_price:
+            initial_sl = db_pos.initial_stop_price
+            sl_order_id = db_pos.stop_loss_order_id
+            logger.info("Preserved initial_stop_price from DB", symbol=symbol, sl=str(initial_sl), sl_order_id=sl_order_id)
+        
+        # 2. Try open orders (recover from exchange)
+        if not initial_sl and orders_for_symbol:
+            for order in orders_for_symbol:
+                # Check if this is a reduce-only stop order
+                is_reduce_only = order.get('reduceOnly', False)
+                order_type = str(order.get('type', '')).lower()
+                has_stop_price = order.get('stopPrice') is not None
+                is_stop_type = any(stop_term in order_type for stop_term in ['stop', 'stop-loss', 'stop_loss', 'stp'])
+                
+                if is_reduce_only and (has_stop_price or is_stop_type):
+                    # Extract stop price
+                    stop_price = order.get('stopPrice') or order.get('price')
+                    if stop_price:
+                        initial_sl = Decimal(str(stop_price))
+                        sl_order_id = order.get('id')
+                        logger.info("Extracted initial_stop_price from SL order", symbol=symbol, sl=str(initial_sl), order_id=sl_order_id)
+                        break
+        
+        # 3. Mark UNPROTECTED if still missing (no fabrication)
+        if not initial_sl:
+            protection_reason = "NO_SL_ORDER_OR_PRICE"
+            logger.error("UNPROTECTED position - no SL recovered", symbol=symbol, reason=protection_reason)
+        
+        # Verify protection status
+        # is_protected = True only if both initial_stop_price AND stop_loss_order_id exist
+        is_protected = (initial_sl is not None and sl_order_id is not None)
+        if initial_sl and not sl_order_id:
+            protection_reason = "SL_ORDER_MISSING"
+            logger.warning("Position has SL price but no SL order", symbol=symbol, sl_price=str(initial_sl))
+        
         return Position(
-            symbol=exchange_data['symbol'],
-            side=Side.LONG if exchange_data['side'] == 'long' else Side.SHORT,
-            size=Decimal(str(exchange_data['size'])),
+            symbol=symbol,
+            side=side,
+            size=size_raw,
             size_notional=Decimal("0"), # Unknown without calc
-            entry_price=Decimal(str(exchange_data['entry_price'])),  # FIX: was 'price'
+            entry_price=Decimal(str(exchange_data['entry_price'])),
             current_mark_price=mark_price,
             liquidation_price=Decimal(str(exchange_data.get('liquidationPrice', 0))),
             unrealized_pnl=Decimal(str(exchange_data.get('unrealizedPnl', 0))),
@@ -1421,8 +1581,13 @@ class LiveTrading:
             margin_used=Decimal("0"),
             opened_at=datetime.now(timezone.utc),
             
-            # Init defaults (safe fallback)
-            initial_stop_price=None,
+            # Recovered/protection fields
+            initial_stop_price=initial_sl,
+            stop_loss_order_id=sl_order_id,
+            is_protected=is_protected,
+            protection_reason=protection_reason,
+            
+            # Init defaults
             tp1_price=None,
             tp2_price=None,
             final_target_price=None,
@@ -1899,9 +2064,9 @@ class LiveTrading:
             logger.debug("TP backfill skipped: zero size", symbol=symbol)
             return True
         
-        # SL is missing (with safety guard)
-        if self.config.execution.require_sl_for_tp_backfill and not db_pos.initial_stop_price:
-            logger.warning("TP backfill skipped: missing SL", symbol=symbol, has_sl=bool(db_pos.initial_stop_price))
+        # Require protection (not just initial_stop_price)
+        if not db_pos.is_protected:
+            logger.warning("TP backfill skipped: position not protected", symbol=symbol, reason=db_pos.protection_reason, has_sl_price=bool(db_pos.initial_stop_price), has_sl_order=bool(db_pos.stop_loss_order_id))
             return True
         
         # Position is within MIN_HOLD_SECONDS after entry
