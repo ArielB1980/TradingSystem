@@ -75,6 +75,8 @@ risk:
 
 **Pre-Production Validation:** All tests passed - code compiles, logic validated, end-to-end auction works correctly with budget margin.
 
+**PRODUCTION ENABLED:** Auction mode is now enabled in production configuration. The system will use auction-based portfolio allocation to select the best 50 positions each cycle with hysteresis and cost penalties to prevent churn.
+
 ### Rollback Plan
 
 If issues occur:
