@@ -79,7 +79,10 @@ class LiveTrading:
         
         self.smc_engine = SMCEngine(config.strategy)
         self.risk_manager = RiskManager(config.risk)
-        self.futures_adapter = FuturesAdapter(self.client)
+        self.futures_adapter = FuturesAdapter(
+            self.client,
+            position_size_is_notional=config.exchange.position_size_is_notional
+        )
         self.executor = Executor(config.execution, self.futures_adapter)
         self.execution_engine = ExecutionEngine(config)
         self.position_manager = PositionManager()
@@ -2125,8 +2128,13 @@ class LiveTrading:
         
         # Place new TP ladder
         try:
-            # Get current position size from exchange data
-            position_size_notional = Decimal(str(pos_data.get('size', 0))) * current_price if pos_data.get('size', 0) else None
+            # CRITICAL: Use centralized method to convert position size to notional
+            # This handles exchange-specific size formats correctly
+            position_size_notional = await self.futures_adapter.position_size_notional(
+                symbol=symbol,
+                pos_data=pos_data,
+                current_price=current_price
+            )
             
             new_sl_id, new_tp_ids = await self.executor.update_protective_orders(
                 symbol=symbol,
