@@ -1810,6 +1810,11 @@ class LiveTrading:
                 continue
             
             try:
+                # Validate pos_data is a dict
+                if not isinstance(pos_data, dict):
+                    logger.error("Invalid pos_data type in _reconcile_protective_orders", symbol=symbol, pos_data_type=type(pos_data).__name__)
+                    continue
+                
                 # Get persisted position state
                 db_pos = await asyncio.to_thread(get_active_position, symbol)
                 if not db_pos:
@@ -1817,9 +1822,21 @@ class LiveTrading:
                     continue
                 
                 # Get current market price
+                if not isinstance(current_prices, dict):
+                    logger.error("Invalid current_prices type", symbol=symbol, current_prices_type=type(current_prices).__name__)
+                    continue
+                    
                 current_price = current_prices.get(symbol)
                 if not current_price:
+                    logger.debug("Skipping TP backfill - no current price", symbol=symbol)
                     continue
+                
+                # Ensure current_price is a Decimal, not a dict
+                if isinstance(current_price, dict):
+                    logger.error("Invalid current_price type (dict)", symbol=symbol, price_type=type(current_price).__name__)
+                    continue
+                if not isinstance(current_price, Decimal):
+                    current_price = Decimal(str(current_price))
                 
                 # Step 4: Safety checks - skip if unsafe
                 if await self._should_skip_tp_backfill(symbol, pos_data, db_pos, current_price):
@@ -1953,6 +1970,11 @@ class LiveTrading:
             return tp_plan
         
         # Compute deterministically using R-multiples
+        # Ensure pos_data is a dict, not a Decimal
+        if not isinstance(pos_data, dict):
+            logger.error("Invalid pos_data type in _compute_tp_plan", symbol=symbol, pos_data_type=type(pos_data).__name__)
+            return None
+        
         entry = Decimal(str(pos_data.get('entry_price', 0)))
         sl = db_pos.initial_stop_price
         
