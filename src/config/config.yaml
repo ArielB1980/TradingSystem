@@ -42,6 +42,20 @@ risk:
   daily_loss_limit_pct: 0.05  # 5% daily loss limit (Accommodates 10x active sizing)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
+  # Auction mode portfolio allocation
+  auction_mode_enabled: true  # Enable auction-based portfolio allocation
+  auction_max_positions: 50  # Maximum positions in portfolio
+  auction_max_margin_util: 0.90  # Maximum margin utilization (90%)
+  auction_max_per_cluster: 12  # Maximum positions per cluster
+  auction_max_per_symbol: 1  # Maximum positions per symbol
+  auction_swap_threshold: 10.0  # Minimum score advantage to replace position
+  auction_min_hold_minutes: 15  # Minimum hold time before position can be kicked
+  auction_max_trades_per_cycle: 5  # Maximum total trades per cycle (anti-churn)
+  auction_max_new_opens_per_cycle: 5  # Maximum new positions per cycle
+  auction_max_closes_per_cycle: 5  # Maximum closes per cycle
+  auction_entry_cost: 2.0  # Entry cost penalty in score points
+  auction_exit_cost: 2.0  # Exit cost penalty in score points
+  
   # Basis guards
   basis_max_pct: 0.0075  # 0.75% max spot-perp divergence for entry
   basis_max_post_pct: 0.0075  # Post-entry divergence limit (same as entry)
