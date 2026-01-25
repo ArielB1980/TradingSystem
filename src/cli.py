@@ -220,18 +220,45 @@ def live(
 
     # Initialize live trading engine
     import asyncio
+    import traceback
     from src.live.live_trading import LiveTrading
 
     async def run_live():
-        engine = LiveTrading(config)
-        await engine.run()
+        try:
+            logger.info("Initializing LiveTrading engine...")
+            engine = LiveTrading(config)
+            logger.info("LiveTrading engine initialized successfully")
+            logger.info("Starting main trading loop...")
+            await engine.run()
+        except Exception as e:
+            logger.critical(
+                "Live trading engine failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            # Print full traceback for debugging
+            logger.critical("Full traceback:\n%s", traceback.format_exc())
+            raise
 
     try:
         asyncio.run(run_live())
     except KeyboardInterrupt:
         logger.info("Live trading stopped by user")
     except Exception as e:
-        logger.critical("Live trading failed with error", error=str(e))
+        logger.critical(
+            "Live trading failed with unhandled error",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
+        # Print full traceback to stderr for visibility in logs
+        import sys
+        print("=" * 80, file=sys.stderr)
+        print("CRITICAL ERROR - Live Trading Failed", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
         raise typer.Exit(1)
 
 
