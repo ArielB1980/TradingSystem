@@ -1064,7 +1064,7 @@ class LiveTrading:
                 logger.error("Failed to log status summary", error=str(e))
         
         # 4.5 CRITICAL: Validate all positions have stop loss protection
-        await self._validate_position_protection()
+        # Legacy validation removed - using new _validate_position_protection after initial tick
         
         # 5. Account Sync (Throttled) - Moved to step 2 to prevent duplicate calls
         # Reference: _sync_positions call in Step 2 handles global state update
@@ -1115,8 +1115,8 @@ class LiveTrading:
         except Exception as e:
             logger.error("Failed to sync account state", error=str(e))
     
-    async def _validate_position_protection(self):
-        """CRITICAL: Ensure all open positions have stop loss orders."""
+    async def _validate_position_protection_legacy(self):
+        """CRITICAL: Ensure all open positions have stop loss orders (legacy method - replaced by _validate_position_protection)."""
         try:
             all_positions = await self.client.get_all_futures_positions()
             
