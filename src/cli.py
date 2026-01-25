@@ -201,12 +201,21 @@ def live(
     if with_health:
         import threading
         import uvicorn
+        import time
         from src.health import worker_health_app
         port = int(os.environ.get("PORT", "8080"))
+        
         def _run_health():
-            uvicorn.run(worker_health_app, host="0.0.0.0", port=port, log_level="warning")
-        t = threading.Thread(target=_run_health, daemon=True)
+            try:
+                uvicorn.run(worker_health_app, host="0.0.0.0", port=port, log_level="warning")
+            except Exception as e:
+                logger.error("Health server error: %s", e, exc_info=True)
+        
+        t = threading.Thread(target=_run_health, daemon=False)  # Non-daemon so it keeps running
         t.start()
+        
+        # Give the health server a moment to start before proceeding
+        time.sleep(1)
         logger.info("Worker health server started on port %s", port)
 
     # Initialize live trading engine
