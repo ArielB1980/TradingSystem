@@ -75,7 +75,9 @@ risk:
 
 **Pre-Production Validation:** All tests passed - code compiles, logic validated, end-to-end auction works correctly with budget margin.
 
-**PRODUCTION ENABLED:** Auction mode is now enabled in production configuration. The system will use auction-based portfolio allocation to select the best 50 positions each cycle with hysteresis and cost penalties to prevent churn.
+**PRODUCTION ENABLED:** Auction mode is now enabled in production configuration. The system will use auction-based portfolio allocation to select the best 25 positions each cycle with hysteresis and cost penalties to prevent churn.
+
+**Configuration Update (2026-01-25):** Reduced max positions from 50 to 25 for more focused portfolio management. Max per cluster set to 6 (25% of max positions) to maintain diversification.
 
 ### Rollback Plan
 
