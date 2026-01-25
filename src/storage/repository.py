@@ -160,6 +160,10 @@ class PositionModel(Base):
 
     opened_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Protection Status
+    is_protected = Column(Boolean, nullable=False, default=False)
+    protection_reason = Column(String, nullable=True)
 
 
 class SystemEventModel(Base):
@@ -513,14 +517,18 @@ def save_position(position: Position) -> None:
                 position_model.margin_used = position.margin_used
                 position_model.stop_loss_order_id = position.stop_loss_order_id
                 position_model.take_profit_order_id = position.take_profit_order_id
-                # Management fields
-                position_model.initial_stop_price = position.initial_stop_price
+                # Management fields - preserve if incoming value is None
+                position_model.initial_stop_price = position.initial_stop_price if position.initial_stop_price is not None else position_model.initial_stop_price
+                position_model.stop_loss_order_id = position.stop_loss_order_id if position.stop_loss_order_id else position_model.stop_loss_order_id
                 position_model.tp1_price = position.tp1_price
                 position_model.tp2_price = position.tp2_price
                 position_model.final_target_price = position.final_target_price
-                # Store tp_order_ids as JSON array
+                # Store tp_order_ids as JSON array - preserve if incoming is empty
                 import json
-                position_model.tp_order_ids = json.dumps(position.tp_order_ids) if position.tp_order_ids else None
+                position_model.tp_order_ids = json.dumps(position.tp_order_ids) if position.tp_order_ids else position_model.tp_order_ids
+                # Protection status
+                position_model.is_protected = getattr(position, 'is_protected', False)
+                position_model.protection_reason = getattr(position, 'protection_reason', None)
                 position_model.updated_at = datetime.utcnow()
             else:
                 # Create new
@@ -541,6 +549,9 @@ def save_position(position: Position) -> None:
                     # Management fields
                     initial_stop_price=position.initial_stop_price,
                     tp1_price=position.tp1_price,
+                    # Protection status
+                    is_protected=getattr(position, 'is_protected', False),
+                    protection_reason=getattr(position, 'protection_reason', None),
                     tp2_price=position.tp2_price,
                     final_target_price=position.final_target_price,
                     # Store tp_order_ids as JSON array
@@ -593,15 +604,20 @@ def sync_active_positions(positions: List[Position]) -> None:
                 pm.unrealized_pnl = pos.unrealized_pnl
                 pm.leverage = pos.leverage
                 pm.margin_used = pos.margin_used
-                pm.stop_loss_order_id = pos.stop_loss_order_id
+                # Protective fields - preserve if incoming value is None/empty
+                pm.stop_loss_order_id = pos.stop_loss_order_id if pos.stop_loss_order_id else pm.stop_loss_order_id
                 pm.take_profit_order_id = pos.take_profit_order_id
-                # Management fields
-                pm.initial_stop_price = pos.initial_stop_price
+                # Management fields - preserve if incoming value is None
+                pm.initial_stop_price = pos.initial_stop_price if pos.initial_stop_price is not None else pm.initial_stop_price
                 pm.tp1_price = pos.tp1_price
                 pm.tp2_price = pos.tp2_price
                 pm.final_target_price = pos.final_target_price
-                # Store tp_order_ids as JSON array
-                pm.tp_order_ids = json.dumps(pos.tp_order_ids) if pos.tp_order_ids else None
+                # Store tp_order_ids as JSON array - preserve if incoming is empty
+                import json
+                pm.tp_order_ids = json.dumps(pos.tp_order_ids) if pos.tp_order_ids else pm.tp_order_ids
+                # Protection status
+                pm.is_protected = getattr(pos, 'is_protected', pm.is_protected if pm.is_protected is not None else False)
+                pm.protection_reason = getattr(pos, 'protection_reason', pm.protection_reason)
                 pm.updated_at = datetime.utcnow()
             else:
                 # Create
@@ -625,6 +641,9 @@ def sync_active_positions(positions: List[Position]) -> None:
                     final_target_price=pos.final_target_price,
                     # Store tp_order_ids as JSON array
                     tp_order_ids=json.dumps(pos.tp_order_ids) if pos.tp_order_ids else None,
+                    # Protection status
+                    is_protected=getattr(pos, 'is_protected', False),
+                    protection_reason=getattr(pos, 'protection_reason', None),
                     opened_at=pos.opened_at,
                 )
                 session.add(pm)
@@ -672,7 +691,10 @@ def get_active_position(symbol: str = "BTC/USD") -> Optional[Position]:
             basis_at_entry=Decimal(str(pm.basis_at_entry)) if pm.basis_at_entry else None,
             basis_current=Decimal(str(pm.basis_current)) if pm.basis_current else None,
             funding_rate=Decimal(str(pm.funding_rate)) if pm.funding_rate else None,
-            cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0")
+            cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0"),
+            # Protection status
+            is_protected=pm.is_protected if pm.is_protected is not None else False,
+            protection_reason=pm.protection_reason
         )
 
 
@@ -708,7 +730,10 @@ def get_active_positions() -> List[Position]:
                 basis_at_entry=Decimal(str(pm.basis_at_entry)) if pm.basis_at_entry else None,
                 basis_current=Decimal(str(pm.basis_current)) if pm.basis_current else None,
                 funding_rate=Decimal(str(pm.funding_rate)) if pm.funding_rate else None,
-                cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0")
+                cumulative_funding=Decimal(str(pm.cumulative_funding)) if pm.cumulative_funding else Decimal("0"),
+                # Protection status
+                is_protected=pm.is_protected if pm.is_protected is not None else False,
+                protection_reason=pm.protection_reason
             )
             for pm in position_models
         ]

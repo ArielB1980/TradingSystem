@@ -106,6 +106,8 @@ def migrate():
                 ("basis_current", "NUMERIC(20, 8)"),
                 ("funding_rate", "NUMERIC(20, 8)"),
                 ("cumulative_funding", "NUMERIC(20, 8)"),
+                ("is_protected", "BOOLEAN DEFAULT FALSE"),
+                ("protection_reason", "VARCHAR"),
             ]
             for col_name, col_type in new_cols:
                 try:

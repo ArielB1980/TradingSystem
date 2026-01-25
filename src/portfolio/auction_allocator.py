@@ -220,15 +220,16 @@ class AuctionAllocator:
         # Remaining opens (not part of swaps) - limit independently
         remaining_opens = remaining_opens[:max(self.max_new_opens_per_cycle - len(swap_pairs), 0)]
         
+        # Build result
+        all_opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
+        closes = [symbol for symbol, _ in swap_pairs] + [op.position.symbol for op in remaining_closes]
+        
         # CRITICAL FIX: Enforce net_opens <= net_closes + free_slots to prevent exceeding max positions
         current_open_count = len(open_positions)
         free_slots = max(self.limits.max_positions - current_open_count, 0)
-        allowed_opens = len(closes) + free_slots
-        
-        # Build result
-        all_opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
+        closes_count = len(closes)
+        allowed_opens = closes_count + free_slots
         opens = all_opens[:allowed_opens]  # Enforce net position limit
-        closes = [symbol for symbol, _ in swap_pairs] + [op.position.symbol for op in remaining_closes]
         
         reasons = {
             "total_contenders": len(contenders),
@@ -262,11 +263,19 @@ class AuctionAllocator:
         # Add open positions
         now = datetime.now(timezone.utc)
         for op_meta in open_positions:
-            # Mark as locked if within MIN_HOLD or protective orders not live
+            # Mark as locked if within MIN_HOLD, protective orders not live, or UNPROTECTED
+            is_unprotected = not getattr(op_meta.position, 'is_protected', True)
             locked = (
                 op_meta.age_seconds < self.min_hold_seconds or
-                not op_meta.is_protective_orders_live
+                not op_meta.is_protective_orders_live or
+                is_unprotected
             )
+            if is_unprotected:
+                logger.warning(
+                    "UNPROTECTED position marked as locked in auction",
+                    symbol=op_meta.position.symbol,
+                    reason=getattr(op_meta.position, 'protection_reason', 'UNKNOWN')
+                )
             
             # Update locked state in metadata (for use in hysteresis)
             op_meta.locked = locked
