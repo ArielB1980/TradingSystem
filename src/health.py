@@ -379,12 +379,16 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
         else:
             reasoning_tip = "No reasoning logged"
 
+        op = data.get("order_placed")
+        op_reason = data.get("order_fail_reason") or ""
         results["recent_decisions"].append({
             "time": ts,
             "symbol": sym,
             "signal": signal,
             "quality": quality,
             "reasoning": reasoning_tip,
+            "order_placed": op,
+            "order_fail_reason": op_reason,
         })
 
         if signal and str(signal).upper() in ("LONG", "SHORT") and results["last_signal"] is None:
@@ -493,15 +497,19 @@ def _debug_signals_html(data: dict) -> str:
         html_parts.append(f"<span class='k'>Signal</span><span class='v {sig_cls}'>{esc(str(last.get('signal', '—')))}</span>")
         html_parts.append(f"<span class='k'>Quality</span><span class='v'>{esc(str(last.get('quality', '—')))}</span>")
         html_parts.append(f"<span class='k'>Time</span><span class='v'>{esc(_format_ts_cet(last.get('timestamp') or ''))}</span>")
+        html_parts.append("</div>")
         order_placed = d.get("order_placed")
         order_fail_reason = d.get("order_fail_reason") or ""
+        html_parts.append("<div class='row' style='margin-top:0.5rem;padding-top:0.5rem;border-top:1px solid #27272a;'>")
         if order_placed is True:
-            html_parts.append(f"<span class='k'>Order opened</span><span class='v' style='color:#22c55e'>Yes</span>")
+            html_parts.append("<span class='k'>Order opened</span><span class='v' style='color:#22c55e;font-weight:600'>Yes</span>")
         elif order_placed is False:
             fail = esc(order_fail_reason) if order_fail_reason else "No (reason not recorded)"
-            html_parts.append(f"<span class='k'>Order opened</span><span class='v' style='color:#ef4444'>No</span>")
+            html_parts.append("<span class='k'>Order opened</span><span class='v' style='color:#ef4444;font-weight:600'>No</span>")
             if order_fail_reason:
                 html_parts.append(f"<span class='k'>Reason</span><span class='v' style='color:#fca5a5'>{fail}</span>")
+        else:
+            html_parts.append("<span class='k'>Order opened</span><span class='v' style='color:#71717a'>—</span>")
         html_parts.append("</div>")
         if reason:
             html_parts.append("<pre>" + esc(reason) + "</pre>")
@@ -532,7 +540,7 @@ def _debug_signals_html(data: dict) -> str:
             )
 
     html_parts.append("<h2>Recent decisions</h2>")
-    html_parts.append("<div class='card'><table><thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>Quality</th><th>Reasoning</th></tr></thead><tbody>")
+    html_parts.append("<div class='card'><table><thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>Quality</th><th>Order opened</th><th>Reasoning</th></tr></thead><tbody>")
     for dec in decisions[:40]:
         t = _format_ts_cet(dec.get("time") or "")
         s = dec.get("symbol", "")
@@ -540,9 +548,17 @@ def _debug_signals_html(data: dict) -> str:
         sig_cls = "signal-long" if sig == "long" else ("signal-short" if sig == "short" else "signal-none")
         q = dec.get("quality", "")
         r = dec.get("reasoning") or "—"
+        op = dec.get("order_placed")
+        op_reason = dec.get("order_fail_reason") or ""
+        if op is True:
+            op_cell = "<span style='color:#22c55e'>Yes</span>"
+        elif op is False:
+            op_cell = f"<span style='color:#ef4444'>No</span>" + (f" <span style='color:#fca5a5;font-size:0.8em' title='{esc(op_reason)}'>{esc(op_reason)[:50]}{'…' if len(op_reason) > 50 else ''}</span>" if op_reason else "")
+        else:
+            op_cell = "—"
         html_parts.append(
             f"<tr><td>{esc(t)}</td><td>{esc(s)}</td><td class='{sig_cls}'>{esc(str(dec.get('signal', '—')))}</td>"
-            f"<td>{esc(str(q))}</td><td class='reason' title='{esc(r)}'>{esc(r)}</td></tr>"
+            f"<td>{esc(str(q))}</td><td>{op_cell}</td><td class='reason' title='{esc(r)}'>{esc(r)}</td></tr>"
         )
     html_parts.append("</tbody></table></div>")
     html_parts.append("</body></html>")
