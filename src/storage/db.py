@@ -49,11 +49,24 @@ class Database:
         try:
             Base.metadata.create_all(bind=self.engine)
         except Exception as e:
-            # Log but don't fail - tables might already exist
+            error_str = str(e).lower()
+            # Log but don't fail for permission errors - these need manual fix
             import logging
-            logging.warning(f"Table creation warning (may be expected): {e}")
-            # Re-raise if it's a critical error (not just "already exists")
-            if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+            if "permission denied" in error_str or "insufficientprivilege" in error_str:
+                logging.warning(
+                    f"Table creation failed due to insufficient privileges: {e}\n"
+                    "Grant CREATE privilege on schema 'public' to your database user.\n"
+                    "The app will continue but database operations will fail until fixed."
+                )
+                # Don't re-raise - app can start but DB ops will fail
+                return
+            elif "already exists" in error_str or "duplicate" in error_str:
+                # Tables already exist - this is fine
+                logging.debug(f"Tables already exist (expected): {e}")
+                return
+            else:
+                # Other errors - log and re-raise
+                logging.warning(f"Table creation warning (may be expected): {e}")
                 raise
 
     def drop_all(self):
