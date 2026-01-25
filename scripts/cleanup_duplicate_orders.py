@@ -80,25 +80,53 @@ def classify_order(order: dict) -> str:
     Classify order as ENTRY, SL, TP, or OTHER.
     
     ENTRY: reduceOnly=False (never cancel in this script)
-    SL: reduceOnly=True AND (stopPrice exists OR type contains "stop")
-    TP: reduceOnly=True AND NOT SL AND (type contains "take" OR explicit TP)
+    SL: reduceOnly=True AND (
+        stopPrice/triggerPrice exists OR
+        type contains "stop"/"stp"/"conditional"
+    )
+    TP: reduceOnly=True AND NOT SL AND (type contains "take")
     OTHER: everything else
+    
+    Robust SL detection handles various Kraken order types:
+    - stop-loss-limit, stop market, conditional, stp orders
+    - Orders with stopPrice, triggerPrice, or trigger_price
     """
     reduce_only = order.get("reduceOnly", False)
     
     if not reduce_only:
         return "ENTRY"
     
-    # Check for stop price or stop type
-    has_stop_price = order.get("stopPrice") is not None
+    # Robust SL detection: check for stop price fields (any numeric value)
+    has_stop_price = False
+    for key in ["stopPrice", "triggerPrice", "trigger_price", "trigger"]:
+        value = order.get(key)
+        if value is not None:
+            try:
+                float(value)  # Check if numeric
+                has_stop_price = True
+                break
+            except (ValueError, TypeError):
+                continue
+    
+    # Check for stop-related type strings
     order_type = str(order.get("type", "")).lower()
-    has_stop_type = "stop" in order_type
+    has_stop_type = (
+        "stop" in order_type or
+        "stp" in order_type or
+        "conditional" in order_type or
+        "stop-loss" in order_type or
+        "stop_loss" in order_type
+    )
     
     if has_stop_price or has_stop_type:
         return "SL"
     
     # Check for take-profit
-    has_take_type = "take" in order_type or "take-profit" in order_type or "take_profit" in order_type
+    has_take_type = (
+        "take" in order_type or
+        "take-profit" in order_type or
+        "take_profit" in order_type
+    )
     
     if has_take_type:
         return "TP"
@@ -126,11 +154,28 @@ def prices_match(p1: Decimal, p2: Decimal, tolerance_pct: Decimal = Decimal("0.0
 
 
 def get_effective_price(order: dict, order_class: str) -> Optional[Decimal]:
-    """Get effective price for an order based on its class."""
+    """
+    Get effective price for an order based on its class.
+    
+    For SL: Priority: stopPrice -> triggerPrice -> trigger_price -> price
+    For TP: Priority: price -> triggerPrice -> stopPrice
+    For others: price
+    """
     if order_class == "SL":
-        price = order.get("stopPrice") or order.get("price")
+        # SL price extraction priority
+        price = (
+            order.get("stopPrice") or
+            order.get("triggerPrice") or
+            order.get("trigger_price") or
+            order.get("trigger") or
+            order.get("price")
+        )
     elif order_class == "TP":
-        price = order.get("price") or order.get("triggerPrice") or order.get("stopPrice")
+        price = (
+            order.get("price") or
+            order.get("triggerPrice") or
+            order.get("stopPrice")
+        )
     else:
         price = order.get("price")
     
@@ -609,44 +654,46 @@ def find_redundant_tp_orders(
 def post_plan_safety_check(
     positions: List[dict],
     orders_to_cancel: List[Dict],
-    all_orders: List[dict]
-) -> Tuple[bool, List[str]]:
+    all_orders: List[dict],
+    verbose: bool = False
+) -> Tuple[bool, List[str], Dict[str, Dict]]:
     """
     Check if any position would have 0 SL after cleanup.
     
-    Returns (safe, warnings)
+    Returns (safe, warnings, diagnostics)
+    diagnostics: Dict mapping position symbol -> diagnostic info
     """
     warnings = []
+    diagnostics = {}
     
     # Build set of order IDs to cancel
     cancel_order_ids = {c["order"].get("id") for c in orders_to_cancel}
     
-    # Build position lookup
+    # Build position lookup (use canonical symbol)
     pos_by_symbol = {}
     for pos in positions:
         pos_sym = pos.get("symbol")
         if not pos_sym or float(pos.get("size", 0)) == 0:
             continue
         
-        variants = get_all_symbol_variants(pos_sym)
-        for variant in variants:
-            pos_by_symbol[variant] = pos
+        # Normalize to canonical form
+        symbol_norm = normalize_symbol_for_comparison(pos_sym)
+        pos_by_symbol[symbol_norm] = pos
     
     # Build map of kept order IDs (from cancellation candidates)
-    # These are orders that are preserved even though they're in duplicate clusters
     kept_order_ids = set()
     for candidate in orders_to_cancel:
         kept_id = candidate.get("kept_order_id")
         if kept_id:
             kept_order_ids.add(kept_id)
     
-    # Count SL orders per position after cancellation
-    # An order remains if:
-    # 1. It's not in the cancellation list, OR
-    # 2. It's a kept order (preserved from duplicate cluster)
-    sl_orders_by_symbol = defaultdict(list)
+    # Collect all SL orders (before cancellation)
+    sl_orders_before = defaultdict(list)
+    sl_orders_marked_cancel = defaultdict(list)
+    
     for order in all_orders:
-        if classify_order(order) != "SL":
+        order_class = classify_order(order)
+        if order_class != "SL":
             continue
         
         order_id = order.get("id")
@@ -658,31 +705,90 @@ def post_plan_safety_check(
             continue
         
         symbol_norm = normalize_symbol_for_comparison(symbol)
+        sl_orders_before[symbol_norm].append(order)
         
-        # Count if not being cancelled, or if it's a kept order
-        if order_id not in cancel_order_ids:
-            sl_orders_by_symbol[symbol_norm].append(order)
-        elif order_id in kept_order_ids:
-            # Kept order - count it even though it might be in cancellation list
-            sl_orders_by_symbol[symbol_norm].append(order)
+        if order_id in cancel_order_ids:
+            sl_orders_marked_cancel[symbol_norm].append(order)
     
-    # Check each position (use set to avoid duplicate warnings for same position)
+    # Count SL orders per position after cancellation
+    sl_orders_after = defaultdict(list)
+    for symbol_norm, orders in sl_orders_before.items():
+        for order in orders:
+            order_id = order.get("id")
+            # Count if not being cancelled, or if it's a kept order
+            if order_id not in cancel_order_ids:
+                sl_orders_after[symbol_norm].append(order)
+            elif order_id in kept_order_ids:
+                sl_orders_after[symbol_norm].append(order)
+    
+    # Check each position
     checked_positions = set()
     for symbol_norm, position in pos_by_symbol.items():
-        # Use original position symbol to avoid duplicate warnings
         pos_sym = position.get("symbol", symbol_norm)
         if pos_sym in checked_positions:
             continue
         checked_positions.add(pos_sym)
         
-        remaining_sl = sl_orders_by_symbol.get(symbol_norm, [])
+        remaining_sl = sl_orders_after.get(symbol_norm, [])
         if len(remaining_sl) == 0:
-            warnings.append(
-                f"Position {pos_sym} would have 0 SL orders after cleanup"
-            )
+            # Build diagnostic info
+            position_size = float(position.get("size", 0))
+            position_side = "LONG" if position_size > 0 else "SHORT"
+            
+            sl_before = sl_orders_before.get(symbol_norm, [])
+            sl_cancel = sl_orders_marked_cancel.get(symbol_norm, [])
+            
+            # Extract classification fields from SL orders
+            classification_info = []
+            for sl_order in sl_before:
+                order_type = sl_order.get("type", "")
+                has_stop_price = any(sl_order.get(k) is not None for k in ["stopPrice", "triggerPrice", "trigger_price", "trigger"])
+                reduce_only = sl_order.get("reduceOnly", False)
+                stop_price = sl_order.get("stopPrice") or sl_order.get("triggerPrice") or sl_order.get("trigger_price")
+                
+                classification_info.append({
+                    "order_id": sl_order.get("id", "")[:30] + "...",
+                    "type": order_type,
+                    "stopPrice": stop_price,
+                    "reduceOnly": reduce_only,
+                    "classified_as": classify_order(sl_order)
+                })
+            
+            diagnostic = {
+                "position_symbol": pos_sym,
+                "position_symbol_normalized": symbol_norm,
+                "position_side": position_side,
+                "sl_orders_found_before": len(sl_before),
+                "sl_orders_remaining_after": len(remaining_sl),
+                "sl_orders_marked_for_cancel": [
+                    {
+                        "order_id": o.get("id", "")[:30] + "...",
+                        "stopPrice": o.get("stopPrice") or o.get("triggerPrice") or o.get("trigger_price")
+                    }
+                    for o in sl_cancel
+                ],
+                "all_sl_orders_classification": classification_info
+            }
+            diagnostics[pos_sym] = diagnostic
+            
+            if verbose:
+                warnings.append(
+                    f"Position {pos_sym} ({position_side}) would have 0 SL orders after cleanup\n"
+                    f"  Raw position symbol: {pos_sym}\n"
+                    f"  Normalized symbol: {symbol_norm}\n"
+                    f"  SL orders found before: {len(sl_before)}\n"
+                    f"  SL orders remaining after: {len(remaining_sl)}\n"
+                    f"  SL orders marked for cancel: {len(sl_cancel)}\n"
+                    f"  Classification details: {json.dumps(classification_info, indent=4)}"
+                )
+            else:
+                warnings.append(
+                    f"Position {pos_sym} ({position_side}) would have 0 SL orders after cleanup "
+                    f"(before: {len(sl_before)}, after: {len(remaining_sl)}, cancelling: {len(sl_cancel)})"
+                )
     
     safe = len(warnings) == 0
-    return safe, warnings
+    return safe, warnings, diagnostics
 
 
 # ============ MAIN CLEANUP FUNCTION ============
@@ -693,7 +799,8 @@ async def cleanup_duplicate_orders(
     price_tolerance_pct: Decimal = Decimal("0.001"),
     symbol_filter: Optional[str] = None,
     prefer_oldest: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    execute_safe_only: bool = False
 ) -> Dict:
     """
     Main cleanup function - executes steps 0-5 in order.
@@ -745,6 +852,46 @@ async def cleanup_duplicate_orders(
         print(f"  Total positions: {len(positions)} (non-zero)")
         print(f"  DB positions with SL: {sum(1 for m in db_metadata.values() if m['stop_loss_order_id'])}")
         print(f"  DB positions with TP: {sum(1 for m in db_metadata.values() if m['tp_order_ids'])}")
+        
+        # Verbose: Show symbol normalization examples
+        if verbose and symbol_filter:
+            print(f"\n  === Symbol Normalization (--symbol {symbol_filter}) ===")
+            symbol_variants = get_all_symbol_variants(symbol_filter)
+            print(f"  Symbol variants: {symbol_variants}")
+            canonical = normalize_symbol_for_comparison(symbol_filter)
+            print(f"  Canonical form: {canonical}")
+            
+            # Show position symbols
+            matching_positions = [p for p in positions if any(v in get_all_symbol_variants(p.get("symbol", "")) for v in symbol_variants)]
+            if matching_positions:
+                print(f"  Matching positions:")
+                for pos in matching_positions:
+                    pos_sym = pos.get("symbol")
+                    pos_norm = normalize_symbol_for_comparison(pos_sym)
+                    print(f"    Raw: {pos_sym} -> Normalized: {pos_norm}")
+            
+            # Show order symbols
+            matching_orders = [o for o in orders_raw if any(v in get_all_symbol_variants(o.get("symbol", "")) for v in symbol_variants)]
+            if matching_orders:
+                print(f"  Matching orders (first 10):")
+                for order in matching_orders[:10]:
+                    order_sym = order.get("symbol")
+                    order_norm = normalize_symbol_for_comparison(order_sym)
+                    order_class = classify_order(order)
+                    print(f"    Raw: {order_sym} -> Normalized: {order_norm}, Class: {order_class}")
+                
+                # Show SL orders with extracted prices
+                sl_orders = [o for o in matching_orders if classify_order(o) == "SL"]
+                if sl_orders:
+                    print(f"  SL orders found: {len(sl_orders)}")
+                    for sl_order in sl_orders[:10]:
+                        order_id = sl_order.get("id", "")[:30] + "..."
+                        order_sym = sl_order.get("symbol")
+                        stop_price = get_effective_price(sl_order, "SL")
+                        order_type = sl_order.get("type", "")
+                        reduce_only = sl_order.get("reduceOnly", False)
+                        print(f"    {order_id}: symbol={order_sym}, stopPrice={stop_price}, "
+                              f"type={order_type}, reduceOnly={reduce_only}")
         
         # Step 1: Find orphan reduce-only orders
         print("\nStep 1: Finding orphan reduce-only orders...")
@@ -932,10 +1079,11 @@ async def cleanup_duplicate_orders(
         
         # Post-plan safety check
         print("\n=== Post-Plan Safety Check ===")
-        safe, warnings = post_plan_safety_check(
+        safe, warnings, diagnostics = post_plan_safety_check(
             positions,
             candidates_to_process,
-            orders_raw
+            orders_raw,
+            verbose=verbose
         )
         
         # If safety check fails, iteratively remove ALL candidates for positions that would be left with 0 SL
@@ -949,7 +1097,13 @@ async def cleanup_duplicate_orders(
             else:
                 print(f"  ⚠️  Safety check still failing (iteration {iteration}) - removing more candidates...")
             
-            unsafe_positions = {w.split()[1] for w in warnings}  # Extract position symbols from warnings
+            # Extract position symbols from warnings (handle both formats)
+            unsafe_positions = set()
+            for w in warnings:
+                # Format: "Position PF_XBTUSD (LONG) would have 0 SL..." or "Position PF_XBTUSD would have..."
+                parts = w.split()
+                if len(parts) >= 2 and parts[0] == "Position":
+                    unsafe_positions.add(parts[1])
             
             if not unsafe_positions:
                 break  # No unsafe positions, exit loop
@@ -976,11 +1130,19 @@ async def cleanup_duplicate_orders(
                 break
             
             # Re-run safety check
-            safe, warnings = post_plan_safety_check(
+            safe, warnings, diagnostics = post_plan_safety_check(
                 positions,
                 candidates_to_process,
-                orders_raw
+                orders_raw,
+                verbose=verbose
             )
+            
+            # Extract position symbols from warnings
+            unsafe_positions = set()
+            for w in warnings:
+                parts = w.split()
+                if len(parts) >= 2 and parts[0] == "Position":
+                    unsafe_positions.add(parts[1])
         
         if not safe:
             print(f"  ⚠️  Safety check still failing after {iteration} iterations")
@@ -989,17 +1151,79 @@ async def cleanup_duplicate_orders(
             for warning in warnings:
                 print(f"  ⚠️  {warning}")
         
+        # Print detailed diagnostics for failing positions
+        if not safe and diagnostics:
+            print("\n  === Detailed Diagnostics ===")
+            for pos_sym, diag in diagnostics.items():
+                print(f"\n  Position: {pos_sym}")
+                print(f"    Side: {diag['position_side']}")
+                print(f"    Raw symbol: {diag['position_symbol']}")
+                print(f"    Normalized: {diag['position_symbol_normalized']}")
+                print(f"    SL orders before: {diag['sl_orders_found_before']}")
+                print(f"    SL orders after: {diag['sl_orders_remaining_after']}")
+                print(f"    SL orders to cancel: {len(diag['sl_orders_marked_for_cancel'])}")
+                if diag['sl_orders_marked_for_cancel']:
+                    print(f"    Cancelling:")
+                    for cancel_info in diag['sl_orders_marked_for_cancel']:
+                        print(f"      - {cancel_info['order_id']} @ {cancel_info.get('stopPrice', 'N/A')}")
+                if diag['all_sl_orders_classification']:
+                    print(f"    All SL orders classification:")
+                    for cls_info in diag['all_sl_orders_classification']:
+                        print(f"      - {cls_info['order_id']}: type={cls_info['type']}, "
+                              f"stopPrice={cls_info.get('stopPrice', 'N/A')}, "
+                              f"reduceOnly={cls_info['reduceOnly']}, "
+                              f"classified_as={cls_info['classified_as']}")
+        
         if safe:
             print("  ✅ Safety check: PASSED")
         else:
             print("  ❌ Safety check: FAILED - Would leave positions without SL")
-            if not dry_run:
+            if execute_safe_only:
+                # Remove all candidates for failing symbols
+                failing_symbols = set(diagnostics.keys())
+                failing_symbol_variants = set()
+                for pos_sym in failing_symbols:
+                    failing_symbol_variants.update(get_all_symbol_variants(pos_sym))
+                
+                safe_candidates = []
+                for candidate in candidates_to_process:
+                    symbol_norm = candidate["symbol_norm"]
+                    if symbol_norm not in failing_symbol_variants:
+                        safe_candidates.append(candidate)
+                
+                removed_count = len(candidates_to_process) - len(safe_candidates)
+                candidates_to_process = safe_candidates
+                
+                print(f"\n  🔧 --execute-safe-only mode: Removed {removed_count} candidates for unsafe positions")
+                print(f"  Executing cancellations for {len(candidates_to_process)} safe candidates")
+                
+                # Re-run safety check on safe subset
+                safe, warnings, diagnostics = post_plan_safety_check(
+                    positions,
+                    candidates_to_process,
+                    orders_raw,
+                    verbose=verbose
+                )
+                
+                if not safe:
+                    print("  ❌ Safety check still failing after removing unsafe positions - ABORTING")
+                    return {
+                        "safe": False,
+                        "cancelled": 0,
+                        "candidates": candidates_to_process,
+                        "warnings": warnings,
+                        "diagnostics": diagnostics
+                    }
+                else:
+                    print("  ✅ Safety check passed for safe subset - proceeding with execution")
+            elif not dry_run:
                 print("  ABORTING - Not executing cancellations")
                 return {
                     "safe": False,
                     "cancelled": 0,
                     "candidates": candidates_to_process,
-                    "warnings": warnings
+                    "warnings": warnings,
+                    "diagnostics": diagnostics
                 }
         
         # Print detailed report
@@ -1118,8 +1342,17 @@ def main():
         action="store_true",
         help="When multiple orders match, prefer oldest by timestamp (default: prefer newest)"
     )
+    parser.add_argument(
+        "--execute-safe-only",
+        action="store_true",
+        help="Execute cancellations only for symbols that pass safety check (removes unsafe candidates)"
+    )
     
     args = parser.parse_args()
+    
+    if args.execute_safe_only and not args.execute:
+        print("Error: --execute-safe-only requires --execute")
+        sys.exit(1)
     
     asyncio.run(cleanup_duplicate_orders(
         dry_run=not args.execute,
@@ -1127,7 +1360,8 @@ def main():
         price_tolerance_pct=Decimal(str(args.price_tolerance)),
         symbol_filter=args.symbol,
         prefer_oldest=args.prefer_oldest,
-        verbose=args.verbose
+        verbose=args.verbose,
+        execute_safe_only=args.execute_safe_only
     ))
 
 
