@@ -32,32 +32,51 @@ from src.storage.repository import PositionModel
 
 def normalize_symbol_for_comparison(symbol: str) -> str:
     """
-    Normalize symbol for comparison (PF_XBTUSD <-> BTC/USD:USD).
+    Normalize symbol to canonical form: PF_*USD (Kraken futures format).
     
-    Handles both directions:
-    - PF_XBTUSD -> BTC/USD:USD
+    Handles:
+    - PF_XBTUSD -> PF_XBTUSD (already canonical)
     - BTC/USD:USD -> PF_XBTUSD
-    - Special case: XBT <-> BTC
+    - BTCUSD-PERP -> PF_XBTUSD
+    - XBT/USD:USD -> PF_XBTUSD
+    - Special case: XBT <-> BTC (Kraken uses XBT for Bitcoin)
     """
     if not symbol:
         return symbol
     
-    # If already in PF_ format, convert to unified
+    # Already in canonical form
     if symbol.startswith("PF_"):
-        base = symbol[3:-3]  # Remove "PF_" and "USD"
-        if base == "XBT":
-            base = "BTC"
-        return f"{base}/USD:USD"
+        return symbol
     
-    # If in unified format, convert to PF_
-    if "/" in symbol and ":" in symbol:
-        base = symbol.split("/")[0]
-        if base == "BTC":
-            base = "XBT"
-        return f"PF_{base}USD"
+    # Extract base currency from various formats
+    base = None
     
-    # Return as-is if format not recognized
-    return symbol
+    # Format: BTC/USD:USD or BTC/USD
+    if "/" in symbol:
+        base = symbol.split("/")[0].strip()
+    
+    # Format: BTCUSD-PERP or BTCUSD
+    elif "-" in symbol:
+        base = symbol.split("-")[0].replace("USD", "").replace("PERP", "").strip()
+    else:
+        # Try to extract base (remove common suffixes)
+        s = symbol.upper()
+        for suffix in ["USD", "PERP", ":USD"]:
+            if s.endswith(suffix):
+                s = s[:-len(suffix)]
+                break
+        base = s
+    
+    if not base:
+        return symbol
+    
+    # Normalize BTC <-> XBT (Kraken uses XBT for Bitcoin)
+    if base == "BTC":
+        base = "XBT"
+    elif base == "XBT":
+        base = "XBT"  # Already correct
+    
+    return f"PF_{base}USD"
 
 
 def get_all_symbol_variants(symbol: str) -> Set[str]:
