@@ -78,18 +78,39 @@ async def backfill_initial_stop_prices(place_missing_sl: bool = False):
     )
     executor = Executor(config.execution, futures_adapter)
     
-    # 1. Load positions missing SL
+    # 1. Load positions missing SL (extract data while in session)
     db = get_db()
+    positions_data = []
     with db.get_session() as session:
         positions_missing_sl = session.query(PositionModel).filter(
             PositionModel.initial_stop_price.is_(None)
         ).all()
+        
+        # Extract all needed data while in session
+        for pm in positions_missing_sl:
+            import json
+            positions_data.append({
+                'symbol': pm.symbol,
+                'side': pm.side,
+                'size': pm.size,
+                'size_notional': pm.size_notional,
+                'entry_price': pm.entry_price,
+                'current_mark_price': pm.current_mark_price,
+                'liquidation_price': pm.liquidation_price,
+                'unrealized_pnl': pm.unrealized_pnl,
+                'leverage': pm.leverage,
+                'margin_used': pm.margin_used,
+                'opened_at': pm.opened_at,
+                'initial_stop_price': pm.initial_stop_price,
+                'stop_loss_order_id': pm.stop_loss_order_id,
+                'tp_order_ids': json.loads(pm.tp_order_ids) if pm.tp_order_ids else [],
+            })
     
-    if not positions_missing_sl:
+    if not positions_data:
         logger.info("No positions missing initial_stop_price")
         return
     
-    logger.info("Found positions missing initial_stop_price", count=len(positions_missing_sl))
+    logger.info("Found positions missing initial_stop_price", count=len(positions_data))
     
     # 2. Fetch open orders once, index by symbol
     try:
@@ -112,27 +133,25 @@ async def backfill_initial_stop_prices(place_missing_sl: bool = False):
     placed_count = 0
     errors = []
     
-    for pm in positions_missing_sl:
-        symbol = pm.symbol
+    for pos_data_dict in positions_data:
+        symbol = pos_data_dict['symbol']
         try:
             # Convert to Position object
-            import json
             pos = Position(
-                symbol=pm.symbol,
-                side=Side(pm.side),
-                size=Decimal(str(pm.size)),
-                size_notional=Decimal(str(pm.size_notional)),
-                entry_price=Decimal(str(pm.entry_price)),
-                current_mark_price=Decimal(str(pm.current_mark_price)),
-                liquidation_price=Decimal(str(pm.liquidation_price)),
-                unrealized_pnl=Decimal(str(pm.unrealized_pnl)),
-                leverage=Decimal(str(pm.leverage)),
-                margin_used=Decimal(str(pm.margin_used)),
-                opened_at=pm.opened_at.replace(tzinfo=timezone.utc),
-                initial_stop_price=pm.initial_stop_price,
-                stop_loss_order_id=pm.stop_loss_order_id,
-                tp_order_ids=json.loads(pm.tp_order_ids) if pm.tp_order_ids else [],
-                # ... other fields ...
+                symbol=pos_data_dict['symbol'],
+                side=Side(pos_data_dict['side']),
+                size=Decimal(str(pos_data_dict['size'])),
+                size_notional=Decimal(str(pos_data_dict['size_notional'])),
+                entry_price=Decimal(str(pos_data_dict['entry_price'])),
+                current_mark_price=Decimal(str(pos_data_dict['current_mark_price'])),
+                liquidation_price=Decimal(str(pos_data_dict['liquidation_price'])),
+                unrealized_pnl=Decimal(str(pos_data_dict['unrealized_pnl'])),
+                leverage=Decimal(str(pos_data_dict['leverage'])),
+                margin_used=Decimal(str(pos_data_dict['margin_used'])),
+                opened_at=pos_data_dict['opened_at'].replace(tzinfo=timezone.utc) if isinstance(pos_data_dict['opened_at'], datetime) else datetime.now(timezone.utc),
+                initial_stop_price=Decimal(str(pos_data_dict['initial_stop_price'])) if pos_data_dict['initial_stop_price'] else None,
+                stop_loss_order_id=pos_data_dict['stop_loss_order_id'],
+                tp_order_ids=pos_data_dict['tp_order_ids'],
             )
             
             # Try to recover from orders
@@ -233,12 +252,18 @@ async def backfill_initial_stop_prices(place_missing_sl: bool = False):
     # 4. Summary report
     logger.info(
         "Backfill complete",
-        total=len(positions_missing_sl),
+        total=len(positions_data),
         recovered=recovered_count,
         placed=placed_count,
         unprotected=unprotected_count,
         errors=len(errors)
     )
+    
+    # Close client resources
+    try:
+        await client.close()
+    except Exception as e:
+        logger.warning("Failed to close client", error=str(e))
     
     if errors:
         logger.error("Errors during backfill", error_count=len(errors))
