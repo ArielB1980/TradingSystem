@@ -68,4 +68,18 @@ def migrate():
     print("Migration complete!")
 
 if __name__ == "__main__":
-    migrate()
+    try:
+        migrate()
+    except RuntimeError as e:
+        print(f"❌ Migration failed: {e}")
+        # Print environment diagnostics
+        print("\nEnvironment diagnostics:")
+        print(f"  DATABASE_URL present: {bool(os.environ.get('DATABASE_URL'))}")
+        print(f"  ENVIRONMENT: {os.environ.get('ENVIRONMENT', 'NOT SET')}")
+        print(f"  Available env vars starting with 'DATABASE': {[k for k in os.environ.keys() if 'DATABASE' in k]}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected error during migration: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
