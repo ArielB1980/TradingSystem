@@ -433,28 +433,26 @@ class Config(BaseSettings):
             config_dict["environment"] = os.environ["ENVIRONMENT"]
             
         # Default local DB if not provided and not in prod
-        # DATABASE_URL is required (PostgreSQL only)
+        # DATABASE_URL is optional at config load time - will be validated lazily when needed
         if not config_dict.get("data", {}).get("database_url"):
             import os
+            from src.utils.secret_manager import is_cloud_platform
+            
             db_url = os.getenv("DATABASE_URL")
             if not db_url:
-                # Check if we're in DigitalOcean App Platform
-                # In DO, RUN_TIME secrets may not be immediately available
-                is_do_platform = os.getenv("DIGITALOCEAN_APP_ID") or os.path.exists("/workspace")
-                
-                if is_do_platform:
-                    # In DigitalOcean, allow missing DATABASE_URL - it will be injected later
-                    # Set a placeholder that will be replaced when the secret is available
+                # In cloud platforms, allow missing DATABASE_URL - it will be injected later
+                # Lazy validation will handle it when database is actually accessed
+                is_cloud = is_cloud_platform()
+                if is_cloud:
                     if "data" not in config_dict:
                         config_dict["data"] = {}
                     # Don't set database_url - let it be None and handle gracefully later
-                    # The database connection will fail with a clearer error if truly missing
+                    # The database connection will use lazy validation with retry logic
                 else:
-                    # Not in DO platform - fail fast with clear error
-                    raise ValueError(
-                        "DATABASE_URL is required. Set it in your environment or .env.local file. "
-                        "Example: postgresql://user@localhost/tradingsystem"
-                    )
+                    # Local development - allow None, will fail with clear error when accessed
+                    if "data" not in config_dict:
+                        config_dict["data"] = {}
+                    # Don't set database_url - lazy validation will provide better error
             else:
                 if "data" not in config_dict:
                     config_dict["data"] = {}
@@ -492,84 +490,80 @@ def validate_required_env_vars() -> None:
     """
     Validate that required environment variables are set.
     
+    This is a lightweight startup check that logs warnings but doesn't fail.
+    Actual secret validation happens lazily when secrets are needed, with
+    retry logic for cloud platform secret injection timing.
+    
     In production (DigitalOcean), RUN_TIME secrets may not be immediately
     available at startup. This validation logs warnings but doesn't fail
     if we're in a deployment environment where secrets are injected later.
-    
-    Raises:
-        ValueError: If required environment variables are missing and we're
-                    not in a deployment environment where they should be injected
     """
     import os
+    from src.utils.secret_manager import is_cloud_platform, check_secret_availability, get_environment
     
-    env = os.getenv("ENV", os.getenv("ENVIRONMENT", "prod"))
+    # Standardize on ENVIRONMENT (not ENV)
+    env = get_environment()
     dry_run = os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", "0"))
     
     # Convert dry_run to boolean
     is_dry_run = dry_run in ("1", "true", "True", "TRUE")
     
-    missing_vars = []
+    # Only check in production mode and not dry run
+    if is_dry_run or env != "prod":
+        return  # Skip validation in dev/dry-run mode
     
-    # Database is always required (but has defaults in local mode)
-    if not is_dry_run and env == "prod":
-        # Production mode - check for required vars
-        if not os.getenv("DATABASE_URL"):
-            missing_vars.append("DATABASE_URL")
-        
-        # API keys required for live trading
-        if not os.getenv("KRAKEN_FUTURES_API_KEY"):
-            missing_vars.append("KRAKEN_FUTURES_API_KEY")
-        if not os.getenv("KRAKEN_FUTURES_API_SECRET"):
-            missing_vars.append("KRAKEN_FUTURES_API_SECRET")
+    # Check required secrets (but don't fail - lazy validation will handle it)
+    required_vars = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
+    missing_vars = []
+    unavailable_details = []
+    
+    for var in required_vars:
+        is_available, error_msg = check_secret_availability(var)
+        if not is_available:
+            missing_vars.append(var)
+            unavailable_details.append(f"  ❌ {var}: {error_msg}")
     
     if missing_vars:
-        # Check if we're in DigitalOcean App Platform
-        # In DO, RUN_TIME secrets are injected but may have timing issues
-        # We'll log a warning but allow the app to continue - the actual
-        # operations will fail later with clearer errors if secrets are truly missing
-        is_do_platform = os.getenv("DIGITALOCEAN_APP_ID") or os.path.exists("/workspace")
+        is_cloud = is_cloud_platform()
+        from src.monitoring.logger import get_logger
+        logger = get_logger(__name__)
         
-        if is_do_platform:
-            # In DigitalOcean, secrets are injected at runtime
-            # Log warning but don't fail - let the actual operations fail with clearer errors
-            from src.monitoring.logger import get_logger
-            logger = get_logger(__name__)
+        if is_cloud:
+            # In cloud platform - log warning but don't fail
             logger.warning(
                 "Some required environment variables are not yet available at startup",
                 missing_vars=missing_vars,
-                note="In DigitalOcean App Platform, RUN_TIME secrets may be injected after startup. "
-                     "The application will continue, but operations requiring these secrets will fail with clearer errors."
+                note="In cloud platforms, RUN_TIME secrets may be injected after startup. "
+                     "The application will continue, and secrets will be validated with retry logic when actually needed. "
+                     "Operations requiring these secrets will fail with clearer errors if secrets are truly missing."
             )
-            # Don't raise - allow app to start and fail later with better context
-            return
-        
-        # Not in DO platform - fail fast with clear error
-        error_msg = f"""
+        else:
+            # Local development - provide helpful error message
+            error_msg = f"""
 ╔══════════════════════════════════════════════════════════════╗
-║  CONFIGURATION ERROR: Missing Required Environment Variables ║
+║  CONFIGURATION WARNING: Missing Required Environment Variables ║
 ╚══════════════════════════════════════════════════════════════╝
 
 The following required environment variables are not set:
-{chr(10).join(f"  ❌ {var}" for var in missing_vars)}
+{chr(10).join(unavailable_details)}
 
-Current environment:
-  ENV: {env}
-  DRY_RUN: {dry_run}
+For local development:
+  - Create .env.local file in project root
+  - Add the following variables:
+{chr(10).join(f"    {var}=your_value" for var in missing_vars)}
 
-To fix this:
-  1. For local development:
-     - Copy .env.local.example to .env.local
-     - Set DRY_RUN=1 for safe testing
-     - Run: make smoke
+Example .env.local:
+    DATABASE_URL=postgresql://user:password@localhost/tradingsystem
+    KRAKEN_FUTURES_API_KEY=your_api_key
+    KRAKEN_FUTURES_API_SECRET=your_api_secret
 
-  2. For production:
-     - Set all required environment variables in DigitalOcean App Platform
-     - Ensure DRY_RUN=0 or unset
-     - Ensure DATABASE_URL points to production database
+Note: Secrets will be validated with retry logic when actually needed.
+      This warning is informational - the app will start but operations
+      requiring these secrets will fail if they're not available.
 
-See LOCAL_DEV.md for detailed setup instructions.
+Environment: {env}
 """
-        raise ValueError(error_msg)
+            logger.warning(error_msg)
 
 
 def load_config(config_path: str | None = None) -> Config:
