@@ -82,7 +82,7 @@ class Contender:
 @dataclass
 class AllocationPlan:
     """Result of the auction allocation."""
-    opens: List[CandidateSignal]  # Signals to open
+    opens: List[Signal]  # Signals to open
     closes: List[str]  # Position symbols to close
     reductions: List[Tuple[str, Decimal]] = field(default_factory=list)  # Optional size reductions
     reasons: Dict[str, any] = field(default_factory=dict)  # Logging metadata
@@ -163,7 +163,7 @@ class AuctionAllocator:
         # Step B: Sort by value (descending)
         contenders.sort(key=lambda c: (
             -c.value,  # Higher value first
-            c.kind == ContenderKind.OPEN,  # OPEN beats NEW (stability)
+            0 if c.kind == ContenderKind.OPEN else 1,  # OPEN beats NEW (stability)
             -c.age_seconds,  # Older open wins (stability)
             c.required_margin,  # Lower margin (efficiency)
         ))
@@ -184,15 +184,45 @@ class AuctionAllocator:
             to_close_candidates,
             to_open_candidates,
             to_keep,
+            portfolio_state,
         )
         
-        # Apply per-cycle limits
-        final_opens = final_opens[:self.max_new_opens_per_cycle]
-        final_closes = final_closes[:self.max_closes_per_cycle]
+        # Apply per-cycle limits as paired swaps to preserve "best 50"
+        # Limit swaps (paired closes+opens) to maintain portfolio quality
+        max_swaps = min(self.max_new_opens_per_cycle, self.max_closes_per_cycle, self.max_trades_per_cycle)
+        
+        # Match closes to opens for swaps
+        swap_pairs = []
+        remaining_closes = []
+        remaining_opens = []
+        
+        # First, pair up closes with opens (swaps)
+        close_by_cluster = {op.position.symbol: op for op in final_closes}
+        for new_contender in final_opens[:max_swaps]:
+            # Find best matching close in same cluster
+            matching_close = None
+            for close_op in final_closes:
+                if close_op.cluster == new_contender.cluster and close_op.position.symbol not in [p[0] for p in swap_pairs]:
+                    if matching_close is None or close_op.position.symbol not in [p[0] for p in swap_pairs]:
+                        matching_close = close_op
+                        break
+            
+            if matching_close:
+                swap_pairs.append((matching_close.position.symbol, new_contender))
+            else:
+                remaining_opens.append(new_contender)
+        
+        # Remaining closes (not part of swaps) - limit independently
+        paired_close_symbols = {p[0] for p in swap_pairs}
+        remaining_closes = [op for op in final_closes if op.position.symbol not in paired_close_symbols]
+        remaining_closes = remaining_closes[:max(self.max_closes_per_cycle - len(swap_pairs), 0)]
+        
+        # Remaining opens (not part of swaps) - limit independently
+        remaining_opens = remaining_opens[:max(self.max_new_opens_per_cycle - len(swap_pairs), 0)]
         
         # Build result
-        opens = [c.candidate.signal for c in final_opens if c.candidate]
-        closes = [op.position.symbol for op in final_closes]
+        opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
+        closes = [symbol for symbol, _ in swap_pairs] + [op.position.symbol for op in remaining_closes]
         
         reasons = {
             "total_contenders": len(contenders),
@@ -231,6 +261,9 @@ class AuctionAllocator:
                 op_meta.age_seconds < self.min_hold_seconds or
                 not op_meta.is_protective_orders_live
             )
+            
+            # Update locked state in metadata (for use in hysteresis)
+            op_meta.locked = locked
             
             # Compute value for open position
             value = self._compute_open_value(op_meta, portfolio_state)
@@ -401,6 +434,7 @@ class AuctionAllocator:
         to_close: List[OpenPositionMetadata],
         to_open: List[Contender],
         to_keep: List[OpenPositionMetadata],
+        portfolio_state: Dict[str, any],
     ) -> Tuple[List[OpenPositionMetadata], List[Contender]]:
         """
         Apply hysteresis swap rule to prevent churn.
@@ -440,8 +474,8 @@ class AuctionAllocator:
             
             # Check swap threshold
             if matching_new:
-                # Recompute values for accurate comparison
-                close_value = self._compute_open_value(close_op, {})
+                # Recompute values for accurate comparison (use same portfolio_state)
+                close_value = self._compute_open_value(close_op, portfolio_state)
                 # For new, we already computed value, but ensure we're comparing apples to apples
                 new_value = matching_new.value
                 

@@ -86,6 +86,32 @@ class LiveTrading:
         self.kill_switch = KillSwitch(self.client)
         self.market_discovery = MarketDiscoveryService(self.client)
         
+        # Auction mode allocator (if enabled)
+        self.auction_allocator = None
+        self.auction_signals_this_tick = []  # Collect signals for auction mode
+        if config.risk.auction_mode_enabled:
+            from src.portfolio.auction_allocator import (
+                AuctionAllocator,
+                PortfolioLimits,
+            )
+            limits = PortfolioLimits(
+                max_positions=config.risk.auction_max_positions,
+                max_margin_util=config.risk.auction_max_margin_util,
+                max_per_cluster=config.risk.auction_max_per_cluster,
+                max_per_symbol=config.risk.auction_max_per_symbol,
+            )
+            self.auction_allocator = AuctionAllocator(
+                limits=limits,
+                swap_threshold=config.risk.auction_swap_threshold,
+                min_hold_minutes=config.risk.auction_min_hold_minutes,
+                max_trades_per_cycle=config.risk.auction_max_trades_per_cycle,
+                max_new_opens_per_cycle=config.risk.auction_max_new_opens_per_cycle,
+                max_closes_per_cycle=config.risk.auction_max_closes_per_cycle,
+                entry_cost=config.risk.auction_entry_cost,
+                exit_cost=config.risk.auction_exit_cost,
+            )
+            logger.info("Auction mode enabled", max_positions=limits.max_positions)
+        
         # ========== POSITION STATE MACHINE V2 ==========
         # Feature flag for gradual rollout
         import os
@@ -789,6 +815,10 @@ class LiveTrading:
                     # Signal is spot-based, execution is futures-based.
                     order_outcome = None
                     if signal.signal_type != SignalType.NO_SIGNAL:
+                        # Collect signal for auction mode (if enabled)
+                        if self.auction_allocator and is_tradable:
+                            self.auction_signals_this_tick.append((signal, spot_price, mark_price))
+                        
                         if not is_tradable:
                             logger.warning(
                                 "Signal skipped (no futures ticker)",
@@ -797,7 +827,9 @@ class LiveTrading:
                                 futures_symbol=futures_symbol,
                             )
                         else:
-                            order_outcome = await self._handle_signal(signal, spot_price, mark_price)
+                            # In auction mode, skip individual signal handling - auction will decide
+                            if not self.auction_allocator:
+                                order_outcome = await self._handle_signal(signal, spot_price, mark_price)
                     
                     # V4: Dynamic Exits (Abandon Ship & Time-Based)
                     # We check this AFTER signal generation because we need the fresh Bias
@@ -854,7 +886,15 @@ class LiveTrading:
                     logger.error(f"Error processing {spot_symbol}", error=str(e))
 
         # Execute parallel processing
+        # Clear signal collection for this tick
+        if self.auction_allocator:
+            self.auction_signals_this_tick = []
+        
         await asyncio.gather(*[process_coin(s) for s in self.markets], return_exceptions=True)
+        
+        # Run auction mode allocation (if enabled) - after all signals processed
+        if self.auction_allocator:
+            await self._run_auction_allocation(all_raw_positions)
         
         # Phase 2: Batch save all collected candles (grouped by symbol/timeframe)
         # Phase 2: Batch save all collected candles (delegated to Manager)
@@ -1396,6 +1436,134 @@ class LiveTrading:
                         
             except Exception as e:
                 logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))
+    
+    async def _run_auction_allocation(self, raw_positions: List[Dict]):
+        """
+        Run auction-based portfolio allocation if auction mode is enabled.
+        
+        Collects all open positions and candidate signals, runs the auction,
+        and executes the allocation plan.
+        """
+        try:
+            from src.portfolio.auction_allocator import (
+                position_to_open_metadata,
+                create_candidate_signal,
+            )
+            from src.execution.equity import calculate_effective_equity
+            from src.domain.models import Signal, SignalType
+            
+            # Get account state
+            balance = await self.client.get_futures_balance()
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, available_margin, _ = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
+            
+            # Convert raw positions to Position objects and metadata
+            open_positions_meta = []
+            for pos_data in raw_positions:
+                if pos_data.get('size', 0) == 0:
+                    continue
+                try:
+                    pos = self._convert_to_position(pos_data)
+                    # Check if protective orders are live
+                    futures_symbol = pos.symbol
+                    is_protective_live = (
+                        pos.stop_loss_order_id is not None or
+                        (hasattr(pos, 'tp_order_ids') and pos.tp_order_ids)
+                    )
+                    meta = position_to_open_metadata(
+                        position=pos,
+                        account_equity=equity,
+                        is_protective_orders_live=is_protective_live,
+                    )
+                    open_positions_meta.append(meta)
+                except Exception as e:
+                    logger.error("Failed to convert position for auction", symbol=pos_data.get('symbol'), error=str(e))
+            
+            # Collect candidate signals from this tick
+            candidate_signals = []
+            for signal, spot_price, mark_price in self.auction_signals_this_tick:
+                try:
+                    # Get risk decision to calculate required margin
+                    balance = await self.client.get_futures_balance()
+                    base = getattr(self.config.exchange, "base_currency", "USD")
+                    equity, available_margin, _ = await calculate_effective_equity(
+                        balance, base_currency=base, kraken_client=self.client
+                    )
+                    
+                    decision = self.risk_manager.validate_trade(
+                        signal, equity, spot_price, mark_price,
+                        available_margin=available_margin,
+                    )
+                    
+                    if decision.approved:
+                        # Calculate stop distance for risk_R
+                        stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price if signal.stop_loss else Decimal("0")
+                        risk_R = decision.position_notional * stop_distance if stop_distance > 0 else Decimal("0")
+                        
+                        candidate = create_candidate_signal(
+                            signal=signal,
+                            required_margin=decision.margin_required,
+                            risk_R=risk_R,
+                        )
+                        candidate_signals.append(candidate)
+                except Exception as e:
+                    logger.error("Failed to create candidate signal for auction", symbol=signal.symbol, error=str(e))
+            
+            portfolio_state = {
+                "available_margin": available_margin,
+                "account_equity": equity,
+            }
+            
+            # Run auction
+            plan = self.auction_allocator.allocate(
+                open_positions=open_positions_meta,
+                candidate_signals=candidate_signals,
+                portfolio_state=portfolio_state,
+            )
+            
+            # Execute closes first
+            for symbol in plan.closes:
+                try:
+                    await self.client.close_position(symbol)
+                    logger.info("Auction: Closed position", symbol=symbol)
+                    # Remove from managed positions
+                    if symbol in self.managed_positions:
+                        del self.managed_positions[symbol]
+                except Exception as e:
+                    logger.error("Auction: Failed to close position", symbol=symbol, error=str(e))
+            
+            # Execute opens from auction plan
+            for signal in plan.opens:
+                try:
+                    # Find corresponding price data
+                    spot_price = None
+                    mark_price = None
+                    for sig, sp, mp in self.auction_signals_this_tick:
+                        if sig.symbol == signal.symbol:
+                            spot_price = sp
+                            mark_price = mp
+                            break
+                    
+                    if spot_price and mark_price:
+                        # Handle signal through normal flow (but skip auction check to avoid recursion)
+                        await self._handle_signal(signal, spot_price, mark_price)
+                        logger.info("Auction: Opened position", symbol=signal.symbol)
+                    else:
+                        logger.warning("Auction: Missing price data for signal", symbol=signal.symbol)
+                except Exception as e:
+                    logger.error("Auction: Failed to open position", symbol=signal.symbol, error=str(e))
+            
+            logger.info(
+                "Auction allocation executed",
+                closes=len(plan.closes),
+                opens=len(plan.opens),
+                reasons=plan.reasons,
+            )
+            
+        except Exception as e:
+            logger.error("Failed to run auction allocation", error=str(e))
     
     async def _save_trade_history(self, position: Position, exit_price: Decimal, exit_reason: str):
         """
