@@ -220,6 +220,12 @@ class Position:
     setup_type: Optional[str] = None # e.g. "ob", "fvg"
     regime: Optional[str] = None # "tight_smc" or "wide_structure"
     
+    # Auction metadata (for portfolio allocation)
+    entry_score: Optional[float] = None  # Signal score at entry
+    cluster: Optional[str] = None  # e.g., "tight_smc_ob", "wide_structure_bos"
+    initial_stop_distance_pct: Optional[Decimal] = None  # Risk in % at entry
+    margin_used_at_entry: Optional[Decimal] = None  # Margin at entry (for tracking)
+    
     def liquidation_distance_pct(self) -> Decimal:
         """
         Calculate liquidation distance as percentage.

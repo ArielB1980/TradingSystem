@@ -54,6 +54,7 @@ class RiskManager:
         exchange_liquidation_price: Optional[Decimal] = None,
         futures_entry_price: Optional[Decimal] = None,
         futures_stop_loss: Optional[Decimal] = None,
+        available_margin: Optional[Decimal] = None,
     ) -> RiskDecision:
         """
         Validate proposed trade against all risk limits.
@@ -66,6 +67,8 @@ class RiskManager:
             exchange_liquidation_price: Exchange-reported liquidation price (if position exists)
             futures_entry_price: Converted futures entry price (for accurate risk calc)
             futures_stop_loss: Converted futures stop price (for accurate risk calc)
+            available_margin: Kraken available margin (equity minus margin in use). When set,
+                position size is capped so we never exceed it, preventing insufficientAvailableFunds.
         
         Returns:
             RiskDecision with approval status and details
@@ -102,6 +105,26 @@ class RiskManager:
             )
 
         stop_distance_pct = abs(entry_for_risk - stop_for_risk) / entry_for_risk
+
+        # Validate stop distance to prevent division by zero
+        if stop_distance_pct <= 0:
+            logger.error(
+                "Invalid stop distance for risk calculation",
+                symbol=signal.symbol,
+                entry_for_risk=str(entry_for_risk),
+                stop_for_risk=str(stop_for_risk),
+                stop_distance_pct=str(stop_distance_pct)
+            )
+            return RiskDecision(
+                approved=False,
+                rejection_reasons=["Invalid stop distance (stop equals entry)"],
+                position_notional=Decimal("0"),
+                leverage=Decimal("1"),
+                margin_required=Decimal("0"),
+                liquidation_buffer_pct=Decimal("0"),
+                basis_divergence_pct=Decimal("0"),
+                estimated_fees_funding=Decimal("0")
+            )
 
         # Validate account equity to prevent division by zero
         if account_equity <= 0:
@@ -208,12 +231,57 @@ class RiskManager:
         buying_power = account_equity * requested_leverage
         if position_notional > buying_power:
              position_notional = buying_power
+
+        # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
+        min_notional = Decimal("50")
+        if available_margin is not None:
+            if available_margin <= 0:
+                rejection_reasons.append(
+                    "Insufficient available margin (all margin in use); cannot open new position"
+                )
+                return RiskDecision(
+                    approved=False,
+                    rejection_reasons=rejection_reasons,
+                    position_notional=Decimal("0"),
+                    leverage=requested_leverage,
+                    margin_required=Decimal("0"),
+                    liquidation_buffer_pct=Decimal("0"),
+                    basis_divergence_pct=Decimal("0"),
+                    estimated_fees_funding=Decimal("0"),
+                )
+            # Use ~95% of available to leave buffer for fees/slippage
+            max_margin_use = available_margin * Decimal("0.95")
+            max_notional_from_avail = max_margin_use * requested_leverage
+            if position_notional > max_notional_from_avail:
+                logger.debug(
+                    "Capping position notional by available margin",
+                    symbol=signal.symbol,
+                    available_margin=str(available_margin),
+                    before=str(position_notional),
+                    after=str(max_notional_from_avail),
+                )
+                position_notional = max_notional_from_avail
+            if position_notional < min_notional:
+                rejection_reasons.append(
+                    f"Insufficient available margin: would allow only ${position_notional:.0f} notional (min ${min_notional})"
+                )
+                return RiskDecision(
+                    approved=False,
+                    rejection_reasons=rejection_reasons,
+                    position_notional=Decimal("0"),
+                    leverage=requested_leverage,
+                    margin_required=Decimal("0"),
+                    liquidation_buffer_pct=Decimal("0"),
+                    basis_divergence_pct=Decimal("0"),
+                    estimated_fees_funding=Decimal("0"),
+                )
         
         logger.debug(
             f"Validating trade: {len(self.current_positions)} active positions",
             symbol=signal.symbol,
             equity=str(account_equity),
-            buying_power=str(buying_power)
+            buying_power=str(buying_power),
+            available_margin=str(available_margin) if available_margin is not None else "n/a",
         )
 
         # Determine Effective Leverage for monitoring ONLY

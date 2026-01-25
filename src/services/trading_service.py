@@ -603,29 +603,47 @@ class TradingService:
                  if not sl_id:
                      logger.critical(f"FAILED TO PLACE STOP LOSS for {futures_symbol}!")
 
-                 # 4. Initialize Position State
-                 v3_pos = Position(
-                     symbol=futures_symbol,
-                     side=intent_model.side,
-                     size=Decimal("0"), # Pending Fill
-                     size_notional=intent_model.size_notional,
-                     entry_price=price,
-                     current_mark_price=price,
-                     liquidation_price=Decimal("0"),
-                     unrealized_pnl=Decimal("0"),
-                     leverage=intent_model.leverage,
-                     margin_used=Decimal("0"),
-                     opened_at=datetime.now(timezone.utc),
-                     
-                     # Immutable Parameters
-                     initial_stop_price=intent_model.stop_loss_futures,
-                     trade_type=signal.regime,
-                     tp1_price=tp1,
-                     tp2_price=tps[1]['price'] if len(tps) > 1 else None,
-                     partial_close_pct=Decimal("0.5"),
-                     
-                     # ID Linking
-                     stop_loss_order_id=sl_id,
+                # 4. Initialize Position State
+                # Calculate stop distance for auction metadata
+                stop_distance_pct = abs(price - intent_model.stop_loss_futures) / price if intent_model.stop_loss_futures else Decimal("0")
+                margin_at_entry = decision.margin_required
+                
+                # Derive cluster from signal
+                from src.portfolio.auction_allocator import derive_cluster
+                cluster = derive_cluster(signal)
+                
+                v3_pos = Position(
+                    symbol=futures_symbol,
+                    side=intent_model.side,
+                    size=Decimal("0"), # Pending Fill
+                    size_notional=intent_model.size_notional,
+                    entry_price=price,
+                    current_mark_price=price,
+                    liquidation_price=Decimal("0"),
+                    unrealized_pnl=Decimal("0"),
+                    leverage=intent_model.leverage,
+                    margin_used=Decimal("0"),
+                    opened_at=datetime.now(timezone.utc),
+                    
+                    # Immutable Parameters
+                    initial_stop_price=intent_model.stop_loss_futures,
+                    trade_type=signal.regime,
+                    tp1_price=tp1,
+                    tp2_price=tps[1]['price'] if len(tps) > 1 else None,
+                    partial_close_pct=Decimal("0.5"),
+                    
+                    # ID Linking
+                    stop_loss_order_id=sl_id,
+                    
+                    # Setup metadata
+                    setup_type=signal.setup_type.value if hasattr(signal.setup_type, 'value') else str(signal.setup_type),
+                    regime=signal.regime,
+                    
+                    # Auction metadata
+                    entry_score=signal.score,
+                    cluster=cluster,
+                    initial_stop_distance_pct=stop_distance_pct,
+                    margin_used_at_entry=margin_at_entry,
                      tp_order_ids=tp_ids
                  )
                  
