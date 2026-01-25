@@ -371,8 +371,13 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
                 data = {"error": "failed to parse details"}
         signal = data.get("signal", "NONE")
         quality = data.get("setup_quality", 0)
-        reasoning = data.get("reasoning", [])
-        reasoning_tip = reasoning[-1] if isinstance(reasoning, list) and reasoning else "No reasoning logged"
+        reason = data.get("reason")
+        if isinstance(reason, list) and reason:
+            reasoning_tip = reason[-1]
+        elif isinstance(reason, str) and reason.strip():
+            reasoning_tip = reason.strip().split("\n")[-1] if "\n" in reason else reason.strip()
+        else:
+            reasoning_tip = "No reasoning logged"
 
         results["recent_decisions"].append({
             "time": ts,
@@ -389,7 +394,7 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
                 "signal": signal,
                 "quality": quality,
                 "details": data,
-                "reasoning": reasoning,
+                "reasoning": data.get("reason"),
             }
 
     return results
@@ -502,11 +507,11 @@ def _debug_signals_html(data: dict) -> str:
             )
         else:
             html_parts.append(
-                "<div class='notice'><strong>Signals but no Kraken trade?</strong> Possible causes: Risk Manager "
-                "rejected, State Machine rejected (e.g. max positions), Entry failed (exchange error), or "
-                "no futures ticker (we skip). Check worker logs for <code>Signal skipped (no futures ticker)</code>, "
-                "<code>Trade rejected by Risk Manager</code>, <code>Entry REJECTED by State Machine</code>, "
-                "<code>Entry failed</code>.</div>"
+                "<div class='notice'><strong>If this signal didn't result in a Kraken trade</strong>, possible "
+                "causes: Risk Manager rejected, State Machine rejected (e.g. max positions), Entry failed "
+                "(exchange error), or no futures ticker (we skip). Check worker logs for "
+                "<code>Signal skipped (no futures ticker)</code>, <code>Trade rejected by Risk Manager</code>, "
+                "<code>Entry REJECTED by State Machine</code>, <code>Entry failed</code>.</div>"
             )
 
     html_parts.append("<h2>Recent decisions</h2>")

@@ -664,29 +664,9 @@ class SMCEngine:
             )
 
 
-        # --- EXPLAINABILITY INSTRUMENTATION ---
-        trace_data = {
-            "signal": signal.signal_type.value,
-            "regime": signal.regime,
-            "bias": signal.higher_tf_bias,
-            "adx": float(signal.adx) if signal.adx else 0.0,
-            "atr": float(signal.atr) if signal.atr else 0.0,
-            "ema200_slope": signal.ema200_slope,
-            "spot_price": float(exec_candles_1h[-1].close) if exec_candles_1h else 0.0,
-            "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
-            "score_breakdown": signal.score_breakdown or {},
-            "structure": structure_signal,
-            "filters": {
-                "adx": float(adx_value),
-                "atr": float(atr_value),
-            },
-            "reasoning": reasoning_parts,
-            "tp_candidates": [float(tp) for tp in tp_candidates]
-        }
-        
-        # Record generic decision trace
-        record_event("DECISION_TRACE", symbol, trace_data, decision_id=decision_id)
-        
+        # DECISION_TRACE is recorded only by live_trading (single source for dashboard).
+        # SMC used to record here too, causing duplicate rows per symbol.
+
         if signal.signal_type != SignalType.NO_SIGNAL:
             logger.info(
                 "Signal generated",
