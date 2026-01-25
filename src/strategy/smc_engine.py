@@ -151,7 +151,7 @@ class SMCEngine:
         bias = "neutral"
         structure_signal = None
         adx_value = 0.0
-        atr_value = 0.0
+        atr_value = Decimal("0")  # Initialize as Decimal to maintain type consistency
         atr_ratio = None
         tp_candidates = []
         used_tolerance = False  # Track if entry zone tolerance was used
@@ -175,11 +175,12 @@ class SMCEngine:
             # Calculate fresh
             adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
             if not adx_df.empty:
-                adx_value = float(adx_df['ADX_14'].iloc[-1])
+                adx_column = f'ADX_{self.config.adx_period}'
+                adx_value = float(adx_df[adx_column].iloc[-1])
             else:
                 adx_value = 0.0
             
-            # ATR
+            # ATR - keep as Decimal throughout
             atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
             if not atr_df.empty:
                 atr_value = Decimal(str(atr_df.iloc[-1]))
@@ -259,8 +260,8 @@ class SMCEngine:
                             ratio_val = float(current_atr / avg_atr)
                             atr_ratio = Decimal(str(ratio_val))
                             
-                            # Store for Signal metadata (Risk Manager needs this)
-                            atr_value = float(current_atr)
+                            # Keep ATR as Decimal - don't overwrite with float
+                            # atr_value is already set as Decimal in Step 0, preserve it
 
                             if ratio_val > self.config.atr_confirmation_threshold_high:
                                 required_candles = self.config.max_confirmation_candles
@@ -321,11 +322,12 @@ class SMCEngine:
                             entry_zone = {'bottom': fvg.get('bottom'), 'top': fvg.get('top')}
                     
                     # Get ATR value for adaptive tolerance calculation
-                    atr_value = None
-                    if exec_candles_1h and len(exec_candles_1h) >= 14:
-                        atr_series = self.indicators.calculate_atr(exec_candles_1h, 14)
-                        if len(atr_series) > 0:
-                            atr_value = Decimal(str(atr_series.iloc[-1]))
+                    # Use cached atr_value if available, otherwise calculate with config period
+                    if atr_value is None or atr_value == Decimal("0"):
+                        if exec_candles_1h and len(exec_candles_1h) >= self.config.atr_period:
+                            atr_series = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+                            if len(atr_series) > 0:
+                                atr_value = Decimal(str(atr_series.iloc[-1]))
                     
                     # Check if we should skip reconfirmation (for trending markets)
                     skip_reconfirmation = getattr(self.config, 'skip_reconfirmation_in_trends', True)
@@ -536,6 +538,7 @@ class SMCEngine:
                     ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
                     
                     # Create TEMP signal for scoring
+                    # Ensure ADX and ATR are Decimal types
                     temp_signal = Signal(
                         timestamp=timestamp,
                         symbol=symbol,
@@ -547,8 +550,8 @@ class SMCEngine:
                         setup_type=setup_type,
                         regime=regime,
                         higher_tf_bias=bias,
-                        adx=adx_value,
-                        atr=atr_value,
+                        adx=Decimal(str(adx_value)),
+                        atr=atr_value if isinstance(atr_value, Decimal) else Decimal(str(atr_value)),
                         atr_ratio=atr_ratio,
                         ema200_slope=ema200_slope,
                         tp_candidates=tp_candidates
@@ -608,6 +611,7 @@ class SMCEngine:
                         reasoning_parts.append(f"✓ Score Passed: {score_obj.total_score:.1f} >= {threshold}")
                         
                         # Create FINAL signal
+                        # Ensure ADX and ATR are Decimal types
                         signal = Signal(
                             timestamp=timestamp,
                             symbol=symbol,
@@ -619,8 +623,8 @@ class SMCEngine:
                             setup_type=setup_type,
                             regime=regime,
                             higher_tf_bias=bias,
-                            adx=adx_value,
-                            atr=atr_value,
+                            adx=Decimal(str(adx_value)),
+                            atr=atr_value if isinstance(atr_value, Decimal) else Decimal(str(atr_value)),
                             atr_ratio=atr_ratio,
                             ema200_slope=ema200_slope,
                             tp_candidates=tp_candidates,
@@ -636,8 +640,8 @@ class SMCEngine:
                             meta_info={
                                 "fib_levels": {k: float(v) for k, v in vars(fib_levels).items() if isinstance(v, Decimal)} if fib_levels else {},
                                 "filters": {
-                                    "adx": adx_value,
-                                    "atr": float(atr_value)
+                                    "adx": float(adx_value),
+                                    "atr": float(atr_value) if isinstance(atr_value, Decimal) else atr_value
                                 }
                             }
                         )
@@ -664,8 +668,11 @@ class SMCEngine:
             )
 
 
-        # DECISION_TRACE is recorded only by live_trading (single source for dashboard).
-        # SMC used to record here too, causing duplicate rows per symbol.
+        # EVENT RECORDING DESIGN:
+        # - DECISION_TRACE: Recorded by LiveTrading for all signals (including NO_SIGNAL) for dashboard coverage
+        # - SIGNAL_GENERATED: Recorded here only for actual trading signals (not NO_SIGNAL) for explicit signal tracking
+        # These serve different purposes: DECISION_TRACE is for dashboard/audit trail, SIGNAL_GENERATED is for signal lifecycle tracking
+        # If you want a single source of truth, remove SIGNAL_GENERATED here and let LiveTrading handle all event recording
 
         if signal.signal_type != SignalType.NO_SIGNAL:
             logger.info(
@@ -675,7 +682,7 @@ class SMCEngine:
                 entry=str(signal.entry_price),
                 stop=str(signal.stop_loss),
             )
-            # Record explicit signal event
+            # Record explicit signal event (design choice: signal source records its own generation)
             record_event(
                 "SIGNAL_GENERATED", 
                 symbol, 
@@ -1004,7 +1011,8 @@ class SMCEngine:
             reasoning.append("❌ ADX not available")
             return False
         
-        adx_value = adx_df['ADX_14'].iloc[-1]
+        adx_column = f'ADX_{self.config.adx_period}'
+        adx_value = adx_df[adx_column].iloc[-1]
         
         # ATR check (ensure volatility is measurable)
         atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
@@ -1171,20 +1179,8 @@ class SMCEngine:
         
         return signal_type, entry_price, stop_loss, take_profit, tp_candidates, class_info
     
-    def _check_rsi_divergence(self, candles: List[Candle], reasoning: List[str]):
-        """Optional RSI divergence confirmation."""
-        rsi_values = self.indicators.calculate_rsi(candles, self.config.rsi_period)
-        
-        if rsi_values.empty:
-            reasoning.append("○ RSI divergence: not available")
-            return
-        
-        divergence = self.indicators.detect_rsi_divergence(candles, rsi_values)
-        
-        if divergence != "none":
-            reasoning.append(f"✓ RSI divergence detected: {divergence}")
-        else:
-            reasoning.append("○ RSI divergence: none")
+    # Removed unused _check_rsi_divergence method - RSI divergence is checked inline
+    # in generate_signal() where it's actually used (around line 297)
     
     def _no_signal(
         self,

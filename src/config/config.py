@@ -80,6 +80,20 @@ class RiskConfig(BaseSettings):
     max_concurrent_positions: int = Field(default=2, ge=1, le=100)
     daily_loss_limit_pct: float = Field(default=0.02, ge=0.01, le=0.10)
     
+    # Auction mode portfolio limits
+    auction_mode_enabled: bool = Field(default=False, description="Enable auction-based portfolio allocation")
+    auction_max_positions: int = Field(default=50, ge=1, le=100)
+    auction_max_margin_util: float = Field(default=0.90, ge=0.50, le=0.95)
+    auction_max_per_cluster: int = Field(default=12, ge=1, le=50)
+    auction_max_per_symbol: int = Field(default=1, ge=1, le=5)
+    auction_swap_threshold: float = Field(default=10.0, ge=0.0, le=50.0)
+    auction_min_hold_minutes: int = Field(default=15, ge=0, le=60)
+    auction_max_trades_per_cycle: int = Field(default=5, ge=1, le=20)
+    auction_max_new_opens_per_cycle: int = Field(default=5, ge=1, le=20)
+    auction_max_closes_per_cycle: int = Field(default=5, ge=1, le=20)
+    auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
+    auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
+    
     # Loss streak protection (time-based, not permanent block)
     loss_streak_cooldown: int = Field(default=3, ge=2, le=10)  # Trigger threshold
     loss_streak_pause_minutes: int = Field(default=240, ge=60, le=720)  # Pause duration (4h default)

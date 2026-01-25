@@ -1007,21 +1007,20 @@ class LiveTrading:
             return await self._handle_signal_v2(signal, spot_price, mark_price)
         
         # ========== LEGACY PATH (below) ==========
-        # 1. Fetch Account Equity
-        # For futures, we need futures balance
+        # 1. Fetch Account Equity and Available Margin
         balance = await self.client.get_futures_balance()
-        
         base = getattr(self.config.exchange, "base_currency", "USD")
-        equity, _, _ = await calculate_effective_equity(
+        equity, available_margin, _ = await calculate_effective_equity(
             balance, base_currency=base, kraken_client=self.client
         )
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return
-            
+
         # 2. Risk Validation (Safety Gate)
         decision = self.risk_manager.validate_trade(
-            signal, equity, spot_price, mark_price
+            signal, equity, spot_price, mark_price,
+            available_margin=available_margin,
         )
         
         if not decision.approved:
@@ -1176,17 +1175,20 @@ class LiveTrading:
                    symbol=signal.symbol, 
                    type=signal.signal_type.value)
         
-        # 1. Fetch Account Equity
+        # 1. Fetch Account Equity and Available Margin
         balance = await self.client.get_futures_balance()
         base = getattr(self.config.exchange, "base_currency", "USD")
-        equity, _, _ = await calculate_effective_equity(
+        equity, available_margin, _ = await calculate_effective_equity(
             balance, base_currency=base, kraken_client=self.client
         )
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return _fail("Insufficient equity for trading")
         # 2. Risk Validation (Safety Gate)
-        decision = self.risk_manager.validate_trade(signal, equity, spot_price, mark_price)
+        decision = self.risk_manager.validate_trade(
+            signal, equity, spot_price, mark_price,
+            available_margin=available_margin,
+        )
         
         if not decision.approved:
             reasons = getattr(decision, "rejection_reasons", []) or []

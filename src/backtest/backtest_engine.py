@@ -387,6 +387,11 @@ class BacktestEngine:
         sl_price = plan['stop_loss']['price']
         sl_id = f"SL-{sl_price}"
 
+        # Calculate auction metadata
+        stop_distance_pct = abs(fill_price - sl_price) / fill_price if sl_price else Decimal("0")
+        from src.portfolio.auction_allocator import derive_cluster
+        cluster = derive_cluster(signal)
+        
         self.position = Position(
             symbol=signal.symbol,
             side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
@@ -406,7 +411,12 @@ class BacktestEngine:
             peak_price=fill_price,
             opened_at=current_candle.timestamp,
             setup_type=signal.setup_type.value if hasattr(signal.setup_type, 'value') else signal.setup_type,
-            regime=signal.regime
+            regime=signal.regime,
+            # Auction metadata
+            entry_score=signal.score,
+            cluster=cluster,
+            initial_stop_distance_pct=stop_distance_pct,
+            margin_used_at_entry=decision.margin_required
         )
         
         # logger.info("Position opened", side=self.position.side.value, size=str(decision.position_notional))
