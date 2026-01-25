@@ -396,6 +396,7 @@ class Executor:
         new_sl_price: Optional[Decimal],
         current_tp_ids: List[str],
         new_tp_prices: List[Decimal],
+        position_size_notional: Optional[Decimal] = None,
     ) -> Tuple[Optional[str], List[str]]:
         """
         Update SL/TP orders (Cancel + Replace).
@@ -420,12 +421,12 @@ class Executor:
                 if current_sl_id:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
                 
-                # Reduce-only SL: size_notional=0 may mean "close full position" on some APIs.
-                # Ideal: fetch actual position size from exchange/managed state and pass it.
+                # Reduce-only SL: use actual position size if provided, else 0 (exchange handles sizing)
+                sl_size = position_size_notional if position_size_notional else Decimal("0")
                 sl_order = await self.futures_adapter.place_order(
                     symbol=symbol,
                     side=protective_side,
-                    size_notional=Decimal("0"),
+                    size_notional=sl_size,
                     leverage=Decimal("1"),
                     order_type=OrderType.STOP_LOSS,
                     price=new_sl_price,
@@ -450,19 +451,17 @@ class Executor:
                 
                 # Place new TP ladder
                 new_tp_ids = []
-                # Get position size for proper TP sizing
-                # For simplicity, divide position equally across TPs
-                # In production, you'd want configurable percentages
-                tp_count = len(new_tp_prices)
+                # Use actual position size if provided (for proper TP sizing)
+                # For reduce-only orders, exchange will handle sizing if 0, but passing actual size is safer
+                tp_size = position_size_notional if position_size_notional else Decimal("0")
                 
                 for i, tp_price in enumerate(new_tp_prices):
                     try:
-                        # Calculate size for this TP level
-                        # Simple equal distribution for now
+                        # Place TP order with position size (reduce-only will close appropriate amount)
                         tp_order = await self.futures_adapter.place_order(
                             symbol=symbol,
                             side=protective_side,
-                            size_notional=Decimal("0"),  # Reduce-only handles sizing
+                            size_notional=tp_size,  # Use actual position size for safety
                             leverage=Decimal("1"),
                             order_type=OrderType.TAKE_PROFIT,
                             price=tp_price,
