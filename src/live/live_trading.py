@@ -1482,22 +1482,28 @@ class LiveTrading:
                     logger.error("Failed to convert position for auction", symbol=pos_data.get('symbol'), error=str(e))
             
             # Collect candidate signals from this tick
+            # CRITICAL: Use auction budget margin instead of current available_margin
+            # The auction needs to see ALL candidates, even if current margin is low,
+            # because it can close positions to free margin for better candidates.
+            # Calculate auction budget once (equity * max_margin_util)
+            auction_budget_margin = equity * Decimal(str(self.config.risk.auction_max_margin_util))
+            
             candidate_signals = []
             for signal, spot_price, mark_price in self.auction_signals_this_tick:
                 try:
-                    # Get risk decision to calculate required margin
-                    balance = await self.client.get_futures_balance()
-                    base = getattr(self.config.exchange, "base_currency", "USD")
-                    equity, available_margin, _ = await calculate_effective_equity(
-                        balance, base_currency=base, kraken_client=self.client
-                    )
-                    
+                    # Always use auction budget margin for candidate sizing
+                    # This allows the auction to see all candidates and decide which positions
+                    # to close to free margin for better opportunities
                     decision = self.risk_manager.validate_trade(
                         signal, equity, spot_price, mark_price,
-                        available_margin=available_margin,
+                        available_margin=auction_budget_margin,  # Use auction budget, not current available
                     )
                     
-                    if decision.approved:
+                    # Include candidate if sizing succeeded (position_notional > 0)
+                    # Even if rejected for other reasons (basis, liquidation, etc.), we still
+                    # want to see the candidate in the auction - the auction will respect hard constraints
+                    # via the _passes_hard_filters check in the allocator
+                    if decision.position_notional > 0 and decision.margin_required > 0:
                         # Calculate stop distance for risk_R
                         stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price if signal.stop_loss else Decimal("0")
                         risk_R = decision.position_notional * stop_distance if stop_distance > 0 else Decimal("0")
@@ -1508,11 +1514,21 @@ class LiveTrading:
                             risk_R=risk_R,
                         )
                         candidate_signals.append(candidate)
+                        
+                        if not decision.approved:
+                            logger.debug(
+                                "Candidate included in auction despite rejection (auction can optimize)",
+                                symbol=signal.symbol,
+                                score=signal.score,
+                                rejection_reasons=decision.rejection_reasons,
+                            )
                 except Exception as e:
                     logger.error("Failed to create candidate signal for auction", symbol=signal.symbol, error=str(e))
             
+            # Use auction budget margin for portfolio state
+            # This represents the total margin the auction is allowed to deploy
             portfolio_state = {
-                "available_margin": available_margin,
+                "available_margin": auction_budget_margin,  # Use auction budget, not current available
                 "account_equity": equity,
             }
             
