@@ -3,6 +3,8 @@
 **Date:** 2026-01-23  
 **Scope:** Kraken Futures SMC Trading System – purpose, correctness, issues, and efficiency.
 
+**Status (2026-01-25):** Many items have been addressed. Production runtime: `run.py live` → `LiveTrading`. App spec: `.do/app.yaml`. See [PRODUCTION_RUNTIME](docs/PRODUCTION_RUNTIME.md), [CLEANUP_PROPOSAL](docs/CLEANUP_PROPOSAL.md).
+
 ---
 
 ## 1. System Purpose & Architecture

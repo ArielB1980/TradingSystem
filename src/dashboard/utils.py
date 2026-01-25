@@ -47,7 +47,7 @@ def _get_monitored_symbols(config) -> List[str]:
 
     # 2. Fallback to Local discovery file (if exists, e.g. local dev)
     try:
-        from src.utils.market_discovery import load_discovered_markets
+        from src.utils.discovered_markets_loader import load_discovered_markets
         discovered_markets = load_discovered_markets()
         if discovered_markets:
             return discovered_markets

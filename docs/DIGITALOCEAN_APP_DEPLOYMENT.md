@@ -1,5 +1,9 @@
 # DigitalOcean App Platform Deployment Guide
 
+## App spec
+
+**Source of truth:** `.do/app.yaml`. Root `app.yaml` was removed; use `.do/app.yaml` for deployment config.
+
 ## Current Setup
 
 Your trading system is deployed on **DigitalOcean App Platform** with 3 services:
@@ -95,7 +99,7 @@ Once deployed, verify the fix is working:
 
 ### Deployment failed
 - Check build logs in DigitalOcean console
-- Verify `app.yaml` is correct
+- Verify `.do/app.yaml` is correct
 - Check for Python syntax errors in recent commits
 
 ### Worker not restarting

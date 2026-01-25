@@ -12,6 +12,8 @@ from src.strategy.smc_engine import SMCEngine
 from src.risk.risk_manager import RiskManager
 from src.execution.executor import Executor
 from src.data.kraken_client import KrakenClient
+from src.data.symbol_utils import position_symbol_matches_order
+from src.execution.equity import calculate_effective_equity
 from src.execution.price_converter import PriceConverter
 from src.execution.futures_adapter import FuturesAdapter
 from src.storage.repository import async_record_event, sync_active_positions, save_account_state
@@ -163,22 +165,6 @@ class TradingService:
             
         logger.info("Trading Service Shutting Down...")
 
-    @staticmethod
-    def _position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bool:
-        """
-        Position uses Kraken native (PF_ADAUSD); orders use CCXT unified (ADA/USD:USD).
-        Return True if they refer to the same market.
-        """
-        if not position_symbol or not order_symbol:
-            return False
-        if position_symbol == order_symbol:
-            return True
-        if position_symbol.startswith("PF_") and position_symbol.endswith("USD"):
-            base = position_symbol[3:-3]  # drop PF_ and USD
-            unified = f"{base}/USD:USD"
-            return order_symbol == unified
-        return False
-
     async def _fetch_stop_loss_for_position(self, symbol: str, side: Side) -> Optional[Decimal]:
         """
         Fetch existing stop loss order price for a position from exchange.
@@ -189,7 +175,7 @@ class TradingService:
         try:
             open_orders = await self.kraken.get_futures_open_orders()
             for order in open_orders:
-                if not self._position_symbol_matches_order(symbol, order.get("symbol") or ""):
+                if not position_symbol_matches_order(symbol, order.get("symbol") or ""):
                     continue
                 # Check if it's a stop loss order (reduce-only, opposite side)
                 order_side = order.get('side', '').lower()
@@ -493,8 +479,10 @@ class TradingService:
                      # or rely on an account_state cache. For safety, let's fetch fresh.
                      try:
                          balance = await self.kraken.get_futures_balance()
-                         # Use robust equity calculation (handles Flex accounts)
-                         equity, _, _ = await self._calculate_effective_equity(balance)
+                         base = getattr(self.config.exchange, "base_currency", "USD")
+                         equity, _, _ = await calculate_effective_equity(
+                             balance, base_currency=base, kraken_client=self.kraken
+                         )
                      except Exception as e:
                          logger.error(f"Failed to fetch balance for risk check: {e}")
                          return
@@ -697,18 +685,14 @@ class TradingService:
             except Exception as e:
                 logger.error(f"Failed to execute {action.type}", symbol=symbol, error=str(e))
 
-    async def _calculate_effective_equity(self, balance: Dict) -> tuple[Decimal, Decimal, Decimal]:
-        from src.execution.equity import calculate_effective_equity
-        base = getattr(self.config.exchange, "base_currency", "USD")
-        return await calculate_effective_equity(balance, base_currency=base, kraken_client=self.kraken)
-
     async def _sync_account_state(self):
         """Update account balance and equity in DB."""
         try:
             balance_data = await self.kraken.get_futures_balance()
-            
-            # Use shared equity calculation logic (handles flex accounts)
-            equity, available, used = await self._calculate_effective_equity(balance_data)
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, available, used = await calculate_effective_equity(
+                balance_data, base_currency=base, kraken_client=self.kraken
+            )
             
             # Unrealized PnL (if available)
             unrealized = Decimal(str(balance_data.get('unrealized_pnl', 0)))

@@ -13,34 +13,13 @@ import argparse
 import asyncio
 import os
 import sys
-from collections import defaultdict
 from decimal import Decimal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from src.config.config import load_config as get_config
 from src.data.kraken_client import KrakenClient
-
-
-def _pf_to_unified(s: str) -> str:
-    """PF_ADAUSD -> ADA/USD:USD."""
-    if not s or not s.startswith("PF_") or not s.endswith("USD"):
-        return s
-    base = s[3:-3]
-    return f"{base}/USD:USD"
-
-
-def _position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bool:
-    """Position uses Kraken native (PF_*); orders use CCXT unified. Same market?"""
-    if not position_symbol or not order_symbol:
-        return False
-    if position_symbol == order_symbol:
-        return True
-    if position_symbol.startswith("PF_") and position_symbol.endswith("USD"):
-        base = position_symbol[3:-3]
-        unified = f"{base}/USD:USD"
-        return order_symbol == unified
-    return False
+from src.data.symbol_utils import pf_to_unified, position_symbol_matches_order
 
 
 def _order_is_stop(o: dict, side: str) -> bool:
@@ -94,7 +73,7 @@ async def place_missing_stops(
             side = (p.get("side") or "long").lower()
             has_stop = False
             for o in orders:
-                if not _position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
+                if not position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
                     continue
                 if _order_is_stop(o, side):
                     has_stop = True
@@ -110,7 +89,7 @@ async def place_missing_stops(
         pct = Decimal(str(stop_pct))
         for p in naked:
             pos_sym = p.get("symbol") or "?"
-            unified = _pf_to_unified(pos_sym)
+            unified = pf_to_unified(pos_sym)
             size = Decimal(str(p.get("size", 0)))
             entry = Decimal(str(p.get("entry_price", 0)))
             side = (p.get("side") or "long").lower()
@@ -129,7 +108,7 @@ async def place_missing_stops(
         placed = 0
         for p in naked:
             pos_sym = p.get("symbol") or "?"
-            unified = _pf_to_unified(pos_sym)
+            unified = pf_to_unified(pos_sym)
             if not unified or unified == pos_sym:
                 print(f"  Skip {pos_sym}: could not resolve unified symbol")
                 continue

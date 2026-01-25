@@ -2,7 +2,7 @@
 
 Prioritized list from the audit, live DO logs, and codebase scan.
 
-**Updates (2026-01-24):** Applied fixes below. Local smoke + backtest passed. See "6. Fixes applied" at end.
+**Updates (2026-01-25):** Superseded in part by applied fixes and [CLEANUP_PROPOSAL](docs/CLEANUP_PROPOSAL.md). See [SYSTEM_AUDIT](SYSTEM_AUDIT.md), [PRODUCTION_RUNTIME](docs/PRODUCTION_RUNTIME.md). App spec: `.do/app.yaml`.
 
 ---
 

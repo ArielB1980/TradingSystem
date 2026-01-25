@@ -2,9 +2,14 @@
 Run 6-month backtest on Tier A coins (20 major assets).
 """
 import asyncio
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from collections import defaultdict
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
 from src.config.config import load_config
 from src.backtest.backtest_engine import BacktestEngine
 from src.monitoring.logger import setup_logging, get_logger
