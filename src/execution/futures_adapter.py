@@ -62,6 +62,7 @@ class FuturesAdapter:
         kraken_client: KrakenClient,
         max_leverage: float = 10.0,
         spot_to_futures_override: Optional[Dict[str, str]] = None,
+        position_size_is_notional: bool = False,
     ):
         """
         Initialize futures adapter.
@@ -70,10 +71,12 @@ class FuturesAdapter:
             kraken_client: Kraken client for API calls
             max_leverage: Maximum leverage cap (hard limit)
             spot_to_futures_override: Optional mapping from market discovery (spot -> futures). Used first.
+            position_size_is_notional: If True, exchange returns size as notional USD. If False, returns contracts.
         """
         self.kraken_client = kraken_client
         self.max_leverage = max_leverage
         self.spot_to_futures_override = spot_to_futures_override or {}
+        self.position_size_is_notional = position_size_is_notional
         logger.info(
             "Futures Adapter initialized",
             max_leverage=max_leverage,
@@ -247,4 +250,51 @@ class FuturesAdapter:
         except Exception as e:
             logger.error("Failed to cancel order via adapter", order_id=order_id, symbol=symbol, error=str(e))
             raise
+    
+    async def position_size_notional(
+        self, symbol: str, pos_data: Dict, current_price: Decimal
+    ) -> Optional[Decimal]:
+        """
+        Convert position size from exchange format to USD notional.
+        
+        CRITICAL: Centralizes the conversion logic to handle different exchange formats.
+        Uses config flag to determine if exchange returns size as notional or contracts.
+        
+        Args:
+            symbol: Futures symbol
+            pos_data: Position data dict from exchange API (must have 'size' key)
+            current_price: Current mark price for conversion (only used if size is in contracts)
+        
+        Returns:
+            Position size in USD notional, or None if size is 0/missing
+        """
+        size_raw = pos_data.get('size', 0)
+        if not size_raw or Decimal(str(size_raw)) == 0:
+            return None
+        
+        size_value = Decimal(str(size_raw))
+        
+        if self.position_size_is_notional:
+            # Exchange already returns size as notional USD - use directly
+            size_notional = size_value
+            logger.debug(
+                "Position size already in notional (from exchange)",
+                symbol=symbol,
+                size_notional=float(size_notional)
+            )
+        else:
+            # Exchange returns size in contracts/base units - convert to notional
+            # Formula: notional = size_contracts * current_price
+            # NOTE: For perpetuals, this is typically correct. For inverse contracts,
+            # the formula may differ, but Kraken perpetuals use linear contracts.
+            size_notional = size_value * current_price
+            logger.debug(
+                "Converted position size to notional",
+                symbol=symbol,
+                size_contracts=float(size_value),
+                current_price=float(current_price),
+                size_notional=float(size_notional)
+            )
+        
+        return size_notional
 

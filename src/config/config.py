@@ -46,6 +46,12 @@ class ExchangeConfig(BaseSettings):
     futures_api_key: Optional[str] = None
     futures_api_secret: Optional[str] = None
     use_testnet: bool = False
+    
+    # Position size format (for exchange compatibility)
+    # If True: exchange returns position size as notional USD (don't multiply by price)
+    # If False: exchange returns size in contracts/base units (multiply by price to get notional)
+    # Default False for Kraken Futures (returns contracts)
+    position_size_is_notional: bool = Field(default=False, description="True if exchange returns size as notional, False if contracts")
 
 
 class RiskConfig(BaseSettings):
