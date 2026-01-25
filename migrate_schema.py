@@ -1,4 +1,8 @@
 from src.storage.db import get_db, Base
+# CRITICAL: Import all ORM models so they're registered with Base.metadata before create_all()
+from src.storage.repository import (
+    CandleModel, TradeModel, PositionModel, SystemEventModel, AccountStateModel
+)
 from sqlalchemy import text
 import os
 import sys
@@ -36,8 +40,17 @@ def migrate():
     else:
         print(f"Target Database: {db_url[:80]}...")
 
+    # Ensure all models are registered before creating tables
+    # Models are imported above, which registers them with Base.metadata
     db = get_db()
     engine = db.engine
+    
+    # Verify models are registered
+    if not Base.metadata.tables:
+        print("⚠️  WARNING: No tables registered in Base.metadata")
+        print("   This may indicate models weren't imported correctly")
+    else:
+        print(f"✅ Found {len(Base.metadata.tables)} registered tables: {list(Base.metadata.tables.keys())}")
 
     # Verify PostgreSQL
     dialect = engine.dialect.name

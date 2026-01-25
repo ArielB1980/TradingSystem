@@ -88,11 +88,16 @@ def get_db() -> Database:
     """
     global _db_instance
     if _db_instance is None:
+        # CRITICAL: Import all ORM models BEFORE creating database instance
+        # This ensures Base.metadata contains all table definitions
+        # Import is idempotent (safe to import multiple times)
+        import src.storage.repository  # This imports all models (CandleModel, TradeModel, etc.)
+        
         # Use lazy validation with retry logic for cloud platforms
         from src.utils.secret_manager import get_database_url
         database_url = get_database_url()
         _db_instance = Database(database_url)
-        _db_instance.create_all()
+        _db_instance.create_all()  # Create all tables on first connection
     return _db_instance
 
 
