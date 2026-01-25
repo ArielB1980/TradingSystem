@@ -150,9 +150,34 @@ def live(
     Example:
         python src/cli.py live
     """
-    # Load configuration
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format, log_file=str(log_file) if log_file else None)
+    # Load configuration with error handling
+    try:
+        config = load_config(str(config_path))
+    except Exception as e:
+        import sys
+        import traceback
+        print("=" * 80, file=sys.stderr)
+        print("CRITICAL ERROR - Failed to load configuration", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
+        print(f"Type: {type(e).__name__}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        raise typer.Exit(1)
+    
+    # Setup logging (may fail if config is invalid)
+    try:
+        setup_logging(config.monitoring.log_level, config.monitoring.log_format, log_file=str(log_file) if log_file else None)
+    except Exception as e:
+        import sys
+        import traceback
+        print("=" * 80, file=sys.stderr)
+        print("CRITICAL ERROR - Failed to setup logging", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        raise typer.Exit(1)
     
     # Validate environment
     if config.environment != "prod" and not force and not config.system.dry_run:
