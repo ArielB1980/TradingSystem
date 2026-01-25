@@ -863,12 +863,13 @@ async def cleanup_duplicate_orders(
         kept_sl_by_pos = defaultdict(set)
         all_kept_order_ids = set()
         for candidate in unique_candidates:
-            if candidate.get("kept_order_id") and candidate["class"] == "SL":
-                symbol_norm = candidate["symbol_norm"]
-                kept_id = candidate["kept_order_id"]
+            kept_id = candidate.get("kept_order_id")
+            if kept_id:
                 all_kept_order_ids.add(kept_id)
-                if symbol_norm in sl_orders_by_pos:
-                    kept_sl_by_pos[symbol_norm].add(kept_id)
+                if candidate["class"] == "SL":
+                    symbol_norm = candidate["symbol_norm"]
+                    if symbol_norm in sl_orders_by_pos:
+                        kept_sl_by_pos[symbol_norm].add(kept_id)
         
         # Select candidates, ensuring at least one SL remains per position
         candidates_to_process = []
@@ -898,26 +899,35 @@ async def cleanup_duplicate_orders(
                 would_be_cancelled = already_cancelled_ids.copy()
                 would_be_cancelled.add(order_id)
                 
-                # Start with all SL orders, remove cancelled ones, add kept ones
-                remaining_ids = total_sl_ids - would_be_cancelled
+                # Calculate remaining SL orders after this cancellation
+                # Start with all SL orders
+                remaining_ids = total_sl_ids.copy()
                 
-                # Add kept orders that aren't being cancelled
+                # Remove all that would be cancelled (including this one)
+                remaining_ids -= would_be_cancelled
+                
+                # Add back kept orders (they're preserved even if in cancellation list)
+                # But only if they're actually in the total_sl_ids set
                 for kept_id in kept:
-                    if kept_id not in would_be_cancelled and kept_id in total_sl_ids:
+                    if kept_id in total_sl_ids:
+                        # Kept order will remain, add it back if it was removed
                         remaining_ids.add(kept_id)
                 
                 # Also check if this candidate has a kept_order_id that would remain
                 if candidate.get("kept_order_id"):
                     kept_id = candidate["kept_order_id"]
-                    if kept_id not in would_be_cancelled and kept_id in total_sl_ids:
+                    if kept_id in total_sl_ids:
+                        # This kept order will remain
                         remaining_ids.add(kept_id)
                 
                 if len(remaining_ids) <= 0:
                     # Would leave position with 0 SL, skip this candidate
+                    # This ensures we never cancel all SL orders for a position
                     continue
                 
                 sl_cancelled_in_selection[symbol_norm].add(order_id)
             
+            # Add candidate (passed all safety checks)
             candidates_to_process.append(candidate)
         
         # Post-plan safety check
@@ -927,6 +937,93 @@ async def cleanup_duplicate_orders(
             candidates_to_process,
             orders_raw
         )
+        
+        # If safety check fails, reduce candidates until it passes
+        # Remove candidates that would leave positions without SL
+        if not safe:
+            print("  ⚠️  Safety check failed - removing unsafe candidates...")
+            unsafe_positions = {w.split()[1] for w in warnings}  # Extract position symbols from warnings
+            
+            # Build map of positions to their SL orders
+            pos_sl_orders = defaultdict(set)
+            for order in orders_raw:
+                if classify_order(order) == "SL":
+                    symbol = order.get("symbol")
+                    if symbol:
+                        symbol_norm = normalize_symbol_for_comparison(symbol)
+                        for pos in positions:
+                            pos_sym = pos.get("symbol")
+                            if pos_sym and float(pos.get("size", 0)) != 0:
+                                pos_variants = get_all_symbol_variants(pos_sym)
+                                if symbol_norm in pos_variants:
+                                    pos_sl_orders[pos_sym].add(order.get("id"))
+            
+            # Remove candidates that would leave unsafe positions with 0 SL
+            safe_candidates = []
+            sl_cancelled_by_pos = defaultdict(set)
+            kept_by_pos = defaultdict(set)
+            
+            # Build kept orders map
+            for candidate in candidates_to_process:
+                if candidate.get("kept_order_id") and candidate["class"] == "SL":
+                    symbol_norm = candidate["symbol_norm"]
+                    for pos in positions:
+                        pos_sym = pos.get("symbol")
+                        if pos_sym and float(pos.get("size", 0)) != 0:
+                            pos_variants = get_all_symbol_variants(pos_sym)
+                            if symbol_norm in pos_variants:
+                                kept_by_pos[pos_sym].add(candidate["kept_order_id"])
+            
+            for candidate in candidates_to_process:
+                order = candidate["order"]
+                order_id = order.get("id")
+                order_class = candidate["class"]
+                symbol_norm = candidate["symbol_norm"]
+                
+                # Check if this candidate would leave any position with 0 SL
+                would_be_unsafe = False
+                if order_class == "SL":
+                    for pos in positions:
+                        pos_sym = pos.get("symbol")
+                        if pos_sym and float(pos.get("size", 0)) != 0:
+                            pos_variants = get_all_symbol_variants(pos_sym)
+                            if symbol_norm in pos_variants and pos_sym in unsafe_positions:
+                                # This position is already unsafe
+                                total_sl = pos_sl_orders.get(pos_sym, set())
+                                already_cancelled = sl_cancelled_by_pos[pos_sym]
+                                kept = kept_by_pos.get(pos_sym, set())
+                                
+                                would_cancel = already_cancelled.copy()
+                                would_cancel.add(order_id)
+                                
+                                remaining = total_sl - would_cancel
+                                for kept_id in kept:
+                                    if kept_id in total_sl:
+                                        remaining.add(kept_id)
+                                
+                                if len(remaining) <= 0:
+                                    would_be_unsafe = True
+                                    break
+                
+                if not would_be_unsafe:
+                    safe_candidates.append(candidate)
+                    if order_class == "SL":
+                        for pos in positions:
+                            pos_sym = pos.get("symbol")
+                            if pos_sym and float(pos.get("size", 0)) != 0:
+                                pos_variants = get_all_symbol_variants(pos_sym)
+                                if symbol_norm in pos_variants:
+                                    sl_cancelled_by_pos[pos_sym].add(order_id)
+            
+            candidates_to_process = safe_candidates
+            print(f"  Reduced to {len(candidates_to_process)} safe candidates")
+            
+            # Re-run safety check
+            safe, warnings = post_plan_safety_check(
+                positions,
+                candidates_to_process,
+                orders_raw
+            )
         
         if warnings:
             for warning in warnings:
