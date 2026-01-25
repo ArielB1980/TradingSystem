@@ -78,12 +78,15 @@ async def backfill_initial_stop_prices(place_missing_sl: bool = False):
     )
     executor = Executor(config.execution, futures_adapter)
     
-    # 1. Load positions missing SL (extract data while in session)
+    # 1. Load positions missing SL or with invalid order IDs (extract data while in session)
     db = get_db()
     positions_data = []
     with db.get_session() as session:
+        # Get positions missing initial_stop_price OR with invalid order IDs (unknown_...)
         positions_missing_sl = session.query(PositionModel).filter(
-            PositionModel.initial_stop_price.is_(None)
+            (PositionModel.initial_stop_price.is_(None)) |
+            (PositionModel.stop_loss_order_id.is_(None)) |
+            (PositionModel.stop_loss_order_id.like('unknown_%'))
         ).all()
         
         # Extract all needed data while in session
