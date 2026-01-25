@@ -31,6 +31,7 @@ from src.execution.position_manager_v2 import (
     ManagementAction as ManagementActionV2,
     ActionType as ActionTypeV2
 )
+from src.execution.equity import calculate_effective_equity
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.position_persistence import PositionPersistence
 from src.execution.production_safety import (
@@ -458,11 +459,6 @@ class LiveTrading:
             await self.data_acq.stop()
             await self.client.close()
             logger.info("Live trading shutdown complete")
-            
-    async def _calculate_effective_equity(self, balance: Dict) -> tuple[Decimal, Decimal, Decimal]:
-        from src.execution.equity import calculate_effective_equity
-        base = getattr(self.config.exchange, "base_currency", "USD")
-        return await calculate_effective_equity(balance, base_currency=base, kraken_client=self.client)
 
     async def _run_order_polling(self, interval_seconds: int = 12) -> None:
         """Poll pending entry order status, process fills, trigger PLACE_STOP (SL/TP)."""
@@ -922,8 +918,10 @@ class LiveTrading:
                 return
 
             # 2. Calculate Effective Equity (Shared Logic)
-            # This handles Multi-Collateral (Flex) and Inverse (Crypto-Margined) accounts correctly
-            equity, avail_margin, margin_used_val = await self._calculate_effective_equity(balance)
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, avail_margin, margin_used_val = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
 
             # 3. Persist
             save_account_state(
@@ -1003,10 +1001,10 @@ class LiveTrading:
         # For futures, we need futures balance
         balance = await self.client.get_futures_balance()
         
-        # Calculate Effective Equity using shared logic
-        # This fixes the issue where inverse/multi-collateral accounts saw $0 equity
-        equity, _, _ = await self._calculate_effective_equity(balance)
-        
+        base = getattr(self.config.exchange, "base_currency", "USD")
+        equity, _, _ = await calculate_effective_equity(
+            balance, base_currency=base, kraken_client=self.client
+        )
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return
@@ -1158,12 +1156,13 @@ class LiveTrading:
         
         # 1. Fetch Account Equity
         balance = await self.client.get_futures_balance()
-        equity, _, _ = await self._calculate_effective_equity(balance)
-        
+        base = getattr(self.config.exchange, "base_currency", "USD")
+        equity, _, _ = await calculate_effective_equity(
+            balance, base_currency=base, kraken_client=self.client
+        )
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return
-        
         # 2. Risk Validation (Safety Gate)
         decision = self.risk_manager.validate_trade(signal, equity, spot_price, mark_price)
         

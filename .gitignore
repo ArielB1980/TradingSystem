@@ -68,3 +68,14 @@ data/discovered_markets.json
 .local/
 logs/
 .venv/
+
+# Ad-hoc logs and output (run-specific)
+raw_logs.txt
+full_logs.txt
+curl_logs.txt
+server_logs.txt
+server_logs_live.txt
+trace_output.txt
+recent_signals.json
+signal_output.json
+trades_today.txt

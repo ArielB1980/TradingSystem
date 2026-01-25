@@ -1,6 +1,8 @@
 """
-Unified server that runs Streamlit as subprocess and FastAPI as main process.
-FastAPI acts as reverse proxy for Streamlit and also serves health endpoints.
+Unified server: FastAPI + Streamlit subprocess (reverse proxy).
+
+Dev-only / optional. Production uses separate dashboard and web components.
+Not referenced in .do/app.yaml.
 """
 import os
 import subprocess

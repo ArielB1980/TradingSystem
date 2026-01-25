@@ -1,6 +1,8 @@
 """
-Combined server that runs both Streamlit dashboard and FastAPI health endpoints.
-This allows us to merge the dashboard and tradingsystem services into one.
+Combined server: Streamlit + FastAPI health in one process (thread-based).
+
+Dev-only / optional. Production uses separate App Platform components:
+dashboard = Streamlit, web = src.health. Not referenced in .do/app.yaml.
 """
 import os
 import sys

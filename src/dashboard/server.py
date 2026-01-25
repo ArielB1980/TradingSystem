@@ -24,7 +24,7 @@ from src.dashboard.utils import (
     get_daily_pnl_total,
     get_daily_pnl_for_symbol,
 )
-from src.utils.market_discovery import load_discovered_mapping
+from src.utils.discovered_markets_loader import load_discovered_mapping
 
 app = FastAPI(title="Trading Board")
 

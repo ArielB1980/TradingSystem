@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -12,6 +12,8 @@ help:
 	@echo "  make install       Install dependencies"
 	@echo "  make validate      Validate environment configuration"
 	@echo "  make backfill      Download 250 days of historical data for all coins"
+	@echo "  make backtest-quick  Quick backtest (scripts/backtest/run_quick_backtest.py)"
+	@echo "  make backtest-full   Full backtest (scripts/backtest/run_full_backtest.py)"
 	@echo "  make run           Run bot in local mode (dry-run)"
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
@@ -38,6 +40,22 @@ backfill:
 	else \
 		echo "❌ .env.local not found. Run 'make validate' first."; \
 		exit 1; \
+	fi
+
+backtest-quick:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) scripts/backtest/run_quick_backtest.py; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; exit 1; \
+	fi
+
+backtest-full:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) scripts/backtest/run_full_backtest.py; \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; exit 1; \
 	fi
 
 venv:

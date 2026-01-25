@@ -15,21 +15,14 @@ from decimal import Decimal
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.data.kraken_client import KrakenClient
 from src.config.config import load_config as get_config
+from src.data.kraken_client import KrakenClient
+from src.data.symbol_utils import pf_to_unified
 
 
 def _order_type(o: dict) -> str:
     t = (o.get("info") or {}).get("orderType") or o.get("type") or o.get("order_type") or "unknown"
     return str(t).lower()
-
-
-def _pf_to_unified(s: str) -> str:
-    """PF_ADAUSD -> ADA/USD:USD."""
-    if not s or not s.startswith("PF_") or not s.endswith("USD"):
-        return s
-    base = s[3:-3]
-    return f"{base}/USD:USD"
 
 
 def _stop_price(o: dict) -> Decimal | None:
@@ -127,7 +120,7 @@ async def audit_open_orders(cancel_redundant: bool = False, cancel_orphaned: boo
             for p in positions:
                 if float(p.get("size", 0)) == 0:
                     continue
-                u = _pf_to_unified(p.get("symbol") or "")
+                u = pf_to_unified(p.get("symbol") or "")
                 if u:
                     unified_to_side[u] = (p.get("side") or "long").lower()
             print("\n=== CANCEL REDUNDANT STOPS ===")
