@@ -46,7 +46,7 @@ risk:
   auction_mode_enabled: true  # Enable auction-based portfolio allocation
   auction_max_positions: 25  # Maximum positions in portfolio
   auction_max_margin_util: 0.90  # Maximum margin utilization (90%)
-  auction_max_per_cluster: 6  # Maximum positions per cluster (25% of max positions)
+  auction_max_per_cluster: 25  # Maximum positions per cluster
   auction_max_per_symbol: 1  # Maximum positions per symbol
   auction_swap_threshold: 10.0  # Minimum score advantage to replace position
   auction_min_hold_minutes: 15  # Minimum hold time before position can be kicked
