@@ -615,9 +615,22 @@ def sync_active_positions(positions: List[Position]) -> None:
                 # Store tp_order_ids as JSON array - preserve if incoming is empty
                 import json
                 pm.tp_order_ids = json.dumps(pos.tp_order_ids) if pos.tp_order_ids else pm.tp_order_ids
-                # Protection status
-                pm.is_protected = getattr(pos, 'is_protected', pm.is_protected if pm.is_protected is not None else False)
-                pm.protection_reason = getattr(pos, 'protection_reason', pm.protection_reason)
+                # Protection status - compute from actual values if not explicitly set
+                if hasattr(pos, 'is_protected') and pos.is_protected is not None:
+                    pm.is_protected = pos.is_protected
+                else:
+                    # Compute from actual values: protected if both SL price and order ID exist
+                    pm.is_protected = (pm.initial_stop_price is not None and pm.stop_loss_order_id is not None and not str(pm.stop_loss_order_id).startswith('unknown'))
+                if hasattr(pos, 'protection_reason'):
+                    pm.protection_reason = pos.protection_reason
+                elif not pm.is_protected:
+                    # Set reason if not protected
+                    if pm.initial_stop_price is None:
+                        pm.protection_reason = "NO_SL_ORDER_OR_PRICE"
+                    elif pm.stop_loss_order_id is None or str(pm.stop_loss_order_id).startswith('unknown'):
+                        pm.protection_reason = "SL_ORDER_MISSING"
+                    else:
+                        pm.protection_reason = None
                 pm.updated_at = datetime.utcnow()
             else:
                 # Create
