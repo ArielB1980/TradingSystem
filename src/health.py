@@ -4,6 +4,7 @@ Simple HTTP server to respond to health checks.
 
 worker_health_app: run.py live --with-health (worker container).
 Serves /, /health, /api, /api/health, /api/debug/signals, /debug/signals.
+Also serves Streamlit dashboard at /dashboard when enabled.
 Default app URL (tradingbot-*.ondigitalocean.app) routes to worker, so these
 debug endpoints live on the worker health server.
 """
@@ -12,14 +13,18 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 import os
 import time
+import subprocess
+import sys
 from typing import Optional, Tuple
+import httpx
 
 app = FastAPI(title="Trading System Health Check")
 
 _worker_start = time.time()
+_streamlit_process = None
 
 
 def _metrics_json() -> Tuple[dict, int]:
@@ -55,14 +60,64 @@ def _metrics_prometheus() -> Tuple[str, int]:
         return (f"# error: {e}\n", 200)
 
 
-def get_worker_health_app() -> FastAPI:
+def _start_streamlit():
+    """Start Streamlit subprocess for dashboard."""
+    global _streamlit_process
+    if _streamlit_process is not None:
+        # Check if process is still running
+        if _streamlit_process.poll() is None:
+            return  # Already started and running
+        # Process died, reset
+        _streamlit_process = None
+    
+    try:
+        _streamlit_process = subprocess.Popen([
+            sys.executable, "-m", "streamlit", "run",
+            "src/dashboard/streamlit_app.py",
+            "--server.port", "8501",
+            "--server.address", "127.0.0.1",
+            "--server.headless", "true",
+            "--browser.serverAddress", "0.0.0.0",
+            "--server.enableCORS", "false",
+            "--server.enableXsrfProtection", "false",
+            "--server.baseUrlPath", "/dashboard"
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Give Streamlit a moment to start (non-blocking check)
+        time.sleep(2)
+        # Check if process is still alive
+        if _streamlit_process.poll() is not None:
+            # Process died immediately
+            stdout, stderr = _streamlit_process.communicate()
+            error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
+            print(f"Warning: Streamlit failed to start: {error_msg[:200]}", file=sys.stderr)
+            _streamlit_process = None
+    except Exception as e:
+        print(f"Warning: Failed to start Streamlit: {e}", file=sys.stderr)
+        _streamlit_process = None
+
+
+def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
     """
     Health app for worker (run.py live --with-health).
     Serves /, /health. Also /api, /api/health, /api/debug/signals, /debug/signals
     so the default app URL (which routes to worker) can serve debug endpoints.
+    Optionally serves Streamlit dashboard at /dashboard.
     """
+    global _streamlit_process
 
     w = FastAPI(title="Worker Health")
+
+    # Note: Streamlit will be started lazily on first dashboard request
+    # This avoids blocking startup if Streamlit has issues
+
+    @w.on_event("shutdown")
+    async def shutdown():
+        """Clean up Streamlit process on shutdown."""
+        global _streamlit_process
+        if _streamlit_process:
+            _streamlit_process.terminate()
+            _streamlit_process.wait()
+            _streamlit_process = None
 
     @w.get("/")
     async def root():
@@ -123,10 +178,74 @@ def get_worker_health_app() -> FastAPI:
         body, status = _metrics_prometheus()
         return PlainTextResponse(body, status_code=status)
 
+    # Proxy dashboard requests to Streamlit
+    @w.api_route("/dashboard", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    @w.api_route("/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    async def proxy_dashboard(request: Request, path: str = ""):
+        """Proxy requests to Streamlit dashboard."""
+        if not with_dashboard:
+            return JSONResponse(
+                content={"error": "Dashboard not enabled"},
+                status_code=503
+            )
+        
+        # Lazy start Streamlit on first request
+        if _streamlit_process is None or (_streamlit_process.poll() is not None):
+            _start_streamlit()
+        
+        # Check if Streamlit is running
+        if _streamlit_process is None or _streamlit_process.poll() is not None:
+            return JSONResponse(
+                content={"error": "Dashboard service unavailable - Streamlit failed to start"},
+                status_code=503
+            )
+        
+        # Build Streamlit URL - handle both /dashboard and /dashboard/...
+        if path:
+            streamlit_url = f"http://127.0.0.1:8501/dashboard/{path}"
+        else:
+            streamlit_url = "http://127.0.0.1:8501/dashboard"
+        
+        query_params = str(request.url.query)
+        if query_params:
+            streamlit_url += f"?{query_params}"
+
+        async with httpx.AsyncClient() as client:
+            headers = dict(request.headers)
+            headers.pop("host", None)
+            
+            try:
+                if request.method == "GET":
+                    response = await client.get(streamlit_url, headers=headers, follow_redirects=True, timeout=30.0)
+                elif request.method == "POST":
+                    body = await request.body()
+                    response = await client.post(streamlit_url, content=body, headers=headers, follow_redirects=True, timeout=30.0)
+                else:
+                    body = await request.body()
+                    response = await client.request(
+                        request.method,
+                        streamlit_url,
+                        content=body,
+                        headers=headers,
+                        follow_redirects=True,
+                        timeout=30.0
+                    )
+                
+                return StreamingResponse(
+                    response.aiter_bytes(),
+                    status_code=response.status_code,
+                    headers=dict(response.headers)
+                )
+            except Exception as e:
+                return JSONResponse(
+                    content={"error": f"Failed to proxy to Streamlit: {str(e)}"},
+                    status_code=502
+                )
+
     return w
 
 
-worker_health_app = get_worker_health_app()
+worker_health_app = get_worker_health_app(with_dashboard=True)
 
 
 @app.get("/api")
