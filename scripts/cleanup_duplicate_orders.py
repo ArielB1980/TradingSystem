@@ -376,7 +376,8 @@ def find_exact_duplicates(
     orders: List[dict],
     db_metadata: Dict[str, Dict],
     tolerance_pct: Decimal,
-    prefer_oldest: bool = False
+    prefer_oldest: bool = False,
+    sl_counts_by_symbol: Optional[Dict[str, int]] = None
 ) -> List[Dict]:
     """
     Find exact duplicates within SL/TP groups using price clustering.
@@ -404,6 +405,13 @@ def find_exact_duplicates(
     
     # Process each group
     for (symbol_norm, side, order_class), symbol_orders_map in grouped.items():
+        # SAFETY: Never cancel if this symbol has exactly 1 SL order
+        if order_class == "SL":
+            sl_count = sl_counts_by_symbol.get(symbol_norm, 0) if sl_counts_by_symbol else 0
+            if sl_count == 1:
+                # Protect the only SL order - skip this symbol entirely
+                continue
+        
         # Flatten all orders for this group
         all_orders = []
         for orders_list in symbol_orders_map.values():
@@ -446,7 +454,7 @@ def find_exact_duplicates(
                         "reason": "EXACT_DUPLICATE",
                         "kept_order_id": keep_order.get("id"),
                         "symbol_norm": symbol_norm,
-                        "raw_symbol": order.get("symbol"),
+                        "raw_symbol": order.get("symbol"),  # Store raw symbol for cancellation
                         "class": order_class,
                         "side": order.get("side", "").lower()
                     })
@@ -460,7 +468,8 @@ def find_redundant_sl_orders(
     db_metadata: Dict[str, Dict],
     tolerance_pct: Decimal,
     prefer_oldest: bool = False,
-    exclude_order_ids: Optional[Set[str]] = None
+    exclude_order_ids: Optional[Set[str]] = None,
+    sl_counts_by_symbol: Optional[Dict[str, int]] = None
 ) -> List[Dict]:
     """
     Find redundant SL orders (keep most protective per position).
@@ -505,6 +514,11 @@ def find_redundant_sl_orders(
     for symbol_norm, sl_orders in sl_orders_by_symbol.items():
         if symbol_norm not in pos_by_symbol:
             continue  # No position, skip (orphans handled separately)
+        
+        # SAFETY: Never cancel if this symbol has exactly 1 SL order
+        sl_count = sl_counts_by_symbol.get(symbol_norm, len(sl_orders)) if sl_counts_by_symbol else len(sl_orders)
+        if sl_count == 1:
+            continue  # Protect the only SL order - never cancel it
         
         if len(sl_orders) <= 1:
             continue  # Only one SL, keep it
@@ -569,7 +583,7 @@ def find_redundant_sl_orders(
                     "reason": "REDUNDANT_SL",
                     "kept_order_id": keep_order.get("id"),
                     "symbol_norm": symbol_norm,
-                    "raw_symbol": order.get("symbol"),
+                    "raw_symbol": order.get("symbol"),  # Store raw symbol for cancellation
                     "class": "SL",
                     "side": order.get("side", "").lower()
                 })
@@ -660,7 +674,7 @@ def find_redundant_tp_orders(
                         "reason": "DUPLICATE_TP_LEVEL",
                         "kept_order_id": keep_order.get("id"),
                         "symbol_norm": symbol_norm,
-                        "raw_symbol": order.get("symbol"),
+                        "raw_symbol": order.get("symbol"),  # Store raw symbol for cancellation
                         "class": "TP",
                         "side": order.get("side", "").lower()
                     })
@@ -941,13 +955,23 @@ async def cleanup_duplicate_orders(
         orphan_order_ids = {o.get("id") for o in orphan_orders}
         active_orders = [o for o in orders_raw if o.get("id") not in orphan_order_ids]
         
+        # Build SL counts by symbol (for protection: never cancel if count == 1)
+        sl_counts_by_symbol = defaultdict(int)
+        for order in active_orders:
+            if classify_order(order) == "SL":
+                symbol = order.get("symbol")
+                if symbol:
+                    symbol_norm = normalize_symbol_for_comparison(symbol)
+                    sl_counts_by_symbol[symbol_norm] += 1
+        
         # Step 3: Find exact duplicates
         print("\nStep 3: Finding exact duplicates...")
         exact_duplicate_candidates = find_exact_duplicates(
             active_orders,
             db_metadata,
             price_tolerance_pct,
-            prefer_oldest
+            prefer_oldest,
+            sl_counts_by_symbol=sl_counts_by_symbol
         )
         print(f"  Found: {len(exact_duplicate_candidates)} exact duplicates")
         
@@ -1280,13 +1304,15 @@ async def cleanup_duplicate_orders(
             for candidate in candidates_to_process:
                 order = candidate["order"]
                 order_id = order.get("id")
-                symbol = order.get("symbol")
+                # Use raw_symbol from candidate (original symbol from order)
+                # This ensures cancellation uses the exact symbol format the exchange expects
+                raw_symbol = candidate.get("raw_symbol") or order.get("symbol")
                 
                 try:
-                    await client.cancel_futures_order(order_id, symbol)
+                    await client.cancel_futures_order(order_id, raw_symbol)
                     cancelled_count += 1
                     if verbose:
-                        print(f"  ✅ Cancelled {order_id[:30]}... ({candidate['reason']})")
+                        print(f"  ✅ Cancelled {order_id[:30]}... ({candidate['reason']}) using symbol {raw_symbol}")
                 except Exception as e:
                     errors.append((order_id, str(e)))
                     if verbose:
