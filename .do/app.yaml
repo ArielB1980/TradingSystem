@@ -4,6 +4,18 @@ envs:
   - key: DATABASE_URL
     scope: RUN_TIME
     type: SECRET
+  - key: KRAKEN_API_KEY
+    scope: RUN_TIME
+    type: SECRET
+  - key: KRAKEN_API_SECRET
+    scope: RUN_TIME
+    type: SECRET
+  - key: KRAKEN_FUTURES_API_KEY
+    scope: RUN_TIME
+    type: SECRET
+  - key: KRAKEN_FUTURES_API_SECRET
+    scope: RUN_TIME
+    type: SECRET
 services:
   - name: worker
     github:
