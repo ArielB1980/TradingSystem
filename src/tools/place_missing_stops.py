@@ -3,9 +3,12 @@ Place missing stop-loss orders for naked futures positions.
 
 Fetches positions and open orders from Kraken Futures, identifies positions with
 no matching stop, and places a reduce-only stop per naked position using a
-configurable %% distance from entry (default 2%%).
+configurable % distance from entry (default 2%).
 
-Use --dry-run to only print what would be done.
+With --cancel-all-first: cancels ALL open orders, then places one SL per open
+position. Use for "reset: cancel everything, then protect all positions."
+
+Use --dry-run to only print what would be done (no cancels, no placements).
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ def _order_is_stop(o: dict, side: str) -> bool:
 async def place_missing_stops(
     stop_pct: float = 2.0,
     dry_run: bool = False,
+    cancel_all_first: bool = False,
 ) -> None:
     try:
         config = get_config()
@@ -66,20 +70,33 @@ async def place_missing_stops(
         positions = [p for p in positions if float(p.get("size", 0)) != 0]
         print(f"Found {len(orders)} open orders, {len(positions)} non-zero positions.\n")
 
-        # For each position, check if there is a matching stop
-        naked: list[dict] = []
-        for p in positions:
-            pos_sym = p.get("symbol") or ""
-            side = (p.get("side") or "long").lower()
-            has_stop = False
-            for o in orders:
-                if not position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
-                    continue
-                if _order_is_stop(o, side):
-                    has_stop = True
-                    break
-            if not has_stop:
-                naked.append(p)
+        if cancel_all_first:
+            if dry_run:
+                print("[DRY-RUN] Would cancel ALL open orders, then place stops for every position.")
+                naked = list(positions)
+            else:
+                print("Cancelling ALL open orders...")
+                cancelled = await client.cancel_all_orders()
+                n_ok = sum(1 for r in cancelled if r.get("status") == "cancelled")
+                print(f"Cancelled {n_ok} order(s).\n")
+                print("Re-fetching positions...")
+                positions = await client.get_all_futures_positions()
+                positions = [p for p in positions if float(p.get("size", 0)) != 0]
+                naked = list(positions)
+        else:
+            naked = []
+            for p in positions:
+                pos_sym = p.get("symbol") or ""
+                side = (p.get("side") or "long").lower()
+                has_stop = False
+                for o in orders:
+                    if not position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
+                        continue
+                    if _order_is_stop(o, side):
+                        has_stop = True
+                        break
+                if not has_stop:
+                    naked.append(p)
 
         if not naked:
             print("No naked positions. All positions have a matching stop.")
@@ -156,9 +173,18 @@ def main() -> None:
         action="store_true",
         help="Only print what would be done; do not place orders.",
     )
+    ap.add_argument(
+        "--cancel-all-first",
+        action="store_true",
+        help="Cancel ALL open orders, then place one SL per open position.",
+    )
     args = ap.parse_args()
     asyncio.run(
-        place_missing_stops(stop_pct=args.stop_pct, dry_run=args.dry_run)
+        place_missing_stops(
+            stop_pct=args.stop_pct,
+            dry_run=args.dry_run,
+            cancel_all_first=args.cancel_all_first,
+        )
     )
 
 
