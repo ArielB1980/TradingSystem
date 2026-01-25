@@ -7,9 +7,10 @@ Serves /, /health, /api, /api/health, /api/debug/signals, /debug/signals.
 Default app URL (tradingbot-*.ondigitalocean.app) routes to worker, so these
 debug endpoints live on the worker health server.
 """
+import html as html_module
 from datetime import datetime, timezone
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import os
 import time
 from typing import Optional, Tuple
@@ -101,14 +102,14 @@ def get_worker_health_app() -> FastAPI:
         return JSONResponse(content=out, status_code=200 if out["status"] == "healthy" else 503)
 
     @w.get("/api/debug/signals")
-    async def api_debug_signals(symbol: Optional[str] = None):
+    async def api_debug_signals(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
         data = _debug_signals_impl(symbol_filter=symbol)
-        return JSONResponse(content=data, status_code=200)
+        return _debug_signals_respond(data, request, format_param=format)
 
     @w.get("/debug/signals")
-    async def debug_signals(symbol: Optional[str] = None):
+    async def debug_signals_route(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
         data = _debug_signals_impl(symbol_filter=symbol)
-        return JSONResponse(content=data, status_code=200)
+        return _debug_signals_respond(data, request, format_param=format)
 
     @w.get("/api/metrics")
     async def api_metrics():
@@ -392,21 +393,123 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
     return results
 
 
+def _debug_signals_html(data: dict) -> str:
+    """Render debug signals payload as human-readable HTML."""
+    def esc(s: str) -> str:
+        if s is None:
+            return ""
+        return html_module.escape(str(s))
+
+    status = data.get("status", "unknown")
+    checked = data.get("checked_events", 0)
+    last = data.get("last_signal")
+    decisions = data.get("recent_decisions") or []
+
+    status_class = "ok" if status == "success" else "err"
+    status_label = "OK" if status == "success" else esc(status)
+
+    html_parts = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+        "<title>Debug Signals</title>",
+        "<style>"
+        "body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:1rem;background:#0f0f12;color:#e4e4e7;}",
+        "h1{font-size:1.25rem;font-weight:600;margin:0 0 0.5rem;}",
+        ".meta{color:#71717a;font-size:0.875rem;margin-bottom:1.5rem;}",
+        ".badge{display:inline-block;padding:0.2rem 0.5rem;border-radius:4px;font-size:0.75rem;font-weight:600;}",
+        ".badge.ok{background:#166534;color:#bbf7d0;}",
+        ".badge.err{background:#7f1d1d;color:#fecaca;}",
+        "h2{font-size:1rem;font-weight:600;margin:1.5rem 0 0.5rem;color:#a1a1aa;}",
+        ".card{background:#18181b;border:1px solid #27272a;border-radius:8px;padding:1rem;margin-bottom:1rem;}",
+        ".card .row{display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.5rem;}",
+        ".card .k{color:#71717a;font-size:0.8rem;}",
+        ".card .v{font-weight:500;}",
+        ".signal-long{color:#22c55e;}",
+        ".signal-short{color:#ef4444;}",
+        ".signal-none{color:#71717a;}",
+        "pre{background:#09090b;border:1px solid #27272a;border-radius:6px;padding:0.75rem;overflow-x:auto;font-size:0.8rem;line-height:1.4;white-space:pre-wrap;word-break:break-word;}",
+        "table{width:100%;border-collapse:collapse;font-size:0.875rem;}",
+        "th,td{padding:0.5rem;text-align:left;border-bottom:1px solid #27272a;}",
+        "th{color:#71717a;font-weight:500;}",
+        "tr:hover{background:#18181b;}",
+        ".reason{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
+        "a{color:#3b82f6;}",
+        "</style></head><body>",
+        f"<h1>Debug Signals</h1>",
+        f"<div class='meta'>Status: <span class='badge {status_class}'>{status_label}</span> · "
+        f"Checked events: {checked} · "
+        f"<a href='?format=json'>JSON</a></div>",
+    ]
+
+    if data.get("message"):
+        html_parts.append(f"<p class='meta'>{esc(data['message'])}</p>")
+
+    if last:
+        d = last.get("details") or {}
+        reason = d.get("reason") or ""
+        sym = last.get("symbol", "—")
+        sig = (last.get("signal") or "no_signal").lower()
+        sig_cls = "signal-long" if sig == "long" else ("signal-short" if sig == "short" else "signal-none")
+        html_parts.append("<h2>Last signal</h2>")
+        html_parts.append("<div class='card'>")
+        html_parts.append("<div class='row'>")
+        html_parts.append(f"<span class='k'>Symbol</span><span class='v'>{esc(sym)}</span>")
+        html_parts.append(f"<span class='k'>Signal</span><span class='v {sig_cls}'>{esc(str(last.get('signal', '—')))}</span>")
+        html_parts.append(f"<span class='k'>Quality</span><span class='v'>{esc(str(last.get('quality', '—')))}</span>")
+        html_parts.append(f"<span class='k'>Time</span><span class='v'>{esc(str(last.get('timestamp', '—')))}</span>")
+        html_parts.append("</div>")
+        if reason:
+            html_parts.append("<pre>" + esc(reason) + "</pre>")
+        html_parts.append("</div>")
+
+    html_parts.append("<h2>Recent decisions</h2>")
+    html_parts.append("<div class='card'><table><thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>Quality</th><th>Reasoning</th></tr></thead><tbody>")
+    for dec in decisions[:40]:
+        t = dec.get("time", "")
+        s = dec.get("symbol", "")
+        sig = (dec.get("signal") or "no_signal").lower()
+        sig_cls = "signal-long" if sig == "long" else ("signal-short" if sig == "short" else "signal-none")
+        q = dec.get("quality", "")
+        r = dec.get("reasoning") or "—"
+        html_parts.append(
+            f"<tr><td>{esc(t)}</td><td>{esc(s)}</td><td class='{sig_cls}'>{esc(str(dec.get('signal', '—')))}</td>"
+            f"<td>{esc(str(q))}</td><td class='reason' title='{esc(r)}'>{esc(r)}</td></tr>"
+        )
+    html_parts.append("</tbody></table></div>")
+    html_parts.append("</body></html>")
+    return "".join(html_parts)
+
+
+def _debug_signals_respond(data: dict, request: Request, format_param: Optional[str] = None):
+    """Return HTML or JSON based on Accept header or ?format=html|json."""
+    use_html = False
+    if format_param == "html":
+        use_html = True
+    elif format_param == "json":
+        use_html = False
+    else:
+        accept = (request.headers.get("accept") or "").lower()
+        use_html = "text/html" in accept
+    if use_html:
+        return HTMLResponse(_debug_signals_html(data))
+    return JSONResponse(content=data, status_code=200)
+
+
 @app.get("/api/debug/signals")
-async def debug_signals(symbol: Optional[str] = None):
+async def debug_signals(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
     """
     Debug endpoint to find the last generated signal.
     Uses system_events DECISION_TRACE. Optional ?symbol=... to filter.
+    Browser (Accept: text/html) or ?format=html → human-readable HTML; ?format=json → raw JSON.
     """
     data = _debug_signals_impl(symbol_filter=symbol)
-    return JSONResponse(content=data, status_code=200)
+    return _debug_signals_respond(data, request, format_param=format)
 
 
 @app.get("/debug/signals")
-async def debug_signals_no_api(symbol: Optional[str] = None):
+async def debug_signals_no_api(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
     """Same as /api/debug/signals, for deployments that strip /api prefix."""
     data = _debug_signals_impl(symbol_filter=symbol)
-    return JSONResponse(content=data, status_code=200)
+    return _debug_signals_respond(data, request, format_param=format)
 
 
 if __name__ == "__main__":
