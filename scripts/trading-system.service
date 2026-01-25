@@ -1,31 +1,17 @@
 [Unit]
-Description=Kraken Futures Trading System
-After=network.target postgresql.service
-Wants=postgresql.service
+Description=Trading System Live Trading
+After=network.target
 
 [Service]
 Type=simple
 User=trading
-Group=trading
-WorkingDirectory=/opt/trading-system
-Environment="PATH=/opt/trading-system/venv/bin:/usr/local/bin:/usr/bin:/bin"
-EnvironmentFile=/opt/trading-system/.env
-ExecStart=/opt/trading-system/venv/bin/python3 /opt/trading-system/run.py live --force
+WorkingDirectory=/home/trading/TradingSystem
+Environment="PATH=/home/trading/TradingSystem/venv/bin"
+ExecStart=/home/trading/TradingSystem/venv/bin/python run.py live --force --with-health
 Restart=always
 RestartSec=10
-StandardOutput=append:/opt/trading-system/logs/live_trading_stdout.log
-StandardError=append:/opt/trading-system/logs/live_trading_stderr.log
-
-# Security
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/trading-system
-
-# Resource limits
-LimitNOFILE=65536
-MemoryMax=2G
+StandardOutput=append:/home/trading/TradingSystem/logs/trading.log
+StandardError=append:/home/trading/TradingSystem/logs/trading-error.log
 
 [Install]
 WantedBy=multi-user.target
