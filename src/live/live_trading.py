@@ -659,6 +659,13 @@ class LiveTrading:
             logger.error("Failed to sync positions", error=str(e))
             return
 
+        # 2.5. Cleanup orphan reduce-only orders (SL/TP orders for closed positions)
+        try:
+            await self._cleanup_orphan_reduce_only_orders(all_raw_positions)
+        except Exception as e:
+            logger.error("Failed to cleanup orphan orders", error=str(e))
+            # Don't return - continue with trading loop
+
         # 3. Batch Data Fetching (Optimization)
         try:
             import time
@@ -1180,6 +1187,7 @@ class LiveTrading:
                  new_sl_price=intent_model.stop_loss_futures,
                  current_tp_ids=[],  # New position, no existing TPs
                  new_tp_prices=tps,  # Full ladder: TP1, TP2, TP3
+                 position_size_notional=intent_model.size_notional,  # Pass actual position size
              )
              
              if new_sl_id:
@@ -1885,6 +1893,9 @@ class LiveTrading:
         has_tp_ids = bool(db_pos.tp_order_ids and len(db_pos.tp_order_ids) > 0)
         
         # Check for open TP orders on exchange
+        # Note: Detection uses reduce-only + opposite side + type check
+        # This may match other reduce-only limit orders if we ever place them for other purposes
+        # For now, this is safe as we only place reduce-only orders for SL/TP
         open_tp_orders = [
             o for o in symbol_orders
             if o.get('reduceOnly', False) and 
@@ -1894,6 +1905,17 @@ class LiveTrading:
             ((db_pos.side == Side.LONG and o.get('side', '').lower() == 'sell') or
              (db_pos.side == Side.SHORT and o.get('side', '').lower() == 'buy'))
         ]
+        
+        # Additional check: prefer orders with explicit take_profit type if available
+        # Some exchanges provide clearer order type differentiation
+        explicit_tp_orders = [
+            o for o in open_tp_orders
+            if o.get('type', '').lower() in ('take_profit', 'take-profit')
+        ]
+        
+        # If we have explicit TP orders, use those; otherwise fall back to reduce-only limit orders
+        if explicit_tp_orders:
+            open_tp_orders = explicit_tp_orders
         
         # Needs backfill if:
         # 1. No TP plan and no TP order IDs in DB
@@ -1987,6 +2009,68 @@ class LiveTrading:
         
         return tp_plan
 
+    async def _cleanup_orphan_reduce_only_orders(self, raw_positions: List[Dict]):
+        """
+        Cleanup orphan reduce-only orders (SL/TP) for positions that no longer exist.
+        
+        Critical: When SL/TP fills, the position closes but reduce-only orders may remain.
+        These must be cancelled to prevent:
+        - Orders failing later with "no position"
+        - Potential position flips if reduce-only isn't honored correctly
+        """
+        # Build set of symbols that currently have open positions
+        open_syms = {p.get("symbol") for p in raw_positions if p.get("size", 0) != 0 and p.get("symbol")}
+        
+        try:
+            orders = await self.client.get_futures_open_orders()
+        except Exception as e:
+            logger.error("Failed to fetch open orders for orphan cleanup", error=str(e))
+            return
+        
+        cancelled = 0
+        max_cancellations = 20  # Rate limit per tick
+        
+        for o in orders:
+            if cancelled >= max_cancellations:
+                break
+                
+            try:
+                # Only process reduce-only orders
+                if not o.get("reduceOnly", False):
+                    continue
+                
+                sym = o.get("symbol")
+                oid = o.get("id")
+                
+                if not sym or not oid:
+                    continue
+                
+                # If symbol has an open position, keep the order
+                if sym in open_syms:
+                    continue
+                
+                # Position is closed but order remains - cancel it
+                await self.futures_adapter.cancel_order(oid, sym)
+                cancelled += 1
+                
+                logger.info(
+                    "Cancelled orphan reduce-only order",
+                    symbol=sym,
+                    order_id=oid,
+                    order_type=o.get("type", "unknown")
+                )
+                
+            except Exception as e:
+                logger.warning(
+                    "Failed to cancel orphan reduce-only order",
+                    symbol=o.get("symbol"),
+                    order_id=o.get("id"),
+                    error=str(e)
+                )
+        
+        if cancelled > 0:
+            logger.info("Orphan order cleanup complete", cancelled=cancelled, total_orders=len(orders))
+
     async def _place_tp_backfill(
         self, symbol: str, pos_data: Dict, db_pos: Position, tp_plan: List[Decimal],
         symbol_orders: List[Dict], current_price: Decimal
@@ -2041,6 +2125,9 @@ class LiveTrading:
         
         # Place new TP ladder
         try:
+            # Get current position size from exchange data
+            position_size_notional = Decimal(str(pos_data.get('size', 0))) * current_price if pos_data.get('size', 0) else None
+            
             new_sl_id, new_tp_ids = await self.executor.update_protective_orders(
                 symbol=symbol,
                 side=db_pos.side,
@@ -2048,6 +2135,7 @@ class LiveTrading:
                 new_sl_price=db_pos.initial_stop_price,  # Keep SL unchanged
                 current_tp_ids=existing_tp_ids,
                 new_tp_prices=tp_plan,
+                position_size_notional=position_size_notional,  # Pass actual position size
             )
             
             # Update position state

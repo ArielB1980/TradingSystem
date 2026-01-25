@@ -220,8 +220,14 @@ class AuctionAllocator:
         # Remaining opens (not part of swaps) - limit independently
         remaining_opens = remaining_opens[:max(self.max_new_opens_per_cycle - len(swap_pairs), 0)]
         
+        # CRITICAL FIX: Enforce net_opens <= net_closes + free_slots to prevent exceeding max positions
+        current_open_count = len(open_positions)
+        free_slots = max(self.limits.max_positions - current_open_count, 0)
+        allowed_opens = len(closes) + free_slots
+        
         # Build result
-        opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
+        all_opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
+        opens = all_opens[:allowed_opens]  # Enforce net position limit
         closes = [symbol for symbol, _ in swap_pairs] + [op.position.symbol for op in remaining_closes]
         
         reasons = {
