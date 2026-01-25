@@ -412,13 +412,33 @@ async def add_tp_to_positions(
                     position_size_notional=position_size_notional
                 )
                 
-                # Update database
-                db_pos.tp_order_ids = new_tp_ids
-                db_pos.tp1_price = tp_plan[0] if len(tp_plan) > 0 else None
-                db_pos.tp2_price = tp_plan[1] if len(tp_plan) > 1 else None
-                db_pos.final_target_price = tp_plan[2] if len(tp_plan) > 2 else None
+                # Update database - create new Position object with updated TP data
+                updated_pos = Position(
+                    symbol=db_pos.symbol,
+                    side=db_pos.side,
+                    size=db_pos.size,
+                    size_notional=db_pos.size_notional,
+                    entry_price=db_pos.entry_price,
+                    current_mark_price=db_pos.current_mark_price,
+                    liquidation_price=db_pos.liquidation_price,
+                    unrealized_pnl=db_pos.unrealized_pnl,
+                    leverage=db_pos.leverage,
+                    margin_used=db_pos.margin_used,
+                    opened_at=db_pos.opened_at,
+                    initial_stop_price=db_pos.initial_stop_price,
+                    stop_loss_order_id=db_pos.stop_loss_order_id,
+                    tp_order_ids=new_tp_ids,
+                    tp1_price=tp_plan[0] if len(tp_plan) > 0 else None,
+                    tp2_price=tp_plan[1] if len(tp_plan) > 1 else None,
+                    final_target_price=tp_plan[2] if len(tp_plan) > 2 else None,
+                    trade_type=db_pos.trade_type,
+                    partial_close_pct=db_pos.partial_close_pct,
+                    original_size=db_pos.original_size,
+                    is_protected=getattr(db_pos, 'is_protected', True),
+                    protection_reason=getattr(db_pos, 'protection_reason', None)
+                )
                 
-                await asyncio.to_thread(save_position, db_pos)
+                await asyncio.to_thread(save_position, updated_pos)
                 
                 # Post-check: verify orders exist
                 verified_count = None
