@@ -493,6 +493,15 @@ def _debug_signals_html(data: dict) -> str:
         html_parts.append(f"<span class='k'>Signal</span><span class='v {sig_cls}'>{esc(str(last.get('signal', '—')))}</span>")
         html_parts.append(f"<span class='k'>Quality</span><span class='v'>{esc(str(last.get('quality', '—')))}</span>")
         html_parts.append(f"<span class='k'>Time</span><span class='v'>{esc(_format_ts_cet(last.get('timestamp') or ''))}</span>")
+        order_placed = d.get("order_placed")
+        order_fail_reason = d.get("order_fail_reason") or ""
+        if order_placed is True:
+            html_parts.append(f"<span class='k'>Order opened</span><span class='v' style='color:#22c55e'>Yes</span>")
+        elif order_placed is False:
+            fail = esc(order_fail_reason) if order_fail_reason else "No (reason not recorded)"
+            html_parts.append(f"<span class='k'>Order opened</span><span class='v' style='color:#ef4444'>No</span>")
+            if order_fail_reason:
+                html_parts.append(f"<span class='k'>Reason</span><span class='v' style='color:#fca5a5'>{fail}</span>")
         html_parts.append("</div>")
         if reason:
             html_parts.append("<pre>" + esc(reason) + "</pre>")
@@ -504,6 +513,14 @@ def _debug_signals_html(data: dict) -> str:
             human = "No Kraken Futures market for this symbol; we skip trading it." if skip_reason == rr else esc(skip_reason)
             html_parts.append(
                 f"<div class='notice'><strong>Why no trade?</strong> This signal was not traded: {human}</div>"
+            )
+        elif order_placed is False and order_fail_reason:
+            html_parts.append(
+                f"<div class='notice'><strong>Why no order?</strong> {esc(order_fail_reason)}</div>"
+            )
+        elif order_placed is True:
+            html_parts.append(
+                "<div class='notice'><strong>Order opened.</strong> Entry was submitted via Execution Gateway.</div>"
             )
         else:
             html_parts.append(

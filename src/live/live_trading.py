@@ -787,6 +787,7 @@ class LiveTrading:
                     
                     # Pass context to signal for execution (mark price for futures)
                     # Signal is spot-based, execution is futures-based.
+                    order_outcome = None
                     if signal.signal_type != SignalType.NO_SIGNAL:
                         if not is_tradable:
                             logger.warning(
@@ -796,7 +797,7 @@ class LiveTrading:
                                 futures_symbol=futures_symbol,
                             )
                         else:
-                            await self._handle_signal(signal, spot_price, mark_price)
+                            order_outcome = await self._handle_signal(signal, spot_price, mark_price)
                     
                     # V4: Dynamic Exits (Abandon Ship & Time-Based)
                     # We check this AFTER signal generation because we need the fresh Bias
@@ -831,6 +832,10 @@ class LiveTrading:
                                 trace_details["skipped"] = not is_tradable
                                 if not is_tradable:
                                     trace_details["skip_reason"] = "no_futures_ticker"
+                                elif order_outcome is not None:
+                                    trace_details["order_placed"] = order_outcome.get("order_placed", False)
+                                    if not order_outcome.get("order_placed") and order_outcome.get("reason"):
+                                        trace_details["order_fail_reason"] = order_outcome["reason"]
 
                             if signal.signal_type == SignalType.NO_SIGNAL and signal.reasoning:
                                 logger.info(f"SMC Analysis {spot_symbol}: NO_SIGNAL -> {signal.reasoning}")
@@ -990,15 +995,16 @@ class LiveTrading:
         except Exception as e:
             logger.error("Failed to validate position protection", error=str(e))
     
-    async def _handle_signal(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
-        """Process signal through risk and executor."""
+    async def _handle_signal(
+        self, signal: Signal, spot_price: Decimal, mark_price: Decimal
+    ) -> Optional[dict]:
+        """Process signal through risk and executor. Returns {order_placed, reason} for V2 path, else None."""
         self.signals_since_emit += 1
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
         
         # ========== V2 PATH: Position State Machine ==========
         if self.use_state_machine_v2 and self.position_manager_v2:
-            await self._handle_signal_v2(signal, spot_price, mark_price)
-            return
+            return await self._handle_signal_v2(signal, spot_price, mark_price)
         
         # ========== LEGACY PATH (below) ==========
         # 1. Fetch Account Equity
@@ -1145,14 +1151,26 @@ class LiveTrading:
              
              # Trade persistence happens on exit defined in Rules 11
 
-    async def _handle_signal_v2(self, signal: Signal, spot_price: Decimal, mark_price: Decimal):
+    async def _handle_signal_v2(
+        self, signal: Signal, spot_price: Decimal, mark_price: Decimal
+    ) -> dict:
         """
         Process signal through Position State Machine V2.
         
         CRITICAL: All orders flow through ExecutionGateway.
         No direct exchange calls allowed.
+
+        Returns:
+            {"order_placed": bool, "reason": str | None}
+            reason is set when order_placed is False (e.g. risk_rejected, state_machine_rejected, entry_failed).
         """
         import uuid
+
+        def _fail(reason: str) -> dict:
+            return {"order_placed": False, "reason": reason}
+
+        def _ok() -> dict:
+            return {"order_placed": True, "reason": None}
         
         logger.info("Processing signal via State Machine V2", 
                    symbol=signal.symbol, 
@@ -1166,13 +1184,15 @@ class LiveTrading:
         )
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
-            return
+            return _fail("Insufficient equity for trading")
         # 2. Risk Validation (Safety Gate)
         decision = self.risk_manager.validate_trade(signal, equity, spot_price, mark_price)
         
         if not decision.approved:
-            logger.warning("Trade rejected by Risk Manager", symbol=signal.symbol, reasons=decision.rejection_reasons)
-            return
+            reasons = getattr(decision, "rejection_reasons", []) or []
+            detail = reasons[0] if reasons else "Trade rejected by Risk Manager"
+            logger.warning("Trade rejected by Risk Manager", symbol=signal.symbol, reasons=reasons)
+            return _fail(f"Risk Manager rejected: {detail}")
         logger.info("Risk approved", symbol=signal.symbol, notional=str(decision.position_notional))
 
         # 3. Map to futures symbol
@@ -1213,7 +1233,7 @@ class LiveTrading:
         
         if action.type == ActionTypeV2.REJECT_ENTRY:
             logger.warning("Entry REJECTED by State Machine", symbol=signal.symbol, reason=action.reason)
-            return
+            return _fail(f"State Machine rejected: {action.reason or 'REJECT_ENTRY'}")
         logger.info("State machine accepted entry", symbol=signal.symbol, client_order_id=action.client_order_id)
 
         # 7. Handle opportunity cost replacement via V2
@@ -1234,7 +1254,7 @@ class LiveTrading:
                 result = await self.execution_gateway.execute_action(close_action)
                 if not result.success:
                     logger.error("Failed to close for replacement", error=result.error)
-                    return
+                    return _fail(f"Failed to close for replacement: {result.error}")
             
             # Confirm reversal is closed
             self.position_registry.confirm_reversal_closed(decision.close_symbol)
@@ -1249,7 +1269,7 @@ class LiveTrading:
             self.position_registry.register_position(position)
         except Exception as e:
             logger.error("Failed to register position", error=str(e))
-            return
+            return _fail(f"Failed to register position: {e}")
         
         # 9. Execute entry via Execution Gateway
         # This is the ONLY way to place orders. Use futures symbol for exchange (Kraken expects X/USD:USD).
@@ -1260,7 +1280,7 @@ class LiveTrading:
             logger.error("Entry failed", error=result.error)
             # Mark position as error
             position.mark_error(f"Entry failed: {result.error}")
-            return
+            return _fail(f"Entry failed: {result.error}")
         
         logger.info("Entry order placed via V2",
                    symbol=futures_symbol,
@@ -1283,7 +1303,7 @@ class LiveTrading:
         
         # Note: Stop placement happens in the gateway's order event handler
         # when the entry fill is confirmed
-
+        return _ok()
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition with throttling."""
