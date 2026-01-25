@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -24,6 +24,8 @@ help:
 	@echo "  make audit-orphaned  Audit + cancel orphaned stops (when 0 positions)"
 	@echo "  make place-missing-stops     List naked positions, dry-run place stops (STOP_PCT=2)"
 	@echo "  make place-missing-stops-live Place missing stops for naked positions (STOP_PCT=2)"
+	@echo "  make cancel-all-place-stops       Cancel ALL orders, dry-run place SL per position"
+	@echo "  make cancel-all-place-stops-live  Cancel ALL orders, then place SL per position (STOP_PCT=2)"
 	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
 	@echo "  make test          Run unit tests"
 	@echo "  make logs          Tail run logs"
@@ -204,6 +206,24 @@ place-missing-stops-live:
 	@if [ -f .env.local ]; then \
 		set -a; source .env.local; set +a; \
 		$(PYTHON) -m src.tools.place_missing_stops --stop-pct $(STOP_PCT); \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+cancel-all-place-stops:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.place_missing_stops --cancel-all-first --dry-run --stop-pct $(STOP_PCT); \
+	else \
+		echo "❌ .env.local not found. Run 'make validate' first."; \
+		exit 1; \
+	fi
+
+cancel-all-place-stops-live:
+	@if [ -f .env.local ]; then \
+		set -a; source .env.local; set +a; \
+		$(PYTHON) -m src.tools.place_missing_stops --cancel-all-first --stop-pct $(STOP_PCT); \
 	else \
 		echo "❌ .env.local not found. Run 'make validate' first."; \
 		exit 1; \

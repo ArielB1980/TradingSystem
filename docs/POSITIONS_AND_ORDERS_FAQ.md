@@ -118,6 +118,15 @@ make place-missing-stops-live         # Place stops (default 2% from entry)
 make place-missing-stops STOP_PCT=1.5 # Use 1.5% distance (dry-run)
 ```
 
+**Cancel all orders, then protect every position with a new SL:** Use the **cancel-all-place-stops** workflow:
+
+```bash
+make cancel-all-place-stops       # Dry-run: would cancel all orders, then place one SL per position
+make cancel-all-place-stops-live  # Live: cancel ALL open orders, then place one SL per position (STOP_PCT=2)
+```
+
+Same `STOP_PCT` and `--dry-run` behaviour as `place-missing-stops`. Use when you want to clear all orders (entries, TPs, existing stops) and re‑protect each open position with a single stop.
+
 ---
 
 ## Summary
