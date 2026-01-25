@@ -63,7 +63,20 @@ def migrate():
         db.create_all()
         print("✅ Tables created/verified")
     except Exception as e:
-        print(f"⚠️  Warning during table creation: {e}")
+        error_str = str(e)
+        if "permission denied" in error_str.lower() or "insufficientprivilege" in error_str.lower():
+            print(f"\n❌ PERMISSION ERROR: Database user lacks CREATE privileges on schema 'public'")
+            print(f"   This is common with managed PostgreSQL databases.")
+            print(f"\n   SOLUTION: Grant CREATE privilege to your database user:")
+            print(f"   Connect to your database as a superuser and run:")
+            print(f"   GRANT CREATE ON SCHEMA public TO {db_url.split('@')[0].split('://')[1].split(':')[0] if '@' in db_url else 'your_user'};")
+            print(f"   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {db_url.split('@')[0].split('://')[1].split(':')[0] if '@' in db_url else 'your_user'};")
+            print(f"\n   Or use a different schema by setting search_path in DATABASE_URL:")
+            print(f"   postgresql://user:pass@host/db?options=-csearch_path%3Dyour_schema")
+            print(f"\n   Tables will be created automatically when the app first uses the database.")
+            print(f"   The app will continue but database operations will fail until permissions are fixed.\n")
+        else:
+            print(f"⚠️  Warning during table creation: {e}")
         # Continue anyway - tables might already exist or error might be non-critical
 
     with engine.connect() as conn:
