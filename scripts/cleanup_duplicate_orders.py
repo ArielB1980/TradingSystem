@@ -395,14 +395,19 @@ def find_redundant_sl_orders(
     positions: List[dict],
     db_metadata: Dict[str, Dict],
     tolerance_pct: Decimal,
-    prefer_oldest: bool = False
+    prefer_oldest: bool = False,
+    exclude_order_ids: Optional[Set[str]] = None
 ) -> List[Dict]:
     """
     Find redundant SL orders (keep most protective per position).
     
+    Args:
+        exclude_order_ids: Set of order IDs to exclude (already marked for cancellation)
+    
     Returns list of cancellation candidates with reason='REDUNDANT_SL'.
     """
     cancellation_candidates = []
+    exclude_order_ids = exclude_order_ids or set()
     
     # Build position lookup by symbol (all variants)
     pos_by_symbol = {}
@@ -415,11 +420,15 @@ def find_redundant_sl_orders(
         for variant in variants:
             pos_by_symbol[variant] = pos
     
-    # Group SL orders by normalized symbol
+    # Group SL orders by normalized symbol (exclude already-cancelled orders)
     sl_orders_by_symbol = defaultdict(list)
     for order in orders:
         if classify_order(order) != "SL":
             continue
+        
+        order_id = order.get("id")
+        if order_id in exclude_order_ids:
+            continue  # Already marked for cancellation
         
         symbol = order.get("symbol")
         if not symbol:
@@ -466,8 +475,9 @@ def find_redundant_sl_orders(
         db_tp_ids = db_info.get("tp_order_ids", [])
         
         # Check if DB-referenced order is within tolerance of most protective
+        # But only if it's not already excluded
         keep_order = None
-        if db_sl_id:
+        if db_sl_id and db_sl_id not in exclude_order_ids:
             for order, price in sl_with_prices:
                 if order.get("id") == db_sl_id:
                     # Check if within tolerance
@@ -477,7 +487,15 @@ def find_redundant_sl_orders(
         
         # If no DB match or DB order not within tolerance, use most protective
         if keep_order is None:
-            keep_order = sl_with_prices[0][0]
+            # Ensure most protective is not excluded
+            for order, price in sl_with_prices:
+                if order.get("id") not in exclude_order_ids:
+                    keep_order = order
+                    break
+            
+            # If all are excluded, skip this position
+            if keep_order is None:
+                continue
         
         # Mark others for cancellation
         for order, price in sl_with_prices:
@@ -614,6 +632,16 @@ def post_plan_safety_check(
         for variant in variants:
             pos_by_symbol[variant] = pos
     
+    # Build map of kept order IDs (from cancellation candidates)
+    # These are orders that are preserved even though they're in duplicate clusters
+    kept_order_ids = set()
+    for candidate in orders_to_cancel:
+        kept_id = candidate.get("kept_order_id")
+        if kept_id:
+            # Only count as kept if the kept order itself is not being cancelled
+            if kept_id not in cancel_order_ids:
+                kept_order_ids.add(kept_id)
+    
     # Count SL orders per position after cancellation
     sl_orders_by_symbol = defaultdict(list)
     for order in all_orders:
@@ -621,14 +649,21 @@ def post_plan_safety_check(
             continue
         
         order_id = order.get("id")
-        if order_id in cancel_order_ids:
-            continue  # This order will be cancelled
-        
         symbol = order.get("symbol")
         if not symbol:
             continue
         
         symbol_norm = normalize_symbol_for_comparison(symbol)
+        
+        # If order is being cancelled, skip it (unless it's a kept order)
+        if order_id in cancel_order_ids:
+            if order_id in kept_order_ids:
+                # This is a kept order, count it
+                sl_orders_by_symbol[symbol_norm].append(order)
+            # Otherwise, skip (being cancelled)
+            continue
+        
+        # Order is not being cancelled, count it
         sl_orders_by_symbol[symbol_norm].append(order)
     
     # Check each position (use set to avoid duplicate warnings for same position)
@@ -764,7 +799,8 @@ async def cleanup_duplicate_orders(
             positions,
             db_metadata,
             price_tolerance_pct,
-            prefer_oldest
+            prefer_oldest,
+            exclude_order_ids=cancelled_order_ids
         )
         print(f"  Found: {len(redundant_sl_candidates)} redundant SL orders")
         
@@ -802,8 +838,87 @@ async def cleanup_duplicate_orders(
                 seen_order_ids.add(order_id)
                 unique_candidates.append(candidate)
         
-        # Limit to max_cancellations
-        candidates_to_process = unique_candidates[:max_cancellations]
+        # Smart selection: ensure we don't cancel all SL orders for any position
+        # Build position lookup
+        pos_variants_map = {}
+        for pos in positions:
+            pos_sym = pos.get("symbol")
+            if pos_sym and float(pos.get("size", 0)) != 0:
+                variants = get_all_symbol_variants(pos_sym)
+                for variant in variants:
+                    pos_variants_map[variant] = pos_sym
+        
+        # Count total SL orders per position
+        sl_orders_by_pos = defaultdict(set)
+        for order in orders_raw:
+            if classify_order(order) == "SL":
+                symbol = order.get("symbol")
+                if symbol:
+                    symbol_norm = normalize_symbol_for_comparison(symbol)
+                    if symbol_norm in pos_variants_map:
+                        sl_orders_by_pos[symbol_norm].add(order.get("id"))
+        
+        # Build map of kept orders (from exact duplicates) - these are preserved
+        # Also build set of all kept order IDs to never cancel them
+        kept_sl_by_pos = defaultdict(set)
+        all_kept_order_ids = set()
+        for candidate in unique_candidates:
+            if candidate.get("kept_order_id") and candidate["class"] == "SL":
+                symbol_norm = candidate["symbol_norm"]
+                kept_id = candidate["kept_order_id"]
+                all_kept_order_ids.add(kept_id)
+                if symbol_norm in sl_orders_by_pos:
+                    kept_sl_by_pos[symbol_norm].add(kept_id)
+        
+        # Select candidates, ensuring at least one SL remains per position
+        candidates_to_process = []
+        sl_cancelled_in_selection = defaultdict(set)
+        
+        for candidate in unique_candidates:
+            if len(candidates_to_process) >= max_cancellations:
+                break
+            
+            order = candidate["order"]
+            order_id = order.get("id")
+            order_class = candidate["class"]
+            symbol_norm = candidate["symbol_norm"]
+            
+            # Never cancel a kept order
+            if order_id in all_kept_order_ids:
+                continue
+            
+            # For SL orders, check if cancelling would leave position with 0 SL
+            if order_class == "SL" and symbol_norm in sl_orders_by_pos:
+                total_sl_ids = sl_orders_by_pos[symbol_norm]
+                total_sl = len(total_sl_ids)
+                already_cancelled_ids = sl_cancelled_in_selection[symbol_norm]
+                kept = kept_sl_by_pos.get(symbol_norm, set())
+                
+                # Calculate which SL orders would remain after this cancellation
+                would_be_cancelled = already_cancelled_ids.copy()
+                would_be_cancelled.add(order_id)
+                
+                # Start with all SL orders, remove cancelled ones, add kept ones
+                remaining_ids = total_sl_ids - would_be_cancelled
+                
+                # Add kept orders that aren't being cancelled
+                for kept_id in kept:
+                    if kept_id not in would_be_cancelled and kept_id in total_sl_ids:
+                        remaining_ids.add(kept_id)
+                
+                # Also check if this candidate has a kept_order_id that would remain
+                if candidate.get("kept_order_id"):
+                    kept_id = candidate["kept_order_id"]
+                    if kept_id not in would_be_cancelled and kept_id in total_sl_ids:
+                        remaining_ids.add(kept_id)
+                
+                if len(remaining_ids) <= 0:
+                    # Would leave position with 0 SL, skip this candidate
+                    continue
+                
+                sl_cancelled_in_selection[symbol_norm].add(order_id)
+            
+            candidates_to_process.append(candidate)
         
         # Post-plan safety check
         print("\n=== Post-Plan Safety Check ===")
