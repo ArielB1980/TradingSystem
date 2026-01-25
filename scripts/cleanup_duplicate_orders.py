@@ -938,11 +938,21 @@ async def cleanup_duplicate_orders(
             orders_raw
         )
         
-        # If safety check fails, remove ALL candidates for positions that would be left with 0 SL
+        # If safety check fails, iteratively remove ALL candidates for positions that would be left with 0 SL
         # This is a conservative approach - better to cancel fewer orders than leave positions unprotected
-        if not safe:
-            print("  ⚠️  Safety check failed - removing ALL candidates for unsafe positions...")
+        max_iterations = 10
+        iteration = 0
+        while not safe and iteration < max_iterations:
+            iteration += 1
+            if iteration == 1:
+                print("  ⚠️  Safety check failed - removing candidates for unsafe positions...")
+            else:
+                print(f"  ⚠️  Safety check still failing (iteration {iteration}) - removing more candidates...")
+            
             unsafe_positions = {w.split()[1] for w in warnings}  # Extract position symbols from warnings
+            
+            if not unsafe_positions:
+                break  # No unsafe positions, exit loop
             
             # Build map of unsafe position symbols (all variants)
             unsafe_symbol_variants = set()
@@ -960,7 +970,10 @@ async def cleanup_duplicate_orders(
             removed_count = len(candidates_to_process) - len(safe_candidates)
             candidates_to_process = safe_candidates
             if removed_count > 0:
-                print(f"  Removed {removed_count} candidates for unsafe positions, {len(candidates_to_process)} remain")
+                print(f"    Removed {removed_count} candidates for unsafe positions, {len(candidates_to_process)} remain")
+            else:
+                # No candidates removed, can't fix - break
+                break
             
             # Re-run safety check
             safe, warnings = post_plan_safety_check(
@@ -968,6 +981,9 @@ async def cleanup_duplicate_orders(
                 candidates_to_process,
                 orders_raw
             )
+        
+        if not safe:
+            print(f"  ⚠️  Safety check still failing after {iteration} iterations")
         
         if warnings:
             for warning in warnings:
