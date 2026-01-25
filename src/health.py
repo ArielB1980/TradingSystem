@@ -147,9 +147,28 @@ def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
 
     @w.get("/api/health")
     async def api_health():
-        """Quick health: DB ping, environment."""
-        out = {"status": "healthy", "database": "unknown", "environment": os.getenv("ENVIRONMENT", "unknown")}
-        if os.getenv("DATABASE_URL"):
+        """Quick health: DB ping, environment, secrets availability."""
+        from src.utils.secret_manager import check_secret_availability, get_environment
+        
+        out = {
+            "status": "healthy",
+            "database": "unknown",
+            "environment": get_environment(),
+            "secrets": {}
+        }
+        
+        # Check secrets availability
+        required_secrets = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
+        for secret in required_secrets:
+            is_available, error_msg = check_secret_availability(secret)
+            out["secrets"][secret] = {
+                "available": is_available,
+                "error": error_msg if not is_available else None
+            }
+        
+        # Check database connection
+        db_available, db_error = check_secret_availability("DATABASE_URL")
+        if db_available:
             out["database"] = "configured"
             try:
                 from src.storage.db import get_db
@@ -162,8 +181,15 @@ def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
                 out["database"] = f"error: {str(e)[:80]}"
                 out["status"] = "unhealthy"
         else:
+            out["database"] = "missing"
             out["status"] = "unhealthy"
-        return JSONResponse(content=out, status_code=200 if out["status"] == "healthy" else 503)
+        
+        # Overall status: unhealthy if any required secret is missing
+        if not all(out["secrets"][s]["available"] for s in required_secrets):
+            out["status"] = "degraded"  # Degraded, not unhealthy, since secrets may be injected later
+        
+        status_code = 200 if out["status"] == "healthy" else (503 if out["status"] == "unhealthy" else 200)
+        return JSONResponse(content=out, status_code=status_code)
 
     @w.get("/api/debug/signals")
     async def api_debug_signals(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
@@ -264,16 +290,29 @@ async def root():
 @app.get("/api/health")
 async def health():
     """Health check. Pings DB; reports kill switch and worker liveness from metrics."""
+    from src.utils.secret_manager import check_secret_availability, get_environment
+    
     checks = {
         "status": "healthy",
         "database": "unknown",
-        "environment": os.getenv("ENVIRONMENT", "unknown"),
+        "environment": get_environment(),
         "kill_switch_active": False,
         "worker_last_tick_at": None,
         "worker_stale": None,
+        "secrets": {}
     }
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
+    
+    # Check secrets availability
+    required_secrets = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
+    for secret in required_secrets:
+        is_available, error_msg = check_secret_availability(secret)
+        checks["secrets"][secret] = {
+            "available": is_available,
+            "error": error_msg if not is_available else None
+        }
+    
+    db_available, db_error = check_secret_availability("DATABASE_URL")
+    if not db_available:
         checks["database"] = "missing"
         checks["status"] = "unhealthy"
     else:

@@ -81,15 +81,16 @@ _db_instance: Database | None = None
 
 
 def get_db() -> Database:
-    """Get or create the global database instance."""
+    """
+    Get or create the global database instance.
+    
+    Uses lazy validation with retry logic for cloud platform secret injection.
+    """
     global _db_instance
     if _db_instance is None:
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
-            raise RuntimeError(
-                "DATABASE_URL environment variable is required. "
-                "Set it to a postgresql:// connection string."
-            )
+        # Use lazy validation with retry logic for cloud platforms
+        from src.utils.secret_manager import get_database_url
+        database_url = get_database_url()
         _db_instance = Database(database_url)
         _db_instance.create_all()
     return _db_instance
