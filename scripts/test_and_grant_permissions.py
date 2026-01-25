@@ -53,6 +53,7 @@ def test_and_grant(host: str, port: int, username: str, password: str, database:
             print(f"Attempting to grant permissions to '{target_user}'...")
             print("=" * 60)
             
+            trans = None
             try:
                 # Start transaction
                 trans = conn.begin()
@@ -80,7 +81,8 @@ def test_and_grant(host: str, port: int, username: str, password: str, database:
                 return True
                 
             except Exception as e:
-                trans.rollback()
+                if trans:
+                    trans.rollback()
                 error_str = str(e).lower()
                 
                 if "permission denied" in error_str or "insufficientprivilege" in error_str:
