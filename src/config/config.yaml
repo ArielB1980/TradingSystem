@@ -38,15 +38,15 @@ risk:
   
   # Portfolio limits (CONSERVATIVE for live start)
   # Portfolio limits (Scaled for Multi-Asset)
-  max_concurrent_positions: 50  # Allow up to 50 parallel trades
+  max_concurrent_positions: 25  # Allow up to 25 parallel trades
   daily_loss_limit_pct: 0.05  # 5% daily loss limit (Accommodates 10x active sizing)
   loss_streak_cooldown: 3  # Halt after 3 consecutive losses
   
   # Auction mode portfolio allocation
   auction_mode_enabled: true  # Enable auction-based portfolio allocation
-  auction_max_positions: 50  # Maximum positions in portfolio
+  auction_max_positions: 25  # Maximum positions in portfolio
   auction_max_margin_util: 0.90  # Maximum margin utilization (90%)
-  auction_max_per_cluster: 12  # Maximum positions per cluster
+  auction_max_per_cluster: 6  # Maximum positions per cluster (25% of max positions)
   auction_max_per_symbol: 1  # Maximum positions per symbol
   auction_swap_threshold: 10.0  # Minimum score advantage to replace position
   auction_min_hold_minutes: 15  # Minimum hold time before position can be kicked
