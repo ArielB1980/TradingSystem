@@ -3,12 +3,15 @@ from sqlalchemy import text
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from files only if they exist (for local dev)
+# Load environment variables from files only in local development
 # In production (DigitalOcean), env vars are already set in the runtime environment
-if os.path.exists(".env.local"):
-    load_dotenv(".env.local")
-elif os.path.exists(".env"):
-    load_dotenv(".env")
+# Only load from .env files if DATABASE_URL is not already set (production has it set)
+if not os.environ.get('DATABASE_URL'):
+    # Local development - try to load from .env files
+    if os.path.exists(".env.local"):
+        load_dotenv(".env.local", override=False)  # Don't override existing vars
+    elif os.path.exists(".env"):
+        load_dotenv(".env", override=False)  # Don't override existing vars
 
 def migrate():
     """Run PostgreSQL schema migrations."""
