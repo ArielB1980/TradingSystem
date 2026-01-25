@@ -111,10 +111,22 @@ def migrate():
             ]
             for col_name, col_type in new_cols:
                 try:
-                    conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
-                    print(f"  ✓ positions.{col_name}")
+                    # Check if column exists first (PostgreSQL doesn't support IF NOT EXISTS in ALTER TABLE)
+                    check_result = conn.execute(text(f"""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name='positions' AND column_name='{col_name}'
+                    """))
+                    if check_result.fetchone():
+                        print(f"  ⊙ positions.{col_name} (already exists)")
+                    else:
+                        conn.execute(text(f"ALTER TABLE positions ADD COLUMN {col_name} {col_type};"))
+                        print(f"  ✓ positions.{col_name}")
                 except Exception as e:
-                    print(f"  ⚠ positions.{col_name}: {e}")
+                    if "already exists" in str(e).lower() or "duplicate column" in str(e).lower():
+                        print(f"  ⊙ positions.{col_name} (already exists)")
+                    else:
+                        print(f"  ⚠ positions.{col_name}: {e}")
             conn.commit()
         except Exception as e:
             if "does not exist" in str(e):
