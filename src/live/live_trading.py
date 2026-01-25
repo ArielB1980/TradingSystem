@@ -827,7 +827,11 @@ class LiveTrading:
                                 "structure": signal.structure_info,
                                 "meta": signal.meta_info
                             }
-                            
+                            if signal.signal_type != SignalType.NO_SIGNAL:
+                                trace_details["skipped"] = not is_tradable
+                                if not is_tradable:
+                                    trace_details["skip_reason"] = "no_futures_ticker"
+
                             if signal.signal_type == SignalType.NO_SIGNAL and signal.reasoning:
                                 logger.info(f"SMC Analysis {spot_symbol}: NO_SIGNAL -> {signal.reasoning}")
                             

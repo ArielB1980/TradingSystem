@@ -9,6 +9,8 @@ debug endpoints live on the worker health server.
 """
 import html as html_module
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import os
@@ -393,6 +395,30 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
     return results
 
 
+_CET = ZoneInfo("Europe/Berlin")
+
+
+def _format_ts_cet(ts: str) -> str:
+    """Format ISO timestamp as human-readable date/time in CET. Returns original if parse fails."""
+    if ts is None:
+        return "—"
+    if not isinstance(ts, str):
+        return str(ts)
+    ts = ts.strip()
+    if not ts:
+        return "—"
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(_CET)
+        return local.strftime("%d %b %Y, %H:%M %Z")
+    except Exception:
+        return ts
+
+
 def _debug_signals_html(data: dict) -> str:
     """Render debug signals payload as human-readable HTML."""
     def esc(s: str) -> str:
@@ -433,10 +459,14 @@ def _debug_signals_html(data: dict) -> str:
         "tr:hover{background:#18181b;}",
         ".reason{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
         "a{color:#3b82f6;}",
+        ".notice{background:#1c1917;border:1px solid #44403c;border-radius:6px;padding:0.75rem 1rem;margin:0.5rem 0;font-size:0.875rem;color:#a8a29e;}",
+        ".notice strong{color:#fafaf9;}",
+        "code{background:#27272a;padding:0.1em 0.35em;border-radius:4px;font-size:0.85em;}",
         "</style></head><body>",
         f"<h1>Debug Signals</h1>",
         f"<div class='meta'>Status: <span class='badge {status_class}'>{status_label}</span> · "
         f"Checked events: {checked} · "
+        f"All times CET · "
         f"<a href='?format=json'>JSON</a></div>",
     ]
 
@@ -446,6 +476,8 @@ def _debug_signals_html(data: dict) -> str:
     if last:
         d = last.get("details") or {}
         reason = d.get("reason") or ""
+        if isinstance(reason, list):
+            reason = "\n".join(str(x) for x in reason) if reason else ""
         sym = last.get("symbol", "—")
         sig = (last.get("signal") or "no_signal").lower()
         sig_cls = "signal-long" if sig == "long" else ("signal-short" if sig == "short" else "signal-none")
@@ -455,16 +487,32 @@ def _debug_signals_html(data: dict) -> str:
         html_parts.append(f"<span class='k'>Symbol</span><span class='v'>{esc(sym)}</span>")
         html_parts.append(f"<span class='k'>Signal</span><span class='v {sig_cls}'>{esc(str(last.get('signal', '—')))}</span>")
         html_parts.append(f"<span class='k'>Quality</span><span class='v'>{esc(str(last.get('quality', '—')))}</span>")
-        html_parts.append(f"<span class='k'>Time</span><span class='v'>{esc(str(last.get('timestamp', '—')))}</span>")
+        html_parts.append(f"<span class='k'>Time</span><span class='v'>{esc(_format_ts_cet(last.get('timestamp') or ''))}</span>")
         html_parts.append("</div>")
         if reason:
             html_parts.append("<pre>" + esc(reason) + "</pre>")
         html_parts.append("</div>")
+        skipped = d.get("skipped")
+        skip_reason = d.get("skip_reason") or ""
+        if skipped and skip_reason:
+            rr = "no_futures_ticker"
+            human = "No Kraken Futures market for this symbol; we skip trading it." if skip_reason == rr else esc(skip_reason)
+            html_parts.append(
+                f"<div class='notice'><strong>Why no trade?</strong> This signal was not traded: {human}</div>"
+            )
+        else:
+            html_parts.append(
+                "<div class='notice'><strong>Signals but no Kraken trade?</strong> Possible causes: Risk Manager "
+                "rejected, State Machine rejected (e.g. max positions), Entry failed (exchange error), or "
+                "no futures ticker (we skip). Check worker logs for <code>Signal skipped (no futures ticker)</code>, "
+                "<code>Trade rejected by Risk Manager</code>, <code>Entry REJECTED by State Machine</code>, "
+                "<code>Entry failed</code>.</div>"
+            )
 
     html_parts.append("<h2>Recent decisions</h2>")
     html_parts.append("<div class='card'><table><thead><tr><th>Time</th><th>Symbol</th><th>Signal</th><th>Quality</th><th>Reasoning</th></tr></thead><tbody>")
     for dec in decisions[:40]:
-        t = dec.get("time", "")
+        t = _format_ts_cet(dec.get("time") or "")
         s = dec.get("symbol", "")
         sig = (dec.get("signal") or "no_signal").lower()
         sig_cls = "signal-long" if sig == "long" else ("signal-short" if sig == "short" else "signal-none")
