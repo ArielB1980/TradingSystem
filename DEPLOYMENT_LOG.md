@@ -64,9 +64,14 @@ risk:
 
 - [x] Code committed
 - [x] Pushed to main branch
+- [x] Critical fix: Auction budget margin logic
 - [ ] Production deployment (if applicable)
 - [ ] Monitoring enabled
 - [ ] Rollback plan prepared
+
+### Latest Update (2026-01-25)
+
+**Critical Fix:** Auction candidate selection now uses auction budget margin instead of current available margin. This ensures the auction sees ALL candidates and can optimize by closing positions to free margin for better opportunities. Without this fix, the auction would only see "best 50 among affordable" instead of "best 50 overall".
 
 ### Rollback Plan
 
