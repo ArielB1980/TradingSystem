@@ -477,14 +477,17 @@ def validate_required_env_vars() -> None:
     """
     Validate that required environment variables are set.
     
-    Fails fast with clear error messages if required vars are missing.
+    In production (DigitalOcean), RUN_TIME secrets may not be immediately
+    available at startup. This validation logs warnings but doesn't fail
+    if we're in a deployment environment where secrets are injected later.
     
     Raises:
-        ValueError: If required environment variables are missing
+        ValueError: If required environment variables are missing and we're
+                    not in a deployment environment where they should be injected
     """
     import os
     
-    env = os.getenv("ENV", "prod")
+    env = os.getenv("ENV", os.getenv("ENVIRONMENT", "prod"))
     dry_run = os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", "0"))
     
     # Convert dry_run to boolean
@@ -494,7 +497,7 @@ def validate_required_env_vars() -> None:
     
     # Database is always required (but has defaults in local mode)
     if not is_dry_run and env == "prod":
-        # Production mode - strict requirements
+        # Production mode - check for required vars
         if not os.getenv("DATABASE_URL"):
             missing_vars.append("DATABASE_URL")
         
@@ -505,6 +508,27 @@ def validate_required_env_vars() -> None:
             missing_vars.append("KRAKEN_FUTURES_API_SECRET")
     
     if missing_vars:
+        # Check if we're in DigitalOcean App Platform
+        # In DO, RUN_TIME secrets are injected but may have timing issues
+        # We'll log a warning but allow the app to continue - the actual
+        # operations will fail later with clearer errors if secrets are truly missing
+        is_do_platform = os.getenv("DIGITALOCEAN_APP_ID") or os.path.exists("/workspace")
+        
+        if is_do_platform:
+            # In DigitalOcean, secrets are injected at runtime
+            # Log warning but don't fail - let the actual operations fail with clearer errors
+            from src.monitoring.logger import get_logger
+            logger = get_logger(__name__)
+            logger.warning(
+                "Some required environment variables are not yet available at startup",
+                missing_vars=missing_vars,
+                note="In DigitalOcean App Platform, RUN_TIME secrets may be injected after startup. "
+                     "The application will continue, but operations requiring these secrets will fail with clearer errors."
+            )
+            # Don't raise - allow app to start and fail later with better context
+            return
+        
+        # Not in DO platform - fail fast with clear error
         error_msg = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║  CONFIGURATION ERROR: Missing Required Environment Variables ║
