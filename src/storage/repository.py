@@ -10,6 +10,9 @@ from typing import List, Optional, Dict, Tuple, Any
 import json
 from src.storage.db import Base, get_db
 from src.domain.models import Candle, Trade, Position, Side
+from src.monitoring.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 # Query Cache
@@ -195,19 +198,23 @@ class AccountStateModel(Base):
 # Repository Functions
 def save_candle(candle: Candle) -> None:
     """Save a candle to the database."""
-    db = get_db()
-    with db.get_session() as session:
-        candle_model = CandleModel(
-            timestamp=candle.timestamp,
-            symbol=candle.symbol,
-            timeframe=candle.timeframe,
-            open=candle.open,
-            high=candle.high,
-            low=candle.low,
-            close=candle.close,
-            volume=candle.volume,
-        )
-        session.add(candle_model)
+    try:
+        db = get_db()
+        with db.get_session() as session:
+            candle_model = CandleModel(
+                timestamp=candle.timestamp,
+                symbol=candle.symbol,
+                timeframe=candle.timeframe,
+                open=candle.open,
+                high=candle.high,
+                low=candle.low,
+                close=candle.close,
+                volume=candle.volume,
+            )
+            session.add(candle_model)
+    except Exception as e:
+        logger.error("Failed to save candle", symbol=candle.symbol, timeframe=candle.timeframe, error=str(e))
+        raise  # Re-raise to allow caller to handle
 
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -222,71 +229,75 @@ def save_candles_bulk(candles: List[Candle]) -> int:
         candles: List of Candle objects
         
     Returns:
-        Number of candles processed
+        Number of candles processed (0 if failed)
     """
     if not candles:
         return 0
         
-    db = get_db()
-    
-    # Prepare data for bulk insert
-    values = [
-        {
-            "timestamp": c.timestamp,
-            "symbol": c.symbol,
-            "timeframe": c.timeframe,
-            "open": c.open,
-            "high": c.high,
-            "low": c.low,
-            "close": c.close,
-            "volume": c.volume
-        }
-        for c in candles
-    ]
-    
-    # Detect database type
-    is_postgres = db.database_url.startswith("postgresql")
-    
-    with db.get_session() as session:
-        if is_postgres:
-            # PostgreSQL: Use ON CONFLICT DO UPDATE
-            stmt = pg_insert(CandleModel).values(values)
-            stmt = stmt.on_conflict_do_update(
-                constraint='uq_candle_key',
-                set_={
-                    "open": stmt.excluded.open,
-                    "high": stmt.excluded.high,
-                    "low": stmt.excluded.low,
-                    "close": stmt.excluded.close,
-                    "volume": stmt.excluded.volume
-                }
-            )
-            session.execute(stmt)
-        else:
-            # SQLite: Use INSERT OR REPLACE (upsert equivalent)
-            # Note: SQLite doesn't support ON CONFLICT with partial updates well
-            # So we do individual upserts for each candle
-            for value in values:
-                # Check if exists
-                existing = session.query(CandleModel).filter(
-                    CandleModel.symbol == value["symbol"],
-                    CandleModel.timeframe == value["timeframe"],
-                    CandleModel.timestamp == value["timestamp"]
-                ).first()
-                
-                if existing:
-                    # Update
-                    existing.open = value["open"]
-                    existing.high = value["high"]
-                    existing.low = value["low"]
-                    existing.close = value["close"]
-                    existing.volume = value["volume"]
-                else:
-                    # Insert
-                    candle_model = CandleModel(**value)
-                    session.add(candle_model)
-            
-    return len(candles)
+    try:
+        db = get_db()
+        
+        # Prepare data for bulk insert
+        values = [
+            {
+                "timestamp": c.timestamp,
+                "symbol": c.symbol,
+                "timeframe": c.timeframe,
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume
+            }
+            for c in candles
+        ]
+        
+        # Detect database type
+        is_postgres = db.database_url.startswith("postgresql")
+        
+        with db.get_session() as session:
+            if is_postgres:
+                # PostgreSQL: Use ON CONFLICT DO UPDATE
+                stmt = pg_insert(CandleModel).values(values)
+                stmt = stmt.on_conflict_do_update(
+                    constraint='uq_candle_key',
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "volume": stmt.excluded.volume
+                    }
+                )
+                session.execute(stmt)
+            else:
+                # SQLite: Use INSERT OR REPLACE (upsert equivalent)
+                # Note: SQLite doesn't support ON CONFLICT with partial updates well
+                # So we do individual upserts for each candle
+                for value in values:
+                    # Check if exists
+                    existing = session.query(CandleModel).filter(
+                        CandleModel.symbol == value["symbol"],
+                        CandleModel.timeframe == value["timeframe"],
+                        CandleModel.timestamp == value["timestamp"]
+                    ).first()
+                    
+                    if existing:
+                        # Update
+                        existing.open = value["open"]
+                        existing.high = value["high"]
+                        existing.low = value["low"]
+                        existing.close = value["close"]
+                        existing.volume = value["volume"]
+                    else:
+                        # Insert
+                        candle_model = CandleModel(**value)
+                        session.add(candle_model)
+        
+        return len(candles)
+    except Exception as e:
+        logger.error("Failed to save candles bulk", error=str(e), count=len(candles) if candles else 0)
+        return 0  # Return 0 on failure (caller can retry)
 
 
 
@@ -482,59 +493,64 @@ def save_trade(trade: Trade) -> None:
 
 def save_position(position: Position) -> None:
     """Save or update position state."""
-    db = get_db()
-    with db.get_session() as session:
-        position_model = session.query(PositionModel).filter(
-            PositionModel.symbol == position.symbol
-        ).first()
-        
-        if position_model:
-            # Update existing
-            position_model.side = position.side.value
-            position_model.size = position.size
-            position_model.size_notional = position.size_notional
-            position_model.entry_price = position.entry_price
-            position_model.current_mark_price = position.current_mark_price
-            position_model.liquidation_price = position.liquidation_price
-            position_model.unrealized_pnl = position.unrealized_pnl
-            position_model.leverage = position.leverage
-            position_model.margin_used = position.margin_used
-            position_model.stop_loss_order_id = position.stop_loss_order_id
-            position_model.take_profit_order_id = position.take_profit_order_id
-            # Management fields
-            position_model.initial_stop_price = position.initial_stop_price
-            position_model.tp1_price = position.tp1_price
-            position_model.tp2_price = position.tp2_price
-            position_model.final_target_price = position.final_target_price
-            # Store tp_order_ids as JSON array
-            import json
-            position_model.tp_order_ids = json.dumps(position.tp_order_ids) if position.tp_order_ids else None
-            position_model.updated_at = datetime.utcnow()
-        else:
-            # Create new
-            position_model = PositionModel(
-                symbol=position.symbol,
-                side=position.side.value,
-                size=position.size,
-                size_notional=position.size_notional,
-                entry_price=position.entry_price,
-                current_mark_price=position.current_mark_price,
-                liquidation_price=position.liquidation_price,
-                unrealized_pnl=position.unrealized_pnl,
-                leverage=position.leverage,
-                margin_used=position.margin_used,
-                stop_loss_order_id=position.stop_loss_order_id,
-                take_profit_order_id=position.take_profit_order_id,
+    try:
+        db = get_db()
+        with db.get_session() as session:
+            position_model = session.query(PositionModel).filter(
+                PositionModel.symbol == position.symbol
+            ).first()
+            
+            if position_model:
+                # Update existing
+                position_model.side = position.side.value
+                position_model.size = position.size
+                position_model.size_notional = position.size_notional
+                position_model.entry_price = position.entry_price
+                position_model.current_mark_price = position.current_mark_price
+                position_model.liquidation_price = position.liquidation_price
+                position_model.unrealized_pnl = position.unrealized_pnl
+                position_model.leverage = position.leverage
+                position_model.margin_used = position.margin_used
+                position_model.stop_loss_order_id = position.stop_loss_order_id
+                position_model.take_profit_order_id = position.take_profit_order_id
                 # Management fields
-                initial_stop_price=position.initial_stop_price,
-                tp1_price=position.tp1_price,
-                tp2_price=position.tp2_price,
-                final_target_price=position.final_target_price,
+                position_model.initial_stop_price = position.initial_stop_price
+                position_model.tp1_price = position.tp1_price
+                position_model.tp2_price = position.tp2_price
+                position_model.final_target_price = position.final_target_price
                 # Store tp_order_ids as JSON array
-                tp_order_ids=json.dumps(position.tp_order_ids) if position.tp_order_ids else None,
-                opened_at=position.opened_at,
-            )
-            session.add(position_model)
+                import json
+                position_model.tp_order_ids = json.dumps(position.tp_order_ids) if position.tp_order_ids else None
+                position_model.updated_at = datetime.utcnow()
+            else:
+                # Create new
+                import json
+                position_model = PositionModel(
+                    symbol=position.symbol,
+                    side=position.side.value,
+                    size=position.size,
+                    size_notional=position.size_notional,
+                    entry_price=position.entry_price,
+                    current_mark_price=position.current_mark_price,
+                    liquidation_price=position.liquidation_price,
+                    unrealized_pnl=position.unrealized_pnl,
+                    leverage=position.leverage,
+                    margin_used=position.margin_used,
+                    stop_loss_order_id=position.stop_loss_order_id,
+                    take_profit_order_id=position.take_profit_order_id,
+                    # Management fields
+                    initial_stop_price=position.initial_stop_price,
+                    tp1_price=position.tp1_price,
+                    tp2_price=position.tp2_price,
+                    final_target_price=position.final_target_price,
+                    # Store tp_order_ids as JSON array
+                    tp_order_ids=json.dumps(position.tp_order_ids) if position.tp_order_ids else None,
+                    opened_at=position.opened_at,
+                )
+                session.add(position_model)
+    except Exception as e:
+        logger.error("Failed to save position", symbol=position.symbol, error=str(e))
+        raise  # Re-raise - position persistence is critical
 
 
 def delete_position(symbol: str) -> None:
@@ -805,16 +821,20 @@ def record_event(
     except Exception as e:
         details_json = json.dumps({"error": str(e), "original_type": str(type(details))})
     
-    db = get_db()
-    with db.get_session() as session:
-        event = SystemEventModel(
-            timestamp=timestamp,
-            event_type=event_type,
-            symbol=symbol,
-            decision_id=decision_id,
-            details=details_json
-        )
-        session.add(event)
+    try:
+        db = get_db()
+        with db.get_session() as session:
+            event = SystemEventModel(
+                timestamp=timestamp,
+                event_type=event_type,
+                symbol=symbol,
+                decision_id=decision_id,
+                details=details_json
+            )
+            session.add(event)
+    except Exception as e:
+        logger.error("Failed to record event", event_type=event_type, symbol=symbol, error=str(e))
+        # Don't re-raise - event logging failures shouldn't crash the system
 
 
 async def async_record_event(
