@@ -312,7 +312,8 @@ class DataConfig(BaseSettings):
     max_gap_seconds: int = Field(default=60, ge=10, le=300)
     
     # Storage
-    database_url: str
+    # database_url can be None in DigitalOcean if RUN_TIME secrets aren't immediately available
+    database_url: Optional[str] = None
 
 
 class ReconciliationConfig(BaseSettings):
@@ -437,13 +438,27 @@ class Config(BaseSettings):
             import os
             db_url = os.getenv("DATABASE_URL")
             if not db_url:
-                raise ValueError(
-                    "DATABASE_URL is required. Set it in your environment or .env.local file. "
-                    "Example: postgresql://user@localhost/tradingsystem"
-                )
-            if "data" not in config_dict:
-                config_dict["data"] = {}
-            config_dict["data"]["database_url"] = db_url
+                # Check if we're in DigitalOcean App Platform
+                # In DO, RUN_TIME secrets may not be immediately available
+                is_do_platform = os.getenv("DIGITALOCEAN_APP_ID") or os.path.exists("/workspace")
+                
+                if is_do_platform:
+                    # In DigitalOcean, allow missing DATABASE_URL - it will be injected later
+                    # Set a placeholder that will be replaced when the secret is available
+                    if "data" not in config_dict:
+                        config_dict["data"] = {}
+                    # Don't set database_url - let it be None and handle gracefully later
+                    # The database connection will fail with a clearer error if truly missing
+                else:
+                    # Not in DO platform - fail fast with clear error
+                    raise ValueError(
+                        "DATABASE_URL is required. Set it in your environment or .env.local file. "
+                        "Example: postgresql://user@localhost/tradingsystem"
+                    )
+            else:
+                if "data" not in config_dict:
+                    config_dict["data"] = {}
+                config_dict["data"]["database_url"] = db_url
 
         # Force dry_run if not explicitly set in local/dev
         if config_dict.get("environment") != "prod":
