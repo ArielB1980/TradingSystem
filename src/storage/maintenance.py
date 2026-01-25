@@ -14,7 +14,15 @@ class DatabasePruner:
     """Service for cleaning up old database records."""
     
     def __init__(self):
-        self.db = get_db()
+        """Initialize pruner. Database connection is lazy-loaded when needed."""
+        self._db = None
+    
+    @property
+    def db(self):
+        """Lazy-load database connection when first accessed."""
+        if self._db is None:
+            self._db = get_db()
+        return self._db
         
     def prune_old_traces(self, days_to_keep: int = 3) -> int:
         """
