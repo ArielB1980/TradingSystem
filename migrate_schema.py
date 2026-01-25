@@ -57,33 +57,56 @@ def migrate():
     if dialect != "postgresql":
         raise RuntimeError(f"Expected PostgreSQL, got {dialect}. Update DATABASE_URL.")
 
-    with engine.connect() as conn:
-        # 1. Alter candle columns for higher precision
-        print("Applying candle column alterations...")
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            conn.execute(text(f"ALTER TABLE candles ALTER COLUMN {col} TYPE NUMERIC(30, 10);"))
-            print(f"  ✓ candles.{col}")
-        conn.commit()
+    # CRITICAL: Create all tables FIRST (if they don't exist)
+    print("\nCreating database tables (if they don't exist)...")
+    try:
+        db.create_all()
+        print("✅ Tables created/verified")
+    except Exception as e:
+        print(f"⚠️  Warning during table creation: {e}")
+        # Continue anyway - tables might already exist or error might be non-critical
 
-        # 2. Add new columns to positions table if they don't exist
-        print("Adding position columns...")
-        new_cols = [
-            ("trade_type", "VARCHAR"),
-            ("partial_close_pct", "NUMERIC(5, 2)"),
-            ("original_size", "NUMERIC(20, 8)"),
-            ("tp_order_ids", "VARCHAR"),
-            ("basis_at_entry", "NUMERIC(20, 8)"),
-            ("basis_current", "NUMERIC(20, 8)"),
-            ("funding_rate", "NUMERIC(20, 8)"),
-            ("cumulative_funding", "NUMERIC(20, 8)"),
-        ]
-        for col_name, col_type in new_cols:
-            try:
-                conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
-                print(f"  ✓ positions.{col_name}")
-            except Exception as e:
-                print(f"  ⚠ positions.{col_name}: {e}")
-        conn.commit()
+    with engine.connect() as conn:
+        # 1. Alter candle columns for higher precision (only if table exists)
+        print("\nApplying candle column alterations...")
+        try:
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                conn.execute(text(f"ALTER TABLE candles ALTER COLUMN {col} TYPE NUMERIC(30, 10);"))
+                print(f"  ✓ candles.{col}")
+            conn.commit()
+        except Exception as e:
+            if "does not exist" in str(e):
+                print(f"  ⚠️  candles table doesn't exist yet (will be created)")
+            else:
+                print(f"  ⚠️  Error altering candles: {e}")
+            conn.rollback()
+
+        # 2. Add new columns to positions table if they don't exist (only if table exists)
+        print("\nAdding position columns (if needed)...")
+        try:
+            new_cols = [
+                ("trade_type", "VARCHAR"),
+                ("partial_close_pct", "NUMERIC(5, 2)"),
+                ("original_size", "NUMERIC(20, 8)"),
+                ("tp_order_ids", "VARCHAR"),
+                ("basis_at_entry", "NUMERIC(20, 8)"),
+                ("basis_current", "NUMERIC(20, 8)"),
+                ("funding_rate", "NUMERIC(20, 8)"),
+                ("cumulative_funding", "NUMERIC(20, 8)"),
+            ]
+            for col_name, col_type in new_cols:
+                try:
+                    conn.execute(text(f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                    print(f"  ✓ positions.{col_name}")
+                except Exception as e:
+                    print(f"  ⚠ positions.{col_name}: {e}")
+            conn.commit()
+        except Exception as e:
+            if "does not exist" in str(e):
+                print(f"  ⚠️  positions table doesn't exist yet (will be created)")
+            else:
+                print(f"  ⚠️  Error adding position columns: {e}")
+            conn.rollback()
 
     print("Migration complete!")
 

@@ -46,7 +46,15 @@ class Database:
 
     def create_all(self):
         """Create all tables."""
-        Base.metadata.create_all(bind=self.engine)
+        try:
+            Base.metadata.create_all(bind=self.engine)
+        except Exception as e:
+            # Log but don't fail - tables might already exist
+            import logging
+            logging.warning(f"Table creation warning (may be expected): {e}")
+            # Re-raise if it's a critical error (not just "already exists")
+            if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+                raise
 
     def drop_all(self):
         """Drop all tables (use with caution!)."""
