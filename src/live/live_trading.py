@@ -1402,7 +1402,11 @@ class LiveTrading:
         
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
-            return
+            return {
+                "order_placed": False,
+                "reason": "Insufficient equity",
+                "rejection_reasons": ["equity <= 0"]
+            }
 
         # 2. Risk Validation (Safety Gate)
         decision = self.risk_manager.validate_trade(
