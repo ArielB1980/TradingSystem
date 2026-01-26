@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from src.config.config import Config
 from src.services.market_discovery import MarketDiscoveryService
@@ -83,6 +83,9 @@ class LiveTrading:
             self.client,
             position_size_is_notional=config.exchange.position_size_is_notional
         )
+        
+        # Store latest futures tickers for mapping (updated each tick)
+        self.latest_futures_tickers: Optional[Dict[str, Decimal]] = None
         
         # ShockGuard: Wick/Flash move protection
         self.shock_guard = None
@@ -763,20 +766,57 @@ class LiveTrading:
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
             
+            # Store latest futures tickers for use in _handle_signal and other call sites
+            self.latest_futures_tickers = map_futures_tickers
+            # Also store on executor for use in execute_signal
+            self.executor.latest_futures_tickers = map_futures_tickers
+            
             # ShockGuard: Evaluate shock conditions and update state
             if self.shock_guard:
-                # Extract mark prices and spot prices for ShockGuard
-                # map_futures_tickers is Dict[str, Decimal] (mark prices directly)
-                mark_prices_dict = dict(map_futures_tickers)
+                # CRITICAL: Deduplicate futures tickers to one canonical symbol per asset
+                # map_futures_tickers contains aliases (PI_*, PF_*, BASE/USD:USD, BASE/USD)
+                # We need to pick one canonical format per asset to avoid false triggers
+                def extract_base(symbol: str) -> Optional[str]:
+                    """Extract base currency from symbol."""
+                    for prefix in ["PI_", "PF_", "FI_"]:
+                        if symbol.startswith(prefix):
+                            symbol = symbol[len(prefix):]
+                    for suffix in ["USD", "/USD:USD", "/USD"]:
+                        if symbol.endswith(suffix):
+                            symbol = symbol[:-len(suffix)]
+                    return symbol if symbol else None
                 
+                # Build canonical mark prices (prefer CCXT unified BASE/USD:USD, else PF_*)
+                canonical_mark_prices = {}
+                base_to_symbol = {}  # Track which symbol we chose per base
+                for symbol, mark_price in map_futures_tickers.items():
+                    base = extract_base(symbol)
+                    if not base:
+                        continue
+                    # Prefer CCXT unified format, else PF_ format
+                    if base not in base_to_symbol:
+                        base_to_symbol[base] = symbol
+                        canonical_mark_prices[symbol] = mark_price
+                    elif "/USD:USD" in symbol and "/USD:USD" not in base_to_symbol[base]:
+                        # Upgrade to CCXT unified if available
+                        canonical_mark_prices.pop(base_to_symbol[base], None)
+                        base_to_symbol[base] = symbol
+                        canonical_mark_prices[symbol] = mark_price
+                    elif symbol.startswith("PF_") and not base_to_symbol[base].startswith("PF_") and "/USD:USD" not in base_to_symbol[base]:
+                        # Use PF_ as fallback
+                        canonical_mark_prices.pop(base_to_symbol[base], None)
+                        base_to_symbol[base] = symbol
+                        canonical_mark_prices[symbol] = mark_price
+                
+                # Spot prices already use canonical format (spot symbols)
                 spot_prices_dict = {}
                 for symbol, ticker in map_spot_tickers.items():
                     if isinstance(ticker, dict) and "last" in ticker:
                         spot_prices_dict[symbol] = Decimal(str(ticker["last"]))
                 
-                # Evaluate shock conditions
+                # Evaluate shock conditions with canonical symbols only
                 shock_detected = self.shock_guard.evaluate(
-                    mark_prices=mark_prices_dict,
+                    mark_prices=canonical_mark_prices,
                     spot_prices=spot_prices_dict if spot_prices_dict else None,
                 )
                 
@@ -1453,11 +1493,11 @@ class LiveTrading:
              
              # 5. Place Protective Orders (Full TP Ladder) - After Entry Fill
              # Split SL and TP placement so failures don't mask each other
-             # Note: map_futures_tickers is not in scope here (only available in _tick)
-             # This uses fallback mapping (TICKER_MAP or PF_{BASE}USD), which should work
-             # but may miss some normalized symbols. For optimal mapping, futures_tickers
-             # should be passed as a parameter to _handle_signal (future improvement).
-             futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
+             # Use latest futures tickers for optimal mapping
+             futures_symbol = self.futures_adapter.map_spot_to_futures(
+                 signal.symbol,
+                 futures_tickers=self.latest_futures_tickers
+             )
              tps = [o["price"] for o in order_intent.get("take_profits", []) if o.get("price")]
              
              # Extract TP prices for position state
@@ -1589,10 +1629,11 @@ class LiveTrading:
             return _fail(f"Risk Manager rejected: {detail}")
         logger.info("Risk approved", symbol=signal.symbol, notional=str(decision.position_notional))
 
-        # 3. Map to futures symbol
-        # Note: map_futures_tickers not in scope here (V2 path)
-        # Uses fallback mapping - should work but may miss normalized symbols
-        futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
+        # 3. Map to futures symbol (use latest futures tickers for optimal mapping)
+        futures_symbol = self.futures_adapter.map_spot_to_futures(
+            signal.symbol,
+            futures_tickers=self.latest_futures_tickers
+        )
         
         # 4. Generate entry plan to get TP levels
         order_intent = self.execution_engine.generate_entry_plan(

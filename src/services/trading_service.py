@@ -471,6 +471,9 @@ class TradingService:
                  logger.info(f"SIGNAL FOUND: {symbol} {signal.signal_type} {signal.regime} Score={signal.score}")
 
                  # Determine Futures Symbol
+                 # Note: TradingService doesn't have latest_futures_tickers in scope
+                 # Uses fallback mapping (TICKER_MAP or PF_{BASE}USD) - should work for most symbols
+                 # For optimal mapping, TradingService should fetch futures tickers if needed
                  futures_symbol = self.futures_adapter.map_spot_to_futures(symbol)
                  if futures_symbol:
                      # 1. Fetch Account Equity (Futures Balance)

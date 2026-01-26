@@ -9,7 +9,7 @@ Handles:
 - Pyramiding guard
 """
 from decimal import Decimal
-from typing import Dict, Optional, Set, List, Tuple
+from typing import Dict, Optional, Set, List, Tuple, Any
 from datetime import datetime, timezone
 import uuid
 import asyncio
@@ -48,6 +48,9 @@ class Executor:
         self.config = config
         self.futures_adapter = futures_adapter
         self.price_converter = PriceConverter()
+        
+        # Latest futures tickers for optimal symbol mapping (updated by LiveTrading each tick)
+        self.latest_futures_tickers: Optional[Dict[str, Any]] = None
         
         # Order tracking for idempotency
         self.submitted_orders: Dict[str, Order] = {}  # client_order_id → Order
@@ -193,7 +196,10 @@ class Executor:
             )
             return None
         
-        futures_symbol = self.futures_adapter.map_spot_to_futures(order_intent.signal.symbol)
+        futures_symbol = self.futures_adapter.map_spot_to_futures(
+            order_intent.signal.symbol,
+            futures_tickers=self.latest_futures_tickers
+        )
         
         # CRITICAL: Acquire per-symbol lock to prevent race conditions
         # This ensures only one order can be processed for a symbol at a time
