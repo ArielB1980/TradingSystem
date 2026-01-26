@@ -221,9 +221,41 @@ class Executor:
                 # This prevents duplicate orders if sync missed something or order was placed externally
                 try:
                     exchange_orders = await self.futures_adapter.kraken_client.get_futures_open_orders()
+                    
+                    # First, clean up stale local orders that don't exist on exchange
+                    # This fixes the issue where local state has pending orders that were already filled/cancelled
+                    exchange_order_ids = {str(o.get('id', '')) for o in exchange_orders}
+                    exchange_client_ids = {str(o.get('clientOrderId', '')) for o in exchange_orders if o.get('clientOrderId')}
+                    
+                    # Remove local orders that don't exist on exchange (they were filled/cancelled)
+                    stale_orders = []
+                    for client_id, local_order in list(self.submitted_orders.items()):
+                        # Check if order exists on exchange
+                        order_exists = (
+                            local_order.order_id in exchange_order_ids or
+                            client_id in exchange_client_ids
+                        )
+                        
+                        # If order is pending locally but doesn't exist on exchange, it's stale
+                        if (local_order.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING) and 
+                            not order_exists):
+                            stale_orders.append(client_id)
+                    
+                    # Remove stale orders
+                    for client_id in stale_orders:
+                        logger.debug(
+                            "Removing stale pending order from local state",
+                            symbol=self.submitted_orders[client_id].symbol,
+                            client_order_id=client_id,
+                            order_id=self.submitted_orders[client_id].order_id
+                        )
+                        del self.submitted_orders[client_id]
+                    
+                    # Now check if exchange has pending orders for this symbol
                     exchange_pending = any(
                         self._normalize_symbol(o.get('symbol', '')) == self._normalize_symbol(futures_symbol)
                         and o.get('side', '').lower() == ('buy' if order_intent.side == Side.LONG else 'sell')
+                        and o.get('status', '').lower() in ('open', 'pending', 'submitted')
                         for o in exchange_orders
                     )
                     
@@ -246,6 +278,7 @@ class Executor:
 
                 # Check if we have any pending (open) entry orders for this symbol
                 # Block duplicate entry orders - only one entry order per symbol at a time
+                # NOTE: After cleaning stale orders above, this should be more accurate
                 has_pending = any(
                     self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol)
                     and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
