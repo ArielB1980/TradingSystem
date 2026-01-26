@@ -42,7 +42,7 @@ python3 -c "from src.storage.db import init_db; import os; init_db(os.getenv('DA
 
 # 7. Create systemd service
 sudo nano /etc/systemd/system/trading-system.service
-# (paste service file from HETZNER_DEPLOYMENT.md)
+# (paste service file from DIGITALOCEAN_DEPLOYMENT.md)
 
 # 8. Start service
 sudo useradd -r -s /bin/bash trading

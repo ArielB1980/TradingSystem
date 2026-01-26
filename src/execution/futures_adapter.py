@@ -87,14 +87,92 @@ class FuturesAdapter:
         """Update mapping from market discovery (spot -> futures)."""
         self.spot_to_futures_override = mapping or {}
 
-    def map_spot_to_futures(self, spot_symbol: str) -> str:
+    def _find_best_executable_symbol(
+        self, spot_symbol: str, futures_tickers: Optional[Dict[str, any]] = None
+    ) -> Optional[str]:
+        """
+        Find the best executable futures symbol for a spot symbol using ticker lookup.
+        
+        Priority:
+        1. Discovery override (usually CCXT unified "BASE/USD:USD")
+        2. Check futures_tickers for derived keys (prefer CCXT unified, then PF_, then raw)
+        3. TICKER_MAP lookup
+        4. Fallback: PF_{BASE}USD
+        
+        Args:
+            spot_symbol: Spot symbol (e.g., "THETA/USD")
+            futures_tickers: Optional dict of futures tickers (from get_futures_tickers_bulk)
+        
+        Returns:
+            Best executable futures symbol, or None if not found
+        """
+        # Priority 1: Discovery override
+        override = self.spot_to_futures_override.get(spot_symbol)
+        if override:
+            # If tickers provided, verify override exists
+            if futures_tickers is None or override in futures_tickers:
+                return override
+        
+        # Priority 2: Check futures_tickers for derived keys
+        if futures_tickers:
+            base = spot_symbol.split("/")[0]
+            if base == "XBT":
+                base = "BTC"
+            
+            # Try CCXT unified first (preferred for execution)
+            ccxt_unified = f"{base}/USD:USD"
+            if ccxt_unified in futures_tickers:
+                return ccxt_unified
+            
+            # Try PF_ format
+            pf_key = f"PF_{base}USD"
+            if pf_key in futures_tickers:
+                return pf_key
+            
+            # Try raw formats (PI_, PF_, FI_)
+            for prefix in ["PI_", "PF_", "FI_"]:
+                raw_key = f"{prefix}{base}USD"
+                if raw_key in futures_tickers:
+                    return raw_key
+        
+        # Priority 3: TICKER_MAP
+        mapped = FuturesAdapter.TICKER_MAP.get(spot_symbol)
+        if mapped:
+            # If tickers provided, verify mapped symbol exists
+            if futures_tickers is None or mapped in futures_tickers:
+                return mapped
+        
+        # Priority 4: Fallback
+        try:
+            base = spot_symbol.split("/")[0]
+            if base == "XBT":
+                base = "BTC"
+            return f"PF_{base}USD"
+        except IndexError:
+            return None
+    
+    def map_spot_to_futures(
+        self, spot_symbol: str, futures_tickers: Optional[Dict[str, any]] = None
+    ) -> str:
         """
         Map spot symbol to futures symbol.
-        Uses override (e.g. from market discovery) first, then TICKER_MAP, then PF_{BASE}USD.
+        
+        Uses override (e.g. from market discovery) first, then checks futures_tickers
+        for best executable symbol, then TICKER_MAP, then PF_{BASE}USD.
+        
+        Args:
+            spot_symbol: Spot symbol (e.g., "THETA/USD")
+            futures_tickers: Optional dict of futures tickers (from get_futures_tickers_bulk)
+                            If provided, will find best executable symbol that exists in tickers.
+        
+        Returns:
+            Futures symbol (e.g., "THETA/USD:USD" or "PF_THETAUSD")
         """
-        s = self.spot_to_futures_override.get(spot_symbol) or FuturesAdapter.TICKER_MAP.get(spot_symbol)
-        if s:
-            return s
+        result = self._find_best_executable_symbol(spot_symbol, futures_tickers)
+        if result:
+            return result
+        
+        # Final fallback if _find_best_executable_symbol returns None
         try:
             base = spot_symbol.split("/")[0]
             if base == "XBT":

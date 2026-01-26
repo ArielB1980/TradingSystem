@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -18,6 +18,8 @@ help:
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
 	@echo "  make pre-deploy    Run all pre-deployment tests (REQUIRED before push to main)"
+	@echo "  make deploy        Full deployment: tests + commit + push + deploy to server"
+	@echo "  make deploy-quick  Quick deployment: skip tests, commit + push + deploy"
 	@echo "  make deploy-live   Enable live flags on DO tradingbot, track deploy, health-check (needs DO_API_TOKEN)"
 	@echo "  make audit           Audit open futures orders (read-only)"
 	@echo "  make audit-cancel    Audit + cancel redundant stop orders"
@@ -146,6 +148,31 @@ deploy-live:
 	$(PYTHON) scripts/enable_live_trading_do.py && \
 	$(PYTHON) scripts/do_track_and_logs.py --track && \
 	$(PYTHON) scripts/do_track_and_logs.py --check-health
+
+deploy:
+	@echo "=========================================="
+	@echo "FULL DEPLOYMENT"
+	@echo "=========================================="
+	@echo ""
+	@echo "This will:"
+	@echo "  1. Run pre-deployment tests"
+	@echo "  2. Commit and push to GitHub"
+	@echo "  3. Deploy to production server"
+	@echo ""
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	./scripts/deploy.sh
+
+deploy-quick:
+	@echo "=========================================="
+	@echo "QUICK DEPLOYMENT (SKIPS TESTS)"
+	@echo "=========================================="
+	@echo ""
+	@echo "This will:"
+	@echo "  1. Commit and push to GitHub (skip tests)"
+	@echo "  2. Deploy to production server"
+	@echo ""
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	./scripts/deploy.sh --skip-tests
 
 pre-deploy:
 	@echo "=========================================="

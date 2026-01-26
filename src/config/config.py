@@ -136,6 +136,17 @@ class RiskConfig(BaseSettings):
     loss_streak_cooldown_wide: int = Field(default=5, ge=2, le=10) # 4-5 losses
     loss_streak_pause_minutes_tight: int = Field(default=120, ge=30, le=300) # 120 minutes
     loss_streak_pause_minutes_wide: int = Field(default=90, ge=30, le=300) # 90 minutes
+    
+    # ShockGuard: Wick/Flash Move Protection
+    shock_guard_enabled: bool = Field(default=True, description="Enable ShockGuard protection")
+    shock_move_pct: float = Field(default=0.025, ge=0.01, le=0.10, description="1-minute move threshold (2.5%)")
+    shock_range_pct: float = Field(default=0.04, ge=0.02, le=0.10, description="1-minute range threshold (4.0%)")
+    basis_shock_pct: float = Field(default=0.015, ge=0.005, le=0.05, description="Basis divergence threshold (1.5%)")
+    shock_cooldown_minutes: int = Field(default=30, ge=5, le=120, description="Cooldown after shock (minutes)")
+    emergency_buffer_pct: float = Field(default=0.10, ge=0.05, le=0.20, description="Liquidation buffer for CLOSE (10%)")
+    trim_buffer_pct: float = Field(default=0.18, ge=0.10, le=0.30, description="Liquidation buffer for TRIM (18%)")
+    shock_marketwide_count: int = Field(default=3, ge=2, le=10, description="Symbols needed for market-wide shock")
+    shock_marketwide_window_sec: int = Field(default=60, ge=30, le=300, description="Window for market-wide detection (seconds)")
 
 
     @field_validator('max_leverage')
