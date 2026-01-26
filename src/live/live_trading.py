@@ -818,6 +818,19 @@ class LiveTrading:
                     futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
                     has_spot = spot_symbol in map_spot_tickers
                     has_futures = futures_symbol in map_futures_tickers
+                    
+                    # Debug: Log when futures symbol not found
+                    if not has_futures and spot_symbol in map_spot_tickers:
+                        # Check if similar futures symbols exist
+                        similar = [s for s in map_futures_tickers.keys() if spot_symbol.split('/')[0].upper() in s.upper()][:3]
+                        logger.debug(
+                            "Futures symbol not found for signal",
+                            spot_symbol=spot_symbol,
+                            mapped_futures=futures_symbol,
+                            similar_futures=similar,
+                            total_futures_available=len(map_futures_tickers)
+                        )
+                    
                     if not has_spot and not has_futures:
                         return  # Skip if no ticker (spot or futures)
 
