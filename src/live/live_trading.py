@@ -971,6 +971,9 @@ class LiveTrading:
                             current_prices_map[symbol] = Decimal(str(pos_data.get('markPrice', pos_data.get('mark_price', pos_data.get('entryPrice', 0)))))
                 
                 await self._reconcile_protective_orders(all_raw_positions, current_prices_map)
+                
+                # Reconcile stop loss order IDs from exchange
+                await self._reconcile_stop_loss_order_ids(all_raw_positions)
             except Exception as e:
                 logger.error("TP backfill reconciliation failed", error=str(e))
                 # Don't return - continue with trading loop
@@ -2425,6 +2428,112 @@ class LiveTrading:
                     symbol,
                     {"reason": f"error: {str(e)}"}
                 )
+
+    async def _reconcile_stop_loss_order_ids(self, raw_positions: List[Dict]):
+        """
+        Reconcile stop loss order IDs from exchange with database positions.
+        
+        This fixes the issue where stop loss orders exist on exchange but aren't
+        tracked in the database, causing false "UNPROTECTED" alerts.
+        """
+        from src.storage.repository import get_active_position, save_position
+        
+        try:
+            # Get all open orders from exchange
+            open_orders = await self.client.get_futures_open_orders()
+            
+            # Group orders by symbol
+            orders_by_symbol: Dict[str, List[Dict]] = {}
+            for order in open_orders:
+                symbol = order.get('symbol')
+                if symbol:
+                    if symbol not in orders_by_symbol:
+                        orders_by_symbol[symbol] = []
+                    orders_by_symbol[symbol].append(order)
+            
+            # For each position, check if we have a stop loss order on exchange
+            for pos_data in raw_positions:
+                symbol = pos_data.get('symbol')
+                if not symbol or pos_data.get('size', 0) == 0:
+                    continue
+                
+                try:
+                    # Get database position
+                    db_pos = await asyncio.to_thread(get_active_position, symbol)
+                    if not db_pos:
+                        continue
+                    
+                    # Check if position already has stop loss order ID
+                    if db_pos.stop_loss_order_id and not str(db_pos.stop_loss_order_id).startswith('unknown_'):
+                        # Already tracked, skip
+                        continue
+                    
+                    # Look for stop loss orders for this symbol
+                    symbol_orders = orders_by_symbol.get(symbol, [])
+                    stop_loss_order = None
+                    
+                    for order in symbol_orders:
+                        # Check if this is a reduce-only stop order
+                        is_reduce_only = order.get('reduceOnly', False)
+                        order_type = str(order.get('type', '')).lower()
+                        has_stop_price = order.get('stopPrice') is not None
+                        is_stop_type = any(stop_term in order_type for stop_term in ['stop', 'stop-loss', 'stop_loss', 'stp'])
+                        
+                        # Match stop loss orders: reduce-only and has stop price or stop type
+                        if is_reduce_only and (has_stop_price or is_stop_type):
+                            # Verify it's for the correct side (opposite of position)
+                            order_side = order.get('side', '').lower()
+                            pos_side = 'long' if pos_data.get('size', 0) > 0 else 'short'
+                            expected_order_side = 'sell' if pos_side == 'long' else 'buy'
+                            
+                            if order_side == expected_order_side:
+                                stop_loss_order = order
+                                break
+                    
+                    # If we found a stop loss order but database doesn't have it, update
+                    if stop_loss_order:
+                        sl_order_id = stop_loss_order.get('id')
+                        if sl_order_id:
+                            logger.info(
+                                "Reconciled stop loss order ID from exchange",
+                                symbol=symbol,
+                                stop_loss_order_id=sl_order_id,
+                                previous_sl_id=db_pos.stop_loss_order_id
+                            )
+                            
+                            # Update position with stop loss order ID
+                            db_pos.stop_loss_order_id = sl_order_id
+                            
+                            # Update is_protected flag if we have both price and order ID
+                            if db_pos.initial_stop_price and sl_order_id:
+                                db_pos.is_protected = True
+                                db_pos.protection_reason = None
+                                logger.info(
+                                    "Position marked as protected after reconciliation",
+                                    symbol=symbol,
+                                    is_protected=True
+                                )
+                            
+                            # Save updated position to database
+                            await asyncio.to_thread(save_position, db_pos)
+                            
+                            # Also update managed_positions if it exists
+                            if symbol in self.managed_positions:
+                                self.managed_positions[symbol].stop_loss_order_id = sl_order_id
+                                if db_pos.initial_stop_price:
+                                    self.managed_positions[symbol].is_protected = True
+                                    self.managed_positions[symbol].protection_reason = None
+                
+                except Exception as e:
+                    logger.warning(
+                        "Failed to reconcile stop loss order ID",
+                        symbol=symbol,
+                        error=str(e)
+                    )
+                    continue
+        
+        except Exception as e:
+            logger.error("Stop loss order ID reconciliation failed", error=str(e))
 
     async def _should_skip_tp_backfill(
         self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal
