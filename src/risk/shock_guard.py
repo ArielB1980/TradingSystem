@@ -170,23 +170,38 @@ class ShockGuard:
             if len(history) < 2:
                 continue  # Need at least 2 snapshots for move detection
             
-            # Get previous mark (before the current one we just added)
-            # History is sorted by timestamp, so [0] is oldest, [-1] is newest (current)
-            # We want the one before the current, so use [-2] if available, else [0]
-            if len(history) >= 2:
-                prev_snapshot = history[-2]  # Second-to-last (previous before current)
-            else:
-                prev_snapshot = history[0]  # Fallback to oldest
-            prev_mark = prev_snapshot.mark_price
-            
             # Detection 1: 1-minute move
-            if prev_mark > 0:
+            # Find the oldest snapshot within 1-minute window (or closest to 60s ago)
+            # Require dt >= 45s to avoid false triggers on micro-moves
+            one_min_ago = now - timedelta(seconds=60)
+            min_age_seconds = 45  # Minimum age to consider for 1-minute move
+            
+            prev_snapshot = None
+            for snapshot in history:
+                age_seconds = (now - snapshot.timestamp).total_seconds()
+                if age_seconds >= min_age_seconds:
+                    # Prefer snapshot closest to 60s ago, but accept any >= 45s
+                    if prev_snapshot is None or abs(age_seconds - 60) < abs((now - prev_snapshot.timestamp).total_seconds() - 60):
+                        prev_snapshot = snapshot
+            
+            if prev_snapshot and prev_snapshot.mark_price > 0:
+                prev_mark = prev_snapshot.mark_price
                 move_pct = abs(current_mark / prev_mark - Decimal("1"))
+                age_seconds = (now - prev_snapshot.timestamp).total_seconds()
                 if move_pct > self.shock_move_pct:
                     triggered_symbols.add(symbol)
                     reasons.append(
-                        f"{symbol}: 1m move {move_pct:.2%} > {self.shock_move_pct:.2%}"
+                        f"{symbol}: 1m move {move_pct:.2%} > {self.shock_move_pct:.2%} (age: {age_seconds:.1f}s)"
                     )
+            
+            # Detection 2: Range spike (1-minute high-low range)
+            # Note: Range detection requires 1m candles or synthetic range from tick history
+            # For now, we skip range detection as it requires additional data not available here
+            # TODO: Implement range detection if 1m candles are available in the main loop
+            # if self.shock_range_pct > 0:
+            #     # Would need: high, low from 1m candle or tick history
+            #     # range_pct = (high - low) / mid
+            #     # if range_pct > self.shock_range_pct: trigger
             
             # Detection 3: Basis spike (if spot available)
             if spot_prices and symbol in spot_prices:
@@ -200,12 +215,32 @@ class ShockGuard:
                         )
         
         # Detection 4: Market-wide shock
+        # Dedupe symbols by BASE to avoid counting aliases (PI_*, PF_*, BASE/USD:USD, BASE/USD)
+        def extract_base(symbol: str) -> Optional[str]:
+            """Extract base currency from symbol (e.g., 'PI_THETAUSD' -> 'THETA', 'THETA/USD:USD' -> 'THETA')."""
+            # Remove common prefixes
+            for prefix in ["PI_", "PF_", "FI_"]:
+                if symbol.startswith(prefix):
+                    symbol = symbol[len(prefix):]
+            # Remove common suffixes
+            for suffix in ["USD", "/USD:USD", "/USD"]:
+                if symbol.endswith(suffix):
+                    symbol = symbol[:-len(suffix)]
+            return symbol if symbol else None
+        
+        # Dedupe triggered symbols by BASE
+        triggered_bases = set()
+        for symbol in triggered_symbols:
+            base = extract_base(symbol)
+            if base:
+                triggered_bases.add(base)
+        
         now_ts = now
         window_start = now_ts - timedelta(seconds=self.shock_marketwide_window_sec)
         
-        # Add current triggers
-        for symbol in triggered_symbols:
-            self.recent_triggers.append((symbol, now_ts))
+        # Add current triggers (using BASE for deduplication)
+        for base in triggered_bases:
+            self.recent_triggers.append((base, now_ts))
         
         # Clean old triggers
         self.recent_triggers = [
@@ -213,12 +248,16 @@ class ShockGuard:
             if t > window_start
         ]
         
-        # Count unique symbols in window
-        unique_symbols_in_window = {s for s, _ in self.recent_triggers}
-        if len(unique_symbols_in_window) >= self.shock_marketwide_count:
-            triggered_symbols.update(unique_symbols_in_window)
+        # Count unique bases in window (already deduped)
+        unique_bases_in_window = {s for s, _ in self.recent_triggers}
+        if len(unique_bases_in_window) >= self.shock_marketwide_count:
+            # Add all symbols that map to the triggered bases
+            for symbol in mark_prices.keys():
+                base = extract_base(symbol)
+                if base in unique_bases_in_window:
+                    triggered_symbols.add(symbol)
             reasons.append(
-                f"Market-wide: {len(unique_symbols_in_window)} symbols triggered within {self.shock_marketwide_window_sec}s"
+                f"Market-wide: {len(unique_bases_in_window)} unique assets triggered within {self.shock_marketwide_window_sec}s"
             )
         
         # Activate shock mode if any triggers
@@ -259,7 +298,14 @@ class ShockGuard:
         if now is None:
             now = datetime.now(timezone.utc)
         
-        if self.shock_until and now < self.shock_until:
+        # Guard against None shock_until
+        if not self.shock_until:
+            # Clear shock mode if somehow active but no cooldown set
+            self.shock_mode_active = False
+            logger.warning("ShockGuard: shock_mode_active but shock_until is None, clearing state")
+            return False
+        
+        if now < self.shock_until:
             return True
         
         # Cooldown expired, clear shock mode

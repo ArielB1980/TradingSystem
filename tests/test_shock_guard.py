@@ -52,9 +52,9 @@ def test_shock_detection_move_threshold(shock_guard):
     """Test that 1-minute move > threshold triggers shock."""
     from src.risk.shock_guard import MarkPriceSnapshot
     
-    # Set up price history manually (within 1-minute window)
+    # Set up price history manually (snapshot must be >= 45s old for move detection)
     now = datetime.now(timezone.utc)
-    thirty_sec_ago = now - timedelta(seconds=30)  # Within 1-minute window
+    fifty_sec_ago = now - timedelta(seconds=50)  # >= 45s old, within 1-minute window
     
     # Set initial price history (need at least 2 snapshots for comparison)
     # The evaluate() method calls update_mark_prices() which adds current price
@@ -62,13 +62,13 @@ def test_shock_detection_move_threshold(shock_guard):
     shock_guard.mark_price_history["BTC/USD:USD"] = [
         MarkPriceSnapshot(
             mark_price=Decimal("50000"),
-            timestamp=thirty_sec_ago,
+            timestamp=fifty_sec_ago,
         ),
     ]
     
     # Now trigger shock with 3% move (51500 / 50000 - 1 = 3%) to exceed 2.5% threshold
     # evaluate() will call update_mark_prices() which adds 51500 to history
-    # Then it compares current (51500) with history[-2] (50000)
+    # Then it compares current (51500) with snapshot >= 45s old (50000)
     mark_prices = {"BTC/USD:USD": Decimal("51500")}  # 3% move > 2.5% threshold
     shock_detected = shock_guard.evaluate(mark_prices)
     
