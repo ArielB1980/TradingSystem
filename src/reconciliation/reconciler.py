@@ -63,32 +63,67 @@ class Reconciler:
             logger.warning("Failed to fetch exchange positions for reconciliation", error=str(e))
             return {}
 
+    def _normalize_symbol_for_comparison(self, symbol: str) -> str:
+        """
+        Normalize symbol for comparison between exchange and system formats.
+        
+        Handles: PF_EURUSD, EUR/USD:USD, EURUSD, EUR/USD -> EURUSD (base only)
+        """
+        if not symbol:
+            return ""
+        s = str(symbol).upper()
+        # Remove Kraken prefixes
+        s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
+        # Remove CCXT suffixes
+        s = s.split(':')[0]
+        # Remove separators
+        s = s.replace('/', '').replace('-', '').replace('_', '')
+        # Remove USD suffix for comparison (PF_EURUSD vs EUR/USD:USD both become EUR)
+        if s.endswith('USD'):
+            s = s[:-3]
+        return s
+
     async def _reconcile_positions(self, exchange_pos: Dict[str, Dict], system_pos: List[Position]):
         """Compare and alert on discrepancies. Alerts on ghosts; deletes zombies from DB."""
         from src.monitoring.alerts import get_alert_system
 
-        exchange_symbols = set(exchange_pos.keys())
-        system_symbols = {p.symbol for p in system_pos}
+        # Normalize symbols for comparison (handle format differences)
+        # Exchange might return PF_EURUSD, system might store EUR/USD:USD
+        exchange_symbols_normalized = {
+            self._normalize_symbol_for_comparison(sym): (sym, pos_data)
+            for sym, pos_data in exchange_pos.items()
+        }
+        system_symbols_normalized = {
+            self._normalize_symbol_for_comparison(p.symbol): (p.symbol, p)
+            for p in system_pos
+        }
+
+        exchange_normalized_set = set(exchange_symbols_normalized.keys())
+        system_normalized_set = set(system_symbols_normalized.keys())
 
         # Ghost Positions (Exchange has it, we don't) -> alert only
-        ghosts = exchange_symbols - system_symbols
-        if ghosts:
-            logger.critical("GHOST POSITIONS DETECTED", symbols=list(ghosts))
+        ghosts_normalized = exchange_normalized_set - system_normalized_set
+        if ghosts_normalized:
+            # Get original exchange symbols for reporting
+            ghost_symbols = [exchange_symbols_normalized[g][0] for g in ghosts_normalized]
+            logger.critical("GHOST POSITIONS DETECTED", symbols=ghost_symbols)
             try:
                 get_alert_system().send_alert(
                     "critical",
                     "Reconciliation: Ghost Positions",
-                    f"Exchange has positions we do not track: {sorted(ghosts)}. Review and sync or close manually.",
-                    metadata={"symbols": list(ghosts)},
+                    f"Exchange has positions we do not track: {sorted(ghost_symbols)}. Review and sync or close manually.",
+                    metadata={"symbols": ghost_symbols},
                 )
             except Exception as e:
                 logger.warning("Failed to send ghost-position alert", error=str(e))
 
         # Zombie Positions (We have it, exchange doesn't) -> delete from DB + alert
-        zombies = system_symbols - exchange_symbols
-        if zombies:
-            logger.critical("ZOMBIE POSITIONS DETECTED", symbols=list(zombies))
-            for z in zombies:
+        zombies_normalized = system_normalized_set - exchange_normalized_set
+        if zombies_normalized:
+            # Get original system symbols for deletion
+            zombie_symbols = [system_symbols_normalized[z][0] for z in zombies_normalized]
+            logger.critical("ZOMBIE POSITIONS DETECTED", symbols=zombie_symbols)
+            for z in zombie_symbols:
                 try:
                     delete_position(z)
                     logger.info("Removed zombie position from DB", symbol=z)
@@ -98,8 +133,8 @@ class Reconciler:
                 get_alert_system().send_alert(
                     "critical",
                     "Reconciliation: Zombie Positions Closed",
-                    f"Positions removed from system (missing on exchange): {sorted(zombies)}.",
-                    metadata={"symbols": list(zombies)},
+                    f"Positions removed from system (missing on exchange): {sorted(zombie_symbols)}.",
+                    metadata={"symbols": zombie_symbols},
                 )
             except Exception as e:
                 logger.warning("Failed to send zombie-position alert", error=str(e))
