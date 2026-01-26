@@ -1,6 +1,7 @@
 """Quick test of backtest engine - 7 days of BTC."""
 import asyncio
 import os
+from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from src.config.config import load_config
 from src.data.kraken_client import KrakenClient
@@ -16,13 +17,22 @@ setup_logging("INFO", "text")
 
 async def test_backtest():
     """Test backtest with 7 days."""
+    import pytest
+    import os
+    
+    # Skip if DATABASE_URL is not PostgreSQL (backtest requires PostgreSQL)
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url.startswith("postgresql"):
+        pytest.skip("Backtest requires PostgreSQL database. Set DATABASE_URL to a postgresql:// connection string.")
+    
     print("Testing backtest engine...")
     
     # Load config
     config = load_config("src/config/config.yaml")
     
-    # Override config for backtest
-    config.data.database_url = "sqlite:///backtest.db"
+    # Use DATABASE_URL from environment or config
+    if not config.data.database_url.startswith("postgresql"):
+        pytest.skip("Backtest requires PostgreSQL database. Set DATABASE_URL to a postgresql:// connection string.")
     
     init_db(config.data.database_url)
     
@@ -37,8 +47,11 @@ async def test_backtest():
     # User wants to simulate as if balance is larger (~3880) due to leverage/funds
     config.backtest.starting_equity = 3880.0
     
-    # Create backtest engine
-    engine = BacktestEngine(config, client)
+    # Create backtest engine (symbol and starting_equity are optional)
+    engine = BacktestEngine(config, symbol="BTC/USD", starting_equity=Decimal("3880.0"))
+    
+    # Set client for data fetching
+    engine.set_client(client)
     
     # Run 7-day backtest
     end_date = datetime.now(timezone.utc)
@@ -48,7 +61,7 @@ async def test_backtest():
     print(f"Starting Equity: ${config.backtest.starting_equity}")
     print(f"Leverage Limit:  {config.risk.max_leverage}x\n")
     
-    metrics = await engine.run("BTC/USD", start_date, end_date)
+    metrics = await engine.run(start_date, end_date)
     
     # Display results
     print("\n" + "="*60)
