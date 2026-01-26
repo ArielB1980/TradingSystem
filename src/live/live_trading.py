@@ -2004,6 +2004,22 @@ class LiveTrading:
             )
             
             # Convert raw positions to Position objects and metadata
+            # CRITICAL: Build spot-to-futures mapping for symbol matching
+            spot_to_futures_map = {}
+            for pos_data in raw_positions:
+                futures_sym = pos_data.get('symbol')
+                if futures_sym:
+                    # Try to reverse-map futures symbol to spot symbol
+                    # This is needed because auction uses spot symbols but positions use futures symbols
+                    for spot_sym in self.auction_signals_this_tick:
+                        mapped_futures = self.futures_adapter.map_spot_to_futures(
+                            spot_sym[0].symbol,  # signal.symbol
+                            futures_tickers=self.latest_futures_tickers
+                        )
+                        if mapped_futures == futures_sym:
+                            spot_to_futures_map[spot_sym[0].symbol] = futures_sym
+                            break
+            
             open_positions_meta = []
             for pos_data in raw_positions:
                 if pos_data.get('size', 0) == 0:
@@ -2021,6 +2037,21 @@ class LiveTrading:
                         account_equity=equity,
                         is_protective_orders_live=is_protective_live,
                     )
+                    # CRITICAL: Store spot symbol for matching against candidate signals
+                    # The position uses futures symbol (e.g., "PF_PROMPTUSD"), but candidates use spot (e.g., "PROMPT/USD")
+                    # Find matching spot symbol by reverse-mapping
+                    spot_symbol = None
+                    for spot_sym, fut_sym in spot_to_futures_map.items():
+                        if fut_sym == futures_symbol:
+                            spot_symbol = spot_sym
+                            break
+                    # If not found in signals, try to derive from futures symbol
+                    if not spot_symbol:
+                        # Extract base from futures symbol (e.g., "PF_PROMPTUSD" -> "PROMPT")
+                        base = futures_symbol.replace('PF_', '').replace('USD', '').replace('PI_', '').replace('FI_', '')
+                        if base:
+                            spot_symbol = f"{base}/USD"
+                    meta.spot_symbol = spot_symbol
                     open_positions_meta.append(meta)
                 except Exception as e:
                     logger.error("Failed to convert position for auction", symbol=pos_data.get('symbol'), error=str(e))

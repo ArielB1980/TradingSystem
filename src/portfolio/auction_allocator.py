@@ -13,6 +13,24 @@ from enum import Enum
 from src.domain.models import Position, Signal, Side
 from src.monitoring.logger import get_logger
 
+
+def _normalize_symbol_for_matching(symbol: str) -> str:
+    """
+    Normalize symbol for matching between spot and futures formats.
+    
+    Handles: PROMPT/USD, PF_PROMPTUSD, PROMPT/USD:USD -> PROMPTUSD
+    """
+    if not symbol:
+        return ""
+    s = str(symbol).upper()
+    # Remove Kraken prefixes
+    s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
+    # Remove CCXT suffixes
+    s = s.split(':')[0]
+    # Remove separators
+    s = s.replace('/', '').replace('-', '').replace('_', '')
+    return s
+
 logger = get_logger(__name__)
 
 
@@ -35,6 +53,7 @@ class OpenPositionMetadata:
     age_seconds: float
     is_protective_orders_live: bool
     locked: bool = False  # Cannot be kicked (within MIN_HOLD, protective orders not live, etc.)
+    spot_symbol: Optional[str] = None  # Spot symbol for matching against candidate signals
 
 
 @dataclass
@@ -284,9 +303,13 @@ class AuctionAllocator:
             # Compute value for open position
             value = self._compute_open_value(op_meta, portfolio_state)
             
+            # CRITICAL: Use spot symbol for matching if available, otherwise use futures symbol
+            # This ensures proper symbol matching between open positions (futures) and candidates (spot)
+            contender_symbol = op_meta.spot_symbol if op_meta.spot_symbol else op_meta.position.symbol
+            
             contender = Contender(
                 kind=ContenderKind.OPEN,
-                symbol=op_meta.position.symbol,
+                symbol=contender_symbol,  # Use spot symbol for proper matching
                 cluster=op_meta.cluster,
                 direction=op_meta.direction,
                 required_margin=op_meta.margin_used,
@@ -411,8 +434,18 @@ class AuctionAllocator:
             if margin_used + contender.required_margin > max_margin:
                 continue
             
-            # Check symbol cap
-            if symbol_counts.get(contender.symbol, 0) >= self.limits.max_per_symbol:
+            # Check symbol cap (normalize symbols for matching spot vs futures)
+            # Candidates use spot symbols (e.g., "PROMPT/USD"), positions use futures (e.g., "PF_PROMPTUSD")
+            contender_normalized = _normalize_symbol_for_matching(contender.symbol)
+            
+            # Check if any existing winner has the same normalized symbol
+            existing_count = 0
+            for winner in winners:
+                winner_normalized = _normalize_symbol_for_matching(winner.symbol)
+                if winner_normalized == contender_normalized:
+                    existing_count += 1
+            
+            if existing_count >= self.limits.max_per_symbol:
                 continue
             
             # Check cluster cap
@@ -436,7 +469,8 @@ class AuctionAllocator:
             winners.append(contender)
             margin_used += contender.required_margin
             cluster_counts[contender.cluster] = cluster_count + 1
-            symbol_counts[contender.symbol] = symbol_counts.get(contender.symbol, 0) + 1
+            # Track by normalized symbol for proper matching
+            symbol_counts[contender_normalized] = symbol_counts.get(contender_normalized, 0) + 1
             
             if contender.direction == Side.LONG:
                 net_long += contender.required_margin
