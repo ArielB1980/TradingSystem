@@ -813,8 +813,29 @@ class LiveTrading:
                                 # Get current position size
                                 pos_data = map_positions.get(symbol)
                                 if pos_data:
-                                    current_size = Decimal(str(pos_data.get("size", 0)))
-                                    trim_size = current_size * Decimal("0.5")  # 50% reduction
+                                    # Get position size - check if system uses notional or contracts
+                                    current_size_raw = Decimal(str(pos_data.get("size", 0)))
+                                    
+                                    # Determine if size is in contracts or notional
+                                    # If position_size_is_notional is True, size is USD notional
+                                    # If False, size is in contracts
+                                    position_size_is_notional = getattr(
+                                        self.config.exchange, "position_size_is_notional", False
+                                    )
+                                    
+                                    if position_size_is_notional:
+                                        # Size is in USD notional - trim by 50%
+                                        trim_notional = current_size_raw * Decimal("0.5")
+                                        # Convert notional to contracts for API call
+                                        mark_price = mark_prices_dict.get(symbol, Decimal("1"))
+                                        if mark_price > 0:
+                                            trim_size_contracts = trim_notional / mark_price
+                                        else:
+                                            logger.error("ShockGuard: Cannot trim - invalid mark price", symbol=symbol)
+                                            continue
+                                    else:
+                                        # Size is in contracts - trim by 50%
+                                        trim_size_contracts = current_size_raw * Decimal("0.5")
                                     
                                     # Determine side for reduce-only order
                                     side_raw = pos_data.get("side", "long").lower()
@@ -824,19 +845,20 @@ class LiveTrading:
                                         "ShockGuard: Trimming position",
                                         symbol=symbol,
                                         buffer_pct=float(action_item.buffer_pct),
-                                        current_size=str(current_size),
-                                        trim_size=str(trim_size),
+                                        current_size=str(current_size_raw),
+                                        trim_size_contracts=str(trim_size_contracts),
+                                        position_size_is_notional=position_size_is_notional,
                                         reason=action_item.reason,
                                     )
                                     
                                     # Place reduce-only market order to trim
                                     futures_symbol = symbol
-                                    # Convert size to float for API call
+                                    # Convert size to float for API call (always in contracts)
                                     await self.client.place_futures_order(
                                         symbol=futures_symbol,
                                         side=close_side,
                                         order_type="market",
-                                        size=float(trim_size),
+                                        size=float(trim_size_contracts),
                                         reduce_only=True,
                                     )
                         except Exception as e:
@@ -1296,7 +1318,7 @@ class LiveTrading:
         available_margin_override: Optional[Decimal] = None,
         notional_override: Optional[Decimal] = None,
         skip_margin_check: bool = False,
-    ) -> Optional[dict]:
+    ) -> dict:
         """
         Process signal through risk and executor.
         
@@ -1309,7 +1331,10 @@ class LiveTrading:
             skip_margin_check: Skip margin validation (auction already validated)
         
         Returns:
-            {order_placed, reason} for V2 path, else None
+            dict with keys:
+                - order_placed: bool (True if order was placed, False if rejected/failed)
+                - reason: str (human-readable reason for success/failure)
+                - rejection_reasons: list[str] (if rejected, list of rejection reasons from RiskManager)
         """
         self.signals_since_emit += 1
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
@@ -1349,7 +1374,11 @@ class LiveTrading:
         
         if not decision.approved:
             logger.warning("Trade rejected by Risk Manager", reasons=decision.rejection_reasons)
-            return
+            return {
+                "order_placed": False,
+                "reason": f"Risk Manager rejected: {', '.join(decision.rejection_reasons)}",
+                "rejection_reasons": decision.rejection_reasons
+            }
         
         # Use notional_override if provided (auction execution)
         final_notional = notional_override if notional_override is not None else decision.position_notional
@@ -1377,7 +1406,11 @@ class LiveTrading:
                     # Proceed anyway? Or abort? 
                     # If close failed, we might exceed limits. Better to abort.
                     logger.error("Aborting new position entry due to failed replacement")
-                    return
+                    return {
+                        "order_placed": False,
+                        "reason": f"Failed to close existing position for replacement: {str(e)}",
+                        "rejection_reasons": ["replacement_close_failed"]
+                    }
 
             # Execute Entry
             order_intent = self.execution_engine.generate_entry_plan( # Reverted to original method name and args
@@ -1420,6 +1453,10 @@ class LiveTrading:
              
              # 5. Place Protective Orders (Full TP Ladder) - After Entry Fill
              # Split SL and TP placement so failures don't mask each other
+             # Note: map_futures_tickers is not in scope here (only available in _tick)
+             # This uses fallback mapping (TICKER_MAP or PF_{BASE}USD), which should work
+             # but may miss some normalized symbols. For optimal mapping, futures_tickers
+             # should be passed as a parameter to _handle_signal (future improvement).
              futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
              tps = [o["price"] for o in order_intent.get("take_profits", []) if o.get("price")]
              
@@ -1491,6 +1528,19 @@ class LiveTrading:
              from src.storage.repository import save_position
              await asyncio.to_thread(save_position, position_state)
              logger.info("Position persisted to database", symbol=futures_symbol)
+             
+             return {
+                 "order_placed": True,
+                 "reason": f"Entry order placed successfully (order_id: {entry_order.order_id})",
+                 "rejection_reasons": []
+             }
+        else:
+            # Entry order failed
+            return {
+                "order_placed": False,
+                "reason": "Entry order execution failed",
+                "rejection_reasons": ["executor_returned_none"]
+            }
 
     async def _handle_signal_v2(
         self, signal: Signal, spot_price: Decimal, mark_price: Decimal
@@ -1540,6 +1590,8 @@ class LiveTrading:
         logger.info("Risk approved", symbol=signal.symbol, notional=str(decision.position_notional))
 
         # 3. Map to futures symbol
+        # Note: map_futures_tickers not in scope here (V2 path)
+        # Uses fallback mapping - should work but may miss normalized symbols
         futures_symbol = self.futures_adapter.map_spot_to_futures(signal.symbol)
         
         # 4. Generate entry plan to get TP levels
@@ -2015,12 +2067,22 @@ class LiveTrading:
                             notional_override=candidate.position_notional,
                             skip_margin_check=True,
                         )
-                        if result is not None or (result is None and not self.use_state_machine_v2):
+                        if result.get("order_placed", False):
                             opens_executed += 1
-                            logger.info("Auction: Opened position", symbol=signal.symbol)
+                            logger.info(
+                                "Auction: Opened position",
+                                symbol=signal.symbol,
+                                reason=result.get("reason", "unknown")
+                            )
                         else:
                             opens_failed += 1
-                            logger.warning("Auction: Open returned None (may have been rejected)", symbol=signal.symbol)
+                            rejection_reasons = result.get("rejection_reasons", [])
+                            logger.warning(
+                                "Auction: Open rejected/failed",
+                                symbol=signal.symbol,
+                                reason=result.get("reason", "unknown"),
+                                rejection_reasons=rejection_reasons
+                            )
                     else:
                         opens_failed += 1
                         missing = []
