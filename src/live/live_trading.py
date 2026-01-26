@@ -825,15 +825,40 @@ class LiveTrading:
                     # Get positions as Position objects
                     positions_list = []
                     liquidation_prices_dict = {}
+                    # Build mark prices keyed by position symbols (exchange symbols like PF_*)
+                    # Positions use exchange symbols, so we need mark prices for those symbols
+                    mark_prices_for_positions = {}
                     for pos_data in all_raw_positions:
                         pos = self._convert_to_position(pos_data)
                         positions_list.append(pos)
                         liquidation_prices_dict[pos.symbol] = pos.liquidation_price
+                        
+                        # Get mark price for this position symbol (try multiple formats)
+                        pos_symbol = pos.symbol
+                        mark_price = None
+                        # Try direct lookup first
+                        if pos_symbol in map_futures_tickers:
+                            mark_price = map_futures_tickers[pos_symbol]
+                        else:
+                            # Try to find any alias for this symbol
+                            for ticker_symbol, ticker_price in map_futures_tickers.items():
+                                # Extract base from both and compare
+                                pos_base = extract_base(pos_symbol)
+                                ticker_base = extract_base(ticker_symbol)
+                                if pos_base and ticker_base and pos_base == ticker_base:
+                                    mark_price = ticker_price
+                                    break
+                        
+                        # Fallback to position data if available
+                        if not mark_price:
+                            mark_price = Decimal(str(pos_data.get("markPrice", pos_data.get("mark_price", pos_data.get("entryPrice", 0)))))
+                        
+                        mark_prices_for_positions[pos_symbol] = mark_price
                     
                     # Get exposure reduction actions
                     actions = self.shock_guard.get_exposure_reduction_actions(
                         positions=positions_list,
-                        mark_prices=mark_prices_dict,
+                        mark_prices=mark_prices_for_positions,
                         liquidation_prices=liquidation_prices_dict,
                     )
                     
@@ -867,7 +892,11 @@ class LiveTrading:
                                         # Size is in USD notional - trim by 50%
                                         trim_notional = current_size_raw * Decimal("0.5")
                                         # Convert notional to contracts for API call
-                                        mark_price = mark_prices_dict.get(symbol, Decimal("1"))
+                                        # Use mark_prices_for_positions which is keyed by position symbols
+                                        mark_price = mark_prices_for_positions.get(symbol)
+                                        if not mark_price or mark_price <= 0:
+                                            # Fallback to position data
+                                            mark_price = Decimal(str(pos_data.get("markPrice", pos_data.get("mark_price", pos_data.get("entryPrice", 1)))))
                                         if mark_price > 0:
                                             trim_size_contracts = trim_notional / mark_price
                                         else:
@@ -941,14 +970,15 @@ class LiveTrading:
                 logger.error("TP backfill reconciliation failed", error=str(e))
                 # Don't return - continue with trading loop
             symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
+            # Use futures_tickers for accurate coverage counting
             symbols_with_futures = len([
                 s for s in market_symbols
-                if self.futures_adapter.map_spot_to_futures(s) in map_futures_tickers
+                if self.futures_adapter.map_spot_to_futures(s, futures_tickers=map_futures_tickers) in map_futures_tickers
             ])
             symbols_with_neither = len([
                 s for s in market_symbols
                 if s not in map_spot_tickers
-                and self.futures_adapter.map_spot_to_futures(s) not in map_futures_tickers
+                and self.futures_adapter.map_spot_to_futures(s, futures_tickers=map_futures_tickers) not in map_futures_tickers
             ])
             self._last_ticker_with = symbols_with_spot
             self._last_ticker_without = len(market_symbols) - symbols_with_spot
