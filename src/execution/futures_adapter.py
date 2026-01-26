@@ -265,12 +265,24 @@ class FuturesAdapter:
         # 1. Fetch instrument metadata to get contract size
         instruments = await self.kraken_client.get_futures_instruments()
         
-        # Try to find instrument by symbol - instruments API may return different formats
-        # Try: PF_AUDUSD, AUDUSD, AUD/USD:USD, etc.
-        instr = None
-        symbol_upper = symbol.upper()
+        # Convert symbol to PF_* format for instrument lookup (Kraken instruments API uses PF_* format)
+        # Handle CCXT unified format (BASE/USD:USD) -> PF_BASEUSD
+        symbol_for_lookup = symbol.upper()
+        if '/' in symbol_for_lookup and ':USD' in symbol_for_lookup:
+            # CCXT unified format: "ONE/USD:USD" -> "PF_ONEUSD"
+            base = symbol_for_lookup.split('/')[0]
+            symbol_for_lookup = f"PF_{base}USD"
+        elif not symbol_for_lookup.startswith('PF_'):
+            # If not PF_ format, try to convert
+            base = symbol_for_lookup.replace('USD', '').replace('/', '').replace(':', '')
+            if base:
+                symbol_for_lookup = f"PF_{base}USD"
         
-        # First try exact match
+        # Try to find instrument by symbol - instruments API uses PF_* format
+        instr = None
+        symbol_upper = symbol_for_lookup
+        
+        # First try exact match with PF_ format
         instr = next((i for i in instruments if i.get('symbol', '').upper() == symbol_upper), None)
         
         if not instr:
@@ -279,11 +291,8 @@ class FuturesAdapter:
             instr = next((i for i in instruments if i.get('symbol', '').upper() == symbol_no_prefix), None)
         
         if not instr:
-            # Try with /USD:USD format (CCXT unified)
-            base = symbol_upper.replace('PF_', '').replace('USD', '')
-            if base:
-                unified_format = f"{base}/USD:USD"
-                instr = next((i for i in instruments if i.get('symbol', '').upper() == unified_format), None)
+            # Try original symbol format (in case instruments API has different format)
+            instr = next((i for i in instruments if i.get('symbol', '').upper() == symbol.upper()), None)
         
         if not instr:
             # Log available symbols for debugging (first 20 that contain similar base)
@@ -292,6 +301,7 @@ class FuturesAdapter:
             logger.error(
                 "Instrument specs not found",
                 requested_symbol=symbol,
+                converted_symbol=symbol_for_lookup,
                 similar_symbols=similar,
                 total_instruments=len(instruments),
             )
