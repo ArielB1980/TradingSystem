@@ -2651,19 +2651,44 @@ class LiveTrading:
                     continue
                 
                 # Position is closed but order remains - cancel it
-                await self.futures_adapter.cancel_order(oid, sym)
-                cancelled += 1
-                
-                logger.info(
-                    "Cancelled orphan reduce-only order",
-                    symbol=sym,
-                    order_id=oid,
-                    order_type=o.get("type", "unknown")
-                )
+                # Skip if order_id is invalid (e.g., "unknown_" prefix)
+                if oid and not oid.startswith("unknown_"):
+                    try:
+                        await self.futures_adapter.cancel_order(oid, sym)
+                        cancelled += 1
+                        logger.info(
+                            "Cancelled orphan reduce-only order",
+                            symbol=sym,
+                            order_id=oid,
+                            order_type=o.get("type", "unknown")
+                        )
+                    except Exception as e:
+                        # Handle invalidArgument errors gracefully
+                        error_str = str(e)
+                        if "invalidArgument" in error_str or "order_id" in error_str.lower():
+                            logger.debug(
+                                "Skipped orphan order cancellation - invalid order ID",
+                                symbol=sym,
+                                order_id=oid,
+                                error=error_str
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to cancel orphan reduce-only order",
+                                symbol=sym,
+                                order_id=oid,
+                                error=str(e)
+                            )
+                else:
+                    logger.debug(
+                        "Skipped orphan order cancellation - placeholder order ID",
+                        symbol=sym,
+                        order_id=oid
+                    )
                 
             except Exception as e:
                 logger.warning(
-                    "Failed to cancel orphan reduce-only order",
+                    "Error processing orphan order",
                     symbol=o.get("symbol"),
                     order_id=o.get("id"),
                     error=str(e)

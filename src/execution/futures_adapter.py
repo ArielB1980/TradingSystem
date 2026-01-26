@@ -404,10 +404,31 @@ class FuturesAdapter:
             order_id: Order ID to cancel
             symbol: Futures symbol
         """
+        # Skip cancellation for "unknown_" order IDs - these are placeholders when exchange
+        # doesn't return a proper order_id. They can't be cancelled because they don't exist on exchange.
+        if order_id and order_id.startswith("unknown_"):
+            logger.debug(
+                "Skipping cancellation for placeholder order ID",
+                order_id=order_id,
+                symbol=symbol,
+                reason="Placeholder ID - order may not exist on exchange"
+            )
+            return
+        
         try:
             await self.kraken_client.cancel_futures_order(order_id, symbol)
             logger.info("Order cancelled via adapter", order_id=order_id, symbol=symbol)
         except Exception as e:
+            # Don't raise for invalidArgument errors - order may already be cancelled or not exist
+            error_str = str(e)
+            if "invalidArgument" in error_str or "order_id" in error_str.lower():
+                logger.warning(
+                    "Order cancellation skipped - invalid order ID",
+                    order_id=order_id,
+                    symbol=symbol,
+                    error=error_str
+                )
+                return
             logger.error("Failed to cancel order via adapter", order_id=order_id, symbol=symbol, error=str(e))
             raise
     
