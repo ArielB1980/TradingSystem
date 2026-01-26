@@ -4,6 +4,7 @@
 system:
   name: "Trading System V3"
   version: "3.0.0"
+  dry_run: false  # Disable dry run to allow real trades
 
 ## Exchange Settings
 exchange:

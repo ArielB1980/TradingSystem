@@ -474,11 +474,15 @@ class Config(BaseSettings):
                 config_dict["data"]["database_url"] = db_url
 
         # Force dry_run if not explicitly set in local/dev
+        # BUT: Allow DRY_RUN env var to override
         if config_dict.get("environment") != "prod":
             if "system" not in config_dict:
                 config_dict["system"] = {}
             if "dry_run" not in config_dict["system"]:
-                config_dict["system"]["dry_run"] = True
+                # Check DRY_RUN env var first
+                env_dry_run = os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", "1"))
+                is_dry_run = env_dry_run in ("1", "true", "True", "TRUE")
+                config_dict["system"]["dry_run"] = is_dry_run
 
         return cls(**config_dict)
 
