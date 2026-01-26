@@ -83,6 +83,22 @@ class LiveTrading:
             self.client,
             position_size_is_notional=config.exchange.position_size_is_notional
         )
+        
+        # ShockGuard: Wick/Flash move protection
+        self.shock_guard = None
+        if config.risk.shock_guard_enabled:
+            from src.risk.shock_guard import ShockGuard
+            self.shock_guard = ShockGuard(
+                shock_move_pct=config.risk.shock_move_pct,
+                shock_range_pct=config.risk.shock_range_pct,
+                basis_shock_pct=config.risk.basis_shock_pct,
+                shock_cooldown_minutes=config.risk.shock_cooldown_minutes,
+                emergency_buffer_pct=config.risk.emergency_buffer_pct,
+                trim_buffer_pct=config.risk.trim_buffer_pct,
+                shock_marketwide_count=config.risk.shock_marketwide_count,
+                shock_marketwide_window_sec=config.risk.shock_marketwide_window_sec,
+            )
+            logger.info("ShockGuard enabled")
         self.executor = Executor(config.execution, self.futures_adapter)
         self.execution_engine = ExecutionEngine(config)
         self.position_manager = PositionManager()
@@ -747,6 +763,90 @@ class LiveTrading:
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
             
+            # ShockGuard: Evaluate shock conditions and update state
+            if self.shock_guard:
+                # Extract mark prices and spot prices for ShockGuard
+                # map_futures_tickers is Dict[str, Decimal] (mark prices directly)
+                mark_prices_dict = dict(map_futures_tickers)
+                
+                spot_prices_dict = {}
+                for symbol, ticker in map_spot_tickers.items():
+                    if isinstance(ticker, dict) and "last" in ticker:
+                        spot_prices_dict[symbol] = Decimal(str(ticker["last"]))
+                
+                # Evaluate shock conditions
+                shock_detected = self.shock_guard.evaluate(
+                    mark_prices=mark_prices_dict,
+                    spot_prices=spot_prices_dict if spot_prices_dict else None,
+                )
+                
+                # Run exposure reduction if shock active
+                if self.shock_guard.shock_mode_active:
+                    # Get positions as Position objects
+                    positions_list = []
+                    liquidation_prices_dict = {}
+                    for pos_data in all_raw_positions:
+                        pos = self._convert_to_position(pos_data)
+                        positions_list.append(pos)
+                        liquidation_prices_dict[pos.symbol] = pos.liquidation_price
+                    
+                    # Get exposure reduction actions
+                    actions = self.shock_guard.get_exposure_reduction_actions(
+                        positions=positions_list,
+                        mark_prices=mark_prices_dict,
+                        liquidation_prices=liquidation_prices_dict,
+                    )
+                    
+                    # Execute actions
+                    for action_item in actions:
+                        try:
+                            symbol = action_item.symbol
+                            if action_item.action.value == "CLOSE":
+                                logger.warning(
+                                    "ShockGuard: Closing position (emergency)",
+                                    symbol=symbol,
+                                    buffer_pct=float(action_item.buffer_pct),
+                                    reason=action_item.reason,
+                                )
+                                await self.client.close_position(symbol)
+                            elif action_item.action.value == "TRIM":
+                                # Get current position size
+                                pos_data = map_positions.get(symbol)
+                                if pos_data:
+                                    current_size = Decimal(str(pos_data.get("size", 0)))
+                                    trim_size = current_size * Decimal("0.5")  # 50% reduction
+                                    
+                                    # Determine side for reduce-only order
+                                    side_raw = pos_data.get("side", "long").lower()
+                                    close_side = "sell" if side_raw == "long" else "buy"
+                                    
+                                    logger.warning(
+                                        "ShockGuard: Trimming position",
+                                        symbol=symbol,
+                                        buffer_pct=float(action_item.buffer_pct),
+                                        current_size=str(current_size),
+                                        trim_size=str(trim_size),
+                                        reason=action_item.reason,
+                                    )
+                                    
+                                    # Place reduce-only market order to trim
+                                    futures_symbol = symbol
+                                    # Convert size to float for API call
+                                    await self.client.place_futures_order(
+                                        symbol=futures_symbol,
+                                        side=close_side,
+                                        order_type="market",
+                                        size=float(trim_size),
+                                        reduce_only=True,
+                                    )
+                        except Exception as e:
+                            logger.error(
+                                "ShockGuard: Failed to execute exposure reduction",
+                                symbol=action_item.symbol,
+                                action=action_item.action.value,
+                                error=str(e),
+                            )
+            
             # 2.4. Fetch open orders once, index by symbol (for position hydration)
             orders_by_symbol: Dict[str, List[Dict]] = {}
             try:
@@ -767,11 +867,10 @@ class LiveTrading:
                 for pos_data in all_raw_positions:
                     symbol = pos_data.get('symbol')
                     if symbol:
-                        # Prefer futures ticker mark price, fallback to position mark price, then entry
-                        futures_ticker = map_futures_tickers.get(symbol, {})
-                        mark_price = futures_ticker.get('last') or futures_ticker.get('mark')
+                        # map_futures_tickers is Dict[str, Decimal] - mark price directly
+                        mark_price = map_futures_tickers.get(symbol)
                         if mark_price:
-                            current_prices_map[symbol] = Decimal(str(mark_price))
+                            current_prices_map[symbol] = mark_price
                         else:
                             current_prices_map[symbol] = Decimal(str(pos_data.get('markPrice', pos_data.get('mark_price', pos_data.get('entryPrice', 0)))))
                 
@@ -815,7 +914,8 @@ class LiveTrading:
         async def process_coin(spot_symbol: str):
             async with sem:
                 try:
-                    futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol)
+                    # Use futures tickers for improved mapping
+                    futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol, futures_tickers=map_futures_tickers)
                     has_spot = spot_symbol in map_spot_tickers
                     has_futures = futures_symbol in map_futures_tickers
                     
@@ -839,6 +939,7 @@ class LiveTrading:
                         spot_price = Decimal(str(spot_ticker["last"]))
                     else:
                         spot_price = None
+                    # map_futures_tickers is Dict[str, Decimal] - mark price directly
                     mark_price = map_futures_tickers.get(futures_symbol) if has_futures else None
                     if not mark_price:
                         mark_price = spot_price
@@ -887,6 +988,14 @@ class LiveTrading:
                         if actions:
                             await self._execute_management_actions(symbol, actions, managed_pos)
                             
+                    # ShockGuard: Skip signal generation if entries paused
+                    if self.shock_guard and self.shock_guard.should_pause_entries():
+                        logger.debug(
+                            "ShockGuard: Skipping signal generation (entries paused)",
+                            symbol=spot_symbol,
+                        )
+                        return
+                    
                     # Signal Generation (SMC)
                     # Use 15m candles (primary timeframe)
                     # NOTE: _update_candles ensures self.candles_15m is populated
@@ -1180,9 +1289,28 @@ class LiveTrading:
             logger.error("Failed to validate position protection", error=str(e))
     
     async def _handle_signal(
-        self, signal: Signal, spot_price: Decimal, mark_price: Decimal
+        self, 
+        signal: Signal, 
+        spot_price: Decimal, 
+        mark_price: Decimal,
+        available_margin_override: Optional[Decimal] = None,
+        notional_override: Optional[Decimal] = None,
+        skip_margin_check: bool = False,
     ) -> Optional[dict]:
-        """Process signal through risk and executor. Returns {order_placed, reason} for V2 path, else None."""
+        """
+        Process signal through risk and executor.
+        
+        Args:
+            signal: Trading signal
+            spot_price: Current spot price
+            mark_price: Current futures mark price
+            available_margin_override: Override available margin (for auction execution)
+            notional_override: Override position notional (for auction execution)
+            skip_margin_check: Skip margin validation (auction already validated)
+        
+        Returns:
+            {order_placed, reason} for V2 path, else None
+        """
         self.signals_since_emit += 1
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
         
@@ -1191,12 +1319,22 @@ class LiveTrading:
             return await self._handle_signal_v2(signal, spot_price, mark_price)
         
         # ========== LEGACY PATH (below) ==========
-        # 1. Fetch Account Equity and Available Margin
-        balance = await self.client.get_futures_balance()
-        base = getattr(self.config.exchange, "base_currency", "USD")
-        equity, available_margin, _ = await calculate_effective_equity(
-            balance, base_currency=base, kraken_client=self.client
-        )
+        # 1. Fetch Account Equity and Available Margin (unless overridden)
+        if available_margin_override is None:
+            balance = await self.client.get_futures_balance()
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, available_margin, _ = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
+        else:
+            # Use override for margin, but still need equity for risk calculations
+            balance = await self.client.get_futures_balance()
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, _, _ = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
+            available_margin = available_margin_override
+        
         if equity <= 0:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return
@@ -1205,12 +1343,17 @@ class LiveTrading:
         decision = self.risk_manager.validate_trade(
             signal, equity, spot_price, mark_price,
             available_margin=available_margin,
+            notional_override=notional_override,
+            skip_margin_check=skip_margin_check,
         )
         
         if not decision.approved:
             logger.warning("Trade rejected by Risk Manager", reasons=decision.rejection_reasons)
             return
-            
+        
+        # Use notional_override if provided (auction execution)
+        final_notional = notional_override if notional_override is not None else decision.position_notional
+        
         if decision.approved:
             # OPPORTUNITY COST REPLACEMENT
             if decision.should_close_existing and decision.close_symbol:
@@ -1239,7 +1382,7 @@ class LiveTrading:
             # Execute Entry
             order_intent = self.execution_engine.generate_entry_plan( # Reverted to original method name and args
                 signal, 
-                decision.position_notional,
+                final_notional,
                 spot_price,
                 mark_price,
                 decision.leverage
@@ -1255,7 +1398,7 @@ class LiveTrading:
             timestamp=datetime.now(timezone.utc),
             signal=signal,
             side=Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
-            size_notional=decision.position_notional,
+            size_notional=final_notional,
             leverage=decision.leverage,
             entry_price_spot=signal.entry_price,
             stop_loss_spot=signal.stop_loss,
@@ -1738,6 +1881,13 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Failed to convert position for auction", symbol=pos_data.get('symbol'), error=str(e))
             
+            # Log signals collected count
+            signals_count = len(self.auction_signals_this_tick)
+            logger.info(
+                "Auction: Collecting candidate signals",
+                signals_count=signals_count,
+            )
+            
             # Collect candidate signals from this tick
             # CRITICAL: Use auction budget margin instead of current available_margin
             # The auction needs to see ALL candidates, even if current margin is low,
@@ -1746,6 +1896,8 @@ class LiveTrading:
             auction_budget_margin = equity * Decimal(str(self.config.risk.auction_max_margin_util))
             
             candidate_signals = []
+            # Map signal symbol to candidate for lookup during execution
+            signal_to_candidate = {}
             for signal, spot_price, mark_price in self.auction_signals_this_tick:
                 try:
                     # Always use auction budget margin for candidate sizing
@@ -1769,8 +1921,10 @@ class LiveTrading:
                             signal=signal,
                             required_margin=decision.margin_required,
                             risk_R=risk_R,
+                            position_notional=decision.position_notional,
                         )
                         candidate_signals.append(candidate)
+                        signal_to_candidate[signal.symbol] = candidate
                         
                         if not decision.approved:
                             logger.debug(
@@ -1796,6 +1950,16 @@ class LiveTrading:
                 portfolio_state=portfolio_state,
             )
             
+            # Log auction plan summary
+            logger.info(
+                "Auction plan generated",
+                closes_count=len(plan.closes),
+                closes_symbols=plan.closes,
+                opens_count=len(plan.opens),
+                opens_symbols=[s.symbol for s in plan.opens],
+                reasons=plan.reasons,
+            )
+            
             # Execute closes first
             for symbol in plan.closes:
                 try:
@@ -1807,31 +1971,83 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Auction: Failed to close position", symbol=symbol, error=str(e))
             
+            # CRITICAL: Refresh margin after closes
+            balance_after_closes = await self.client.get_futures_balance()
+            equity_after, refreshed_available_margin, _ = await calculate_effective_equity(
+                balance_after_closes, base_currency=base, kraken_client=self.client
+            )
+            logger.info(
+                "Auction: Margin refreshed after closes",
+                equity=str(equity_after),
+                refreshed_available_margin=str(refreshed_available_margin),
+                previous_available_margin=str(available_margin),
+            )
+            
             # Execute opens from auction plan
+            opens_executed = 0
+            opens_failed = 0
             for signal in plan.opens:
                 try:
-                    # Find corresponding price data
+                    # Find corresponding price data and candidate
                     spot_price = None
                     mark_price = None
+                    candidate = signal_to_candidate.get(signal.symbol)
+                    
                     for sig, sp, mp in self.auction_signals_this_tick:
                         if sig.symbol == signal.symbol:
                             spot_price = sp
                             mark_price = mp
                             break
                     
-                    if spot_price and mark_price:
-                        # Handle signal through normal flow (but skip auction check to avoid recursion)
-                        await self._handle_signal(signal, spot_price, mark_price)
-                        logger.info("Auction: Opened position", symbol=signal.symbol)
+                    if spot_price and mark_price and candidate:
+                        # Use auction overrides: refreshed margin, pre-computed notional, skip margin check
+                        logger.info(
+                            "Auction: Executing open with overrides",
+                            symbol=signal.symbol,
+                            notional_override=str(candidate.position_notional),
+                            refreshed_margin=str(refreshed_available_margin),
+                        )
+                        result = await self._handle_signal(
+                            signal, 
+                            spot_price, 
+                            mark_price,
+                            available_margin_override=refreshed_available_margin,
+                            notional_override=candidate.position_notional,
+                            skip_margin_check=True,
+                        )
+                        if result is not None or (result is None and not self.use_state_machine_v2):
+                            opens_executed += 1
+                            logger.info("Auction: Opened position", symbol=signal.symbol)
+                        else:
+                            opens_failed += 1
+                            logger.warning("Auction: Open returned None (may have been rejected)", symbol=signal.symbol)
                     else:
-                        logger.warning("Auction: Missing price data for signal", symbol=signal.symbol)
+                        opens_failed += 1
+                        missing = []
+                        if not spot_price or not mark_price:
+                            missing.append("price_data")
+                        if not candidate:
+                            missing.append("candidate")
+                        logger.warning(
+                            "Auction: Missing data for signal",
+                            symbol=signal.symbol,
+                            missing=missing,
+                        )
                 except Exception as e:
-                    logger.error("Auction: Failed to open position", symbol=signal.symbol, error=str(e))
+                    opens_failed += 1
+                    logger.error(
+                        "Auction: Failed to open position",
+                        symbol=signal.symbol,
+                        error=str(e),
+                        exc_info=True,
+                    )
             
             logger.info(
                 "Auction allocation executed",
                 closes=len(plan.closes),
-                opens=len(plan.opens),
+                opens_planned=len(plan.opens),
+                opens_executed=opens_executed,
+                opens_failed=opens_failed,
                 reasons=plan.reasons,
             )
             

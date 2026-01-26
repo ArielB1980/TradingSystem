@@ -158,6 +158,7 @@ class CandleManager:
 
             candles: List[Candle] = []
             used_futures = False
+            data_source = "spot"
 
             try:
                 candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
@@ -171,6 +172,7 @@ class CandleManager:
                     if raw:
                         candles = _candles_with_symbol(raw, symbol)
                         used_futures = True
+                        data_source = "futures_fallback"
                 except Exception:
                     pass
 
@@ -182,6 +184,25 @@ class CandleManager:
             if used_futures:
                 self._futures_fallback_symbols.add(symbol)
                 logger.debug(f"Using futures OHLCV for {symbol} {tf}", count=len(candles))
+            
+            # Rate-limited log for candle data source (log once per symbol per 5 minutes)
+            # Only log for 15m timeframe to avoid spam
+            if tf == "15m":
+                # Use a simple rate limit: log if last log was > 5 minutes ago
+                # Store last log time per symbol in a simple dict (cleared periodically)
+                if not hasattr(self, '_last_source_log'):
+                    self._last_source_log = {}
+                
+                last_log = self._last_source_log.get(symbol, datetime.min.replace(tzinfo=timezone.utc))
+                if (now - last_log).total_seconds() > 300:  # 5 minutes
+                    logger.info(
+                        "Candle data source",
+                        symbol=symbol,
+                        timeframe=tf,
+                        source=data_source,
+                        count=len(candles),
+                    )
+                    self._last_source_log[symbol] = now
 
             self.last_candle_update[symbol][tf] = now
             if not existing:

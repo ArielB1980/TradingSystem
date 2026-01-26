@@ -55,6 +55,8 @@ class RiskManager:
         futures_entry_price: Optional[Decimal] = None,
         futures_stop_loss: Optional[Decimal] = None,
         available_margin: Optional[Decimal] = None,
+        notional_override: Optional[Decimal] = None,
+        skip_margin_check: bool = False,
     ) -> RiskDecision:
         """
         Validate proposed trade against all risk limits.
@@ -149,92 +151,105 @@ class RiskManager:
         # max_leverage is the absolute cap for safety checks (10x)
         requested_leverage = Decimal(str(getattr(self.config, 'target_leverage', self.config.max_leverage)))
         
-        # --- NEW SIZING LOGIC (V4: Adaptive) ---
+        # Get sizing method (needed for later logic even if using override)
         sizing_method = getattr(self.config, 'sizing_method', 'fixed')
-
-        # Leverage-Based Sizing (Simple)
-        # Position size = Equity × Leverage × Risk%
-        if sizing_method == "leverage_based":
-            buying_power = account_equity * requested_leverage
-            position_notional = buying_power * Decimal(str(self.config.risk_per_trade_pct))
+        
+        # Calculate buying_power (needed for later checks even if using override)
+        buying_power = account_equity * requested_leverage
+        
+        # If notional_override provided (auction execution), use it directly and skip sizing
+        if notional_override is not None:
+            position_notional = notional_override
             logger.debug(
-                "Leverage-based sizing",
-                equity=str(account_equity),
-                leverage=str(requested_leverage),
-                risk_pct=str(self.config.risk_per_trade_pct),
-                position_notional=str(position_notional)
+                "Using notional override from auction",
+                symbol=signal.symbol,
+                notional=str(position_notional),
             )
         else:
-            # Base Sizing (Fixed Risk)
-            # Position size = (Equity * Risk%) / Stop_Dist%
-            base_risk_amount = account_equity * Decimal(str(self.config.risk_per_trade_pct))
-            position_notional = base_risk_amount / stop_distance_pct
-
-        # Kelly Criterion Sizing (skip if leverage_based)
-        if sizing_method in ["kelly", "kelly_volatility"]:
-            win_prob = Decimal(str(self.config.kelly_win_prob))
-            win_loss_ratio = Decimal(str(self.config.kelly_win_loss_ratio))
-            
-            # Kelly % = W - (1-W)/R
-            kelly_pct = win_prob - ((Decimal("1") - win_prob) / win_loss_ratio)
-            
-            # Apply Cap (Quarter Kelly defaults to 0.25)
-            max_kelly = Decimal(str(self.config.kelly_max_fraction))
-            kelly_fraction = min(kelly_pct, max_kelly)
-            
-            if kelly_fraction > 0:
-                # Kelly suggests risking X% of bankroll per trade
-                # Risk Amount = Equity * Kelly%
-                kelly_risk_amount = account_equity * kelly_fraction
-                
-                # Check absolute max risk cap
-                max_risk_pct = Decimal(str(self.config.max_risk_per_trade_entry_pct))
-                abs_risk_cap = account_equity * max_risk_pct
-                
-                final_risk_amount = min(kelly_risk_amount, abs_risk_cap)
-                
-                kelly_notional = final_risk_amount / stop_distance_pct
-                position_notional = kelly_notional
-                logger.debug(f"Kelly Sizing: Frac={kelly_fraction:.2f}, Risk=${final_risk_amount:.2f}")
-        
-        # Volatility Scaling
-        # Volatility Scaling
-        if sizing_method in ["volatility", "kelly_volatility"]:
-            # Check availability of ATR Ratio from Signal
-            if hasattr(signal, 'atr_ratio') and signal.atr_ratio is not None:
-                ratio = float(signal.atr_ratio)
-                scaler = 1.0
-                
-                high_threshold = float(getattr(self.config, 'vol_sizing_atr_threshold_high', 1.5))
-                low_threshold = float(getattr(self.config, 'vol_sizing_atr_threshold_low', 0.8))
-                
-                if ratio > high_threshold:
-                    penalty = float(getattr(self.config, 'vol_sizing_high_vol_penalty', 0.6))
-                    scaler = penalty
-                    logger.debug(f"Volatility Sizing: High Vol (Ratio {ratio:.2f}) -> Penalty {penalty}x")
-                    
-                elif ratio < low_threshold:
-                    boost = float(getattr(self.config, 'vol_sizing_low_vol_boost', 1.2))
-                    scaler = boost
-                    logger.debug(f"Volatility Sizing: Low Vol (Ratio {ratio:.2f}) -> Boost {boost}x")
-                    
-                position_notional *= Decimal(str(scaler))
+            # --- NEW SIZING LOGIC (V4: Adaptive) ---
+            # Leverage-Based Sizing (Simple)
+            # Position size = Equity × Leverage × Risk%
+            if sizing_method == "leverage_based":
+                position_notional = buying_power * Decimal(str(self.config.risk_per_trade_pct))
+                logger.debug(
+                    "Leverage-based sizing",
+                    equity=str(account_equity),
+                    leverage=str(requested_leverage),
+                    risk_pct=str(self.config.risk_per_trade_pct),
+                    position_notional=str(position_notional)
+                )
             else:
-                logger.debug("Volatility Sizing skipped: atr_ratio missing in Signal")
-            
-        # Hard Cap: Max Notional USD
-        max_usd = Decimal(str(self.config.max_position_size_usd))
-        if position_notional > max_usd:
-            position_notional = max_usd
+                # Base Sizing (Fixed Risk)
+                # Position size = (Equity * Risk%) / Stop_Dist%
+                base_risk_amount = account_equity * Decimal(str(self.config.risk_per_trade_pct))
+                position_notional = base_risk_amount / stop_distance_pct
 
-        # Hard Cap: Max Leverage Buying Power
-        buying_power = account_equity * requested_leverage
-        if position_notional > buying_power:
-             position_notional = buying_power
+            # Kelly Criterion Sizing (skip if leverage_based)
+            if sizing_method in ["kelly", "kelly_volatility"]:
+                win_prob = Decimal(str(self.config.kelly_win_prob))
+                win_loss_ratio = Decimal(str(self.config.kelly_win_loss_ratio))
+                
+                # Kelly % = W - (1-W)/R
+                kelly_pct = win_prob - ((Decimal("1") - win_prob) / win_loss_ratio)
+                
+                # Apply Cap (Quarter Kelly defaults to 0.25)
+                max_kelly = Decimal(str(self.config.kelly_max_fraction))
+                kelly_fraction = min(kelly_pct, max_kelly)
+                
+                if kelly_fraction > 0:
+                    # Kelly suggests risking X% of bankroll per trade
+                    # Risk Amount = Equity * Kelly%
+                    kelly_risk_amount = account_equity * kelly_fraction
+                    
+                    # Check absolute max risk cap
+                    max_risk_pct = Decimal(str(self.config.max_risk_per_trade_entry_pct))
+                    abs_risk_cap = account_equity * max_risk_pct
+                    
+                    final_risk_amount = min(kelly_risk_amount, abs_risk_cap)
+                    
+                    kelly_notional = final_risk_amount / stop_distance_pct
+                    position_notional = kelly_notional
+                    logger.debug(f"Kelly Sizing: Frac={kelly_fraction:.2f}, Risk=${final_risk_amount:.2f}")
+            
+            # Volatility Scaling
+            if sizing_method in ["volatility", "kelly_volatility"]:
+                # Check availability of ATR Ratio from Signal
+                if hasattr(signal, 'atr_ratio') and signal.atr_ratio is not None:
+                    ratio = float(signal.atr_ratio)
+                    scaler = 1.0
+                    
+                    high_threshold = float(getattr(self.config, 'vol_sizing_atr_threshold_high', 1.5))
+                    low_threshold = float(getattr(self.config, 'vol_sizing_atr_threshold_low', 0.8))
+                    
+                    if ratio > high_threshold:
+                        penalty = float(getattr(self.config, 'vol_sizing_high_vol_penalty', 0.6))
+                        scaler = penalty
+                        logger.debug(f"Volatility Sizing: High Vol (Ratio {ratio:.2f}) -> Penalty {penalty}x")
+                        
+                    elif ratio < low_threshold:
+                        boost = float(getattr(self.config, 'vol_sizing_low_vol_boost', 1.2))
+                        scaler = boost
+                        logger.debug(f"Volatility Sizing: Low Vol (Ratio {ratio:.2f}) -> Boost {boost}x")
+                        
+                    position_notional *= Decimal(str(scaler))
+                else:
+                    logger.debug("Volatility Sizing skipped: atr_ratio missing in Signal")
+            
+            # Hard Cap: Max Notional USD
+            max_usd = Decimal(str(self.config.max_position_size_usd))
+            if position_notional > max_usd:
+                position_notional = max_usd
+
+        # Hard Cap: Max Leverage Buying Power (only if not using override)
+        if notional_override is None:
+            buying_power = account_equity * requested_leverage
+            if position_notional > buying_power:
+                 position_notional = buying_power
 
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
+        # Skip margin check if skip_margin_check=True (auction already validated)
         min_notional = Decimal("50")
-        if available_margin is not None:
+        if not skip_margin_check and available_margin is not None:
             if available_margin <= 0:
                 rejection_reasons.append(
                     "Insufficient available margin (all margin in use); cannot open new position"
@@ -275,6 +290,12 @@ class RiskManager:
                     basis_divergence_pct=Decimal("0"),
                     estimated_fees_funding=Decimal("0"),
                 )
+        elif skip_margin_check:
+            logger.debug(
+                "Skipping margin check (auction execution)",
+                symbol=signal.symbol,
+                notional=str(position_notional),
+            )
         
         logger.debug(
             f"Validating trade: {len(self.current_positions)} active positions",

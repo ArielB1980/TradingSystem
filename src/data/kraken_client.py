@@ -532,8 +532,13 @@ class KrakenClient:
     async def get_futures_tickers_bulk(self) -> Dict[str, Decimal]:
         """
         Get ALL futures mark prices in one call.
-        Returns dict keyed by both Kraken raw (e.g. PF_XBTUSD) and CCXT unified (e.g. XBT/USD:USD)
-        so callers can look up using either format (e.g. discovery uses CCXT, TICKER_MAP uses PF_*).
+        Returns dict keyed by multiple formats for each ticker:
+        - Original raw symbol (e.g., "PI_THETAUSD")
+        - PF_{BASE}USD format (e.g., "PF_THETAUSD")
+        - CCXT unified format (e.g., "THETA/USD:USD")
+        - BASE/USD format (e.g., "THETA/USD")
+        
+        This ensures lookup works regardless of format used.
         """
         await self.public_limiter.wait_for_token()
         try:
@@ -547,13 +552,53 @@ class KrakenClient:
                     data = await response.json()
 
             results: Dict[str, Decimal] = {}
+            
+            def derive_base(symbol: str) -> Optional[str]:
+                """Derive base currency from symbol (e.g., PI_THETAUSD -> THETA)."""
+                # Strip prefixes: PI_, PF_, FI_
+                base = symbol.upper()
+                for prefix in ["PI_", "PF_", "FI_"]:
+                    if base.startswith(prefix):
+                        base = base[len(prefix):]
+                        break
+                # Strip trailing USD
+                if base.endswith("USD"):
+                    base = base[:-3]
+                # Handle XBT -> BTC
+                if base == "XBT":
+                    base = "BTC"
+                return base if base else None
+            
             for ticker in data.get("tickers", []):
                 raw_symbol = ticker.get("symbol")
                 mark = ticker.get("markPrice")
-                if raw_symbol and mark:
-                    results[raw_symbol] = Decimal(str(mark))
+                if not raw_symbol or not mark:
+                    continue
+                
+                mark_decimal = Decimal(str(mark))
+                
+                # Store original raw key
+                results[raw_symbol] = mark_decimal
+                
+                # Derive base and create normalized keys
+                base = derive_base(raw_symbol)
+                if base:
+                    # Add PF_{BASE}USD format
+                    pf_key = f"PF_{base}USD"
+                    if pf_key not in results:
+                        results[pf_key] = mark_decimal
+                    
+                    # Add {BASE}/USD:USD (CCXT unified)
+                    ccxt_unified = f"{base}/USD:USD"
+                    if ccxt_unified not in results:
+                        results[ccxt_unified] = mark_decimal
+                    
+                    # Add {BASE}/USD (helper format)
+                    base_usd = f"{base}/USD"
+                    if base_usd not in results:
+                        results[base_usd] = mark_decimal
 
-            # Add CCXT unified keys so discovery override (spot -> CCXT symbol) lookups succeed
+            # Also add CCXT unified keys from exchange markets (for any we might have missed)
             if self.futures_exchange:
                 try:
                     if not self.futures_exchange.markets:

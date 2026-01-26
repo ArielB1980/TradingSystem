@@ -47,6 +47,7 @@ class CandidateSignal:
     cluster: str
     required_margin: Decimal
     risk_R: Decimal  # Stop distance in R
+    position_notional: Decimal  # Pre-computed position notional from auction sizing
 
 
 @dataclass
@@ -545,6 +546,7 @@ def create_candidate_signal(
     signal: Signal,
     required_margin: Decimal,
     risk_R: Decimal,
+    position_notional: Decimal,
 ) -> CandidateSignal:
     """Create a CandidateSignal from a Signal."""
     direction = Side.LONG if signal.signal_type.value == "long" else Side.SHORT
@@ -558,6 +560,7 @@ def create_candidate_signal(
         cluster=cluster,
         required_margin=required_margin,
         risk_R=risk_R,
+        position_notional=position_notional,
     )
 
 
