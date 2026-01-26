@@ -1244,7 +1244,15 @@ class LiveTrading:
         
         # Run auction mode allocation (if enabled) - after all signals processed
         if self.auction_allocator:
+            signals_count = len(self.auction_signals_this_tick)
+            logger.info(
+                "Auction: About to run allocation",
+                signals_collected=signals_count,
+                auction_allocator_exists=bool(self.auction_allocator),
+            )
             await self._run_auction_allocation(all_raw_positions)
+        else:
+            logger.debug("Auction: Skipped (auction_allocator is None)")
         
         # Phase 2: Batch save all collected candles (grouped by symbol/timeframe)
         # Phase 2: Batch save all collected candles (delegated to Manager)
@@ -1976,6 +1984,7 @@ class LiveTrading:
         Collects all open positions and candidate signals, runs the auction,
         and executes the allocation plan.
         """
+        logger.debug("Auction: _run_auction_allocation called", signals_count=len(self.auction_signals_this_tick))
         try:
             from src.portfolio.auction_allocator import (
                 position_to_open_metadata,
