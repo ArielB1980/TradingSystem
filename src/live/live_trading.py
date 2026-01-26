@@ -770,6 +770,8 @@ class LiveTrading:
             self.latest_futures_tickers = map_futures_tickers
             # Also store on executor for use in execute_signal
             self.executor.latest_futures_tickers = map_futures_tickers
+            # Update adapter cache for use when futures_tickers not explicitly passed
+            self.futures_adapter.update_cached_futures_tickers(map_futures_tickers)
             
             # ShockGuard: Evaluate shock conditions and update state
             if self.shock_guard:
@@ -891,14 +893,17 @@ class LiveTrading:
                                     if position_size_is_notional:
                                         # Size is in USD notional - trim by 50%
                                         trim_notional = current_size_raw * Decimal("0.5")
-                                        # Convert notional to contracts for API call
+                                        # Convert notional to contracts using proper adapter method
                                         # Use mark_prices_for_positions which is keyed by position symbols
                                         mark_price = mark_prices_for_positions.get(symbol)
                                         if not mark_price or mark_price <= 0:
                                             # Fallback to position data
                                             mark_price = Decimal(str(pos_data.get("markPrice", pos_data.get("mark_price", pos_data.get("entryPrice", 1)))))
                                         if mark_price > 0:
-                                            trim_size_contracts = trim_notional / mark_price
+                                            # Use adapter's notional_to_contracts method for proper conversion
+                                            trim_size_contracts = self.futures_adapter.notional_to_contracts(
+                                                trim_notional, mark_price
+                                            )
                                         else:
                                             logger.error("ShockGuard: Cannot trim - invalid mark price", symbol=symbol)
                                             continue
