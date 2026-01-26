@@ -77,6 +77,8 @@ class FuturesAdapter:
         self.max_leverage = max_leverage
         self.spot_to_futures_override = spot_to_futures_override or {}
         self.position_size_is_notional = position_size_is_notional
+        # Cache latest futures tickers for use when futures_tickers not provided
+        self.cached_futures_tickers: Optional[Dict[str, any]] = None
         logger.info(
             "Futures Adapter initialized",
             max_leverage=max_leverage,
@@ -86,6 +88,10 @@ class FuturesAdapter:
     def set_spot_to_futures_override(self, mapping: Dict[str, str]) -> None:
         """Update mapping from market discovery (spot -> futures)."""
         self.spot_to_futures_override = mapping or {}
+    
+    def update_cached_futures_tickers(self, futures_tickers: Dict[str, any]) -> None:
+        """Update cached futures tickers for use when futures_tickers not provided to map_spot_to_futures()."""
+        self.cached_futures_tickers = futures_tickers
 
     def _find_best_executable_symbol(
         self, spot_symbol: str, futures_tickers: Optional[Dict[str, any]] = None
@@ -164,11 +170,15 @@ class FuturesAdapter:
             spot_symbol: Spot symbol (e.g., "THETA/USD")
             futures_tickers: Optional dict of futures tickers (from get_futures_tickers_bulk)
                             If provided, will find best executable symbol that exists in tickers.
+                            If None, will use cached_futures_tickers if available.
         
         Returns:
             Futures symbol (e.g., "THETA/USD:USD" or "PF_THETAUSD")
         """
-        result = self._find_best_executable_symbol(spot_symbol, futures_tickers)
+        # Use provided tickers, or fall back to cached tickers
+        tickers_to_use = futures_tickers or self.cached_futures_tickers
+        
+        result = self._find_best_executable_symbol(spot_symbol, tickers_to_use)
         if result:
             return result
         
@@ -180,6 +190,28 @@ class FuturesAdapter:
             return f"PF_{base}USD"
         except IndexError:
             raise ValueError(f"Invalid spot symbol format: {spot_symbol}")
+    
+    def notional_to_contracts(
+        self,
+        notional_usd: Decimal,
+        mark_price: Decimal,
+    ) -> Decimal:
+        """
+        Convert USD notional to contracts.
+        
+        For Kraken perps, contracts = notional / mark_price (1 contract = 1 USD notional at mark price).
+        This matches the logic used in ExecutionEngine.generate_entry_plan().
+        
+        Args:
+            notional_usd: Position size in USD notional
+            mark_price: Current mark price
+        
+        Returns:
+            Number of contracts
+        """
+        if mark_price <= 0:
+            raise ValueError(f"Invalid mark price for contract conversion: {mark_price}")
+        return notional_usd / mark_price
     
     async def place_order(
         self,
