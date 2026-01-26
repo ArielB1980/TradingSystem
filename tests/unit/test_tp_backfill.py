@@ -15,6 +15,34 @@ from src.config.config import Config, ExecutionConfig
 def mock_config():
     """Create a mock config with TP backfill settings."""
     config = Mock(spec=Config)
+    
+    # System config
+    config.system = Mock()
+    config.system.dry_run = True
+    
+    # Exchange config
+    config.exchange = Mock()
+    config.exchange.api_key = "test_key"
+    config.exchange.api_secret = "test_secret"
+    config.exchange.futures_api_key = "test_futures_key"
+    config.exchange.futures_api_secret = "test_futures_secret"
+    config.exchange.use_testnet = False
+    config.exchange.spot_markets = ["BTC/USD", "ETH/USD"]
+    config.exchange.futures_markets = ["BTCUSD-PERP", "ETHUSD-PERP"]
+    config.exchange.position_size_is_notional = True
+    config.exchange.use_futures_ohlcv_fallback = True
+    
+    # Strategy config
+    config.strategy = Mock()
+    config.strategy.bias_timeframes = ["4h", "1d"]
+    config.strategy.execution_timeframes = ["15m", "1h"]
+    
+    # Risk config
+    config.risk = Mock()
+    config.risk.shock_guard_enabled = False
+    config.risk.auction_mode_enabled = False
+    
+    # Execution config
     config.execution = Mock(spec=ExecutionConfig)
     config.execution.tp_backfill_enabled = True
     config.execution.tp_backfill_cooldown_minutes = 10
@@ -23,8 +51,20 @@ def mock_config():
     config.execution.max_tp_distance_pct = None
     config.execution.min_tp_orders_expected = 2
     config.execution.min_hold_seconds = 30
-    config.system = Mock()
-    config.system.dry_run = True
+    config.execution.order_timeout_seconds = 300  # 5 minutes
+    config.execution.tp_splits = [0.35, 0.35, 0.30]  # TP split percentages
+    config.execution.rr_fallback_multiples = [1.0, 2.0, 3.0]  # R:R multiples for fallback
+    
+    # Assets config
+    config.assets = Mock()
+    config.assets.mode = "auto"
+    config.assets.whitelist = []
+    config.assets.blacklist = []
+    
+    # Coin universe config
+    config.coin_universe = Mock()
+    config.coin_universe.enabled = False
+    
     return config
 
 
