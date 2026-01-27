@@ -105,8 +105,20 @@ Once candle pipeline and/or universe are fixed and health goes back above both t
 
 ---
 
+## Instrument Specs and Order Rejection Reasons
+
+The **InstrumentSpecRegistry** (`src/execution/instrument_specs.py`) loads futures contract specs from Kraken (min size, step, leverage mode) and caches to `data/instrument_specs_cache.json`. The auction only plans opens for symbols that have a spec; the executor validates size (min, step) and leverage (flexible vs fixed) before placing orders.
+
+- **AUCTION_OPEN_REJECTED**: Planned open dropped before sending (reason: NO_SPEC, SIZE_BELOW_MIN, SIZE_STEP_ROUND_TO_ZERO, or leverage).
+- **ORDER_REJECTED_BY_VENUE**: Kraken rejected set_leverage or create_order (e.g. CONTRACT_NOT_FLEXIBLE_FUTURES). Check `venue_error_code`, `venue_error_message`, `payload_summary`.
+
+Common reasons: **NO_SPEC** = symbol not in instruments or format mismatch; **SIZE_STEP_ROUND_TO_ZERO** = notional too small; **SIZE_BELOW_MIN** = rounded size below min; **CONTRACT_NOT_FLEXIBLE_FUTURES** = contract supports only fixed leverage tiers (registry adjusts to nearest allowed).
+
+---
+
 ## Related
 
 - **OHLCV resilience**: Retries, per-symbol cooldown, and rate limits are in `src.data.ohlcv_fetcher` and configured via `data.ohlcv_*`.
 - **Symbol trimming**: Only Kraken-supported symbols are traded; see “SYMBOL REMOVED (unsupported on Kraken)” in logs when the universe is trimmed.
-- **Log markers**: `AUCTION_START` / `AUCTION_PLAN` / `AUCTION_END`, `PYRAMIDING_GUARD_SKIP`, `RECONCILE_SUMMARY`, `STARTUP_BANNER` for ops visibility.
+- **Log markers**: `AUCTION_START` / `AUCTION_PLAN` / `AUCTION_END`, `AUCTION_OPEN_REJECTED`, `ORDER_REJECTED_BY_VENUE`, `PYRAMIDING_GUARD_SKIP`, `RECONCILE_SUMMARY`, `STARTUP_BANNER` for ops visibility.
+- **Instrument specs**: `src/execution/instrument_specs.py` – registry for min_size, size_step, leverage_mode (flexible/fixed/unknown). Rejections: NO_SPEC, SIZE_STEP_ROUND_TO_ZERO, SIZE_BELOW_MIN; venue CONTRACT_NOT_FLEXIBLE_FUTURES.
