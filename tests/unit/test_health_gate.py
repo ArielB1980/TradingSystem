@@ -48,6 +48,19 @@ def test_health_gate_ratio_boundary():
     assert trade_paused is True
 
 
+def test_health_gate_small_universe_all_healthy():
+    """When total < min_healthy but all coins have data, effective_min = min(30, total) so we pass."""
+    min_healthy = 30
+    min_ratio = 0.25
+    total = 12
+    sufficient = 12
+    effective_min = min(min_healthy, total)  # 12
+    ratio = sufficient / total  # 1.0
+    trade_paused = sufficient < effective_min or ratio < min_ratio
+    assert trade_paused is False
+    assert effective_min == 12
+
+
 def test_universe_trimming_dropped_symbols():
     """When configured symbols include unsupported ones, dropped = prev - supported."""
     prev_symbols = {"BTC/USD", "ETH/USD", "LUNA2/USD", "THETA/USD"}

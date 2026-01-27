@@ -195,6 +195,11 @@ data:
   
   # Data validation
   max_gap_seconds: 60  # Alert if data gap > 1 minute
+
+  # Candle health gate: pause new entries when below threshold
+  # When universe size < min_healthy_coins, we require all coins to have sufficient candles (effective_min = min(30, total))
+  min_healthy_coins: 30   # Min coins with >=50 bars 15m to allow new entries; small universes use min(30, total)
+  min_health_ratio: 0.25  # Min fraction of universe that must have sufficient candles
   
   # Storage
   database_url: "${DATABASE_URL}"  # From environment variable
