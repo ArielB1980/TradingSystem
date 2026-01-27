@@ -187,7 +187,9 @@ class TestTPBackfillLogic:
         from src.live.live_trading import LiveTrading
         
         live_trading = LiveTrading(mock_config)
-        # No cooldown, has SL, old enough
+        # No cooldown, has SL, old enough, and position is marked protected
+        sample_position_long.is_protected = True
+        sample_position_long.protection_reason = None
         
         raw_pos = {"symbol": "BTCUSD-PERP", "size": "1.0", "entryPrice": "50000"}
         
@@ -260,7 +262,7 @@ class TestTPBackfillLogic:
     
     @pytest.mark.asyncio
     async def test_compute_tp_plan_from_r_multiples_long(self, mock_config, sample_position_short):
-        """Test TP plan computation for LONG position using R-multiples."""
+        """Test TP plan computation for SHORT position using R-multiples."""
         from src.live.live_trading import LiveTrading
         
         live_trading = LiveTrading(mock_config)
@@ -272,7 +274,8 @@ class TestTPBackfillLogic:
             "entryPrice": "3000",
             "size": "10.0",
         }
-        current_price = Decimal("2900")
+        # Current above TP1 so "TP1 too close" guard passes (SHORT: require tp1 < current - min_distance)
+        current_price = Decimal("2910")
         
         tp_plan = await live_trading._compute_tp_plan(
             "ETHUSD-PERP", raw_pos, sample_position_short, current_price
@@ -422,6 +425,7 @@ class TestTPBackfillLogic:
         )
         live_trading.futures_adapter = Mock()
         live_trading.futures_adapter.cancel_order = AsyncMock()
+        live_trading.futures_adapter.position_size_notional = AsyncMock(return_value=Decimal("30000"))
         
         sample_position_short.initial_stop_price = Decimal("3100")
         sample_position_short.stop_loss_order_id = "sl_123"
@@ -437,10 +441,10 @@ class TestTPBackfillLogic:
         current_price = Decimal("2900")
         
         with patch('src.live.live_trading.asyncio.to_thread') as mock_thread, \
-             patch('src.live.live_trading.async_record_event') as mock_event, \
+             patch('src.storage.repository.async_record_event', new_callable=AsyncMock) as mock_event, \
              patch('src.storage.repository.save_position') as mock_save:
             
-            mock_thread.return_value = None
+            mock_thread.return_value = AsyncMock(return_value=None)
             mock_event.return_value = None
             
             await live_trading._place_tp_backfill(

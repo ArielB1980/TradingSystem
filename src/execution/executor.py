@@ -217,6 +217,7 @@ class Executor:
                     for p in current_positions
                 )
                 if has_position:
+                    logger.info("PYRAMIDING_GUARD_SKIP", symbol=futures_symbol, reason="position_already_exists")
                     logger.warning(
                         "Pyramiding guard REJECTED",
                         symbol=futures_symbol,

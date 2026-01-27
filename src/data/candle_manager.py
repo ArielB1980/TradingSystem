@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Any
 from collections import defaultdict
 
 from src.monitoring.logger import get_logger
@@ -38,10 +38,12 @@ class CandleManager:
         client: KrakenClient,
         spot_to_futures: Optional[Callable[[str], str]] = None,
         use_futures_fallback: bool = False,
+        ohlcv_fetcher: Optional[Any] = None,
     ):
         self.client = client
         self.spot_to_futures = spot_to_futures
         self.use_futures_fallback = use_futures_fallback
+        self.ohlcv_fetcher = ohlcv_fetcher
         self._futures_fallback_symbols: set = set()  # Symbols that used futures OHLCV (cleared each summary)
         # Storage: timeframe -> symbol -> list[Candle]
         self.candles: Dict[str, Dict[str, List[Candle]]] = {
@@ -161,7 +163,12 @@ class CandleManager:
             data_source = "spot"
 
             try:
-                candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
+                if self.ohlcv_fetcher:
+                    candles = await self.ohlcv_fetcher.fetch_spot_ohlcv(symbol, tf, since_ms, 300)
+                    if not isinstance(candles, list):
+                        candles = []
+                else:
+                    candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
             except Exception:
                 candles = []
 

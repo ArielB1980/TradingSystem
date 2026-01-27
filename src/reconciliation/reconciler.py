@@ -1,54 +1,91 @@
 """
-Reconciliation engine for state synchronization.
+Reconciliation engine for position state synchronization.
 
-Ensures the internal system state matches the exchange reality.
+Ensures internal DB and in-memory state match exchange reality.
+- Unmanaged (ghost): exchange has position, we don't → adopt or force_close.
+- Zombie: we track position, exchange doesn't → remove from state.
 """
-from typing import List, Dict, Optional
+import asyncio
+from typing import List, Dict, Optional, Callable, Any, Union, Awaitable
 from decimal import Decimal
 from datetime import datetime, timezone
+
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
-from src.domain.models import Position
-from src.storage.repository import get_active_positions, delete_position
+from src.domain.models import Position, Side
+from src.storage.repository import get_active_positions, delete_position, save_position
 
 logger = get_logger(__name__)
 
 
+def _exchange_dict_to_position(data: Dict[str, Any]) -> Position:
+    """Build a Position from raw exchange position dict (same shape as get_all_futures_positions)."""
+    symbol = data.get("symbol") or ""
+    side_raw = (data.get("side") or "long").lower()
+    side = Side.LONG if side_raw in ("long", "buy") else Side.SHORT
+    size = Decimal(str(data.get("size") or 0))
+    entry_price = Decimal(str(data.get("entryPrice") or data.get("entry_price") or 0))
+    mark_price = Decimal(str(data.get("markPrice") or data.get("mark_price") or entry_price))
+    liq = Decimal(str(data.get("liquidationPrice") or data.get("liquidation_price") or 0))
+    unrealized_pnl = Decimal(str(data.get("unrealizedPnl") or data.get("unrealized_pnl") or 0))
+    leverage = Decimal(str(data.get("leverage") or 1))
+    margin_used = Decimal(str(data.get("initialMargin") or data.get("margin_used") or 0))
+    size_notional = size * mark_price if mark_price else size * entry_price
+    return Position(
+        symbol=symbol,
+        side=side,
+        size=size,
+        size_notional=size_notional,
+        entry_price=entry_price,
+        current_mark_price=mark_price,
+        liquidation_price=liq,
+        unrealized_pnl=unrealized_pnl,
+        leverage=leverage,
+        margin_used=margin_used,
+        opened_at=datetime.now(timezone.utc),
+        is_protected=False,
+        protection_reason="ADOPTED_UNMANAGED",
+    )
+
+
 class Reconciler:
     """
-    Reconciliation engine.
-    
-    Responsibilities:
-    1. Verify active positions (System vs Exchange).
-    2. Detect ghost positions (Exchange has it, System doesn't).
-    3. Detect zombie positions (System has it, Exchange doesn't).
-    4. Verify active orders (counts, types).
+    Position reconciliation: adopt or force-close unmanaged (ghost) positions,
+    and remove zombies from DB. Logs RECONCILE_SUMMARY with counts.
     """
-    
-    def __init__(self, client: KrakenClient):
+
+    def __init__(
+        self,
+        client: KrakenClient,
+        config: Any,
+        *,
+        place_futures_order_fn: Optional[Callable[..., Union[Any, Awaitable[Any]]]] = None,
+        place_protection_callback: Optional[Callable[[Position], Union[None, Awaitable[None]]]] = None,
+    ):
         self.client = client
-        
-    async def reconcile_all(self):
-        """Run full reconciliation."""
-        logger.info("Starting reconciliation...")
-        try:
-            # 1. Fetch Exchange State
-            futures_positions = await self._fetch_exchange_positions()
-            
-            # 2. Fetch System State
-            system_positions = get_active_positions()
-            
-            # 3. Compare
-            await self._reconcile_positions(futures_positions, system_positions)
-            
-            logger.info("Reconciliation complete")
-            
-        except Exception as e:
-            logger.error("Reconciliation failed", error=str(e))
-            raise
+        self.config = config
+        self.place_futures_order_fn = place_futures_order_fn
+        self.place_protection_callback = place_protection_callback
+
+        recon_cfg = getattr(config, "reconciliation", None)
+        self.reconcile_enabled = getattr(recon_cfg, "reconcile_enabled", True)
+        self.unmanaged_policy = getattr(recon_cfg, "unmanaged_position_policy", "adopt")
+        self.adopt_place_protection = getattr(
+            recon_cfg, "unmanaged_position_adopt_place_protection", True
+        )
+
+    def _normalize_symbol_for_comparison(self, symbol: str) -> str:
+        if not symbol:
+            return ""
+        s = str(symbol).upper()
+        s = s.replace("PF_", "").replace("PI_", "").replace("FI_", "")
+        s = s.split(":")[0]
+        s = s.replace("/", "").replace("-", "").replace("_", "")
+        if s.endswith("USD"):
+            s = s[:-3]
+        return s
 
     async def _fetch_exchange_positions(self) -> Dict[str, Dict]:
-        """Fetch all open positions from exchange via Kraken Futures API."""
         try:
             if not self.client.has_valid_futures_credentials():
                 return {}
@@ -56,90 +93,112 @@ class Reconciler:
             out: Dict[str, Dict] = {}
             for p in raw:
                 sym = p.get("symbol")
-                if sym and (p.get("size") or 0) != 0:
+                if sym and (float(p.get("size") or 0)) != 0:
                     out[str(sym)] = p
             return out
         except Exception as e:
             logger.warning("Failed to fetch exchange positions for reconciliation", error=str(e))
             return {}
 
-    def _normalize_symbol_for_comparison(self, symbol: str) -> str:
+    async def reconcile_all(self) -> Dict[str, int]:
         """
-        Normalize symbol for comparison between exchange and system formats.
-        
-        Handles: PF_EURUSD, EUR/USD:USD, EURUSD, EUR/USD -> EURUSD (base only)
+        Run full reconciliation. Returns summary counts.
+        Logs RECONCILE_SUMMARY with on_exchange, tracked, adopted, force_closed, zombies_cleaned.
         """
-        if not symbol:
-            return ""
-        s = str(symbol).upper()
-        # Remove Kraken prefixes
-        s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
-        # Remove CCXT suffixes
-        s = s.split(':')[0]
-        # Remove separators
-        s = s.replace('/', '').replace('-', '').replace('_', '')
-        # Remove USD suffix for comparison (PF_EURUSD vs EUR/USD:USD both become EUR)
-        if s.endswith('USD'):
-            s = s[:-3]
-        return s
+        if not self.reconcile_enabled:
+            logger.info("RECONCILE_SUMMARY", event="reconcile_disabled", on_exchange=0, tracked=0, adopted=0, force_closed=0, zombies_cleaned=0)
+            return {"on_exchange": 0, "tracked": 0, "adopted": 0, "force_closed": 0, "zombies_cleaned": 0}
 
-    async def _reconcile_positions(self, exchange_pos: Dict[str, Dict], system_pos: List[Position]):
-        """Compare and alert on discrepancies. Alerts on ghosts; deletes zombies from DB."""
-        from src.monitoring.alerts import get_alert_system
+        logger.info("RECONCILE_START")
+        summary = {"on_exchange": 0, "tracked": 0, "adopted": 0, "force_closed": 0, "zombies_cleaned": 0}
 
-        # Normalize symbols for comparison (handle format differences)
-        # Exchange might return PF_EURUSD, system might store EUR/USD:USD
-        exchange_symbols_normalized = {
-            self._normalize_symbol_for_comparison(sym): (sym, pos_data)
-            for sym, pos_data in exchange_pos.items()
-        }
-        system_symbols_normalized = {
-            self._normalize_symbol_for_comparison(p.symbol): (p.symbol, p)
-            for p in system_pos
-        }
+        try:
+            exchange_pos = await self._fetch_exchange_positions()
+            summary["on_exchange"] = len(exchange_pos)
+            system_pos = get_active_positions()
 
-        exchange_normalized_set = set(exchange_symbols_normalized.keys())
-        system_normalized_set = set(system_symbols_normalized.keys())
+            exchange_norm = {
+                self._normalize_symbol_for_comparison(s): (s, d) for s, d in exchange_pos.items()
+            }
+            system_norm = {self._normalize_symbol_for_comparison(p.symbol): (p.symbol, p) for p in system_pos}
+            summary["tracked"] = len(system_pos)
 
-        # Ghost Positions (Exchange has it, we don't) -> alert only
-        ghosts_normalized = exchange_normalized_set - system_normalized_set
-        if ghosts_normalized:
-            # Get original exchange symbols for reporting
-            ghost_symbols = [exchange_symbols_normalized[g][0] for g in ghosts_normalized]
-            logger.critical("GHOST POSITIONS DETECTED", symbols=ghost_symbols)
-            try:
-                get_alert_system().send_alert(
-                    "critical",
-                    "Reconciliation: Ghost Positions",
-                    f"Exchange has positions we do not track: {sorted(ghost_symbols)}. Review and sync or close manually.",
-                    metadata={"symbols": ghost_symbols},
-                )
-            except Exception as e:
-                logger.warning("Failed to send ghost-position alert", error=str(e))
+            exchange_set = set(exchange_norm.keys())
+            system_set = set(system_norm.keys())
 
-        # Zombie Positions (We have it, exchange doesn't) -> delete from DB + alert
-        zombies_normalized = system_normalized_set - exchange_normalized_set
-        if zombies_normalized:
-            # Get original system symbols for deletion
-            zombie_symbols = [system_symbols_normalized[z][0] for z in zombies_normalized]
-            logger.critical("ZOMBIE POSITIONS DETECTED", symbols=zombie_symbols)
-            for z in zombie_symbols:
+            # Unmanaged (ghost): exchange has it, we don't
+            ghosts_norm = exchange_set - system_set
+            for g in ghosts_norm:
+                orig_sym, pos_data = exchange_norm[g]
+                if self.unmanaged_policy == "adopt":
+                    try:
+                        pos = _exchange_dict_to_position(pos_data)
+                        save_position(pos)
+                        summary["adopted"] += 1
+                        logger.info(
+                            "RECONCILE_ADOPTED",
+                            symbol=orig_sym,
+                            size=str(pos.size),
+                            side=pos.side.value,
+                        )
+                        if self.adopt_place_protection and self.place_protection_callback:
+                            try:
+                                r = self.place_protection_callback(pos)
+                                if asyncio.iscoroutine(r):
+                                    await r
+                            except Exception as e:
+                                logger.warning("Adopt place protection failed", symbol=orig_sym, error=str(e))
+                    except Exception as e:
+                        logger.error("Adopt failed", symbol=orig_sym, error=str(e))
+                else:  # force_close
+                    try:
+                        side = (pos_data.get("side") or "long").lower()
+                        close_side = "sell" if side in ("long", "buy") else "buy"
+                        size = float(pos_data.get("size") or 0)
+                        if self.place_futures_order_fn and size > 0:
+                            coro = self.place_futures_order_fn(
+                                symbol=orig_sym,
+                                side=close_side,
+                                order_type="market",
+                                size=size,
+                                reduce_only=True,
+                            )
+                            if asyncio.iscoroutine(coro):
+                                await coro
+                            else:
+                                coro  # sync call already executed
+                            summary["force_closed"] += 1
+                            logger.critical(
+                                "RECONCILE_FORCE_CLOSED",
+                                symbol=orig_sym,
+                                size=size,
+                                reason="unmanaged_position_policy=force_close",
+                            )
+                    except Exception as e:
+                        logger.error("Force-close failed", symbol=orig_sym, error=str(e))
+
+            # Zombies: we have it, exchange doesn't
+            zombies_norm = system_set - exchange_set
+            for z in zombies_norm:
+                orig_sym = system_norm[z][0]
                 try:
-                    delete_position(z)
-                    logger.info("Removed zombie position from DB", symbol=z)
+                    delete_position(orig_sym)
+                    summary["zombies_cleaned"] += 1
+                    logger.info("RECONCILE_ZOMBIE_CLEANED", symbol=orig_sym, event="zombie_removed")
                 except Exception as e:
-                    logger.warning("Failed to delete zombie position", symbol=z, error=str(e))
-            try:
-                get_alert_system().send_alert(
-                    "critical",
-                    "Reconciliation: Zombie Positions Closed",
-                    f"Positions removed from system (missing on exchange): {sorted(zombie_symbols)}.",
-                    metadata={"symbols": zombie_symbols},
-                )
-            except Exception as e:
-                logger.warning("Failed to send zombie-position alert", error=str(e))
+                    logger.warning("Failed to delete zombie", symbol=orig_sym, error=str(e))
 
-    async def verify_order_alignment(self, position: Position):
-        """Verify that a specific position has the correct orders open."""
-        # Logic to check if TP/SL orders exist on exchange
-        pass
+            logger.info(
+                "RECONCILE_SUMMARY",
+                on_exchange=summary["on_exchange"],
+                tracked=summary["tracked"],
+                adopted=summary["adopted"],
+                force_closed=summary["force_closed"],
+                zombies_cleaned=summary["zombies_cleaned"],
+            )
+            logger.info("RECONCILE_END")
+        except Exception as e:
+            logger.error("Reconciliation failed", error=str(e))
+            raise
+
+        return summary
