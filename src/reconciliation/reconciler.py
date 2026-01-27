@@ -116,7 +116,7 @@ class Reconciler:
         Logs RECONCILE_SUMMARY with on_exchange, tracked, adopted, force_closed, zombies_cleaned.
         """
         if not self.reconcile_enabled:
-            logger.info("RECONCILE_SUMMARY", event="reconcile_disabled", on_exchange=0, tracked=0, adopted=0, force_closed=0, zombies_cleaned=0)
+            logger.info("RECONCILE_SUMMARY", reconcile_disabled=True, on_exchange=0, tracked=0, adopted=0, force_closed=0, zombies_cleaned=0)
             return {"on_exchange": 0, "tracked": 0, "adopted": 0, "force_closed": 0, "zombies_cleaned": 0}
 
         logger.info("RECONCILE_START")
@@ -194,7 +194,7 @@ class Reconciler:
                 try:
                     delete_position(orig_sym)
                     summary["zombies_cleaned"] += 1
-                    logger.info("RECONCILE_ZOMBIE_CLEANED", symbol=orig_sym, event="zombie_removed")
+                    logger.info("RECONCILE_ZOMBIE_CLEANED", symbol=orig_sym, zombie_removed=True)
                 except Exception as e:
                     logger.warning("Failed to delete zombie", symbol=orig_sym, error=str(e))
 
