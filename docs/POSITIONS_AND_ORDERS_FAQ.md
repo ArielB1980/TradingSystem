@@ -129,6 +129,30 @@ Same `STOP_PCT` and `--dry-run` behaviour as `place-missing-stops`. Use when you
 
 ---
 
+## "TP backfill skipped: position not protected" – what to do
+
+When the live loop skips TP backfill for a position because it is **not protected** (no SL or no SL order on the exchange), it logs per symbol and, once per run, a consolidated event:
+
+- **Per-symbol:** `TP backfill skipped: position not protected` with `symbol`, `reason`, `has_sl_price`, `has_sl_order`.
+- **Consolidated:** `Positions needing protection (TP backfill skipped)` with `symbols=[...]`, `count=N`, and `action="Run 'make place-missing-stops' (dry-run) then 'make place-missing-stops-live' to protect."`
+
+**Treat those symbols as a list to fix:** they are positions that have no stop (or no stop order) and are intentionally skipped for TP backfill until they are protected.
+
+**Fix steps:**
+
+1. **(Optional)** List symbols from recent logs:  
+   `make list-needing-protection` (or `python scripts/list_positions_needing_protection.py`).
+2. **Dry-run** to see what would be placed:  
+   `make place-missing-stops`
+3. **Place stops** (default 2% from entry):  
+   `make place-missing-stops-live`  
+   Or with a custom distance:  
+   `make place-missing-stops-live STOP_PCT=1.5`
+
+The **place-missing-stops** tool uses **exchange state** (positions + open orders); it does not read the DB. So any position with no reduce-only stop on the book is treated as naked and can get a stop. The "TP backfill skipped: position not protected" set and the "naked" set from place-missing-stops should match for positions the system tracks.
+
+---
+
 ## Summary
 
 | Question | Short answer |

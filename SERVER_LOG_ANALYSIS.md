@@ -1,109 +1,83 @@
-# Server Log Analysis Report
+# Server Log Analysis
 
-**Date**: 2026-01-26  
-**Analysis Time**: After service restart (07:01:09 UTC)
+## Date: 2026-01-26 14:05 UTC
+**Service Status**: ✅ Running (active for 58 minutes since restart at 13:05:37 UTC)
 
-## Executive Summary
+## Critical Issues Found
 
-### ✅ Positive Indicators
-1. **No "Instrument specs not found" errors after restart** - The fix is working!
-2. **Signals are being generated** - System is actively analyzing markets
-3. **Auction system is functioning** - Last auction at 06:54:53 processed 5 positions
-4. **Service is stable** - Running continuously since restart
+### 1. ✅ Ghost Positions - FIXED
+- **Last alert**: 2026-01-26T12:50:01 UTC (before fix deployment)
+- **Status**: No new ghost position alerts since fix deployment at 13:05:37 UTC
+- **Fix working**: ✅ Confirmed
 
-### ⚠️ Issues Found
-1. **No successful order submissions after restart** - Waiting for next auction cycle
-2. **API timeout errors** - Some data fetching timeouts (non-critical)
-3. **Invalid symbols** - LUNA2/USD, THETA/USD don't exist on Kraken (expected)
+### 2. ✅ Order Cancellation Errors - FIXED
+- **Status**: No "invalidArgument: order_id" errors found
+- **Fix working**: ✅ Confirmed
 
-## Detailed Findings
+### 3. ⚠️ UNPROTECTED Positions Alert (Likely False Positive)
+- **Alert**: 2026-01-26T13:34:46 UTC - 7 unprotected positions
+- **Details**: System detected positions without stop loss orders in database
+- **Symbols affected**: PF_EURUSD, PF_PAXGUSD, PF_PROMPTUSD, PF_ONEUSD, PF_TNSRUSD, PF_DYMUSD, PF_RARIUSD, PF_TIAUSD, PF_API3USD
+- **User Observation**: Stop loss orders ARE present on exchange (confirmed for PAXG)
+- **Root Cause**: Stop loss orders are being placed on exchange but `stop_loss_order_id` is not being properly tracked/saved in database or `is_protected` flag is not being set correctly
+- **Status**: Orders function as stop losses on exchange, but system tracking is incomplete
+- **Action Required**: Fix order ID tracking so system recognizes existing stop loss orders
 
-### 1. Errors Analysis
+### 4. ⚠️ Auction Selecting Winners But Not Executing Trades
+- **Issue**: Auction is running and selecting 15-16 winners, but 0 opens and 0 closes
+- **Recent auctions**:
+  - 13:34:41 UTC: 15 winners selected, 0 opens, 0 closes
+  - 13:56:23 UTC: 16 winners selected, 0 opens, 0 closes
+- **Trades approved**: Many "Trade approved" messages (13:56:15-13:56:22 UTC)
+- **Missing**: "Entry order submitted" messages after trade approval
+- **Status**: Trades are being approved but orders are not being placed
+- **Action Required**: Investigate why entry orders are not being submitted after trade approval
 
-#### Critical Errors: NONE ✅
-- No "Instrument specs not found" errors after 07:01:09 (fix is working!)
+## Non-Critical Issues
 
-#### Non-Critical Errors:
-- **TimeoutError**: Some spot OHLCV data fetching timeouts
-  - Affected symbols: LINK, AVAX, XMR, GMT, SAND, ENJ, FLOW, ZEC
-  - Impact: Low - system retries and continues
-  - Frequency: Occasional, not blocking
+### Spot OHLCV Fetch Errors
+- **Error**: "Failed to fetch spot OHLCV" for various symbols
+- **Affected symbols**: SXP/USD, CFX/USD, AGLD/USD, LUNA2/USD, TAIKO/USD
+- **Reason**: These symbols don't exist on Kraken spot markets
+- **Impact**: Non-critical - system uses futures fallback
+- **Status**: Expected behavior, handled gracefully
 
-- **BadSymbol**: Invalid market symbols
-  - LUNA2/USD - doesn't exist on Kraken
-  - THETA/USD - doesn't exist on Kraken
-  - Impact: Low - system skips these symbols
-  - Action: Consider removing from coin universe
+## System Activity
 
-### 2. Trade Execution Status
+### Signal Generation
+- ✅ System is generating signals regularly
+- Recent signals: PAXG/USD (long), TIA/USD (short), WIF/USD (short), ARKM/USD (short), API3/USD (short), etc.
 
-#### Before Restart (06:54:53 UTC):
-- **Last Auction**: Processed 5 positions
-- **Positions Opened**: BRETT/USD, AUD/USD, API3/USD, MORPHO/USD, ONE/USD
-- **Order Status**: All failed with "Instrument specs not found" (before fix)
+### Trade Approval
+- ✅ Risk manager is approving trades
+- Multiple trades approved at 13:56:15-13:56:22 UTC
+- Notional values: ~$72.88 per trade
 
-#### After Restart (07:01:09 UTC):
-- **Signals Generated**: 
-  - SOL/USD (long) at 07:04:46
-  - BAT/USD (short) at 07:08:23
-- **Auction Cycles**: None yet (waiting for next cycle)
-- **Order Submissions**: None yet
-- **Status**: System is waiting for next auction allocation cycle
+### Auction Execution
+- ⚠️ Auction is running and selecting winners
+- ❌ But no trades are actually being executed (0 opens, 0 closes)
 
-### 3. Signal Generation
+## Summary
 
-**Recent Signals** (last 20):
-- Multiple short signals: API3, ONDO, TOKEN, BRETT, ZETA, SYN, CELO, FLUX, HIPPO, MORPHO, GOAT, CAKE, IO, SKL, HYPE, XCN, ONE, BAT
-- Long signals: AUD, SOL
-- **Frequency**: Regular signal generation (system is active)
+### ✅ Working Correctly
+1. Ghost positions reconciliation (fixed)
+2. Order cancellation (fixed)
+3. Signal generation
+4. Trade approval by risk manager
+5. Auction winner selection
 
-### 4. Auction System
+### ⚠️ Issues Requiring Attention
+1. **UNPROTECTED positions** - 7 positions without stop loss orders
+2. **Auction not executing trades** - Winners selected but orders not placed
 
-**Last Auction** (06:54:53 UTC):
-- Opens: 5 positions
-- Closes: 0 positions
-- Winners selected: 16
-- **Status**: System functioning normally
-
-**Next Auction**: Expected within auction cycle interval (typically every 20-30 minutes)
-
-## Key Observations
-
-### ✅ What's Working
-1. Signal generation is active and regular
-2. Auction allocation system is functioning
-3. No critical errors blocking execution
-4. Service is stable and running
-
-### ⏳ What's Pending
-1. Next auction cycle to process new signals
-2. First successful order submission after fix
-3. Verification that fix resolves order placement
-
-### 🔍 What to Monitor
-
-**Immediate Focus:**
-```bash
-# Watch for next auction cycle
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Auction allocation executed|Entry order submitted|Failed to submit'"
-```
-
-**Success Indicators to Watch For:**
-- "Entry order submitted" messages (not "Failed to submit")
-- No "Instrument specs not found" errors
-- "Auction: Opened position" followed by successful order
+### 🔍 Root Cause Analysis Needed
+- Why are entry orders not being submitted after trade approval?
+- Why are stop loss orders missing for 7 positions?
+- Is there a connection between these two issues?
 
 ## Recommendations
 
-1. **Wait for Next Auction Cycle** - System needs to run its auction allocation to process new signals
-2. **Monitor Order Placement** - Watch for first successful order after fix
-3. **Clean Up Invalid Symbols** - Remove LUNA2/USD and THETA/USD from coin universe
-4. **Review Timeout Handling** - Consider increasing timeout or retry logic for data fetching
-
-## Conclusion
-
-The system is **operating normally** and the fix appears to be working (no instrument spec errors after restart). The system is waiting for the next auction allocation cycle to process new signals and place orders. All indicators suggest the system will successfully place orders when the next auction runs.
-
----
-
-**Next Steps**: Monitor logs for the next auction cycle and verify successful order placement.
+1. **Immediate**: Investigate why entry orders are not being placed after auction approval
+2. **High Priority**: Place missing stop loss orders for unprotected positions
+3. **Monitor**: Continue monitoring for ghost positions (should be resolved)
+4. **Monitor**: Continue monitoring order cancellation (should be resolved)
