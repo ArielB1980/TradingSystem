@@ -29,6 +29,9 @@ class ExchangeConfig(BaseSettings):
     # Market Discovery (for multi-asset expansion)
     use_market_discovery: bool = True
     discovery_refresh_hours: int = 24
+    market_discovery_cache_minutes: int = 60
+    allow_futures_only_universe: bool = False
+    market_discovery_failure_log_cooldown_minutes: int = 60
     
     # Legacy: Hardcoded markets (used if use_market_discovery=False)
     spot_markets: List[str] = ["BTC/USD", "ETH/USD"]

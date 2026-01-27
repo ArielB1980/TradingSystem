@@ -40,9 +40,7 @@ class MarketDiscoveryService:
         """
         try:
             logger.info("Starting market discovery (MarketRegistry)...")
-            if not self.client.futures_exchange:
-                await self.client.initialize()
-
+            # Registry uses client.get_spot_markets() / get_futures_markets(); they initialize as needed.
             pairs = await self._registry.discover_markets()
             mapping = {spot: pair.futures_symbol for spot, pair in pairs.items()}
             sorted_spots = sorted(mapping.keys())

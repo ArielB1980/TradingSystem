@@ -92,22 +92,27 @@ class KrakenClient:
         futures_api_key: Optional[str] = None,
         futures_api_secret: Optional[str] = None,
         use_testnet: bool = False,
+        *,
+        market_cache_minutes: int = 60,
     ):
         """
         Initialize Kraken client.
-        
+
         Args:
             api_key: Kraken spot API key
             api_secret: Kraken spot API secret
             futures_api_key: Kraken Futures API key (optional)
             futures_api_secret: Kraken Futures API secret (optional)
+            use_testnet: Use testnet
+            market_cache_minutes: TTL for get_spot_markets/get_futures_markets cache (default 60)
         """
         self.api_key = api_key
         self.api_secret = api_secret
         self.futures_api_key = futures_api_key
         self.futures_api_secret = futures_api_secret
         self.use_testnet = use_testnet
-        
+        self._market_cache_minutes = max(1, market_cache_minutes)
+
         # Helper to sanitize base64 secrets
         def sanitize_secret(secret: str) -> str:
             if not secret: return secret
@@ -119,20 +124,24 @@ class KrakenClient:
             self.api_secret = sanitize_secret(self.api_secret)
         if self.futures_api_secret:
             self.futures_api_secret = sanitize_secret(self.futures_api_secret)
-        
+
         if self.futures_api_secret:
             self.futures_api_secret = sanitize_secret(self.futures_api_secret)
-        
+
         self.exchange = None
         self.futures_exchange = None
-        
+
+        # Markets cache for get_spot_markets / get_futures_markets (avoids spamming load_markets)
+        self._markets_cache: Dict[str, tuple] = {}  # "spot" -> (ts, data), "futures" -> (ts, data)
+        self._markets_lock = asyncio.Lock()
+
         # Rate limiters (configurable per endpoint group)
         self.public_limiter = RateLimiter(capacity=PUBLIC_API_CAPACITY, refill_rate=PUBLIC_API_REFILL_RATE)
         self.private_limiter = RateLimiter(capacity=PRIVATE_API_CAPACITY, refill_rate=PRIVATE_API_REFILL_RATE)
-        
+
         # Reusable SSL context
         self._ssl_context = None
-        
+
         logger.info("Kraken client configuration loaded")
     
     def has_valid_spot_credentials(self) -> bool:
@@ -179,7 +188,78 @@ class KrakenClient:
         self._ssl_context = None
         
         logger.info("Kraken client initialized")
-    
+
+    async def get_spot_markets(self) -> Dict[str, dict]:
+        """
+        Fetch Kraken spot markets (USD-quoted, active). Cached for market_cache_minutes.
+        Callers must use this instead of accessing spot_exchange.
+        """
+        if not self.exchange:
+            await self.initialize()
+        async with self._markets_lock:
+            now = time.time()
+            if "spot" in self._markets_cache:
+                ts, data = self._markets_cache["spot"]
+                if (now - ts) < self._market_cache_minutes * 60:
+                    return data
+            try:
+                await self.exchange.load_markets()
+                usd_markets = {}
+                for m in self.exchange.markets.values():
+                    if m.get("quote") == "USD" and m.get("active", True):
+                        sym = m.get("symbol", "")
+                        if sym:
+                            usd_markets[sym] = {
+                                "id": m.get("id"),
+                                "base": m.get("base"),
+                                "quote": m.get("quote"),
+                                "active": m.get("active", True),
+                            }
+                self._markets_cache["spot"] = (now, usd_markets)
+                return usd_markets
+            except Exception as e:
+                logger.error("Failed to fetch spot markets", error=str(e))
+                raise
+
+    async def get_futures_markets(self) -> Dict[str, dict]:
+        """
+        Fetch Kraken futures perpetuals (swap, active). Cached for market_cache_minutes.
+        Returns Dict[base_quote, info] e.g. "BTC/USD" -> {symbol, base, quote, active}.
+        """
+        if not self.futures_exchange:
+            await self.initialize()
+        if not self.futures_exchange:
+            return {}
+        async with self._markets_lock:
+            now = time.time()
+            if "futures" in self._markets_cache:
+                ts, data = self._markets_cache["futures"]
+                if (now - ts) < self._market_cache_minutes * 60:
+                    return data
+            try:
+                await self.futures_exchange.load_markets()
+                perps = {}
+                for m in self.futures_exchange.markets.values():
+                    if m.get("type") == "swap" and m.get("active", True):
+                        symbol = m.get("symbol", "")
+                        if ":" in symbol:
+                            base_quote = symbol.split(":")[0]
+                        else:
+                            base_quote = symbol
+                        if base_quote:
+                            perps[base_quote] = {
+                                "id": m.get("id"),
+                                "symbol": symbol,
+                                "base": m.get("base"),
+                                "quote": m.get("quote"),
+                                "active": m.get("active", True),
+                            }
+                self._markets_cache["futures"] = (now, perps)
+                return perps
+            except Exception as e:
+                logger.error("Failed to fetch futures markets", error=str(e))
+                raise
+
     async def get_spot_balance(self) -> Dict[str, Any]:
         """
         Get spot account balance using CCXT.
