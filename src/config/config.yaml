@@ -202,7 +202,8 @@ data:
 ## Reconciliation
 reconciliation:
   # Event-driven: immediate on fills, order updates, margin updates
-  periodic_interval_seconds: 15
+  # Live: use >= 60 (prefer 120). 15s hammers Kraken combined with OHLCV/tickers/orders.
+  periodic_interval_seconds: 120
   
 ## Monitoring
 monitoring:
