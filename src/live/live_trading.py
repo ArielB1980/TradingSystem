@@ -836,13 +836,16 @@ class LiveTrading:
             min_ratio = getattr(self.config.data, "min_health_ratio", 0.25)
             if total_coins > 0:
                 ratio = coins_with_sufficient_candles / total_coins
-                if coins_with_sufficient_candles < min_healthy or ratio < min_ratio:
+                # When universe is smaller than min_healthy, require all coins to have data (ratio 1.0)
+                effective_min = min(min_healthy, total_coins)
+                if coins_with_sufficient_candles < effective_min or ratio < min_ratio:
                     self.trade_paused = True
                     logger.critical(
                         "TRADING PAUSED: candle health insufficient",
                         coins_with_sufficient_candles=coins_with_sufficient_candles,
                         total=total_coins,
                         min_healthy_coins=min_healthy,
+                        effective_min=effective_min,
                         min_health_ratio=min_ratio,
                     )
                 else:
