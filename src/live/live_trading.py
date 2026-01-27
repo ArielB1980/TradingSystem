@@ -178,10 +178,13 @@ class LiveTrading:
         self.active = False
         
         # Candle data managed by dedicated service
+        from src.data.ohlcv_fetcher import OHLCVFetcher
+        _ohlcv_fetcher = OHLCVFetcher(self.client, config)
         self.candle_manager = CandleManager(
             self.client,
             spot_to_futures=self.futures_adapter.map_spot_to_futures,
             use_futures_fallback=getattr(config.exchange, "use_futures_ohlcv_fallback", True),
+            ohlcv_fetcher=_ohlcv_fetcher,
         )
         
         self.last_trace_log: Dict[str, datetime] = {} # Dashboard update throttling
@@ -253,6 +256,13 @@ class LiveTrading:
                 logger.warning("Market discovery returned empty - keeping existing")
                 return
             
+            # Trim to Kraken-supported only; log any symbols we drop
+            prev_symbols = set(self._market_symbols())
+            supported = set(mapping.keys())
+            dropped = prev_symbols - supported
+            for sym in sorted(dropped):
+                logger.warning("SYMBOL REMOVED (unsupported on Kraken)", symbol=sym)
+            
             # Update internal state (Maintain Spot -> Futures mapping)
             self.markets = mapping
             self.futures_adapter.set_spot_to_futures_override(mapping)
@@ -303,6 +313,8 @@ class LiveTrading:
                    smoke_mode=is_smoke_mode)
 
         self.active = True
+        self._reconcile_requested = False
+        self.trade_paused = False
         logger.critical("🚀 STARTING LIVE TRADING")
         
         try:
@@ -317,6 +329,19 @@ class LiveTrading:
                 self.last_discovery_time = datetime.now(timezone.utc)
             else:
                 self.last_discovery_time = datetime.min.replace(tzinfo=timezone.utc)
+
+            # Startup banner: config flags and universe size (same log sink)
+            _recon_cfg = getattr(self.config, "reconciliation", None)
+            _auction = getattr(self.config.risk, "auction_mode_enabled", False)
+            _recon_en = getattr(_recon_cfg, "reconcile_enabled", True) if _recon_cfg else True
+            _shock = getattr(self.config.risk, "shock_guard_enabled", False)
+            logger.info(
+                "STARTUP_BANNER",
+                auction_enabled=_auction,
+                reconcile_enabled=_recon_en,
+                shock_guard_enabled=bool(self.shock_guard or _shock),
+                universe_size=len(self._market_symbols()),
+            )
 
             # 1.6 Startup: ensure all monitored coins have DECISION_TRACE (dashboard coverage)
             try:
@@ -377,15 +402,17 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Failed to start order poller", error=str(e))
 
-            # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt unprotected)
+            # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt or force_close)
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
-                try:
-                    logger.info("Running startup reconciliation...")
-                    recon = Reconciler(self.client)
-                    await recon.reconcile_all()
-                    self.last_recon_time = datetime.now(timezone.utc)
-                except Exception as ex:
-                    logger.warning("Startup reconciliation failed", error=str(ex))
+                _recon_cfg = getattr(self.config, "reconciliation", None)
+                if _recon_cfg and getattr(_recon_cfg, "reconcile_enabled", True):
+                    try:
+                        logger.info("Running startup reconciliation...")
+                        recon = self._build_reconciler()
+                        await recon.reconcile_all()
+                        self.last_recon_time = datetime.now(timezone.utc)
+                    except Exception as ex:
+                        logger.warning("Startup reconciliation failed", error=str(ex))
 
             # 3. Fast Startup - Load candles
             logger.info("Loading candles from database...")
@@ -470,16 +497,19 @@ class LiveTrading:
                         logger.warning("Failed to emit metrics snapshot", error=str(ex))
 
                 # Periodic reconciliation (positions: system vs exchange)
-                recon_interval = getattr(
-                    self.config.reconciliation, "periodic_interval_seconds", 15
-                )
-                if (now - self.last_recon_time).total_seconds() >= recon_interval:
-                    try:
-                        recon = Reconciler(self.client)
-                        await recon.reconcile_all()
-                        self.last_recon_time = now
-                    except Exception as ex:
-                        logger.warning("Reconciliation failed", error=str(ex))
+                _recon_cfg = getattr(self.config, "reconciliation", None)
+                if _recon_cfg and getattr(_recon_cfg, "reconcile_enabled", True):
+                    recon_interval = getattr(_recon_cfg, "periodic_interval_seconds", 120)
+                    run_after_orders = getattr(self, "_reconcile_requested", False)
+                    if run_after_orders or (now - self.last_recon_time).total_seconds() >= recon_interval:
+                        try:
+                            recon = self._build_reconciler()
+                            await recon.reconcile_all()
+                            self.last_recon_time = now
+                            if run_after_orders:
+                                self._reconcile_requested = False
+                        except Exception as ex:
+                            logger.warning("Reconciliation failed", error=str(ex))
 
                 # Dynamic sleep to align with 1m intervals
                 elapsed = (now - loop_start).total_seconds()
@@ -626,6 +656,19 @@ class LiveTrading:
         
         return raw_positions
 
+    def _build_reconciler(self) -> "Reconciler":
+        """Build Reconciler with config, place_futures_order, and optional place_protection callback."""
+        place_futures = lambda symbol, side, order_type, size, reduce_only: self.client.place_futures_order(
+            symbol=symbol, side=side, order_type=order_type, size=size, reduce_only=reduce_only
+        )
+        place_protection = None  # Adopted positions get protection on next tick via _reconcile_protective_orders
+        return Reconciler(
+            self.client,
+            self.config,
+            place_futures_order_fn=place_futures,
+            place_protection_callback=place_protection,
+        )
+
     async def _validate_position_protection(self):
         """
         Validate all positions have protection (startup safety gate).
@@ -760,6 +803,28 @@ class LiveTrading:
             import time
             _t0 = time.perf_counter()
             market_symbols = self._market_symbols()
+            # Health gate: pause new entries when candle health below threshold
+            total_coins = len(market_symbols)
+            coins_with_sufficient_candles = sum(
+                1 for s in market_symbols if len(self.candle_manager.get_candles(s, "15m")) >= 50
+            )
+            min_healthy = getattr(self.config.data, "min_healthy_coins", 30)
+            min_ratio = getattr(self.config.data, "min_health_ratio", 0.25)
+            if total_coins > 0:
+                ratio = coins_with_sufficient_candles / total_coins
+                if coins_with_sufficient_candles < min_healthy or ratio < min_ratio:
+                    self.trade_paused = True
+                    logger.critical(
+                        "TRADING PAUSED: candle health insufficient",
+                        coins_with_sufficient_candles=coins_with_sufficient_candles,
+                        total=total_coins,
+                        min_healthy_coins=min_healthy,
+                        min_health_ratio=min_ratio,
+                    )
+                else:
+                    self.trade_paused = False
+            else:
+                self.trade_paused = False
             map_spot_tickers = await self.client.get_spot_tickers_bulk(market_symbols)
             map_futures_tickers = await self.client.get_futures_tickers_bulk()
             _t1 = time.perf_counter()
@@ -1248,12 +1313,14 @@ class LiveTrading:
         # Run auction mode allocation (if enabled) - after all signals processed
         if self.auction_allocator:
             signals_count = len(self.auction_signals_this_tick)
+            logger.info("AUCTION_START", signals_collected=signals_count)
             logger.info(
                 "Auction: About to run allocation",
                 signals_collected=signals_count,
                 auction_allocator_exists=bool(self.auction_allocator),
             )
             await self._run_auction_allocation(all_raw_positions)
+            logger.info("AUCTION_END", signals_collected=signals_count)
         else:
             logger.debug("Auction: Skipped (auction_allocator is None)")
         
@@ -1424,6 +1491,14 @@ class LiveTrading:
         """
         self.signals_since_emit += 1
         logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
+        
+        # Health gate: no new entries when candle health is insufficient
+        if getattr(self, "trade_paused", False):
+            return {
+                "order_placed": False,
+                "reason": "TRADING PAUSED: candle health insufficient",
+                "rejection_reasons": ["trade_paused"],
+            }
         
         # ========== V2 PATH: Position State Machine ==========
         if self.use_state_machine_v2 and self.position_manager_v2:
@@ -2127,7 +2202,8 @@ class LiveTrading:
             
             # Log auction plan summary
             logger.info(
-                "Auction plan generated",
+                "AUCTION_PLAN",
+                event="Auction plan generated",
                 closes_count=len(plan.closes),
                 closes_symbols=plan.closes,
                 opens_count=len(plan.opens),
@@ -2245,6 +2321,8 @@ class LiveTrading:
                 opens_failed=opens_failed,
                 reasons=plan.reasons,
             )
+            if opens_executed > 0 or len(plan.closes) > 0:
+                self._reconcile_requested = True
             
         except Exception as e:
             logger.error("Failed to run auction allocation", error=str(e))
@@ -2601,8 +2679,12 @@ class LiveTrading:
                 logger.debug("TP backfill skipped: cooldown", symbol=symbol, elapsed=elapsed, cooldown=cooldown_seconds)
                 return True
         
-        # Position size <= 0
-        if pos_data.get('size', 0) <= 0:
+        # Position size <= 0 (coerce: exchange may return str)
+        try:
+            size_val = float(pos_data.get('size') or 0)
+        except (TypeError, ValueError):
+            size_val = 0
+        if size_val <= 0:
             logger.debug("TP backfill skipped: zero size", symbol=symbol)
             return True
         
@@ -2689,7 +2771,7 @@ class LiveTrading:
             logger.error("Invalid pos_data type in _compute_tp_plan", symbol=symbol, pos_data_type=type(pos_data).__name__)
             return None
         
-        entry = Decimal(str(pos_data.get('entry_price', 0)))
+        entry = Decimal(str(pos_data.get('entry_price', pos_data.get('entryPrice', 0))))
         sl = db_pos.initial_stop_price
         
         if not entry or not sl or entry == 0:

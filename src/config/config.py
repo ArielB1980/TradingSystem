@@ -337,6 +337,16 @@ class DataConfig(BaseSettings):
     # Data validation
     max_gap_seconds: int = Field(default=60, ge=10, le=300)
     
+    # OHLCV resilience
+    ohlcv_max_retries: int = Field(default=3, ge=1, le=10)
+    ohlcv_failure_disable_after: int = Field(default=3, ge=1, le=20, description="Consecutive failures before symbol cooldown")
+    ohlcv_symbol_cooldown_minutes: int = Field(default=60, ge=5, le=480)
+    max_concurrent_ohlcv: int = Field(default=8, ge=1, le=20)
+    ohlcv_min_delay_ms: int = Field(default=200, ge=50, le=1000)
+    allow_futures_ohlcv_fallback: bool = Field(default=True, description="Use futures OHLCV when spot fails")
+    min_healthy_coins: int = Field(default=30, ge=1, le=500, description="Min coins with sufficient candles to allow new entries")
+    min_health_ratio: float = Field(default=0.25, ge=0.05, le=1.0, description="Min ratio sufficient/total to allow new entries")
+    
     # Storage
     # database_url can be None in DigitalOcean if RUN_TIME secrets aren't immediately available
     database_url: Optional[str] = None
@@ -344,7 +354,16 @@ class DataConfig(BaseSettings):
 
 class ReconciliationConfig(BaseSettings):
     """Reconciliation configuration."""
-    periodic_interval_seconds: int = Field(default=15, ge=5, le=60)
+    reconcile_enabled: bool = Field(default=True, description="Run position reconciliation at startup and periodically")
+    periodic_interval_seconds: int = Field(default=120, ge=5, le=600, description="Reconcile every N seconds (default 2 min)")
+    unmanaged_position_policy: Literal["adopt", "force_close"] = Field(
+        default="adopt",
+        description="Adopt exchange positions into tracking, or force-close them",
+    )
+    unmanaged_position_adopt_place_protection: bool = Field(
+        default=True,
+        description="When adopting, attempt to place SL/TP protective orders",
+    )
 
 
 class MonitoringConfig(BaseSettings):
