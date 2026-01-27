@@ -63,12 +63,15 @@ class LiveTrading:
         self.config = config
         
         # Core Components
+        cache_mins = getattr(config.exchange, "market_discovery_cache_minutes", 60)
+        cache_mins = int(cache_mins) if isinstance(cache_mins, (int, float)) else 60
         self.client = KrakenClient(
             api_key=config.exchange.api_key,
             api_secret=config.exchange.api_secret,
             futures_api_key=config.exchange.futures_api_key,
             futures_api_secret=config.exchange.futures_api_secret,
-            use_testnet=config.exchange.use_testnet
+            use_testnet=config.exchange.use_testnet,
+            market_cache_minutes=cache_mins,
         )
         
         self.data_acq = DataAcquisition(
@@ -107,7 +110,8 @@ class LiveTrading:
         self.position_manager = PositionManager()
         self.kill_switch = KillSwitch(self.client)
         self.market_discovery = MarketDiscoveryService(self.client, config)
-        
+        self._last_discovery_error_log_time: Optional[datetime] = None
+
         # Auction mode allocator (if enabled)
         self.auction_allocator = None
         self.auction_signals_this_tick = []  # Collect signals for auction mode
@@ -251,9 +255,23 @@ class LiveTrading:
         try:
             logger.info("Executing periodic market discovery...")
             mapping = await self.market_discovery.discover_markets()
-            
+
             if not mapping:
-                logger.warning("Market discovery returned empty - keeping existing")
+                cooldown_min = getattr(
+                    self.config.exchange, "market_discovery_failure_log_cooldown_minutes", 60
+                )
+                now = datetime.now(timezone.utc)
+                should_log = (
+                    self._last_discovery_error_log_time is None
+                    or (now - self._last_discovery_error_log_time).total_seconds()
+                    >= cooldown_min * 60
+                )
+                if should_log:
+                    logger.critical(
+                        "Market discovery empty; using existing universe; "
+                        "check spot/futures market fetch (get_spot_markets/get_futures_markets)."
+                    )
+                    self._last_discovery_error_log_time = now
                 return
             
             # Trim to Kraken-supported only; log any symbols we drop

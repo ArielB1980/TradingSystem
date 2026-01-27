@@ -49,81 +49,72 @@ class MarketRegistry:
     
     async def discover_markets(self) -> Dict[str, MarketPair]:
         """
-        Discover all eligible market pairs.
-        
-        Returns:
-            Dict mapping spot_symbol → MarketPair
+        Discover all eligible market pairs via client.get_spot_markets / get_futures_markets.
+        Returns Dict[spot_symbol, MarketPair]. If spot fails but futures succeed and
+        config allows, builds futures-only universe.
         """
         logger.info("Starting market discovery...")
-        
-        # 1. Fetch spot markets
+
+        # 1. Fetch via KrakenClient interface (no spot_exchange / futures_exchange)
         spot_markets = await self._fetch_spot_markets()
-        logger.info(f"Found {len(spot_markets)} spot markets")
-        
-        # 2. Fetch futures perpetuals
+        logger.info("Found %s spot markets", len(spot_markets))
+
         futures_markets = await self._fetch_futures_markets()
-        logger.info(f"Found {len(futures_markets)} futures perpetuals")
-        
-        # 3. Build mappings
-        pairs = self._build_mappings(spot_markets, futures_markets)
-        logger.info(f"Built {len(pairs)} spot→futures mappings")
-        
-        # 4. Apply filters
+        logger.info("Found %s futures perpetuals", len(futures_markets))
+
+        # 2. Build mappings (spot×futures or, if allowed, futures-only)
+        allow_futures_only = getattr(
+            getattr(self.config, "exchange", None), "allow_futures_only_universe", False
+        )
+        if spot_markets and futures_markets:
+            pairs = self._build_mappings(spot_markets, futures_markets)
+        elif not spot_markets and futures_markets and allow_futures_only:
+            pairs = self._build_futures_only_mappings(futures_markets)
+        else:
+            pairs = self._build_mappings(spot_markets, futures_markets)
+
+        logger.info("Built %s spot→futures mappings", len(pairs))
+
+        # 3. Apply filters
         eligible_pairs = await self._apply_filters(pairs)
-        logger.info(f"{len(eligible_pairs)} pairs passed filters")
-        
+        logger.info("%s pairs passed filters", len(eligible_pairs))
+
         self.discovered_pairs = eligible_pairs
         self.last_discovery = datetime.now(timezone.utc)
-        
+
         return eligible_pairs
-    
+
     async def _fetch_spot_markets(self) -> Dict[str, dict]:
-        """Fetch all Kraken Spot markets with USD quote."""
+        """Fetch Kraken spot markets via client.get_spot_markets()."""
         try:
-            markets = await self.client.spot_exchange.fetch_markets()
-            
-            # Filter for USD quote currency
-            usd_markets = {}
-            for market in markets:
-                if market['quote'] == 'USD' and market['active']:
-                    symbol = market['symbol']  # e.g., "BTC/USD"
-                    usd_markets[symbol] = {
-                        'id': market['id'],
-                        'base': market['base'],
-                        'quote': market['quote'],
-                        'active': market['active']
-                    }
-            
-            return usd_markets
+            return await self.client.get_spot_markets()
         except Exception as e:
             logger.error("Failed to fetch spot markets", error=str(e))
             return {}
-    
+
     async def _fetch_futures_markets(self) -> Dict[str, dict]:
-        """Fetch all Kraken Futures perpetuals."""
+        """Fetch Kraken futures perpetuals via client.get_futures_markets()."""
         try:
-            markets = await self.client.futures_exchange.fetch_markets()
-            
-            # Filter for perpetuals only
-            perps = {}
-            for market in markets:
-                if market.get('type') == 'swap' and market.get('active'):
-                    symbol = market['symbol']  # e.g., "BTC/USD:USD"
-                    # Normalize to standard format
-                    if ':' in symbol:
-                        base_quote = symbol.split(':')[0]  # "BTC/USD"
-                        perps[base_quote] = {
-                            'id': market['id'],
-                            'symbol': symbol,
-                            'base': market['base'],
-                            'quote': market['quote'],
-                            'active': market['active']
-                        }
-            
-            return perps
+            return await self.client.get_futures_markets()
         except Exception as e:
             logger.error("Failed to fetch futures markets", error=str(e))
             return {}
+
+    def _build_futures_only_mappings(self, futures_markets: Dict[str, dict]) -> Dict[str, MarketPair]:
+        """Build spot_symbol -> MarketPair when only futures available (base_quote used as spot_symbol)."""
+        pairs = {}
+        for base_quote, info in futures_markets.items():
+            pair = MarketPair(
+                spot_symbol=base_quote,
+                futures_symbol=info["symbol"],
+                spot_volume_24h=Decimal("0"),
+                futures_open_interest=None,
+                spread_pct=Decimal("0"),
+                is_eligible=False,
+                last_updated=datetime.now(timezone.utc),
+            )
+            pairs[base_quote] = pair
+        return pairs
     
     def _build_mappings(
         self, 
