@@ -61,6 +61,22 @@ async def test_reconcile_adopt_creates_managed_position():
     assert float(pos.size) == 100.0
 
 
+def test_exchange_dict_to_position_respects_position_size_is_notional():
+    """Adopt uses config.exchange.position_size_is_notional for size_notional."""
+    # Contracts (default): notional = size * mark_price
+    cfg_contracts = MagicMock()
+    cfg_contracts.exchange = MagicMock()
+    cfg_contracts.exchange.position_size_is_notional = False
+    pos_c = _exchange_dict_to_position(_exchange_pos("X", 10.0), cfg_contracts)
+    assert float(pos_c.size_notional) == pytest.approx(10.0 * 0.018, rel=1e-6)
+    # Notional: exchange size is already USD notional
+    cfg_notional = MagicMock()
+    cfg_notional.exchange = MagicMock()
+    cfg_notional.exchange.position_size_is_notional = True
+    pos_n = _exchange_dict_to_position(_exchange_pos("X", 500.0), cfg_notional)
+    assert float(pos_n.size_notional) == 500.0
+
+
 @pytest.mark.asyncio
 async def test_reconcile_force_close_calls_place_futures_order():
     """Force_close path calls place_futures_order with reduce_only."""
