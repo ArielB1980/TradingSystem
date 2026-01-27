@@ -3,16 +3,23 @@ Kraken Futures adapter for order execution.
 
 Handles:
 - Spot-to-futures ticker mapping
-- Leverage setting
+- Leverage setting (flexible/fixed/unknown from InstrumentSpec)
+- Size rounding via instrument specs
 - Reduce-only orders
 - Order submission
 """
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from src.domain.models import Order, OrderType, OrderStatus, Side
 from src.data.kraken_client import KrakenClient
 from src.monitoring.logger import get_logger
+from src.execution.instrument_specs import (
+    InstrumentSpecRegistry,
+    InstrumentSpec,
+    compute_size_contracts,
+    resolve_leverage,
+)
 import uuid
 
 logger = get_logger(__name__)
@@ -63,6 +70,7 @@ class FuturesAdapter:
         max_leverage: float = 10.0,
         spot_to_futures_override: Optional[Dict[str, str]] = None,
         position_size_is_notional: bool = False,
+        instrument_spec_registry: Optional[InstrumentSpecRegistry] = None,
     ):
         """
         Initialize futures adapter.
@@ -72,17 +80,19 @@ class FuturesAdapter:
             max_leverage: Maximum leverage cap (hard limit)
             spot_to_futures_override: Optional mapping from market discovery (spot -> futures). Used first.
             position_size_is_notional: If True, exchange returns size as notional USD. If False, returns contracts.
+            instrument_spec_registry: Optional registry for specs; when set, size/leverage use spec (min_size, step, leverage_mode).
         """
         self.kraken_client = kraken_client
         self.max_leverage = max_leverage
         self.spot_to_futures_override = spot_to_futures_override or {}
         self.position_size_is_notional = position_size_is_notional
-        # Cache latest futures tickers for use when futures_tickers not provided
-        self.cached_futures_tickers: Optional[Dict[str, any]] = None
+        self.instrument_spec_registry = instrument_spec_registry
+        self.cached_futures_tickers: Optional[Dict[str, Any]] = None
         logger.info(
             "Futures Adapter initialized",
             max_leverage=max_leverage,
             override_size=len(self.spot_to_futures_override),
+            has_spec_registry=instrument_spec_registry is not None,
         )
 
     def set_spot_to_futures_override(self, mapping: Dict[str, str]) -> None:
@@ -238,19 +248,13 @@ class FuturesAdapter:
         Returns:
             Order object
         """
-        # Cap leverage
+        # Cap leverage (config cap)
+        lev_int = max(1, int(leverage))
         if leverage > Decimal(str(self.max_leverage)):
-            logger.warning(
-                "Leverage capped",
-                requested=str(leverage),
-                max=self.max_leverage,
-            )
-            leverage = Decimal(str(self.max_leverage))
+            logger.warning("Leverage capped", requested=str(leverage), max=self.max_leverage)
+            lev_int = int(self.max_leverage)
         
-        # Generate client order ID
         client_order_id = f"order_{uuid.uuid4().hex[:16]}"
-        
-        # Map order type to Kraken format
         kraken_order_type_map = {
             OrderType.LIMIT: "lmt",
             OrderType.MARKET: "mkt",
@@ -258,86 +262,79 @@ class FuturesAdapter:
             OrderType.TAKE_PROFIT: "take_profit",
         }
         kraken_order_type = kraken_order_type_map.get(order_type, "lmt")
-        
-        # Map side to Kraken format
         kraken_side = "buy" if side == Side.LONG else "sell"
         
-        # 1. Fetch instrument metadata to get contract size
-        instruments = await self.kraken_client.get_futures_instruments()
+        price_use = price if price and price > 0 else size_notional / Decimal("1")  # fallback for market
+        size_contracts: Decimal
+        effective_leverage: Optional[Decimal]
+        contract_size = Decimal("1")
         
-        # Extract base currency from symbol (handle multiple formats)
-        # Examples: "SUN/USD:USD" -> "SUN", "PF_SUNUSD" -> "SUN", "SUNUSD" -> "SUN"
-        symbol_upper = symbol.upper()
-        base = None
-        
-        # Try to extract base from various formats
-        if '/' in symbol_upper:
-            base = symbol_upper.split('/')[0]
-        elif symbol_upper.startswith('PF_'):
-            base = symbol_upper.replace('PF_', '').replace('USD', '')
+        if self.instrument_spec_registry:
+            await self.instrument_spec_registry.refresh()
+            spec = self.instrument_spec_registry.get_spec(symbol)
+            if not spec:
+                logger.error(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason="NO_SPEC",
+                    requested_leverage=lev_int,
+                    spec_summary=None,
+                )
+                raise ValueError(f"Instrument specs for {symbol} not found")
+            size_contracts, size_reason = compute_size_contracts(spec, size_notional, price_use)
+            if size_reason:
+                logger.warning(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason=size_reason,
+                    requested_leverage=lev_int,
+                    spec_summary={"min_size": str(spec.min_size), "size_step": str(spec.size_step), "leverage_mode": spec.leverage_mode, "max_leverage": spec.max_leverage},
+                )
+                raise ValueError(f"Size validation failed: {size_reason}")
+            contract_size = spec.contract_size
+            effective_lev, lev_reason = resolve_leverage(spec, lev_int)
+            if lev_reason:
+                logger.warning(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason=lev_reason,
+                    requested_leverage=lev_int,
+                    spec_summary={"leverage_mode": spec.leverage_mode, "allowed_leverages": spec.allowed_leverages, "max_leverage": spec.max_leverage},
+                )
+                raise ValueError(f"Leverage rejected: {lev_reason}")
+            effective_leverage = Decimal(str(effective_lev)) if effective_lev is not None else None
+            if effective_leverage is None and not reduce_only:
+                self.instrument_spec_registry.log_unknown_leverage_once(symbol)
         else:
-            # Remove USD suffix if present
-            base = symbol_upper.replace('USD', '').replace(':', '').replace('-', '')
-        
-        # Try multiple symbol formats for lookup
-        instr = None
-        lookup_variants = []
-        
-        if base:
-            # Generate all possible formats
-            lookup_variants = [
-                f"PF_{base}USD",           # PF_SUNUSD
-                f"{base}USD",               # SUNUSD
-                f"{base}/USD:USD",          # SUN/USD:USD (CCXT unified)
-                f"{base}/USD",              # SUN/USD
-                symbol_upper,               # Original symbol
-            ]
-        
-        # Try each variant
-        for variant in lookup_variants:
-            # Try exact match
-            instr = next((i for i in instruments if i.get('symbol', '').upper() == variant.upper()), None)
-            if instr:
-                break
-            
-            # Try case-insensitive match with stripped whitespace
-            instr = next((i for i in instruments if str(i.get('symbol', '')).strip().upper() == variant.upper()), None)
-            if instr:
-                break
-        
-        if not instr:
-            # Log available symbols for debugging
-            base_part = base[:3] if base else symbol_upper[:3]
-            similar = [str(i.get('symbol', '')) for i in instruments if base_part in str(i.get('symbol', '')).upper()][:20]
-            logger.error(
-                "Instrument specs not found",
-                requested_symbol=symbol,
-                extracted_base=base,
-                lookup_variants=lookup_variants,
-                similar_symbols=similar,
-                total_instruments=len(instruments),
-            )
-            raise ValueError(f"Instrument specs for {symbol} not found")
-        
-        contract_size = Decimal(str(instr.get('contractSize', 1)))
-        
-        # 2. Convert USD notional to contract count
-        # Formula: size_contracts = Position Notional / (Entry Price * Contract Multiplier)
-        size_contracts = (size_notional / (price * contract_size)).quantize(
-            Decimal("0.0001"), rounding="ROUND_DOWN"
-        )
+            # Legacy path: fetch instruments and resolve size manually
+            instruments = await self.kraken_client.get_futures_instruments()
+            symbol_upper = symbol.upper()
+            base = symbol_upper.split("/")[0] if "/" in symbol_upper else symbol_upper.replace("PF_", "").replace("USD", "").replace(":", "").replace("-", "")
+            if not base:
+                base = symbol_upper
+            lookup_variants = [f"PF_{base}USD", f"{base}USD", f"{base}/USD:USD", symbol_upper]
+            instr = None
+            for v in lookup_variants:
+                instr = next((i for i in instruments if str(i.get("symbol", "")).strip().upper() == v.upper()), None)
+                if instr:
+                    break
+            if not instr:
+                logger.error("Instrument specs not found", requested_symbol=symbol, total_instruments=len(instruments))
+                raise ValueError(f"Instrument specs for {symbol} not found")
+            contract_size = Decimal(str(instr.get("contractSize", 1)))
+            size_contracts = (size_notional / (price_use * contract_size)).quantize(Decimal("0.0001"), rounding="ROUND_DOWN")
+            effective_leverage = leverage
         
         logger.info(
             "Converting notional to contracts",
             symbol=symbol,
             notional=float(size_notional),
-            price=float(price),
+            price=float(price_use),
             multiplier=float(contract_size),
-            contracts=float(size_contracts)
+            contracts=float(size_contracts),
         )
         
         try:
-            # Place order via Kraken Futures API
             response = await self.kraken_client.place_futures_order(
                 symbol=symbol,
                 side=kraken_side,
@@ -346,7 +343,7 @@ class FuturesAdapter:
                 price=price,
                 stop_price=price if order_type in [OrderType.STOP_LOSS, OrderType.TAKE_PROFIT] else None,
                 reduce_only=reduce_only,
-                leverage=leverage,
+                leverage=effective_leverage,
                 client_order_id=client_order_id,
             )
             

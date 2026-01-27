@@ -82,9 +82,15 @@ class LiveTrading:
         
         self.smc_engine = SMCEngine(config.strategy)
         self.risk_manager = RiskManager(config.risk)
+        from src.execution.instrument_specs import InstrumentSpecRegistry
+        self.instrument_spec_registry = InstrumentSpecRegistry(
+            get_instruments_fn=self.client.get_futures_instruments,
+            cache_ttl_seconds=getattr(config.exchange, "instrument_spec_cache_ttl_seconds", 12 * 3600),
+        )
         self.futures_adapter = FuturesAdapter(
             self.client,
-            position_size_is_notional=config.exchange.position_size_is_notional
+            position_size_is_notional=config.exchange.position_size_is_notional,
+            instrument_spec_registry=self.instrument_spec_registry,
         )
         
         # Store latest futures tickers for mapping (updated each tick)
@@ -2156,35 +2162,40 @@ class LiveTrading:
                 signals_count=signals_count,
             )
             
-            # Collect candidate signals from this tick
-            # CRITICAL: Use auction budget margin instead of current available_margin
-            # The auction needs to see ALL candidates, even if current margin is low,
-            # because it can close positions to free margin for better candidates.
+            # Refresh instrument spec registry so auction only plans executable trades
+            try:
+                await self.instrument_spec_registry.refresh()
+            except Exception as e:
+                logger.warning("Instrument spec refresh failed before auction", error=str(e))
+            
             # Calculate auction budget once (equity * max_margin_util)
             auction_budget_margin = equity * Decimal(str(self.config.risk.auction_max_margin_util))
             
             candidate_signals = []
-            # Map signal symbol to candidate for lookup during execution
             signal_to_candidate = {}
+            requested_leverage = int(getattr(self.config.risk, "target_leverage", 7) or 7)
             for signal, spot_price, mark_price in self.auction_signals_this_tick:
                 try:
-                    # Always use auction budget margin for candidate sizing
-                    # This allows the auction to see all candidates and decide which positions
-                    # to close to free margin for better opportunities
+                    futures_symbol = self.futures_adapter.map_spot_to_futures(
+                        signal.symbol, futures_tickers=self.latest_futures_tickers
+                    )
+                    spec = self.instrument_spec_registry.get_spec(futures_symbol)
+                    if not spec:
+                        logger.warning(
+                            "AUCTION_OPEN_REJECTED",
+                            symbol=signal.symbol,
+                            reason="NO_SPEC",
+                            requested_leverage=requested_leverage,
+                            spec_summary=None,
+                        )
+                        continue
                     decision = self.risk_manager.validate_trade(
                         signal, equity, spot_price, mark_price,
-                        available_margin=auction_budget_margin,  # Use auction budget, not current available
+                        available_margin=auction_budget_margin,
                     )
-                    
-                    # Include candidate if sizing succeeded (position_notional > 0)
-                    # Even if rejected for other reasons (basis, liquidation, etc.), we still
-                    # want to see the candidate in the auction - the auction will respect hard constraints
-                    # via the _passes_hard_filters check in the allocator
                     if decision.position_notional > 0 and decision.margin_required > 0:
-                        # Calculate stop distance for risk_R
                         stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price if signal.stop_loss else Decimal("0")
                         risk_R = decision.position_notional * stop_distance if stop_distance > 0 else Decimal("0")
-                        
                         candidate = create_candidate_signal(
                             signal=signal,
                             required_margin=decision.margin_required,
@@ -2193,7 +2204,6 @@ class LiveTrading:
                         )
                         candidate_signals.append(candidate)
                         signal_to_candidate[signal.symbol] = candidate
-                        
                         if not decision.approved:
                             logger.debug(
                                 "Candidate included in auction despite rejection (auction can optimize)",

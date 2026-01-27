@@ -40,6 +40,32 @@ from src.utils.retry import retry_on_transient_errors
 logger = get_logger(__name__)
 
 
+def _extract_venue_error(exc: Exception) -> tuple:
+    """Extract venue error code and message from Kraken/ccxt exception. Returns (code, message)."""
+    code, msg = "UNKNOWN", str(exc)
+    try:
+        import json
+        if hasattr(exc, "response") and exc.response is not None:
+            r = getattr(exc, "response", {}) or {}
+            errs = r.get("errors") or r.get("error") or []
+            if isinstance(errs, list) and errs and isinstance(errs[0], dict):
+                code = str(errs[0].get("code", code))
+                msg = str(errs[0].get("message", msg))
+                return (code, msg)
+        s = str(exc)
+        if "{" in s and "errors" in s.lower():
+            start, end = s.find("{"), s.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(s[start:end])
+                errs = data.get("errors") or []
+                if errs and isinstance(errs[0], dict):
+                    code = str(errs[0].get("code", code))
+                    msg = str(errs[0].get("message", msg))
+    except Exception:
+        pass
+    return (code, msg)
+
+
 @dataclass
 class RateLimiter:
     """Token bucket rate limiter."""
@@ -796,46 +822,54 @@ class KrakenClient:
                 leverage=str(leverage) if leverage else "default",
             )
             
-            # CRITICAL: Set leverage BEFORE placing order
-            # This is mandatory for correct position sizing
+            # Set leverage only when explicitly requested and not reduce-only.
+            # When leverage is None (e.g. unknown spec), skip set_leverage and use venue default.
             leverage_set_success = False
-            if leverage and not reduce_only:  # Only set leverage for entry orders, not protective orders
+            if leverage is not None and leverage and not reduce_only:
                 try:
                     await self.futures_exchange.set_leverage(float(leverage), unified_symbol)
                     logger.info("Leverage set successfully", leverage=float(leverage), symbol=unified_symbol)
                     leverage_set_success = True
                 except Exception as lev_err:
                     error_str = str(lev_err).lower()
-                    # Some exchanges return error if leverage is already set to same value - that's OK
                     if "already" in error_str or "same" in error_str or "no change" in error_str:
                         logger.info("Leverage already set to target value", leverage=float(leverage), symbol=unified_symbol)
                         leverage_set_success = True
                     else:
+                        venue_code, venue_msg = _extract_venue_error(lev_err)
                         logger.error(
-                            "CRITICAL: Failed to set leverage - order will be REJECTED for safety",
+                            "ORDER_REJECTED_BY_VENUE",
                             symbol=unified_symbol,
-                            target_leverage=float(leverage),
-                            error=str(lev_err)
+                            venue_error_code=venue_code,
+                            venue_error_message=venue_msg,
+                            payload_summary={"side": side, "type": ccxt_type, "amount": float(size), "leverage": float(leverage)},
                         )
-                        # SAFETY: Do NOT place order if leverage cannot be set
-                        # This prevents placing orders at unintended (likely 1x) leverage
                         raise Exception(f"Leverage setting failed for {unified_symbol}: {lev_err}. Order rejected for safety.")
             else:
-                # Reduce-only orders don't need leverage setting
                 leverage_set_success = True
             
-            # Additional safety: pass leverage in params as backup for some exchange implementations
-            if leverage and not reduce_only:
+            if leverage is not None and leverage and not reduce_only:
                 params['leverage'] = float(leverage)
             
-            order = await self.futures_exchange.create_order(
-                symbol=unified_symbol,
-                type=ccxt_type,
-                side=side,
-                amount=float(size),
-                price=float(price) if price else None,
-                params=params
-            )
+            try:
+                order = await self.futures_exchange.create_order(
+                    symbol=unified_symbol,
+                    type=ccxt_type,
+                    side=side,
+                    amount=float(size),
+                    price=float(price) if price else None,
+                    params=params
+                )
+            except Exception as order_err:
+                venue_code, venue_msg = _extract_venue_error(order_err)
+                logger.error(
+                    "ORDER_REJECTED_BY_VENUE",
+                    symbol=unified_symbol,
+                    venue_error_code=venue_code,
+                    venue_error_message=venue_msg,
+                    payload_summary={"side": side, "type": ccxt_type, "amount": float(size)},
+                )
+                raise
             
             logger.info(
                 "Futures order placed successfully",
