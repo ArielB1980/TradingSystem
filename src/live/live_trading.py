@@ -2228,10 +2228,9 @@ class LiveTrading:
                 portfolio_state=portfolio_state,
             )
             
-            # Log auction plan summary
+            # Log auction plan summary (first positional is event for structlog; do not also pass event=)
             logger.info(
-                "AUCTION_PLAN",
-                event="Auction plan generated",
+                "Auction plan generated",
                 closes_count=len(plan.closes),
                 closes_symbols=plan.closes,
                 opens_count=len(plan.opens),
