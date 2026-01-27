@@ -106,7 +106,7 @@ class LiveTrading:
         self.execution_engine = ExecutionEngine(config)
         self.position_manager = PositionManager()
         self.kill_switch = KillSwitch(self.client)
-        self.market_discovery = MarketDiscoveryService(self.client)
+        self.market_discovery = MarketDiscoveryService(self.client, config)
         
         # Auction mode allocator (if enabled)
         self.auction_allocator = None

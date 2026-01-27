@@ -18,19 +18,29 @@ from src.storage.repository import get_active_positions, delete_position, save_p
 logger = get_logger(__name__)
 
 
-def _exchange_dict_to_position(data: Dict[str, Any]) -> Position:
-    """Build a Position from raw exchange position dict (same shape as get_all_futures_positions)."""
+def _exchange_dict_to_position(data: Dict[str, Any], config: Optional[Any] = None) -> Position:
+    """Build a Position from raw exchange position dict (same shape as get_all_futures_positions).
+    Uses config.exchange.position_size_is_notional to interpret size: if True, size is already
+    notional USD; if False (Kraken default), size is in contracts and we compute notional = size * price.
+    """
     symbol = data.get("symbol") or ""
     side_raw = (data.get("side") or "long").lower()
     side = Side.LONG if side_raw in ("long", "buy") else Side.SHORT
     size = Decimal(str(data.get("size") or 0))
     entry_price = Decimal(str(data.get("entryPrice") or data.get("entry_price") or 0))
     mark_price = Decimal(str(data.get("markPrice") or data.get("mark_price") or entry_price))
+    price = mark_price if mark_price else entry_price
     liq = Decimal(str(data.get("liquidationPrice") or data.get("liquidation_price") or 0))
     unrealized_pnl = Decimal(str(data.get("unrealizedPnl") or data.get("unrealized_pnl") or 0))
     leverage = Decimal(str(data.get("leverage") or 1))
     margin_used = Decimal(str(data.get("initialMargin") or data.get("margin_used") or 0))
-    size_notional = size * mark_price if mark_price else size * entry_price
+    # Same conversion logic as FuturesAdapter.position_size_notional
+    exchange_cfg = getattr(config, "exchange", None) if config else None
+    position_size_is_notional = getattr(exchange_cfg, "position_size_is_notional", False) if exchange_cfg else False
+    if position_size_is_notional:
+        size_notional = size  # exchange already returns notional USD
+    else:
+        size_notional = size * price if price else size  # size in contracts -> notional
     return Position(
         symbol=symbol,
         side=side,
@@ -132,7 +142,7 @@ class Reconciler:
                 orig_sym, pos_data = exchange_norm[g]
                 if self.unmanaged_policy == "adopt":
                     try:
-                        pos = _exchange_dict_to_position(pos_data)
+                        pos = _exchange_dict_to_position(pos_data, self.config)
                         save_position(pos)
                         summary["adopted"] += 1
                         logger.info(
