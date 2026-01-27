@@ -120,6 +120,54 @@ Scale up after the full loop is proven. Config keys live under `risk` in `config
 
 ---
 
+## Must-be-green before live entries
+
+These are **runtime log checks**. Confirm them while the bot is running (e.g. paper or live with dry_run) before enabling real entries.
+
+### 1) Candle health gate is passing
+
+The live loop pauses entries when candle health is bad (`min_healthy_coins` default 30, `min_health_ratio` default 0.25).
+
+**Go-live check (in logs):**
+
+- You must see **no recurring** `TRADING PAUSED: candle health insufficient`.
+- You must see something like `coins_with_sufficient_candles >= 30` and `ratio >= 0.25`.
+
+If this gate is red, the system will intentionally not trade.
+
+### 2) Reconciliation is running and quiet
+
+With reconciliation every 120s (or your chosen interval):
+
+**Go-live check (in logs):**
+
+- You see **RECONCILE_SUMMARY** every ~2 minutes.
+- Unmanaged-found (or adopted count) quickly drops to **0** after startup or any one-off fix.
+- **No repeated** “UNMANAGED POSITION … not tracked” lines.
+
+If this isn’t green, you’re flying blind on SL/TP and exposure.
+
+### 3) Auction expectation matches config
+
+Config has `risk.auction_mode_enabled: true` by default → the bot collects signals and waits for the auction cycle even if you have room (< 25 positions), unless gating is “only when full”.
+
+**Go-live decision:**
+
+- **Immediate entries:** Set `risk.auction_mode_enabled: false`.
+- **Batching:** Keep it enabled and ensure auction is actually running: look for **AUCTION_START** / **AUCTION_PLAN** / **AUCTION_END** in logs.
+
+### 4) Kill switch + daily loss limit configured and tested
+
+**Before live:**
+
+- Confirm **daily loss limit** is set and not absurdly high (`risk.daily_loss_limit_pct` or equivalent).
+- Confirm **kill switch** file/state works (e.g. `.kill_switch_state` or your mechanism).
+- Confirm **ShockGuard** is enabled and not overly sensitive.
+
+**Go-live check:** Trigger a dry “shock” scenario in a controlled way (or temporarily lower thresholds) and ensure it **logs + pauses entries** without crashing.
+
+---
+
 ## Final “Go Live” Conditions
 
 You are ready to enable live entries **only if**:
@@ -131,5 +179,6 @@ You are ready to enable live entries **only if**:
 5. **Live safety gate:** Paper thresholds are met **or** `live.require_paper_success=false` is set deliberately.
 6. **Unmanaged policy:** `reconciliation.unmanaged_position_policy=adopt` (or force_close by design), and **RECONCILE_SUMMARY** appears periodically in logs.
 7. **Alerts:** At least log alerts; ideally Slack/Discord for CRITICAL.
+8. **Must-be-green (above):** Candle health passing, reconciliation running and quiet, auction expectation correct, kill switch + daily loss limit configured and tested.
 
 For reconciliation behavior and candle health details, see **OPS_HEALTH.md**.
