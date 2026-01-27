@@ -19,6 +19,7 @@ from src.execution.futures_adapter import FuturesAdapter
 from src.execution.price_converter import PriceConverter
 from src.config.config import ExecutionConfig
 from src.monitoring.logger import get_logger
+from src.data.symbol_utils import normalize_symbol_for_position_match
 
 logger = get_logger(__name__)
 
@@ -206,9 +207,15 @@ class Executor:
         async with self._symbol_locks[futures_symbol]:
             # Pyramiding guard
             if self.config.pyramiding_enabled is False:
-                # Check if we already have a position in this symbol
-                has_position = any(p.symbol == futures_symbol for p in current_positions)
-                
+                # Check if we already have a position in this symbol.
+                # CRITICAL: Normalize both sides — exchange positions may use PF_* or PI_*,
+                # while map_spot_to_futures can return ROSE/USD:USD. Exact match would miss
+                # the existing position and allow a second order on the same contract (pyramiding).
+                fut_norm = normalize_symbol_for_position_match(futures_symbol)
+                has_position = any(
+                    normalize_symbol_for_position_match(p.symbol) == fut_norm
+                    for p in current_positions
+                )
                 if has_position:
                     logger.warning(
                         "Pyramiding guard REJECTED",

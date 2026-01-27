@@ -2158,10 +2158,20 @@ class LiveTrading:
                 previous_available_margin=str(available_margin),
             )
             
-            # Execute opens from auction plan
+            # Execute opens from auction plan.
+            # Dedupe by symbol so we never open the same coin twice in one plan
+            # (defense in depth if allocator ever emits duplicates).
+            seen_opens: set[str] = set()
             opens_executed = 0
             opens_failed = 0
             for signal in plan.opens:
+                if signal.symbol in seen_opens:
+                    logger.warning(
+                        "Auction: Skipping duplicate open for same symbol",
+                        symbol=signal.symbol,
+                    )
+                    continue
+                seen_opens.add(signal.symbol)
                 try:
                     # Find corresponding price data and candidate
                     spot_price = None
@@ -2383,6 +2393,7 @@ class LiveTrading:
         
         from src.storage.repository import get_active_position, save_position, async_record_event
         
+        skipped_not_protected: List[str] = []
         for pos_data in raw_positions:
             symbol = pos_data.get('symbol')
             if not symbol or pos_data.get('size', 0) == 0:
@@ -2418,6 +2429,8 @@ class LiveTrading:
                     current_price = Decimal(str(current_price))
                 
                 # Step 4: Safety checks - skip if unsafe
+                if not db_pos.is_protected:
+                    skipped_not_protected.append(symbol)
                 if await self._should_skip_tp_backfill(symbol, pos_data, db_pos, current_price):
                     continue
                 
@@ -2459,6 +2472,15 @@ class LiveTrading:
                     symbol,
                     {"reason": f"error: {str(e)}"}
                 )
+
+        if skipped_not_protected:
+            symbols_dedupe = sorted(set(skipped_not_protected))
+            logger.warning(
+                "Positions needing protection (TP backfill skipped)",
+                symbols=symbols_dedupe,
+                count=len(symbols_dedupe),
+                action="Run 'make place-missing-stops' (dry-run) then 'make place-missing-stops-live' to protect.",
+            )
 
     async def _reconcile_stop_loss_order_ids(self, raw_positions: List[Dict]):
         """
