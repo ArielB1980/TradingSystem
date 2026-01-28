@@ -19,6 +19,7 @@ from src.execution.instrument_specs import (
     InstrumentSpecRegistry,
     InstrumentSpec,
     compute_size_contracts,
+    ensure_size_step_aligned,
     resolve_leverage,
 )
 import uuid
@@ -224,7 +225,9 @@ class FuturesAdapter:
             leverage: Leverage to use (capped at max_leverage)
             order_type: Order type
             price: Limit price (required for limit orders)
-            reduce_only: Whether order is reduce-only (for SL/TP)
+            reduce_only: Whether order is reduce-only (for SL/TP/close). Must be True for
+            all protective exits (SL, TP, close, emergency close, replace flow) so
+            size-step alignment uses ROUND_UP and no dust remains.
         
         Returns:
             Order object
@@ -301,6 +304,16 @@ class FuturesAdapter:
                     spec_summary={"min_size": str(spec.min_size), "size_step": str(spec.size_step), "leverage_mode": spec.leverage_mode, "max_leverage": spec.max_leverage},
                 )
                 raise ValueError(f"Size validation failed: {size_reason}")
+            # Last-resort guard: ensure size is a multiple of size_step (spec drift)
+            size_contracts, align_reason = ensure_size_step_aligned(spec, size_contracts, reduce_only=reduce_only)
+            if align_reason:
+                logger.warning(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason=align_reason,
+                    spec_summary={"min_size": str(spec.min_size), "size_step": str(spec.size_step)},
+                )
+                raise ValueError(f"Size step alignment failed: {align_reason}")
             contract_size = spec.contract_size
             effective_lev, lev_reason = resolve_leverage(spec, lev_int)
             if lev_reason:

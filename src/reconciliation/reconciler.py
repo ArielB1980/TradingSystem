@@ -162,6 +162,7 @@ class Reconciler:
                         logger.error("Adopt failed", symbol=orig_sym, error=str(e))
                 else:  # force_close
                     try:
+                        # reduce_only=True: exit, no dust (required for all protective exits)
                         side = (pos_data.get("side") or "long").lower()
                         close_side = "sell" if side in ("long", "buy") else "buy"
                         size = float(pos_data.get("size") or 0)

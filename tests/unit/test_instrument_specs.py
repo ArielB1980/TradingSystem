@@ -12,6 +12,7 @@ from src.execution.instrument_specs import (
     InstrumentSpecRegistry,
     resolve_leverage,
     compute_size_contracts,
+    ensure_size_step_aligned,
     _parse_instrument,
 )
 
@@ -155,7 +156,7 @@ def test_registry_missing_spec_returns_none():
     assert out is None
 
 
-def test_registry_get_spec_by_raw():
+def test_registry_get_spec_by_raw(tmp_path):
     """get_spec resolves by symbol_raw (e.g. PF_BCHUSD) and normalized forms."""
     spec = InstrumentSpec(
         symbol_raw="PF_BCHUSD",
@@ -163,7 +164,8 @@ def test_registry_get_spec_by_raw():
         base="BCH",
         quote="USD",
     )
-    reg = InstrumentSpecRegistry(get_instruments_fn=None)
+    # Use tmp_path to avoid loading from real cache
+    reg = InstrumentSpecRegistry(get_instruments_fn=None, cache_path=tmp_path / "nonexistent_cache.json")
     reg._by_raw = {"PF_BCHUSD": spec, "BCHUSD": spec}
     reg._by_ccxt = {"BCH/USD:USD": spec}
     reg._loaded_at = 1
@@ -240,3 +242,101 @@ def test_paxg_notional_sufficient_passes():
     assert reason is None
     assert contracts >= Decimal("0.001")
     assert contracts == Decimal("0.0015")
+
+
+# ---------- size_step_source and ensure_size_step_aligned ----------
+
+
+def test_size_step_source_from_precision_amount():
+    """_parse_instrument sets size_step_source to precision.amount when precision.amount is present."""
+    raw = {
+        "symbol": "PF_XBTUSD",
+        "contractSize": 1,
+        "precision": {"amount": 0.001},
+        "limits": {"amount": {"min": 0.001}},
+    }
+    spec = _parse_instrument(raw)
+    assert spec is not None
+    assert spec.size_step_source == "precision.amount"
+    assert spec.size_step == Decimal("0.001")
+
+
+def test_ensure_size_step_aligned_passes_when_aligned():
+    """ensure_size_step_aligned returns (size_contracts, None) when already a multiple of size_step."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_ETHUSD",
+        symbol_ccxt="ETH/USD:USD",
+        base="ETH",
+        quote="USD",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+    )
+    out, reason = ensure_size_step_aligned(spec, Decimal("0.015"))
+    assert reason is None
+    assert out == Decimal("0.015")
+
+
+def test_ensure_size_step_aligned_when_size_step_zero():
+    """ensure_size_step_aligned returns (size_contracts, None) when size_step is 0."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_LEGACY",
+        symbol_ccxt="LEG/USD:USD",
+        base="LEG",
+        quote="USD",
+        size_step=Decimal("0"),
+    )
+    out, reason = ensure_size_step_aligned(spec, Decimal("1.2345"))
+    assert reason is None
+    assert out == Decimal("1.2345")
+
+
+def test_ensure_size_step_aligned_rounds_down_for_entries():
+    """ensure_size_step_aligned rounds DOWN for entries (reduce_only=False) to never increase exposure."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_BCHUSD",
+        symbol_ccxt="BCH/USD:USD",
+        base="BCH",
+        quote="USD",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+    )
+    # 0.0151 is not an exact multiple of 0.001 (drift); ROUND_DOWN -> 0.015 (never increases)
+    out, reason = ensure_size_step_aligned(spec, Decimal("0.0151"), reduce_only=False)
+    assert reason is None
+    assert out == Decimal("0.015")
+    # 0.0155 with ROUND_DOWN -> 0.015 (not 0.016)
+    out2, reason2 = ensure_size_step_aligned(spec, Decimal("0.0155"), reduce_only=False)
+    assert reason2 is None
+    assert out2 == Decimal("0.015")
+
+
+def test_ensure_size_step_aligned_rounds_up_for_exits():
+    """ensure_size_step_aligned rounds UP for exits (reduce_only=True) to fully close position if needed."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_BCHUSD",
+        symbol_ccxt="BCH/USD:USD",
+        base="BCH",
+        quote="USD",
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+    )
+    # 0.0151 is not an exact multiple of 0.001 (drift); ROUND_UP -> 0.016 (may be needed to fully close)
+    out, reason = ensure_size_step_aligned(spec, Decimal("0.0151"), reduce_only=True)
+    assert reason is None
+    assert out == Decimal("0.016")
+
+
+def test_ensure_size_step_aligned_rejects_when_rounded_below_min():
+    """ensure_size_step_aligned returns SIZE_STEP_MISALIGNED when rounded value is 0 or below min_size."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_TINY",
+        symbol_ccxt="TINY/USD:USD",
+        base="TINY",
+        quote="USD",
+        min_size=Decimal("0.01"),
+        size_step=Decimal("0.01"),
+    )
+    # 0.004 is misaligned (step 0.01); ROUND_DOWN -> 0.00 < min_size -> reject
+    out, reason = ensure_size_step_aligned(spec, Decimal("0.004"), reduce_only=False)
+    assert reason == "SIZE_STEP_MISALIGNED"
+    assert out == Decimal("0.004")

@@ -6,12 +6,13 @@ Used for: pre-validate order params, leverage rules (flexible vs fixed), size ro
 """
 from __future__ import annotations
 
+import math
 import os
 import json
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +50,7 @@ class InstrumentSpec:
     contract_size: Decimal = Decimal("1")
     min_size: Decimal = Decimal("0")
     size_step: Decimal = Decimal("0.0001")
+    size_step_source: str = "missing"  # "precision.amount" | "info.lotSize" | "info.quantityIncrement" | "missing"
     price_tick: Optional[Decimal] = None
     max_leverage: int = 50
     leverage_mode: str = "unknown"  # "flexible" | "fixed" | "unknown"
@@ -65,6 +67,7 @@ class InstrumentSpec:
             "contract_size": str(self.contract_size),
             "min_size": str(self.min_size),
             "size_step": str(self.size_step),
+            "size_step_source": self.size_step_source,
             "price_tick": str(self.price_tick) if self.price_tick is not None else None,
             "max_leverage": self.max_leverage,
             "leverage_mode": self.leverage_mode,
@@ -83,6 +86,7 @@ class InstrumentSpec:
             contract_size=Decimal(str(d.get("contract_size", 1))),
             min_size=Decimal(str(d.get("min_size", 0))),
             size_step=Decimal(str(d.get("size_step", "0.0001"))),
+            size_step_source=str(d.get("size_step_source", "missing")),
             price_tick=Decimal(str(d["price_tick"])) if d.get("price_tick") is not None else None,
             max_leverage=int(d.get("max_leverage", 50)),
             leverage_mode=str(d.get("leverage_mode", "unknown")),
@@ -90,6 +94,37 @@ class InstrumentSpec:
             supports_reduce_only=bool(d.get("supports_reduce_only", True)),
             last_updated_ts=float(d.get("last_updated_ts", 0)),
         )
+
+
+def _precision_amount_to_size_step(precision_amount: Any) -> Optional[Decimal]:
+    """
+    Convert CCXT precision.amount to size_step.
+    - Integer or whole number (e.g. 3.0) → decimal places: size_step = 10**(-n)
+    - Float < 1 → step value directly (exchange already gives step)
+    Do not use tickSize here; it is a price increment, not amount.
+    """
+    if precision_amount is None:
+        return None
+    try:
+        prec = Decimal(str(precision_amount))
+    except (ValueError, TypeError):
+        return None
+    if prec <= 0:
+        return None
+    # Float < 1: treat as step directly
+    if prec < 1:
+        return prec
+    # Integer type or whole number (e.g. 3.0): treat as decimal places
+    if isinstance(precision_amount, int):
+        return Decimal("10") ** (-precision_amount)
+    try:
+        f = float(prec)
+        if abs(f - round(f)) < 1e-9:
+            return Decimal("10") ** (-int(round(f)))
+    except (ValueError, OverflowError):
+        pass
+    # Fallback: >= 1 treat as decimal places
+    return Decimal("10") ** (-int(prec))
 
 
 def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
@@ -109,14 +144,38 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
     # CCXT unified format
     symbol_ccxt = f"{base}/USD:USD" if "/" not in symbol else symbol
     contract_size = Decimal(str(raw.get("contractSize", raw.get("contractMultiplier", raw.get("contract_size", 1)))))
-    tick_size = raw.get("tickSize") or raw.get("tick_size") or raw.get("precision", {}).get("amount")
-    if isinstance(tick_size, dict):
-        tick_size = tick_size.get("min") or tick_size.get("step")
-    if tick_size is not None and isinstance(tick_size, (int, float, str)):
-        ts = Decimal(str(tick_size))
-        size_step = ts if ts > 0 else Decimal("0.0001")
-    else:
-        size_step = Decimal("0.0001")
+    
+    # Size step: precision.amount only (never tickSize — that is price increment).
+    # Fallback: info.lotSize or exchange amount increment; else 0 + log warning.
+    precision_data = raw.get("precision", {})
+    precision_amount = precision_data.get("amount") if isinstance(precision_data, dict) else None
+    size_step = _precision_amount_to_size_step(precision_amount) if precision_amount is not None else None
+    size_step_source = "precision.amount" if (size_step is not None and size_step > 0) else "missing"
+
+    if size_step is None or size_step <= 0:
+        info = raw.get("info", {}) or {}
+        lot_size = None
+        if info.get("lotSize") is not None or info.get("lot_size") is not None:
+            lot_size = info.get("lotSize") or info.get("lot_size")
+            size_step_source = "info.lotSize"
+        elif info.get("quantityIncrement") is not None:
+            lot_size = info.get("quantityIncrement")
+            size_step_source = "info.quantityIncrement"
+        if lot_size is not None:
+            try:
+                ls = Decimal(str(lot_size))
+                size_step = ls if ls > 0 else Decimal("0")
+            except (ValueError, TypeError):
+                size_step = Decimal("0")
+        else:
+            size_step = Decimal("0")
+            size_step_source = "missing"
+        if size_step <= 0:
+            logger.warning(
+                "SPEC_SIZE_STEP_MISSING",
+                symbol=symbol,
+                hint="precision.amount and info.lotSize missing; relying on min_size only",
+            )
     # Leverage: Kraken CONTRACT_NOT_FLEXIBLE_FUTURES implies fixed; no API field = unknown
     leverage_mode = "unknown"
     allowed_leverages: Optional[List[int]] = None
@@ -166,6 +225,7 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
         contract_size=contract_size,
         min_size=Decimal(str(min_sz)),
         size_step=size_step,
+        size_step_source=size_step_source,
         price_tick=Decimal(str(tick_val)) if tick_val is not None else None,
         max_leverage=max_lev,
         leverage_mode=leverage_mode,
@@ -244,6 +304,67 @@ def compute_size_contracts(
     return (contracts, None)
 
 
+# Symbols we've already logged for size-step alignment correction this process (once per symbol per run)
+_size_step_alignment_logged: set = set()
+
+
+def ensure_size_step_aligned(
+    spec: InstrumentSpec,
+    size_contracts: Decimal,
+    reduce_only: bool = False,
+) -> Tuple[Decimal, Optional[str]]:
+    """
+    Last-resort guard before order placement: ensure size_contracts is a multiple of size_step.
+    Uses pure Decimal arithmetic (no float/epsilon).
+    
+    Rounding direction:
+    - ROUND_DOWN for entries (reduce_only=False): never increases exposure
+    - ROUND_UP for exits (reduce_only=True): may be needed to fully close position
+    
+    If size_step == 0, returns (size_contracts, None). If misaligned, rounds using the
+    appropriate direction and logs (once per symbol per run); if rounded value is 0 or
+    below min_size, rejects.
+    
+    Returns (adjusted_contracts, rejection_reason).
+    """
+    if spec.size_step <= 0:
+        return (size_contracts, None)
+    
+    # Pure Decimal arithmetic: compute k = (size_contracts / step).to_integral_value()
+    ratio = size_contracts / spec.size_step
+    rounding_mode = ROUND_UP if reduce_only else ROUND_DOWN
+    k = ratio.to_integral_value(rounding=rounding_mode)
+    rounded = k * spec.size_step
+    
+    # Exact match: already aligned
+    if rounded == size_contracts:
+        return (size_contracts, None)
+    
+    # Misaligned: check if rounded value is valid
+    effective_min = spec.min_size if spec.min_size > 0 else Decimal("0.001")
+    if rounded <= 0 or rounded < effective_min:
+        return (
+            size_contracts,
+            "SIZE_STEP_MISALIGNED",
+        )
+    
+    # Log correction (once per symbol per process)
+    if spec.symbol_raw not in _size_step_alignment_logged:
+        _size_step_alignment_logged.add(spec.symbol_raw)
+        direction = "up" if rounded > size_contracts else "down"
+        logger.warning(
+            "SIZE_STEP_ALIGNMENT_CORRECTED",
+            symbol=spec.symbol_raw,
+            original=str(size_contracts),
+            rounded=str(rounded),
+            size_step=str(spec.size_step),
+            direction=direction,
+            reduce_only=reduce_only,
+            message=f"Spec drift: size_contracts was not a multiple of size_step; rounded {direction} to valid step",
+        )
+    return (rounded, None)
+
+
 class InstrumentSpecRegistry:
     """
     Single source of truth for futures instrument specs.
@@ -255,8 +376,10 @@ class InstrumentSpecRegistry:
         get_instruments_fn=None,
         cache_path: Optional[Path] = None,
         cache_ttl_seconds: int = CACHE_TTL_SECONDS,
+        ccxt_exchange=None,  # Optional CCXT exchange for precision.amount enrichment
     ):
         self._get_instruments_fn = get_instruments_fn
+        self._ccxt_exchange = ccxt_exchange  # Optional: for precision.amount from CCXT markets
         # Use provided path, or env var, or default (data/ under repo root)
         self._cache_path = cache_path or _instrument_specs_cache_path()
         self._cache_ttl = cache_ttl_seconds
@@ -280,6 +403,8 @@ class InstrumentSpecRegistry:
             specs = [InstrumentSpec.from_dict(d) for d in data.get("specs", [])]
             self._index(specs)
             self._loaded_at = data.get("loaded_at", time.time())
+            # Startup sanity check: fail fast if size_step >> min_size
+            self._validate_specs_sanity()
             logger.debug("InstrumentSpecRegistry loaded from cache", count=len(specs), path=str(self._cache_path))
             return True
         except Exception as e:
@@ -296,6 +421,116 @@ class InstrumentSpecRegistry:
             key = (s.base + "USD").upper()
             if key not in self._by_raw:
                 self._by_raw[key] = s
+    
+    async def _enrich_from_ccxt_markets(self, specs: List[InstrumentSpec]) -> None:
+        """
+        Enrich specs with precision.amount from CCXT markets if available.
+        This ensures we use the correct size_step from CCXT market data.
+        """
+        if not self._ccxt_exchange:
+            return
+        try:
+            # Load CCXT markets if not already loaded
+            if not hasattr(self._ccxt_exchange, 'markets') or not self._ccxt_exchange.markets:
+                await self._ccxt_exchange.load_markets()
+            
+            # Map specs to CCXT markets by symbol
+            for spec in specs:
+                # Try multiple symbol formats
+                ccxt_symbols = [
+                    spec.symbol_ccxt,
+                    spec.symbol_raw,
+                    spec.symbol_raw.replace("PF_", "").replace("PI_", "").replace("FI_", ""),
+                ]
+                for ccxt_sym in ccxt_symbols:
+                    market = self._ccxt_exchange.markets.get(ccxt_sym)
+                    if market:
+                        precision = market.get("precision", {})
+                        if isinstance(precision, dict):
+                            precision_amount = precision.get("amount")
+                            step = _precision_amount_to_size_step(precision_amount)
+                            if step is not None and step > 0:
+                                spec.size_step = step
+                                spec.size_step_source = "precision.amount"
+                                logger.debug(
+                                    "Enriched spec from CCXT market",
+                                    symbol=spec.symbol_raw,
+                                    precision_amount=str(precision_amount),
+                                    size_step=str(spec.size_step),
+                                )
+                                break
+        except Exception as e:
+            logger.debug("Failed to enrich specs from CCXT markets (non-critical)", error=str(e))
+
+    def _validate_specs_sanity(self) -> None:
+        """
+        Startup sanity check: log specs and fail fast if size_step >> min_size (indicates parsing bug).
+        
+        Logs once per symbol showing min_size, size_step, and precision.amount (if available).
+        If size_step is significantly larger than min_size (e.g., 10x+), this indicates a parsing
+        error (likely using wrong precision source) and fails fast.
+        """
+        # Skip only when explicitly disabled (prod always runs unless env set)
+        if os.environ.get("TRADING_SYSTEM_SKIP_SPEC_SANITY") == "1":
+            return
+
+        # Log all specs once at startup (for debugging)
+        for spec in sorted(self._by_raw.values(), key=lambda s: s.symbol_raw):
+            if spec.min_size <= 0 or spec.size_step <= 0:
+                logger.warning(
+                    "SPEC_SANITY_SKIP_RATIO",
+                    symbol=spec.symbol_raw,
+                    min_size=str(spec.min_size),
+                    size_step=str(spec.size_step),
+                    reason="min_size or size_step <= 0; skipping ratio check",
+                )
+                continue
+
+            # Calculate precision.amount from size_step (reverse: if size_step = 0.001, precision.amount = 3)
+            precision_amount = None
+            if spec.size_step > 0:
+                try:
+                    # size_step = 10**(-precision_amount) → precision_amount = -log10(size_step)
+                    precision_amount = int(-math.log10(float(spec.size_step)))
+                except (ValueError, OverflowError):
+                    pass
+            
+            logger.info(
+                "Instrument spec loaded",
+                symbol=spec.symbol_raw,
+                min_size=str(spec.min_size),
+                size_step=str(spec.size_step),
+                size_step_source=spec.size_step_source,
+                precision_amount=precision_amount,
+            )
+            
+            # Check if size_step is much larger than min_size (red flag)
+            ratio = float(spec.size_step / spec.min_size)
+            if ratio > 10.0:  # size_step is 10x+ larger than min_size
+                logger.critical(
+                    "INSTRUMENT_SPEC_SANITY_CHECK_FAILED",
+                    symbol=spec.symbol_raw,
+                    min_size=str(spec.min_size),
+                    size_step=str(spec.size_step),
+                    precision_amount=precision_amount,
+                    ratio=f"{ratio:.1f}x",
+                    message="size_step >> min_size indicates parsing bug (check precision.amount)",
+                )
+                raise ValueError(
+                    f"Instrument spec sanity check failed for {spec.symbol_raw}: "
+                    f"size_step ({spec.size_step}) >> min_size ({spec.min_size}). "
+                    f"This indicates a parsing bug - check precision.amount handling."
+                )
+            elif ratio > 2.0:  # Warn if size_step is 2x+ larger (still suspicious)
+                logger.warning(
+                    "INSTRUMENT_SPEC_SANITY_WARNING",
+                    symbol=spec.symbol_raw,
+                    min_size=str(spec.min_size),
+                    size_step=str(spec.size_step),
+                    precision_amount=precision_amount,
+                    ratio=f"{ratio:.1f}x",
+                    message="size_step > min_size (may be correct, but verify precision.amount)",
+                )
 
     def _save_to_disk(self) -> None:
         if not self._cache_path:
@@ -334,9 +569,14 @@ class InstrumentSpecRegistry:
             if s:
                 specs.append(s)
         if specs:
+            # Enrich with CCXT market precision.amount if available
+            if self._ccxt_exchange:
+                await self._enrich_from_ccxt_markets(specs)
             self._index(specs)
             self._loaded_at = time.time()
             self._save_to_disk()
+            # Startup sanity check: fail fast if size_step >> min_size
+            self._validate_specs_sanity()
             logger.info("InstrumentSpecRegistry refreshed", count=len(specs))
         elif self._loaded_at == 0:
             self._load_from_disk()

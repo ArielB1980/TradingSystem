@@ -340,7 +340,7 @@ class ExecutionGateway:
         
         self._wal_record_intent(action, "close")
         try:
-            # Close via reduce-only market order
+            # Close via reduce-only market order (reduceOnly=True required: rounds up, no dust)
             close_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
@@ -350,7 +350,7 @@ class ExecutionGateway:
                 amount=float(action.size),
                 params={
                     "clientOrderId": action.client_order_id,
-                    "reduceOnly": True
+                    "reduceOnly": True,
                 }
             )
             
@@ -403,6 +403,7 @@ class ExecutionGateway:
         
         self._wal_record_intent(action, "partial_close")
         try:
+            # reduceOnly=True required for exits: size rounds up, no dust
             close_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
@@ -412,7 +413,7 @@ class ExecutionGateway:
                 amount=float(action.size),
                 params={
                     "clientOrderId": action.client_order_id,
-                    "reduceOnly": True
+                    "reduceOnly": True,
                 }
             )
             
@@ -457,6 +458,7 @@ class ExecutionGateway:
         
         self._wal_record_intent(action, "place_stop", price=action.price)
         try:
+            # reduceOnly=True required for protective exits: rounds up, no dust
             stop_side = "sell" if action.side == Side.LONG else "buy"
             
             result = await self.client.create_order(
@@ -468,7 +470,7 @@ class ExecutionGateway:
                 params={
                     "clientOrderId": action.client_order_id,
                     "reduceOnly": True,
-                    "stopPrice": float(action.price)
+                    "stopPrice": float(action.price),
                 }
             )
             
