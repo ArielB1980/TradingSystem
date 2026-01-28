@@ -307,14 +307,16 @@ class Executor:
             
             # Place entry order
             try:
+                is_market = self.config.default_order_type != "limit"
                 entry_order = await self.futures_adapter.place_order(
                     symbol=futures_symbol,
                     side=order_intent.side,
                     size_notional=order_intent.size_notional,
                     leverage=order_intent.leverage,
-                    order_type=OrderType.LIMIT if self.config.default_order_type == "limit" else OrderType.MARKET,
-                    price=order_intent.entry_price_futures if self.config.default_order_type == "limit" else None,
+                    order_type=OrderType.LIMIT if not is_market else OrderType.MARKET,
+                    price=order_intent.entry_price_futures if not is_market else None,
                     reduce_only=False,
+                    mark_price=futures_mark_price if is_market else None,
                 )
                 
                 # Save converted levels for protective orders

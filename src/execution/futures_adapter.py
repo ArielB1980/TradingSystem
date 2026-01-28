@@ -13,6 +13,7 @@ from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from src.domain.models import Order, OrderType, OrderStatus, Side
 from src.data.kraken_client import KrakenClient
+from src.data.symbol_utils import futures_candidate_symbols
 from src.monitoring.logger import get_logger
 from src.execution.instrument_specs import (
     InstrumentSpecRegistry,
@@ -129,27 +130,11 @@ class FuturesAdapter:
             if futures_tickers is None or override in futures_tickers:
                 return override
         
-        # Priority 2: Check futures_tickers for derived keys
+        # Priority 2: Check futures_tickers using centralized candidate list (BTC/XBT handled in symbol_utils)
         if futures_tickers:
-            base = spot_symbol.split("/")[0]
-            if base == "XBT":
-                base = "BTC"
-            
-            # Try CCXT unified first (preferred for execution)
-            ccxt_unified = f"{base}/USD:USD"
-            if ccxt_unified in futures_tickers:
-                return ccxt_unified
-            
-            # Try PF_ format
-            pf_key = f"PF_{base}USD"
-            if pf_key in futures_tickers:
-                return pf_key
-            
-            # Try raw formats (PI_, PF_, FI_)
-            for prefix in ["PI_", "PF_", "FI_"]:
-                raw_key = f"{prefix}{base}USD"
-                if raw_key in futures_tickers:
-                    return raw_key
+            for cand in futures_candidate_symbols(spot_symbol):
+                if cand in futures_tickers:
+                    return cand
         
         # Priority 3: TICKER_MAP
         mapped = FuturesAdapter.TICKER_MAP.get(spot_symbol)
@@ -158,14 +143,9 @@ class FuturesAdapter:
             if futures_tickers is None or mapped in futures_tickers:
                 return mapped
         
-        # Priority 4: Fallback
-        try:
-            base = spot_symbol.split("/")[0]
-            if base == "XBT":
-                base = "BTC"
-            return f"PF_{base}USD"
-        except IndexError:
-            return None
+        # Priority 4: Fallback using same candidate list
+        candidates = futures_candidate_symbols(spot_symbol)
+        return candidates[0] if candidates else None
     
     def map_spot_to_futures(
         self, spot_symbol: str, futures_tickers: Optional[Dict[str, any]] = None
@@ -192,14 +172,11 @@ class FuturesAdapter:
         if result:
             return result
         
-        # Final fallback if _find_best_executable_symbol returns None
-        try:
-            base = spot_symbol.split("/")[0]
-            if base == "XBT":
-                base = "BTC"
-            return f"PF_{base}USD"
-        except IndexError:
-            raise ValueError(f"Invalid spot symbol format: {spot_symbol}")
+        # Final fallback using centralized candidate list
+        candidates = futures_candidate_symbols(spot_symbol)
+        if candidates:
+            return candidates[0]
+        raise ValueError(f"Invalid spot symbol format: {spot_symbol}")
     
     def notional_to_contracts(
         self,
@@ -232,9 +209,13 @@ class FuturesAdapter:
         order_type: OrderType = OrderType.LIMIT,
         price: Optional[Decimal] = None,
         reduce_only: bool = False,
+        *,
+        mark_price: Optional[Decimal] = None,
     ) -> Order:
         """
         Place order on Kraken Futures.
+
+        mark_price: If provided, used for contract sizing when order is market and price is missing (avoids wrong size from fallback).
         
         Args:
             symbol: Futures symbol (e.g., "PF_XBTUSD" on Kraken)
@@ -264,7 +245,36 @@ class FuturesAdapter:
         kraken_order_type = kraken_order_type_map.get(order_type, "lmt")
         kraken_side = "buy" if side == Side.LONG else "sell"
         
-        price_use = price if price and price > 0 else size_notional / Decimal("1")  # fallback for market
+        # Price for contract sizing: limit/sl/tp use price; market uses mark_price or cached ticker (invariant: never size_notional/1).
+        price_use: Optional[Decimal] = None
+        price_from_mark_or_ticker = False
+        if price and price > 0:
+            price_use = price
+        elif order_type == OrderType.MARKET:
+            if mark_price and mark_price > 0:
+                price_use = mark_price
+                price_from_mark_or_ticker = True
+            elif self.cached_futures_tickers:
+                ticker_val = self.cached_futures_tickers.get(symbol)
+                if ticker_val is not None:
+                    try:
+                        p = Decimal(str(ticker_val))
+                        if p > 0:
+                            price_use = p
+                            price_from_mark_or_ticker = True
+                    except Exception:
+                        pass
+            if price_use is None or price_use <= 0:
+                raise ValueError(
+                    "Market order requires mark_price or ticker for size calculation; none available. "
+                    f"symbol={symbol!r} client_order_id={client_order_id!r} size_notional={size_notional!r}"
+                )
+        else:
+            price_use = price if price is not None else Decimal("0")
+        # Invariant: market orders are sized only from mark/ticker (never size_notional/1).
+        assert (
+            order_type != OrderType.MARKET or price_from_mark_or_ticker or (price and price > 0)
+        ), "MARKET order price_use must come from mark_price, ticker, or explicit price"
         size_contracts: Decimal
         effective_leverage: Optional[Decimal]
         contract_size = Decimal("1")
