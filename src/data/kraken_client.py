@@ -764,6 +764,14 @@ class KrakenClient:
         """
         Place order on Kraken Futures using CCXT.
         
+        ⚠️ PRODUCTION RISK: SL/TP semantics are exchange-specific and not fully validated.
+        See docs/PRODUCTION_BLOCKERS.md for details. Integration tests required before live trading.
+        
+        Current SL/TP mapping (UNVALIDATED):
+        - STOP_LOSS ("stp"): type="stop", params={"stopPrice": stop_price}
+        - TAKE_PROFIT ("take_profit"): type="take_profit", params={"stopPrice": stop_price}
+        - Behavior (stop-market vs stop-limit) depends on CCXT/Kraken implementation
+        
         Args:
             symbol: Futures symbol (e.g., "BTC/USD:USD" or "PF_XBTUSD")
             side: "buy" or "sell"
@@ -772,6 +780,7 @@ class KrakenClient:
             price: Limit price (required for limit orders)
             stop_price: Stop price (for stop/take_profit orders)
             reduce_only: Whether order is reduce-only
+            leverage: Optional leverage to set
             client_order_id: Optional client order ID
         
         Returns:

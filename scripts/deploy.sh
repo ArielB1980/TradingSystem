@@ -257,6 +257,15 @@ ssh -i "$SSH_KEY" "$SERVER" << DEPLOY_EOF
     echo "🔄 Resetting to origin/main..."
     su - $TRADING_USER -c "cd $TRADING_DIR && git reset --hard origin/main"
     
+    echo "📦 Installing/updating dependencies..."
+    if [ -d "$TRADING_DIR/venv" ]; then
+        su - $TRADING_USER -c "cd $TRADING_DIR && venv/bin/pip install --upgrade pip && venv/bin/pip install -r requirements.txt"
+    elif [ -d "$TRADING_DIR/.venv" ]; then
+        su - $TRADING_USER -c "cd $TRADING_DIR && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt"
+    else
+        echo "⚠️  No venv found; assuming dependencies installed via system Python or other method"
+    fi
+    
     echo "📝 Recent commits:"
     su - $TRADING_USER -c "cd $TRADING_DIR && git log --oneline -5"
     
