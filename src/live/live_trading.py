@@ -1108,6 +1108,9 @@ class LiveTrading:
                 
                 # Reconcile stop loss order IDs from exchange
                 await self._reconcile_stop_loss_order_ids(all_raw_positions)
+
+                # Auto-place missing stops for unprotected positions (rate-limited per tick)
+                await self._place_missing_stops_for_unprotected(all_raw_positions, max_per_tick=3)
             except Exception as e:
                 logger.error("TP backfill reconciliation failed", error=str(e))
                 # Don't return - continue with trading loop
@@ -1676,11 +1679,28 @@ class LiveTrading:
         )
 
         # 4. Execute (pass actual positions for pyramiding guard)
-        entry_order = await self.executor.execute_signal(
-            intent_model,
-            mark_price,
-            self.risk_manager.current_positions
-        )
+        try:
+            entry_order = await self.executor.execute_signal(
+                intent_model,
+                mark_price,
+                self.risk_manager.current_positions
+            )
+        except ValueError as e:
+            err_str = str(e)
+            if "SIZE_BELOW_MIN" in err_str:
+                reason = "SIZE_BELOW_MIN"
+            elif "SIZE_STEP_ROUND_TO_ZERO" in err_str:
+                reason = "SIZE_STEP_ROUND_TO_ZERO"
+            elif "Size validation failed" in err_str and ":" in err_str:
+                reason = err_str.split(":")[-1].strip()
+            else:
+                reason = "SIZE_VALIDATION_FAILED"
+            logger.warning("Entry rejected (size/validation)", symbol=signal.symbol, reason=reason, error=err_str[:200])
+            return {
+                "order_placed": False,
+                "reason": err_str[:200],
+                "rejection_reasons": [reason],
+            }
 
         if entry_order:
              logger.info("Entry order placed", order_id=entry_order.order_id)
@@ -2312,6 +2332,7 @@ class LiveTrading:
             seen_opens: set[str] = set()
             opens_executed = 0
             opens_failed = 0
+            rejection_counts: Dict[str, int] = {}  # reason -> count for summary
             for signal in plan.opens:
                 if signal.symbol in seen_opens:
                     logger.warning(
@@ -2358,6 +2379,8 @@ class LiveTrading:
                         else:
                             opens_failed += 1
                             rejection_reasons = result.get("rejection_reasons", [])
+                            for r in rejection_reasons:
+                                rejection_counts[r] = rejection_counts.get(r, 0) + 1
                             logger.warning(
                                 "Auction: Open rejected/failed",
                                 symbol=signal.symbol,
@@ -2371,13 +2394,34 @@ class LiveTrading:
                             missing.append("price_data")
                         if not candidate:
                             missing.append("candidate")
+                        reason = "missing_data:" + ",".join(missing)
+                        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                         logger.warning(
                             "Auction: Missing data for signal",
                             symbol=signal.symbol,
                             missing=missing,
                         )
+                except ValueError as e:
+                    opens_failed += 1
+                    err_str = str(e)
+                    if "SIZE_BELOW_MIN" in err_str:
+                        reason = "SIZE_BELOW_MIN"
+                    elif "SIZE_STEP_ROUND_TO_ZERO" in err_str:
+                        reason = "SIZE_STEP_ROUND_TO_ZERO"
+                    elif "Size validation failed" in err_str:
+                        reason = err_str.split(":")[-1].strip() if ":" in err_str else "SIZE_VALIDATION_FAILED"
+                    else:
+                        reason = "ValueError"
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                    logger.error(
+                        "Auction: Failed to open position (size/validation)",
+                        symbol=signal.symbol,
+                        error=err_str,
+                    )
                 except Exception as e:
                     opens_failed += 1
+                    reason = type(e).__name__
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                     logger.error(
                         "Auction: Failed to open position",
                         symbol=signal.symbol,
@@ -2391,6 +2435,7 @@ class LiveTrading:
                 opens_planned=len(plan.opens),
                 opens_executed=opens_executed,
                 opens_failed=opens_failed,
+                rejection_counts=rejection_counts if rejection_counts else None,
                 reasons=plan.reasons,
             )
             if opens_executed > 0 or len(plan.closes) > 0:
@@ -2737,6 +2782,99 @@ class LiveTrading:
         
         except Exception as e:
             logger.error("Stop loss order ID reconciliation failed", error=str(e))
+
+    async def _place_missing_stops_for_unprotected(self, raw_positions: List[Dict], max_per_tick: int = 3) -> None:
+        """
+        Place missing stop-loss orders for positions that have no SL on exchange.
+        Reduces UNPROTECTED alerts by auto-placing one reduce-only stop per naked position (rate-limited).
+        """
+        from src.data.symbol_utils import position_symbol_matches_order
+
+        def _order_is_stop(o: Dict, side: str) -> bool:
+            t = (o.get("info") or {}).get("orderType") or o.get("type") or o.get("order_type") or ""
+            t = str(t).lower()
+            if "take_profit" in t or "take-profit" in t:
+                return False
+            if "stop" not in t and "stop_loss" not in t and t != "stop":
+                return False
+            if not o.get("reduceOnly", o.get("reduce_only", False)):
+                return False
+            order_side = (o.get("side") or "").lower()
+            expect = "sell" if side == "long" else "buy"
+            return order_side == expect
+
+        if self.config.system.dry_run:
+            return
+        try:
+            open_orders = await self.client.get_futures_open_orders()
+        except Exception as e:
+            logger.warning("Failed to fetch open orders for missing-stops check", error=str(e))
+            return
+        naked = []
+        for pos_data in raw_positions:
+            pos_sym = pos_data.get("symbol") or ""
+            if not pos_sym or float(pos_data.get("size", 0)) == 0:
+                continue
+            side = "long" if float(pos_data.get("size", 0)) > 0 else "short"
+            has_stop = False
+            for o in open_orders:
+                if not position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
+                    continue
+                if _order_is_stop(o, side):
+                    has_stop = True
+                    break
+            if not has_stop:
+                naked.append(pos_data)
+        if not naked:
+            return
+        stop_pct = Decimal("2.0")
+        placed = 0
+        for pos_data in naked:
+            if placed >= max_per_tick:
+                break
+            symbol = pos_data.get("symbol") or ""
+            size = Decimal(str(pos_data.get("size", 0)))
+            if size <= 0:
+                continue
+            # Kraken minimum amount is often 0.001; skip if below to avoid venue rejection
+            if size < Decimal("0.001"):
+                logger.debug("Skip placing missing stop: size below venue min", symbol=symbol, size=str(size))
+                continue
+            entry = Decimal(str(pos_data.get("entryPrice", pos_data.get("entry_price", 0))))
+            if entry <= 0:
+                continue
+            side = "long" if float(pos_data.get("size", 0)) > 0 else "short"
+            if side == "long":
+                stop_price = entry * (Decimal("1") - stop_pct / Decimal("100"))
+            else:
+                stop_price = entry * (Decimal("1") + stop_pct / Decimal("100"))
+            close_side = "sell" if side == "long" else "buy"
+            unified = symbol
+            if symbol.startswith("PF_") and "/" not in symbol:
+                from src.data.symbol_utils import pf_to_unified
+                unified = pf_to_unified(symbol) or symbol
+            try:
+                await self.client.place_futures_order(
+                    symbol=unified,
+                    side=close_side,
+                    order_type="stop",
+                    size=size,
+                    stop_price=stop_price,
+                    reduce_only=True,
+                )
+                logger.info(
+                    "Placed missing stop for unprotected position",
+                    symbol=symbol,
+                    stop_price=str(stop_price),
+                    size=str(size),
+                )
+                placed += 1
+            except Exception as e:
+                logger.warning(
+                    "Failed to place missing stop for unprotected position",
+                    symbol=symbol,
+                    error=str(e),
+                )
 
     async def _should_skip_tp_backfill(
         self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal

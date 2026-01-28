@@ -323,6 +323,30 @@ class FuturesAdapter:
                 raise ValueError(f"Instrument specs for {symbol} not found")
             contract_size = Decimal(str(instr.get("contractSize", 1)))
             size_contracts = (size_notional / (price_use * contract_size)).quantize(Decimal("0.0001"), rounding="ROUND_DOWN")
+            # Enforce venue minimum to avoid "amount must be greater than minimum amount precision" (e.g. PAXG 0.001)
+            lim = instr.get("limits") or {}
+            amount_lim = lim.get("amount") if isinstance(lim, dict) else {}
+            min_sz = instr.get("minSize") or instr.get("minimumSize") or (amount_lim.get("min") if isinstance(amount_lim, dict) else None)
+            min_size = Decimal(str(min_sz)) if min_sz is not None else Decimal("0.001")
+            if min_size <= 0:
+                min_size = Decimal("0.001")
+            if size_contracts > 0 and size_contracts < min_size:
+                logger.warning(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason="SIZE_BELOW_MIN",
+                    requested_leverage=lev_int,
+                    spec_summary={"min_size": str(min_size), "size_contracts": str(size_contracts)},
+                )
+                raise ValueError(f"Size {size_contracts} below minimum {min_size} for {symbol}")
+            if size_contracts <= 0:
+                logger.warning(
+                    "AUCTION_OPEN_REJECTED",
+                    symbol=symbol,
+                    reason="SIZE_STEP_ROUND_TO_ZERO",
+                    requested_leverage=lev_int,
+                )
+                raise ValueError(f"Size rounded to zero for {symbol}")
             effective_leverage = leverage
         
         logger.info(

@@ -473,22 +473,22 @@ class TradingService:
              if signal.signal_type != SignalType.NO_SIGNAL:
                  logger.info(f"SIGNAL FOUND: {symbol} {signal.signal_type} {signal.regime} Score={signal.score}")
 
-                # Determine Futures Symbol
-                # Use cached futures tickers if available, or fetch fresh if needed
-                if self.latest_futures_tickers is None:
-                    try:
-                        # Fetch futures tickers for optimal mapping
-                        self.latest_futures_tickers = await self.kraken.get_futures_tickers_bulk()
-                        # Update adapter cache
-                        self.futures_adapter.update_cached_futures_tickers(self.latest_futures_tickers)
-                    except Exception as e:
-                        logger.debug("Failed to fetch futures tickers, using fallback mapping", error=str(e))
-                
-                # Use futures_tickers for optimal mapping (handles LUNA2/THETA edge cases)
-                futures_symbol = self.futures_adapter.map_spot_to_futures(
-                    symbol,
-                    futures_tickers=self.latest_futures_tickers
-                )
+                 # Determine Futures Symbol
+                 # Use cached futures tickers if available, or fetch fresh if needed
+                 if self.latest_futures_tickers is None:
+                     try:
+                         # Fetch futures tickers for optimal mapping
+                         self.latest_futures_tickers = await self.kraken.get_futures_tickers_bulk()
+                         # Update adapter cache
+                         self.futures_adapter.update_cached_futures_tickers(self.latest_futures_tickers)
+                     except Exception as e:
+                         logger.debug("Failed to fetch futures tickers, using fallback mapping", error=str(e))
+
+                 # Use futures_tickers for optimal mapping (handles LUNA2/THETA edge cases)
+                 futures_symbol = self.futures_adapter.map_spot_to_futures(
+                     symbol,
+                     futures_tickers=self.latest_futures_tickers
+                 )
                  if futures_symbol:
                      # 1. Fetch Account Equity (Futures Balance)
                      # In V2, we might not have direct client access in same way, but we have self.kraken
