@@ -3,8 +3,11 @@ Shared symbol helpers for Kraken Futures.
 
 - PF_* (Kraken raw) <-> X/USD:USD (CCXT unified)
 - Position symbol vs order symbol matching (positions use PF_*, orders use unified)
+- futures_candidate_symbols: single source of truth for Kraken BTC/XBT and variants
 """
 from __future__ import annotations
+
+from typing import List
 
 
 def normalize_symbol_for_position_match(symbol: str) -> str:
@@ -34,6 +37,34 @@ def pf_to_unified(s: str) -> str:
     if base == "XBT":
         base = "BTC"
     return f"{base}/USD:USD"
+
+
+def futures_candidate_symbols(spot_symbol: str) -> List[str]:
+    """
+    Futures symbol candidates for a spot symbol (Kraken: PF_*, PI_*, BASE/USD:USD, BASEUSD).
+
+    Single source of truth for Kraken BTC/XBT: when base is BTC or XBT, returns candidates
+    for both bases so specs keyed by XBT (e.g. PF_XBTUSD) are found when resolving "BTC/USD".
+    Other bases get only their own candidates (no cross-asset pollution).
+    """
+    if not spot_symbol or "/" not in spot_symbol:
+        return []
+    base = (spot_symbol or "").strip().upper().split("/")[0]
+    if not base:
+        return []
+    if base in ("BTC", "XBT"):
+        bases = ["XBT", "BTC"]
+    else:
+        bases = [base]
+    seen: set = set()
+    out: List[str] = []
+    for b in bases:
+        for cand in (f"{b}/USD:USD", f"PF_{b}USD", f"PI_{b}USD", f"{b}USD"):
+            key = cand.upper()
+            if key not in seen:
+                seen.add(key)
+                out.append(cand)
+    return out
 
 
 def position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bool:

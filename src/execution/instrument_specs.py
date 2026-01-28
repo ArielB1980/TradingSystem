@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.data.symbol_utils import futures_candidate_symbols
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -251,6 +252,9 @@ class InstrumentSpecRegistry:
         self._log_unknown_leverage: Dict[str, bool] = {}  # symbol -> already logged
 
     def _is_stale(self) -> bool:
+        """True if never loaded, empty, or past TTL. Treat never-loaded as stale."""
+        if not self._by_raw or self._loaded_at == 0:
+            return True
         return (time.time() - self._loaded_at) > self._cache_ttl
 
     def _load_from_disk(self) -> bool:
@@ -284,9 +288,10 @@ class InstrumentSpecRegistry:
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            by_symbol = {s.symbol_raw: s for s in self._by_raw.values()}
             data = {
                 "loaded_at": self._loaded_at,
-                "specs": [s.to_dict() for s in set(self._by_raw.values())],
+                "specs": [s.to_dict() for s in by_symbol.values()],
             }
             with open(self._cache_path, "w") as f:
                 json.dump(data, f, indent=2)
@@ -298,6 +303,8 @@ class InstrumentSpecRegistry:
         if not self._get_instruments_fn:
             if self._loaded_at == 0:
                 self._load_from_disk()
+            return
+        if self._by_raw and not self._is_stale():
             return
         try:
             raw_list = await self._get_instruments_fn()
@@ -356,15 +363,9 @@ class InstrumentSpecRegistry:
     ) -> Optional[InstrumentSpec]:
         """Resolve spot symbol to futures spec using tickers/markets for symbol choice."""
         self.ensure_loaded()
-        base = (spot_symbol or "").split("/")[0]
-        if base == "XBT":
-            base = "BTC"
-        candidates = [
-            f"{base}/USD:USD",
-            f"PF_{base}USD",
-            f"PI_{base}USD",
-            f"{base}USD",
-        ]
+        candidates = futures_candidate_symbols(spot_symbol)
+        if not candidates:
+            return None
         if futures_tickers:
             for c in candidates:
                 if c in futures_tickers:

@@ -3,12 +3,27 @@ Kill switch with latching emergency stop.
 
 Once triggered, system cannot auto-resume - manual acknowledgment required.
 """
+import os
 from enum import Enum
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Deterministic state path: data/ under repo root, or env override (e.g. for systemd/Docker).
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_DATA_DIR = _REPO_ROOT / "data"
+_DEFAULT_STATE_FILE = _DATA_DIR / "kill_switch_state.json"
+
+
+def _kill_switch_state_path() -> Path:
+    """State file path: KILL_SWITCH_STATE_PATH env, or data/kill_switch_state.json under repo root."""
+    env_path = os.environ.get("KILL_SWITCH_STATE_PATH")
+    if env_path:
+        return Path(env_path)
+    return _DEFAULT_STATE_FILE
 
 
 class KillSwitchReason(str, Enum):
@@ -180,32 +195,30 @@ class KillSwitch:
         }
 
     def _save_state(self) -> None:
-        """Persist kill switch state to file."""
+        """Persist kill switch state to file (data/ under repo root, or KILL_SWITCH_STATE_PATH)."""
         try:
             import json
+            path = _kill_switch_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "active": self.active,
                 "latched": self.latched,
                 "activated_at": self.activated_at.isoformat() if self.activated_at else None,
                 "reason": self.reason.value if self.reason else None
             }
-
-            with open(".kill_switch_state", "w") as f:
+            with open(path, "w") as f:
                 json.dump(state, f)
-
         except Exception as e:
             logger.error("Failed to save kill switch state", error=str(e))
 
     def _load_state(self) -> None:
-        """Load persisted kill switch state."""
+        """Load persisted kill switch state from data/ or KILL_SWITCH_STATE_PATH."""
         try:
             import json
-            import os
-
-            if not os.path.exists(".kill_switch_state"):
+            path = _kill_switch_state_path()
+            if not path.exists():
                 return
-
-            with open(".kill_switch_state", "r") as f:
+            with open(path, "r") as f:
                 state = json.load(f)
 
             self.active = state.get("active", False)
@@ -246,12 +259,12 @@ def read_kill_switch_state() -> dict:
     """
     Read persisted kill switch state from file (no KillSwitch instance).
     Use from health/dashboard to check status without loading full module.
+    Uses same path as KillSwitch: data/ under repo root or KILL_SWITCH_STATE_PATH.
     """
     import json
-    import os
     out = {"active": False, "latched": False, "reason": None, "activated_at": None}
-    path = os.path.join(os.getcwd(), ".kill_switch_state")
-    if not os.path.exists(path):
+    path = _kill_switch_state_path()
+    if not path.exists():
         return out
     try:
         with open(path, "r") as f:
