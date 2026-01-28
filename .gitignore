@@ -62,6 +62,11 @@ trading.db
 # Market discovery data
 data/discovered_markets.json
 
+# State files (legacy and current)
+.kill_switch_state
+data/kill_switch_state.json
+data/instrument_specs_cache.json
+
 # Process management
 .watchdog_live_trading.pid
 .env.local

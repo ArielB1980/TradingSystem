@@ -6,6 +6,7 @@ Used for: pre-validate order params, leverage rules (flexible vs fixed), size ro
 """
 from __future__ import annotations
 
+import os
 import json
 import time
 from dataclasses import dataclass, field
@@ -19,9 +20,21 @@ from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default cache path and TTL
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-CACHE_PATH = DATA_DIR / "instrument_specs_cache.json"
+# Default cache path and TTL (env override: INSTRUMENT_SPECS_CACHE_PATH)
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_DATA_DIR = _REPO_ROOT / "data"
+_DEFAULT_CACHE_PATH = _DATA_DIR / "instrument_specs_cache.json"
+
+
+def _instrument_specs_cache_path() -> Path:
+    """Cache file path: INSTRUMENT_SPECS_CACHE_PATH env, or data/instrument_specs_cache.json under repo root."""
+    env_path = os.environ.get("INSTRUMENT_SPECS_CACHE_PATH")
+    if env_path:
+        return Path(env_path)
+    return _DEFAULT_CACHE_PATH
+
+
+CACHE_PATH = _instrument_specs_cache_path()  # For backward compatibility
 CACHE_TTL_SECONDS = 12 * 3600  # 12 hours
 
 
@@ -244,7 +257,8 @@ class InstrumentSpecRegistry:
         cache_ttl_seconds: int = CACHE_TTL_SECONDS,
     ):
         self._get_instruments_fn = get_instruments_fn
-        self._cache_path = cache_path or CACHE_PATH
+        # Use provided path, or env var, or default (data/ under repo root)
+        self._cache_path = cache_path or _instrument_specs_cache_path()
         self._cache_ttl = cache_ttl_seconds
         self._by_raw: Dict[str, InstrumentSpec] = {}
         self._by_ccxt: Dict[str, InstrumentSpec] = {}
@@ -287,6 +301,7 @@ class InstrumentSpecRegistry:
         if not self._cache_path:
             return
         try:
+            # Ensure parent directory exists (data/ or custom path from env)
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             by_symbol = {s.symbol_raw: s for s in self._by_raw.values()}
             data = {
