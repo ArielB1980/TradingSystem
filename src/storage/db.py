@@ -116,7 +116,48 @@ def get_db() -> Database:
         
         # Use lazy validation with retry logic for cloud platforms
         from src.utils.secret_manager import get_database_url
+        from src.monitoring.logger import get_logger
+        from urllib.parse import urlparse
+        import os
+        
+        logger = get_logger(__name__)
         database_url = get_database_url()
+        
+        # CRITICAL: Log database connection details (without password) for debugging
+        try:
+            parsed = urlparse(database_url)
+            db_host = parsed.hostname or "unknown"
+            db_port = parsed.port or 5432
+            db_name = parsed.path.lstrip('/') or "unknown"
+            db_user = parsed.username or "unknown"
+            
+            logger.critical(
+                "DATABASE_CONNECTION_INIT",
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                has_password=bool(parsed.password)
+            )
+            
+            # CRITICAL: Fail fast if test_db is detected in production
+            if "test_db" in db_name.lower():
+                env = os.getenv("ENVIRONMENT", "unknown")
+                if env == "prod" or not os.getenv("ENVIRONMENT"):
+                    logger.critical(
+                        "CRITICAL: test_db detected in production!",
+                        database=db_name,
+                        environment=env,
+                        database_url_preview=database_url[:50] + "..." if len(database_url) > 50 else database_url
+                    )
+                    raise ValueError(
+                        f"CRITICAL: Database 'test_db' detected in production environment. "
+                        f"Check DATABASE_URL environment variable. "
+                        f"Current database: {db_name}, Environment: {env}"
+                    )
+        except Exception as e:
+            logger.warning("Failed to parse DATABASE_URL for logging", error=str(e))
+        
         _db_instance = Database(database_url)
         _db_instance.create_all()  # Create all tables on first connection
     return _db_instance

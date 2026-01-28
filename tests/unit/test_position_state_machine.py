@@ -59,7 +59,19 @@ class TestInvariants:
         pos1 = self._create_position("BTC/USD:USD", Side.LONG)
         registry.register_position(pos1)
         
-        pos2 = self._create_position("BTC/USD:USD", Side.LONG)
+        # Create a DIFFERENT position (different position_id) for the same symbol
+        # This should fail because it's a different position, not the same one registered twice
+        pos2 = ManagedPosition(
+            symbol="BTC/USD:USD",
+            side=Side.LONG,
+            position_id="different-position-id",  # Different position_id = different position
+            initial_size=Decimal("0.1"),
+            initial_entry_price=Decimal("50000"),
+            initial_stop_price=Decimal("49000"),
+            initial_tp1_price=Decimal("52000"),
+            initial_tp2_price=None,
+            initial_final_target=None
+        )
         
         with pytest.raises(InvariantViolation, match="Cannot register position"):
             registry.register_position(pos2)

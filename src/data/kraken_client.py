@@ -948,6 +948,36 @@ class KrakenClient:
         Returns:
             List of open order dicts
         """
+        # CRITICAL: Runtime assertion - detect mocks in production
+        import sys
+        import os
+        from unittest.mock import Mock, MagicMock
+        
+        is_test = (
+            "pytest" in sys.modules or
+            "PYTEST_CURRENT_TEST" in os.environ or
+            any("test" in path.lower() for path in sys.path if isinstance(path, str))
+        )
+        
+        if not is_test:
+            # Verify futures_exchange is not a mock
+            if isinstance(self.futures_exchange, Mock) or isinstance(self.futures_exchange, MagicMock):
+                logger.critical("CRITICAL: futures_exchange is a Mock/MagicMock in production!")
+                raise RuntimeError(
+                    "CRITICAL: futures_exchange is a Mock/MagicMock. "
+                    "This should never happen in production. Check for test code leaking into runtime."
+                )
+            
+            # Verify fetch_open_orders is callable and not a mock
+            if hasattr(self.futures_exchange, 'fetch_open_orders'):
+                fetch_fn = getattr(self.futures_exchange, 'fetch_open_orders')
+                if isinstance(fetch_fn, Mock) or isinstance(fetch_fn, MagicMock):
+                    logger.critical("CRITICAL: fetch_open_orders is a Mock/MagicMock in production!")
+                    raise RuntimeError(
+                        "CRITICAL: fetch_open_orders is a Mock/MagicMock. "
+                        "This should never happen in production. Check for test code leaking into runtime."
+                    )
+        
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
             

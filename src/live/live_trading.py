@@ -62,6 +62,25 @@ class LiveTrading:
         """Initialize live trading."""
         self.config = config
         
+        # CRITICAL: Runtime assertion - detect test mocks in production
+        import sys
+        import os
+        from unittest.mock import Mock, MagicMock
+        
+        # Check if we're in a test environment
+        is_test = (
+            "pytest" in sys.modules or
+            "PYTEST_CURRENT_TEST" in os.environ or
+            any("test" in path.lower() for path in sys.path if isinstance(path, str))
+        )
+        
+        if not is_test:
+            # Production mode - verify no mocks are being used
+            logger.critical("PRODUCTION_MODE_VERIFICATION", 
+                          pytest_in_modules="pytest" in sys.modules,
+                          pytest_env=os.getenv("PYTEST_CURRENT_TEST"),
+                          sys_path_test_dirs=[p for p in sys.path if isinstance(p, str) and "test" in p.lower()])
+        
         # Core Components
         cache_mins = getattr(config.exchange, "market_discovery_cache_minutes", 60)
         cache_mins = int(cache_mins) if isinstance(cache_mins, (int, float)) else 60
@@ -73,6 +92,14 @@ class LiveTrading:
             use_testnet=config.exchange.use_testnet,
             market_cache_minutes=cache_mins,
         )
+        
+        # CRITICAL: Verify client is not a mock
+        if not is_test and (isinstance(self.client, Mock) or isinstance(self.client, MagicMock)):
+            logger.critical("CRITICAL: KrakenClient is a Mock/MagicMock in production!")
+            raise RuntimeError(
+                "CRITICAL: KrakenClient is a Mock/MagicMock. "
+                "This should never happen in production. Check for test code leaking into runtime."
+            )
         
         self.data_acq = DataAcquisition(
             self.client,
@@ -1038,6 +1065,19 @@ class LiveTrading:
             # 2.4. Fetch open orders once, index by symbol (for position hydration)
             orders_by_symbol: Dict[str, List[Dict]] = {}
             try:
+                # CRITICAL: Verify client is not a mock before calling
+                from unittest.mock import Mock, MagicMock
+                import sys
+                import os
+                is_test = (
+                    "pytest" in sys.modules or
+                    "PYTEST_CURRENT_TEST" in os.environ or
+                    any("test" in path.lower() for path in sys.path if isinstance(path, str))
+                )
+                if not is_test and (isinstance(self.client, Mock) or isinstance(self.client, MagicMock)):
+                    logger.critical("CRITICAL: self.client is a Mock/MagicMock in _tick!")
+                    raise RuntimeError("CRITICAL: self.client is a Mock/MagicMock in production")
+                
                 open_orders = await self.client.get_futures_open_orders()
                 for order in open_orders:
                     sym = order.get('symbol')
@@ -1045,6 +1085,8 @@ class LiveTrading:
                         if sym not in orders_by_symbol:
                             orders_by_symbol[sym] = []
                         orders_by_symbol[sym].append(order)
+            except RuntimeError:
+                raise  # Re-raise critical errors
             except Exception as e:
                 logger.warning("Failed to fetch open orders for hydration", error=str(e))
             
