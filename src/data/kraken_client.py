@@ -779,7 +779,15 @@ class KrakenClient:
         """
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
-            
+
+        # Reject zero or negative size to avoid venue "amount must be greater than minimum" errors
+        size_f = float(size)
+        if size_f <= 0:
+            raise ValueError(
+                f"Order size must be positive (got {size}). "
+                "Check instrument min_size and size rounding."
+            )
+
         try:
             # Create params dict for extra options
             params = {}

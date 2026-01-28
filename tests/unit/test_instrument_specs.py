@@ -12,6 +12,7 @@ from src.execution.instrument_specs import (
     InstrumentSpecRegistry,
     resolve_leverage,
     compute_size_contracts,
+    _parse_instrument,
 )
 
 
@@ -170,3 +171,72 @@ def test_registry_get_spec_by_raw():
     assert reg.get_spec("BCHUSD") is spec
     assert reg.get_spec("BCH/USD:USD") is spec
     assert reg.get_spec("NONEXISTENT_XYZ") is None
+
+
+# ---------- PAXG-style min-size / venue rejection (proves fix) ----------
+
+
+def test_parse_instrument_min_size_missing_uses_fallback(caplog):
+    """When minSize/limits.amount.min missing or 0, parsed spec gets min_size=0.001 (fallback)."""
+    raw = {
+        "symbol": "PF_PAXGUSD",
+        "contractSize": 1,
+        "limits": {"amount": {"max": 1000}},  # no "min"
+    }
+    spec = _parse_instrument(raw)
+    assert spec is not None
+    assert spec.min_size == Decimal("0.001")
+    assert "SPEC_MIN_SIZE_MISSING" in caplog.text or spec.min_size == Decimal("0.001")
+
+
+def test_paxg_notional_small_rounds_to_zero_rejected():
+    """Notional so small that contracts round to 0 -> SIZE_STEP_ROUND_TO_ZERO (PAXG-style)."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_PAXGUSD",
+        symbol_ccxt="PAXG/USD:USD",
+        base="PAXG",
+        quote="USD",
+        contract_size=Decimal("1"),
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.001"),
+    )
+    # e.g. notional 0.20 USD, price 2650 -> 0.000075... -> rounds down to 0
+    contracts, reason = compute_size_contracts(spec, Decimal("0.20"), Decimal("2650"))
+    assert reason == "SIZE_STEP_ROUND_TO_ZERO"
+    assert contracts == 0
+
+
+def test_paxg_notional_slightly_bigger_below_min_rejected():
+    """Notional gives contracts > 0 but < 0.001 -> SIZE_BELOW_MIN (PAXG venue min)."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_PAXGUSD",
+        symbol_ccxt="PAXG/USD:USD",
+        base="PAXG",
+        quote="USD",
+        contract_size=Decimal("1"),
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.0001"),
+    )
+    # notional 2 USD, price 2650 -> 0.000754... -> rounds to 0.0007 < 0.001
+    contracts, reason = compute_size_contracts(spec, Decimal("2"), Decimal("2650"))
+    assert reason == "SIZE_BELOW_MIN"
+    assert contracts < spec.min_size
+    assert contracts > 0
+
+
+def test_paxg_notional_sufficient_passes():
+    """Notional sufficient -> passes and contracts >= 0.001 (no venue reject)."""
+    spec = InstrumentSpec(
+        symbol_raw="PF_PAXGUSD",
+        symbol_ccxt="PAXG/USD:USD",
+        base="PAXG",
+        quote="USD",
+        contract_size=Decimal("1"),
+        min_size=Decimal("0.001"),
+        size_step=Decimal("0.0001"),
+    )
+    # notional 4 USD, price 2650 -> 0.001509... -> rounds to 0.0015 >= 0.001
+    contracts, reason = compute_size_contracts(spec, Decimal("4"), Decimal("2650"))
+    assert reason is None
+    assert contracts >= Decimal("0.001")
+    assert contracts == Decimal("0.0015")

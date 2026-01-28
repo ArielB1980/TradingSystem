@@ -123,9 +123,26 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
                 break
             except (TypeError, ValueError):
                 pass
+    # Min size: prefer per-symbol source, then conservative default. Log when using fallback.
     lim = raw.get("limits") or {}
     amount_lim = lim.get("amount") if isinstance(lim, dict) else {}
-    min_sz = raw.get("minSize") or raw.get("minimumSize") or (amount_lim.get("min") if isinstance(amount_lim, dict) else None) or 0
+    # Order: ccxt market limits.amount.min -> Kraken instrument minSize/minimumSize -> default
+    min_from_limits = amount_lim.get("min") if isinstance(amount_lim, dict) else None
+    min_from_instrument = raw.get("minSize") or raw.get("minimumSize")
+    min_sz = min_from_limits if min_from_limits is not None else min_from_instrument
+    min_source = "limits.amount.min" if min_from_limits is not None else ("minSize" if min_from_instrument is not None else None)
+    min_sz = float(min_sz) if min_sz is not None else 0
+    if min_sz <= 0:
+        min_sz = 0.001
+        logger.warning(
+            "SPEC_MIN_SIZE_MISSING",
+            symbol=symbol,
+            using_fallback=min_sz,
+            source="default",
+            hint="Fix upstream: set limits.amount.min or minSize per instrument",
+        )
+    elif min_source:
+        min_source = min_source or "minSize"
     tick_val = raw.get("tickSize") or raw.get("tick_size")
     return InstrumentSpec(
         symbol_raw=symbol,
@@ -177,24 +194,38 @@ def compute_size_contracts(
     price: Decimal,
 ) -> Tuple[Decimal, Optional[str]]:
     """
-    Convert notional to contract size using spec, rounding down to size_step.
+    Convert notional to contract size using spec. All sizes in contracts (same unit as min_size/size_step).
+
+    Order of operations:
+    1. Compute raw contracts from notional / (price * contract_size)
+    2. Round down to size_step
+    3. If <= 0 -> SIZE_STEP_ROUND_TO_ZERO
+    4. If < min_size -> SIZE_BELOW_MIN
+    5. Otherwise return (contracts, None)
+
     Returns (contracts, rejection_reason). rejection_reason non-None means reject.
+    If spec.min_size is 0, uses 0.001 as fallback (see _parse_instrument SPEC_MIN_SIZE_MISSING when upstream missing).
     """
     if price <= 0:
         return (Decimal("0"), "PRICE_INVALID")
     if spec.contract_size <= 0:
         return (Decimal("0"), "CONTRACT_SIZE_INVALID")
-    # contracts = notional / (price * contract_size)
-    contracts = (size_notional / (price * spec.contract_size))
-    # Round down to size_step
+    effective_min = spec.min_size
+    if effective_min <= 0:
+        effective_min = Decimal("0.001")
+    # 1. Raw contracts (notional and min_size both in same unit: contracts for futures)
+    contracts = size_notional / (price * spec.contract_size)
+    # 2. Round down to size_step
     if spec.size_step > 0:
         steps = int(contracts / spec.size_step)
         contracts = Decimal(steps) * spec.size_step
     else:
         contracts = contracts.quantize(Decimal("0.0001"), rounding="ROUND_DOWN")
-    if contracts < spec.min_size:
-        if contracts == 0:
-            return (Decimal("0"), "SIZE_STEP_ROUND_TO_ZERO")
+    # 3. Zero after round-down
+    if contracts <= 0:
+        return (Decimal("0"), "SIZE_STEP_ROUND_TO_ZERO")
+    # 4. Below minimum
+    if contracts < effective_min:
         return (contracts, "SIZE_BELOW_MIN")
     return (contracts, None)
 
