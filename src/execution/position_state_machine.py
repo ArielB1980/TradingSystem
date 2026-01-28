@@ -872,12 +872,33 @@ class PositionRegistry:
         """
         Register a new position.
         
+        IDEMPOTENT: If the SAME position (same position_id) is registered twice,
+        treat as no-op (duplicate registration from concurrent tasks).
+        
         Raises:
-            InvariantViolation if position already exists
+            InvariantViolation if a DIFFERENT position tries to register for the same symbol
         """
         with self._lock:
-            can_open, reason = self.can_open_position(position.symbol, position.side)
-            check_invariant(can_open, f"Cannot register position: {reason}")
+            existing = self._positions.get(position.symbol)
+            
+            if existing is not None:
+                # IDEMPOTENT HANDLING: Same position (same position_id) registered twice
+                # This handles duplicate registration from concurrent tasks
+                if existing.position_id == position.position_id:
+                    # Same position object - idempotent no-op
+                    logger.debug(
+                        "Duplicate position registration ignored (idempotent - same position_id)",
+                        symbol=position.symbol,
+                        position_id=position.position_id,
+                        state=existing.state.value
+                    )
+                    return  # Idempotent - same position already registered
+                
+                # Different position trying to register for same symbol - check if allowed
+                can_open, reason = self.can_open_position(position.symbol, position.side)
+                if not can_open:
+                    # This is a real conflict - raise invariant violation
+                    check_invariant(False, f"Cannot register position: {reason}")
             
             # Archive old terminal position if exists
             old_pos = self._positions.get(position.symbol)
