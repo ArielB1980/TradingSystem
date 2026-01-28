@@ -1120,13 +1120,13 @@ class KrakenClient:
             side=close_side
         )
         
-        # Place reduce-only market order
+        # reduce_only=True: close exit, no dust (required for all protective exits)
         return await self.place_futures_order(
             symbol=symbol,
             side=close_side,
             order_type='market',
             size=size,
-            reduce_only=True
+            reduce_only=True,
         )
 
     async def close(self):

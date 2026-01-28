@@ -113,6 +113,7 @@ class LiveTrading:
         self.instrument_spec_registry = InstrumentSpecRegistry(
             get_instruments_fn=self.client.get_futures_instruments,
             cache_ttl_seconds=getattr(config.exchange, "instrument_spec_cache_ttl_seconds", 12 * 3600),
+            ccxt_exchange=self.client.futures_exchange if hasattr(self.client, 'futures_exchange') else None,
         )
         self.futures_adapter = FuturesAdapter(
             self.client,
@@ -1044,9 +1045,8 @@ class LiveTrading:
                                         reason=action_item.reason,
                                     )
                                     
-                                    # Place reduce-only market order to trim
+                                    # Place reduce-only market order to trim (reduce_only=True: exit, no dust)
                                     futures_symbol = symbol
-                                    # Convert size to float for API call (always in contracts)
                                     await self.client.place_futures_order(
                                         symbol=futures_symbol,
                                         side=close_side,
@@ -2109,15 +2109,14 @@ class LiveTrading:
                     # State update handled on next tick (position gone)
                     
                 elif action.type == ActionType.PARTIAL_CLOSE:
-                    # Place market reduce-only order
-                    # Invert side
+                    # Place market reduce-only order (reduce_only=True: exit, no dust)
                     exit_side = 'sell' if position.side == Side.LONG else 'buy'
                     await self.client.place_futures_order(
-                         symbol=symbol,
-                         side=exit_side,
-                         order_type='market',
-                         size=float(action.quantity),
-                         reduce_only=True
+                        symbol=symbol,
+                        side=exit_side,
+                        order_type='market',
+                        size=float(action.quantity),
+                        reduce_only=True,
                     )
                     # Update internal state (flags)
                     if "TP1" in action.reason:
@@ -2854,6 +2853,7 @@ class LiveTrading:
                 from src.data.symbol_utils import pf_to_unified
                 unified = pf_to_unified(symbol) or symbol
             try:
+                # reduce_only=True: protective stop, no dust
                 await self.client.place_futures_order(
                     symbol=unified,
                     side=close_side,

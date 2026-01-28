@@ -158,7 +158,7 @@ class AtomicStopReplacer:
         self._pending_replaces[position.symbol] = ctx
         
         try:
-            # Step 1: Place NEW stop first
+            # Step 1: Place NEW stop first (reduce_only=True: protective exit, no dust)
             new_client_order_id = generate_client_order_id(position.position_id, "stop")
             stop_side = "sell" if position.side.value == "long" else "buy"
             exchange_symbol = getattr(position, "futures_symbol", None) or position.symbol
@@ -170,7 +170,7 @@ class AtomicStopReplacer:
                 size=position.remaining_qty,
                 stop_price=new_stop_price,
                 reduce_only=True,
-                client_order_id=new_client_order_id
+                client_order_id=new_client_order_id,
             )
             
             ctx.new_stop_order_id = result.get("id")
@@ -306,6 +306,7 @@ class ProtectionEnforcer:
         )
         
         try:
+            # reduce_only=True: emergency close, no dust
             close_side = "sell" if position.side.value == "long" else "buy"
             exchange_symbol = getattr(position, "futures_symbol", None) or position.symbol
             await self.client.place_futures_order(
@@ -313,7 +314,7 @@ class ProtectionEnforcer:
                 side=close_side,
                 order_type="market",
                 size=position.remaining_qty,
-                reduce_only=True
+                reduce_only=True,
             )
             
             # Mark position as closed with emergency reason
