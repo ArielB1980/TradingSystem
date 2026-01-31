@@ -931,10 +931,11 @@ class LiveTrading:
                     for prefix in ["PI_", "PF_", "FI_"]:
                         if symbol.startswith(prefix):
                             symbol = symbol[len(prefix):]
-                    for suffix in ["USD", "/USD:USD", "/USD"]:
+                    # IMPORTANT: match longer suffixes first ("/USD:USD" must not be reduced by "USD").
+                    for suffix in ["/USD:USD", "/USD", "USD"]:
                         if symbol.endswith(suffix):
                             symbol = symbol[:-len(suffix)]
-                    return symbol if symbol else None
+                    return symbol.rstrip(":/") if symbol else None
                 
                 # Build canonical mark prices (prefer CCXT unified BASE/USD:USD, else PF_*)
                 canonical_mark_prices = {}

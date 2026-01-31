@@ -223,10 +223,11 @@ class ShockGuard:
                 if symbol.startswith(prefix):
                     symbol = symbol[len(prefix):]
             # Remove common suffixes
-            for suffix in ["USD", "/USD:USD", "/USD"]:
+            # IMPORTANT: match longer suffixes first ("/USD:USD" must not be reduced by "USD").
+            for suffix in ["/USD:USD", "/USD", "USD"]:
                 if symbol.endswith(suffix):
                     symbol = symbol[:-len(suffix)]
-            return symbol if symbol else None
+            return symbol.rstrip(":/") if symbol else None
         
         # Dedupe triggered symbols by BASE
         triggered_bases = set()
