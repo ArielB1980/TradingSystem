@@ -142,7 +142,7 @@ class RiskConfig(BaseSettings):
     
     # ShockGuard: Wick/Flash Move Protection
     shock_guard_enabled: bool = Field(default=True, description="Enable ShockGuard protection")
-    shock_move_pct: float = Field(default=0.025, ge=0.01, le=0.10, description="1-minute move threshold (2.5%)")
+    shock_move_pct: float = Field(default=0.05, ge=0.01, le=0.10, description="1-minute move threshold (5.0%)")
     shock_range_pct: float = Field(default=0.04, ge=0.02, le=0.10, description="1-minute range threshold (4.0%)")
     basis_shock_pct: float = Field(default=0.015, ge=0.005, le=0.05, description="Basis divergence threshold (1.5%)")
     shock_cooldown_minutes: int = Field(default=30, ge=5, le=120, description="Cooldown after shock (minutes)")
