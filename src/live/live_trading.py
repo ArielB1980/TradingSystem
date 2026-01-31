@@ -50,6 +50,29 @@ from src.reconciliation.reconciler import Reconciler
 
 logger = get_logger(__name__)
 
+def _exchange_position_side(pos_data: Dict[str, Any]) -> str:
+    """
+    Determine position side from exchange position dict.
+
+    IMPORTANT: Our Kraken Futures client normalizes `size` to ALWAYS be positive and
+    provides an explicit `side` field ("long" / "short"). Therefore we must prefer
+    `side` over inferring from the sign of `size`.
+
+    Falls back to signed-size inference for compatibility with any older/alternate
+    exchange adapters that might still return signed sizes.
+    """
+    side_raw = (pos_data.get("side") or pos_data.get("positionSide") or pos_data.get("direction") or "")
+    side = str(side_raw).lower().strip()
+    if side in ("long", "short"):
+        return side
+
+    # Fallback: infer from signed size if side field is missing.
+    try:
+        size_val = Decimal(str(pos_data.get("size", 0)))
+    except Exception:
+        return "long"
+    return "long" if size_val > 0 else "short"
+
 
 class LiveTrading:
     """
@@ -2721,16 +2744,32 @@ class LiveTrading:
                     
                     for order in symbol_orders:
                         # Check if this is a reduce-only stop order
-                        is_reduce_only = order.get('reduceOnly', False)
-                        order_type = str(order.get('type', '')).lower()
-                        has_stop_price = order.get('stopPrice') is not None
+                        info = order.get("info")
+                        if not isinstance(info, dict):
+                            info = {}
+                        is_reduce_only = (
+                            order.get("reduceOnly")
+                            if order.get("reduceOnly") is not None
+                            else (
+                                order.get("reduce_only")
+                                if order.get("reduce_only") is not None
+                                else info.get("reduceOnly", info.get("reduce_only", False))
+                            )
+                        )
+                        order_type = str(order.get("type") or info.get("orderType") or info.get("type") or "").lower()
+                        has_stop_price = (
+                            order.get("stopPrice") is not None
+                            or order.get("triggerPrice") is not None
+                            or info.get("stopPrice") is not None
+                            or info.get("triggerPrice") is not None
+                        )
                         is_stop_type = any(stop_term in order_type for stop_term in ['stop', 'stop-loss', 'stop_loss', 'stp'])
                         
                         # Match stop loss orders: reduce-only and has stop price or stop type
                         if is_reduce_only and (has_stop_price or is_stop_type):
                             # Verify it's for the correct side (opposite of position)
                             order_side = order.get('side', '').lower()
-                            pos_side = 'long' if pos_data.get('size', 0) > 0 else 'short'
+                            pos_side = _exchange_position_side(pos_data)
                             expected_order_side = 'sell' if pos_side == 'long' else 'buy'
                             
                             if order_side == expected_order_side:
@@ -2750,6 +2789,38 @@ class LiveTrading:
                             
                             # Update position with stop loss order ID
                             db_pos.stop_loss_order_id = sl_order_id
+
+                            # If we are missing the stop price in DB, backfill it from exchange.
+                            # Without this, positions can remain "unprotected" even when the stop exists.
+                            if db_pos.initial_stop_price is None:
+                                stop_price_raw = (
+                                    stop_loss_order.get("stopPrice")
+                                    or stop_loss_order.get("triggerPrice")
+                                    or (stop_loss_order.get("info") or {}).get("stopPrice")
+                                    or (stop_loss_order.get("info") or {}).get("triggerPrice")
+                                )
+                                if stop_price_raw is not None:
+                                    try:
+                                        stop_price_dec = Decimal(str(stop_price_raw))
+                                        # Sanity: stop must be on the correct side of entry.
+                                        if db_pos.side == Side.LONG and stop_price_dec < db_pos.entry_price:
+                                            db_pos.initial_stop_price = stop_price_dec
+                                        elif db_pos.side == Side.SHORT and stop_price_dec > db_pos.entry_price:
+                                            db_pos.initial_stop_price = stop_price_dec
+                                        else:
+                                            logger.warning(
+                                                "Skip reconciling initial_stop_price: direction mismatch",
+                                                symbol=symbol,
+                                                db_side=db_pos.side.value if hasattr(db_pos.side, "value") else str(db_pos.side),
+                                                entry_price=str(db_pos.entry_price),
+                                                exchange_stop_price=str(stop_price_dec),
+                                            )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to parse stop price from exchange order",
+                                            symbol=symbol,
+                                            error=str(e),
+                                        )
                             
                             # Update is_protected flag if we have both price and order ID
                             if db_pos.initial_stop_price and sl_order_id:
@@ -2814,7 +2885,7 @@ class LiveTrading:
             pos_sym = pos_data.get("symbol") or ""
             if not pos_sym or float(pos_data.get("size", 0)) == 0:
                 continue
-            side = "long" if float(pos_data.get("size", 0)) > 0 else "short"
+            side = _exchange_position_side(pos_data)
             has_stop = False
             for o in open_orders:
                 if not position_symbol_matches_order(pos_sym, o.get("symbol") or ""):
@@ -2842,7 +2913,7 @@ class LiveTrading:
             entry = Decimal(str(pos_data.get("entryPrice", pos_data.get("entry_price", 0))))
             if entry <= 0:
                 continue
-            side = "long" if float(pos_data.get("size", 0)) > 0 else "short"
+            side = _exchange_position_side(pos_data)
             if side == "long":
                 stop_price = entry * (Decimal("1") - stop_pct / Decimal("100"))
             else:
