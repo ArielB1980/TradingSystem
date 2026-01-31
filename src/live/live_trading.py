@@ -921,6 +921,14 @@ class LiveTrading:
             # Update adapter cache for use when futures_tickers not explicitly passed
             self.futures_adapter.update_cached_futures_tickers(map_futures_tickers)
             
+            # Ensure instrument specs are loaded (used to decide tradability and size/leverage rules).
+            # This is TTL-cached; refresh() is a cheap no-op when not stale.
+            if getattr(self, "instrument_spec_registry", None):
+                try:
+                    await self.instrument_spec_registry.refresh()
+                except Exception as e:
+                    logger.warning("InstrumentSpecRegistry refresh failed (non-fatal)", error=str(e))
+            
             # ShockGuard: Evaluate shock conditions and update state
             if self.shock_guard:
                 # CRITICAL: Deduplicate futures tickers to one canonical symbol per asset
@@ -1213,7 +1221,38 @@ class LiveTrading:
                         return
                     if spot_price is None:
                         spot_price = mark_price  # Use futures mark when no spot ticker (futures-only)
-                    is_tradable = bool(has_futures)
+                    
+                    # Tradability gate:
+                    # - Must have a futures ticker
+                    # - Must have an instrument spec (otherwise execution will fail with NO_SPEC)
+                    has_spec = True
+                    if has_futures and getattr(self, "instrument_spec_registry", None):
+                        try:
+                            has_spec = self.instrument_spec_registry.get_spec(futures_symbol) is not None
+                        except Exception:
+                            has_spec = False
+                    
+                    skip_reason: Optional[str] = None
+                    if not has_futures:
+                        skip_reason = "no_futures_ticker"
+                    elif not has_spec:
+                        skip_reason = "no_instrument_spec"
+                        # Throttle to avoid log spam if a spot market exists but the futures instrument is not tradeable/known.
+                        now = datetime.now(timezone.utc)
+                        last_map = getattr(self, "_last_no_spec_log", {})
+                        last = last_map.get(futures_symbol, datetime.min.replace(tzinfo=timezone.utc))
+                        if (now - last).total_seconds() >= 3600:
+                            logger.warning(
+                                "Signal skipped (no instrument spec)",
+                                spot_symbol=spot_symbol,
+                                futures_symbol=futures_symbol,
+                                reason="NO_SPEC",
+                                hint="Futures ticker exists but instrument specs missing; likely delisted/non-tradeable. Skipping to avoid AUCTION_OPEN_REJECTED spam.",
+                            )
+                            last_map[futures_symbol] = now
+                            self._last_no_spec_log = last_map
+                    
+                    is_tradable = skip_reason is None
 
                     # Update Candles (spot first; futures fallback when spot unavailable)
                     await self._update_candles(spot_symbol)
@@ -1340,10 +1379,11 @@ class LiveTrading:
                         
                         if not is_tradable:
                             logger.warning(
-                                "Signal skipped (no futures ticker)",
+                                "Signal skipped (not tradable)",
                                 symbol=spot_symbol,
                                 signal=signal.signal_type.value,
                                 futures_symbol=futures_symbol,
+                                skip_reason=skip_reason,
                             )
                         else:
                             # In auction mode, skip individual signal handling - auction will decide
@@ -1382,7 +1422,7 @@ class LiveTrading:
                             if signal.signal_type != SignalType.NO_SIGNAL:
                                 trace_details["skipped"] = not is_tradable
                                 if not is_tradable:
-                                    trace_details["skip_reason"] = "no_futures_ticker"
+                                    trace_details["skip_reason"] = skip_reason or "unknown"
                                 elif order_outcome is not None:
                                     trace_details["order_placed"] = order_outcome.get("order_placed", False)
                                     if not order_outcome.get("order_placed") and order_outcome.get("reason"):
