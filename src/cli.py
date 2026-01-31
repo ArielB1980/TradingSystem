@@ -228,11 +228,31 @@ def live(
         import uvicorn
         import time
         from src.health import worker_health_app
+        from src.utils.secret_manager import is_cloud_platform
         port = int(os.environ.get("PORT", "8080"))
+        health_host = os.environ.get("WORKER_HEALTH_HOST") or os.environ.get("HEALTH_HOST")
+        if not health_host:
+            # Default safe behavior:
+            # - In App Platform / managed environments, bind publicly for readiness.
+            # - On a droplet/VM, bind localhost to avoid exposing debug/metrics endpoints to the internet.
+            try:
+                health_host = "0.0.0.0" if is_cloud_platform() else "127.0.0.1"
+            except Exception:
+                health_host = "127.0.0.1"
+
+        # Reduce noisy warnings like "Invalid HTTP request received." (common from port scans).
+        # Health server is auxiliary; keep errors, drop warnings by default.
+        health_log_level = os.environ.get("WORKER_HEALTH_LOG_LEVEL") or os.environ.get("HEALTH_LOG_LEVEL") or "error"
         
         def _run_health():
             try:
-                uvicorn.run(worker_health_app, host="0.0.0.0", port=port, log_level="warning")
+                uvicorn.run(
+                    worker_health_app,
+                    host=health_host,
+                    port=port,
+                    log_level=health_log_level,
+                    access_log=False,
+                )
             except Exception as e:
                 logger.error("Health server error: %s", e, exc_info=True)
         
@@ -241,7 +261,7 @@ def live(
         
         # Give the health server a moment to start before proceeding
         time.sleep(1)
-        logger.info("Worker health server started on port %s", port)
+        logger.info("Worker health server started", host=health_host, port=port, log_level=health_log_level)
 
     # Initialize live trading engine
     import asyncio
