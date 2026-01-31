@@ -131,7 +131,8 @@ def get_db() -> Database:
             db_name = parsed.path.lstrip('/') or "unknown"
             db_user = parsed.username or "unknown"
             
-            logger.critical(
+            # Informational: connection target (no password) for debugging deployments.
+            logger.info(
                 "DATABASE_CONNECTION_INIT",
                 host=db_host,
                 port=db_port,

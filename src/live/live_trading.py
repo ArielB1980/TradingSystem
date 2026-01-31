@@ -99,10 +99,13 @@ class LiveTrading:
         
         if not is_test:
             # Production mode - verify no mocks are being used
-            logger.critical("PRODUCTION_MODE_VERIFICATION", 
-                          pytest_in_modules="pytest" in sys.modules,
-                          pytest_env=os.getenv("PYTEST_CURRENT_TEST"),
-                          sys_path_test_dirs=[p for p in sys.path if isinstance(p, str) and "test" in p.lower()])
+            # Informational: confirms runtime is not contaminated by test harness.
+            logger.info(
+                "PRODUCTION_MODE_VERIFICATION",
+                pytest_in_modules="pytest" in sys.modules,
+                pytest_env=os.getenv("PYTEST_CURRENT_TEST"),
+                sys_path_test_dirs=[p for p in sys.path if isinstance(p, str) and "test" in p.lower()],
+            )
         
         # Core Components
         cache_mins = getattr(config.exchange, "market_discovery_cache_minutes", 60)
@@ -390,7 +393,8 @@ class LiveTrading:
         self.active = True
         self._reconcile_requested = False
         self.trade_paused = False
-        logger.critical("🚀 STARTING LIVE TRADING")
+        # Important but not an error condition.
+        logger.warning("🚀 STARTING LIVE TRADING")
         
         try:
             # 1. Initialize Client
@@ -782,7 +786,8 @@ class LiveTrading:
                     })
         
         if unprotected:
-            logger.critical(
+            # This is actionable (positions lack protection) but is not a crash.
+            logger.error(
                 "UNPROTECTED positions detected",
                 count=len(unprotected),
                 positions=unprotected
