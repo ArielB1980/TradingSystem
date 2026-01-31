@@ -267,17 +267,29 @@ class KrakenClient:
                 perps = {}
                 for m in self.futures_exchange.markets.values():
                     if m.get("type") == "swap" and m.get("active", True):
-                        symbol = m.get("symbol", "")
-                        if ":" in symbol:
-                            base_quote = symbol.split(":")[0]
+                        # CCXT unified futures symbols for Kraken can sometimes be weird (e.g. "ADA/USD:ADA").
+                        # For our system we prefer to store the market ID (Kraken raw, e.g. "PF_ADAUSD")
+                        # as the executable symbol, because KrakenClient.place_futures_order reliably
+                        # resolves ID -> unified symbol at order placement time.
+                        ccxt_symbol = m.get("symbol", "") or ""
+                        market_id = m.get("id") or ccxt_symbol
+                        base = m.get("base")
+                        quote = m.get("quote")
+
+                        # Build a stable spot-style key like "ADA/USD" (used by MarketRegistry to pair spot×futures).
+                        if base and quote:
+                            base_quote = f"{base}/{quote}"
+                        elif ":" in ccxt_symbol:
+                            base_quote = ccxt_symbol.split(":")[0]
                         else:
-                            base_quote = symbol
+                            base_quote = ccxt_symbol
                         if base_quote:
                             perps[base_quote] = {
-                                "id": m.get("id"),
-                                "symbol": symbol,
-                                "base": m.get("base"),
-                                "quote": m.get("quote"),
+                                "id": market_id,
+                                "symbol": market_id,
+                                "ccxt_symbol": ccxt_symbol,
+                                "base": base,
+                                "quote": quote,
                                 "active": m.get("active", True),
                             }
                 self._markets_cache["futures"] = (now, perps)
