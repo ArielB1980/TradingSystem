@@ -33,6 +33,12 @@ app = FastAPI(title="Trading System Health Check")
 _worker_start = time.time()
 _streamlit_process = None
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
 
 def _metrics_json() -> Tuple[dict, int]:
     """Shared logic for /api/metrics. Returns (content, status_code)."""
@@ -103,7 +109,7 @@ def _start_streamlit():
         _streamlit_process = None
 
 
-def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
+def get_worker_health_app(with_dashboard: bool = True, enable_debug: bool = False) -> FastAPI:
     """
     Health app for worker (run.py live --with-health).
     Serves /, /health. Also /api, /api/health, /api/debug/signals, /debug/signals
@@ -193,11 +199,15 @@ def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
 
     @w.get("/api/debug/signals")
     async def api_debug_signals(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
+        if not enable_debug:
+            return JSONResponse(content={"error": "Debug endpoints disabled"}, status_code=403)
         data = _debug_signals_impl(symbol_filter=symbol)
         return _debug_signals_respond(data, request, format_param=format)
 
     @w.get("/debug/signals")
     async def debug_signals_route(request: Request, symbol: Optional[str] = None, format: Optional[str] = None):
+        if not enable_debug:
+            return JSONResponse(content={"error": "Debug endpoints disabled"}, status_code=403)
         data = _debug_signals_impl(symbol_filter=symbol)
         return _debug_signals_respond(data, request, format_param=format)
 
@@ -278,7 +288,12 @@ def get_worker_health_app(with_dashboard: bool = True) -> FastAPI:
     return w
 
 
-worker_health_app = get_worker_health_app(with_dashboard=True)
+# Secure defaults: disable dashboard + debug unless explicitly enabled.
+# This prevents accidental public exposure if the worker health server is bound to 0.0.0.0.
+worker_health_app = get_worker_health_app(
+    with_dashboard=_env_bool("WORKER_HEALTH_ENABLE_DASHBOARD", default=False),
+    enable_debug=_env_bool("WORKER_HEALTH_ENABLE_DEBUG", default=False),
+)
 
 
 @app.get("/api")
