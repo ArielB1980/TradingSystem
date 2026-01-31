@@ -105,16 +105,21 @@ def check_existing_coverage(
     return is_covered, existing_prices_sorted
 
 
+DEFAULT_RISK_PCT_NO_SL = Decimal("0.02")  # 2% when no SL in DB (--no-require-sl)
+
+
 def compute_tp_plan(
     db_pos: Position,
     exchange_pos: Dict,
     current_price: Decimal,
-    config
+    config,
+    default_risk_pct_when_no_sl: Optional[Decimal] = None,
 ) -> Optional[List[Decimal]]:
     """
     Compute TP plan: prefer DB stored prices, else compute by R-multiples.
-    
-    Returns None if computation fails or guards fail.
+
+    When default_risk_pct_when_no_sl is set (e.g. 0.02) and initial_stop_price
+    is missing, use entry * default_risk_pct as risk for the TP ladder.
     """
     # Prefer stored plan
     tp_plan = []
@@ -124,25 +129,30 @@ def compute_tp_plan(
         tp_plan.append(db_pos.tp2_price)
     if db_pos.final_target_price:
         tp_plan.append(db_pos.final_target_price)
-    
+
     if len(tp_plan) >= 2:  # We have a stored plan
         return tp_plan
-    
+
     # Compute by R-multiples
-    entry = Decimal(str(exchange_pos.get('entry_price', 0)))
+    entry = Decimal(str(exchange_pos.get("entry_price", 0)))
     sl = db_pos.initial_stop_price
-    
-    if not entry or not sl or entry == 0:
+
+    if not entry or entry == 0:
         return None
-    
-    risk = abs(entry - sl)
-    if risk == 0:
-        return None
-    
-    # Risk sanity check
-    risk_pct = risk / entry
-    if risk_pct < Decimal("0.002") or risk_pct > Decimal("0.10"):
-        logger.warning("Risk outside sensible band", symbol=db_pos.symbol, risk_pct=float(risk_pct))
+
+    if sl is not None:
+        risk = abs(entry - sl)
+        if risk == 0:
+            return None
+        risk_pct = risk / entry
+        if risk_pct < Decimal("0.002") or risk_pct > Decimal("0.10"):
+            logger.warning("Risk outside sensible band", symbol=db_pos.symbol, risk_pct=float(risk_pct))
+            return None
+    elif default_risk_pct_when_no_sl is not None:
+        risk = entry * default_risk_pct_when_no_sl
+        if risk == 0:
+            return None
+    else:
         return None
     
     # Determine side sign
@@ -280,14 +290,15 @@ async def add_tp_to_positions(
                     logger.debug("Skipped: no exchange position", symbol=symbol)
                 skipped_count += 1
                 continue
-            
-            if not db_pos.initial_stop_price or not db_pos.stop_loss_order_id:
+
+            # When require_sl=True, skip positions without SL in DB
+            if require_sl and (not db_pos.initial_stop_price or not db_pos.stop_loss_order_id):
                 skip_reasons['no_sl'] = skip_reasons.get('no_sl', 0) + 1
                 if verbose:
                     logger.debug("Skipped: no SL", symbol=symbol)
                 skipped_count += 1
                 continue
-            
+
             entry_price = Decimal(str(exchange_pos.get('entry_price', 0)))
             if entry_price == 0:
                 entry_price = db_pos.entry_price
@@ -343,8 +354,12 @@ async def add_tp_to_positions(
                     skipped_count += 1
                     continue
             
-            # Compute TP plan
-            tp_plan = compute_tp_plan(db_pos, exchange_pos, current_price, config)
+            # Compute TP plan (use default 2% risk when no SL and --no-require-sl)
+            default_risk = DEFAULT_RISK_PCT_NO_SL if not require_sl else None
+            tp_plan = compute_tp_plan(
+                db_pos, exchange_pos, current_price, config,
+                default_risk_pct_when_no_sl=default_risk,
+            )
             if not tp_plan:
                 skip_reasons['tp_computation_failed'] = skip_reasons.get('tp_computation_failed', 0) + 1
                 if verbose:

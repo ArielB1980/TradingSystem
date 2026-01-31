@@ -15,7 +15,12 @@ exchange:
   futures_markets:
     - "BTCUSD-PERP"
     - "ETHUSD-PERP"
-  # spot_ohlcv_blocklist: ["2Z/USD", "ANIME/USD"]  # Optional: exclude delisted/failing pairs
+  # Excluded from coin processing (analysis + trading loop). This is a hard block:
+  # blocked symbols will not be analyzed and will never be opened as new trades.
+  spot_ohlcv_blocklist:
+    - "2Z/USD"
+    - "ANIME/USD"
+    - "USDT/USD"  # Requested: block analysis + trading for USDT
   use_futures_ohlcv_fallback: true   # Use futures OHLCV when spot unavailable (e.g. BadSymbol)
   # Credentials
   api_key: "${KRAKEN_API_KEY}"
