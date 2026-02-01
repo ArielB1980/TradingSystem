@@ -622,6 +622,120 @@ Environment: {env}
             logger.warning(error_msg)
 
 
+def fail_fast_startup(strict: bool = True) -> None:
+    """
+    Production fail-fast startup validation.
+    
+    CRITICAL: This should be called at the very start of the application
+    BEFORE any trading operations begin. In production, missing critical
+    configuration causes immediate exit.
+    
+    Validates:
+    1. ENVIRONMENT is set and valid
+    2. Trading mode is unambiguous (DRY_RUN explicit)
+    3. Required API credentials present
+    4. Database URL configured
+    5. Exchange type matches expectations (spot vs futures)
+    
+    Args:
+        strict: If True (default), raises SystemExit on failure in production
+    """
+    import os
+    from src.monitoring.logger import get_logger
+    logger = get_logger(__name__)
+    
+    errors = []
+    warnings = []
+    
+    # Get environment
+    env = os.getenv("ENVIRONMENT", os.getenv("ENV", "")).lower()
+    dry_run = os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", ""))
+    
+    # 1. ENVIRONMENT validation
+    if not env:
+        errors.append("ENVIRONMENT not set - must be 'prod', 'paper', 'dev', or 'local'")
+    elif env not in ("prod", "paper", "dev", "local"):
+        errors.append(f"ENVIRONMENT='{env}' invalid - must be 'prod', 'paper', 'dev', or 'local'")
+    
+    # 2. Trading mode validation (DRY_RUN must be explicit in production)
+    if env == "prod":
+        if dry_run == "":
+            errors.append("DRY_RUN must be explicitly set in production (0 for live, 1 for dry-run)")
+        elif dry_run not in ("0", "1", "true", "false", "True", "False"):
+            errors.append(f"DRY_RUN='{dry_run}' ambiguous - use '0' or '1'")
+    
+    # 3. API credentials validation (in production)
+    if env == "prod" and dry_run in ("0", "false", "False"):
+        # Live trading requires real credentials
+        futures_key = os.getenv("KRAKEN_FUTURES_API_KEY", "")
+        futures_secret = os.getenv("KRAKEN_FUTURES_API_SECRET", "")
+        
+        if not futures_key or len(futures_key) < 20:
+            errors.append("KRAKEN_FUTURES_API_KEY missing or invalid (too short)")
+        if not futures_secret or len(futures_secret) < 30:
+            errors.append("KRAKEN_FUTURES_API_SECRET missing or invalid (too short)")
+    
+    # 4. Database URL validation (in production/paper)
+    if env in ("prod", "paper"):
+        db_url = os.getenv("DATABASE_URL", "")
+        if not db_url:
+            errors.append("DATABASE_URL not set - required for production/paper trading")
+        elif not db_url.startswith(("postgres", "postgresql")):
+            warnings.append(f"DATABASE_URL does not appear to be PostgreSQL: {db_url[:30]}...")
+    
+    # 5. Exchange configuration validation
+    # Check for conflicting env vars that might indicate misconfiguration
+    testnet = os.getenv("KRAKEN_TESTNET", os.getenv("USE_TESTNET", ""))
+    if env == "prod" and testnet in ("1", "true", "True"):
+        errors.append("TESTNET enabled in production mode - this is likely misconfiguration")
+    
+    # Log results
+    if warnings:
+        for w in warnings:
+            logger.warning("Startup validation warning", warning=w)
+    
+    if errors:
+        error_block = "\n".join(f"  ❌ {e}" for e in errors)
+        
+        logger.critical(
+            "STARTUP_VALIDATION_FAILED",
+            environment=env,
+            error_count=len(errors),
+            errors=errors,
+        )
+        
+        if strict and env == "prod":
+            # HARD FAILURE in production
+            raise SystemExit(f"""
+╔══════════════════════════════════════════════════════════════╗
+║  FATAL: PRODUCTION STARTUP FAILED - INVALID CONFIGURATION   ║
+╚══════════════════════════════════════════════════════════════╝
+
+The following configuration errors prevent safe startup:
+
+{error_block}
+
+The system CANNOT start in production mode with these errors.
+Fix the configuration and restart.
+
+Environment: {env}
+DRY_RUN: {dry_run}
+""")
+        elif strict:
+            # Log but don't exit in non-production
+            logger.error(
+                "Startup validation failed (non-production, continuing)",
+                errors=errors
+            )
+    else:
+        logger.info(
+            "STARTUP_VALIDATION_PASSED",
+            environment=env,
+            dry_run=dry_run,
+            mode="live" if dry_run in ("0", "false", "False") else "dry_run",
+        )
+
+
 def load_config(config_path: str | None = None) -> Config:
     """
     Load and validate configuration.
@@ -635,8 +749,12 @@ def load_config(config_path: str | None = None) -> Config:
     Raises:
         FileNotFoundError: If config file not found
         ValueError: If configuration validation fails
+        SystemExit: If critical configuration missing in production
     """
-    # Validate environment variables first
+    # CRITICAL: Fail-fast startup check (exits in production if invalid)
+    fail_fast_startup(strict=True)
+    
+    # Legacy validation (warning-only)
     validate_required_env_vars()
     
     if config_path is None:
