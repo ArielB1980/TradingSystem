@@ -48,6 +48,13 @@ from src.live.startup_validator import ensure_all_coins_have_traces
 from src.live.maintenance import periodic_data_maintenance
 from src.reconciliation.reconciler import Reconciler
 
+# Production Hardening Layer V2 (Issue #1-5 fixes + V2 hardening)
+from src.safety.integration import (
+    ProductionHardeningLayer,
+    init_hardening_layer,
+    HardeningDecision,
+)
+
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
@@ -296,9 +303,26 @@ class LiveTrading:
             futures_symbols=config.exchange.futures_markets
         )
         
+        # ===== PRODUCTION HARDENING LAYER =====
+        # Integrates: InvariantMonitor, CycleGuard, PositionDeltaReconciler, DecisionAuditLogger
+        # This provides hard safety limits, timing protection, and decision-complete logging
+        try:
+            self.hardening = init_hardening_layer(
+                config=config,
+                kill_switch=self.kill_switch,
+            )
+            logger.info(
+                "ProductionHardeningLayer initialized",
+                trading_allowed=self.hardening.is_trading_allowed(),
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize ProductionHardeningLayer", error=str(e))
+            self.hardening = None
+        
         logger.info("Live Trading initialized", 
                    markets=config.exchange.futures_markets,
-                   state_machine_v2=self.use_state_machine_v2)
+                   state_machine_v2=self.use_state_machine_v2,
+                   hardening_enabled=self.hardening is not None)
 
     def _market_symbols(self) -> List[str]:
         """Return list of spot symbols. Handles both list (initial) and dict (after discovery). Excludes blocklist."""
@@ -423,6 +447,19 @@ class LiveTrading:
         self.trade_paused = False
         # Important but not an error condition.
         logger.warning("🚀 STARTING LIVE TRADING")
+        
+        # ===== PRODUCTION HARDENING SELF-TEST (V2) =====
+        # Must pass before trading can start
+        if self.hardening:
+            success, errors = self.hardening.self_test()
+            if not success:
+                logger.critical(
+                    "HARDENING_SELF_TEST_FAILED",
+                    errors=errors,
+                    action="REFUSING_TO_START",
+                )
+                raise RuntimeError(f"Production hardening self-test failed: {errors}")
+            logger.info("Hardening self-test passed", run_id=self.hardening._run_id)
         
         try:
             # 1. Initialize Client
@@ -983,6 +1020,52 @@ class LiveTrading:
         except Exception as e:
             logger.error("Failed to sync positions", error=str(e))
             return
+
+        # 2.1 PRODUCTION HARDENING V2: Pre-tick Invariant Check
+        # This checks all hard limits (drawdown, positions, margin) and halts if violated
+        # Uses HardeningDecision enum for explicit state handling
+        if self.hardening:
+            try:
+                # Get account info for invariant checks
+                account_info = await self.client.get_futures_account_info()
+                current_equity = Decimal(str(account_info.get("equity", 0)))
+                available_margin = Decimal(str(account_info.get("availableMargin", 0)))
+                margin_used = Decimal(str(account_info.get("marginUsed", 0)))
+                margin_util = margin_used / current_equity if current_equity > 0 else Decimal("0")
+                
+                # Convert raw positions to Position objects for check
+                position_objs = [self._convert_to_position(p) for p in all_raw_positions if p.get('size', 0) != 0]
+                
+                # Run pre-tick safety checks (returns HardeningDecision)
+                decision = await self.hardening.pre_tick_check(
+                    current_equity=current_equity,
+                    open_positions=position_objs,
+                    margin_utilization=margin_util,
+                    available_margin=available_margin,
+                )
+                
+                if decision == HardeningDecision.HALT:
+                    logger.critical(
+                        "TRADING_HALTED_BY_INVARIANT_MONITOR",
+                        message="System halted - manual intervention required via clear_halt()",
+                    )
+                    # Ensure cleanup runs via finally block
+                    return
+                
+                if decision == HardeningDecision.SKIP_TICK:
+                    logger.debug("TICK_SKIPPED_BY_CYCLE_GUARD")
+                    return
+                
+                # Log if new entries are blocked but position management allowed
+                if not self.hardening.is_trading_allowed():
+                    logger.warning(
+                        "NEW_ENTRIES_BLOCKED",
+                        system_state=self.hardening.invariant_monitor.state.value,
+                        management_allowed=self.hardening.is_management_allowed(),
+                    )
+            except Exception as e:
+                logger.error("Production hardening pre-tick check failed", error=str(e))
+                # Don't halt trading due to hardening check failure - log and continue
 
         # 2.5. Cleanup orphan reduce-only orders (SL/TP orders for closed positions)
         try:
@@ -1662,6 +1745,12 @@ class LiveTrading:
                 self.last_data_maintenance = now
             except Exception as e:
                 logger.error("Periodic data maintenance failed", error=str(e))
+
+        # 9. PRODUCTION HARDENING V2: Post-tick Cleanup
+        # CRITICAL: This must always run, even on exceptions
+        # The post_tick_cleanup() method internally uses try/finally to ensure lock release
+        if self.hardening:
+            self.hardening.post_tick_cleanup()
 
     # _background_hydration_task removed (Replaced by CandleManager.initialize)
 
