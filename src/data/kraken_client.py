@@ -1066,6 +1066,101 @@ class KrakenClient:
             logger.error("Failed to cancel futures order", order_id=order_id, error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
 
+    async def edit_futures_order(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        stop_price: Optional[Decimal] = None,
+        price: Optional[Decimal] = None,
+    ) -> Dict[str, Any]:
+        """
+        Edit an existing futures order (primarily stop-loss updates).
+
+        Strategy:
+        - Prefer CCXT `edit_order` if supported by the exchange.
+        - Fallback to cancel + recreate (returns a NEW order id).
+        """
+        if not self.futures_exchange:
+            raise ValueError("Futures credentials not configured")
+        if not symbol:
+            raise ValueError("symbol is required to edit futures order")
+
+        # Resolve unified symbol for CCXT calls
+        unified_symbol = symbol
+        if not self.futures_exchange.markets:
+            await self.futures_exchange.load_markets()
+        for m in self.futures_exchange.markets.values():
+            mid = m.get("id")
+            msym = m.get("symbol")
+            if mid and (mid == symbol or str(mid).upper() == str(symbol).upper()):
+                unified_symbol = msym
+                break
+            if msym and msym == symbol:
+                unified_symbol = symbol
+                break
+
+        params: Dict[str, Any] = {}
+        if stop_price is not None:
+            rounded_stop = self.futures_exchange.price_to_precision(unified_symbol, float(stop_price))
+            params["stopPrice"] = float(rounded_stop)
+
+        # Try CCXT native edit first
+        if hasattr(self.futures_exchange, "edit_order"):
+            try:
+                edited = await self.futures_exchange.edit_order(
+                    id=order_id,
+                    symbol=unified_symbol,
+                    type=None,
+                    side=None,
+                    amount=None,
+                    price=float(price) if price is not None else None,
+                    params=params,
+                )
+                new_id = edited.get("id") if isinstance(edited, dict) else None
+                logger.info("Futures order edited", order_id=order_id, new_order_id=new_id, symbol=unified_symbol)
+                return {"result": "edited", "order_id": new_id or order_id, "order": edited}
+            except Exception as e:
+                logger.warning(
+                    "edit_order failed; falling back to cancel+replace",
+                    order_id=order_id,
+                    symbol=unified_symbol,
+                    error=str(e),
+                )
+
+        # Fallback: cancel + recreate using fetched order details
+        existing = await self.futures_exchange.fetch_order(order_id, unified_symbol)
+        if not existing:
+            raise ValueError(f"Order not found for edit: {order_id} {unified_symbol}")
+
+        side = existing.get("side")
+        otype = existing.get("type") or "stop"
+        amount = existing.get("amount") or existing.get("remaining") or existing.get("filled")
+        if not side or not amount or float(amount) <= 0:
+            raise ValueError(f"Cannot replace order without side/amount (order_id={order_id}, symbol={unified_symbol})")
+
+        info = existing.get("info") or {}
+        reduce_only = bool(existing.get("reduceOnly") or info.get("reduceOnly"))
+        if reduce_only:
+            params["reduceOnly"] = True
+
+        cli = existing.get("clientOrderId") or info.get("cliOrdId") or info.get("clientOrderId")
+        if cli:
+            params["cliOrdId"] = cli
+
+        await self.futures_exchange.cancel_order(order_id, unified_symbol)
+        created = await self.futures_exchange.create_order(
+            symbol=unified_symbol,
+            type=otype,
+            side=side,
+            amount=float(amount),
+            price=float(price) if price is not None else None,
+            params=params,
+        )
+        new_id = created.get("id") if isinstance(created, dict) else None
+        logger.info("Futures order replaced", old_order_id=order_id, new_order_id=new_id, symbol=unified_symbol)
+        return {"result": "replaced", "old_order_id": order_id, "order_id": new_id, "order": created}
+
     async def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> Dict[str, Any]:
         """CCXT-style cancel_order for ExecutionGateway. Delegates to cancel_futures_order."""
         return await self.cancel_futures_order(order_id, symbol)
