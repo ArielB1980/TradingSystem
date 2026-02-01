@@ -330,6 +330,17 @@ class ExecutionConfig(BaseSettings):
     # Pyramiding
     pyramiding_enabled: bool = False  # Default: no adding to positions
 
+    # Hard entry blocks (defense-in-depth)
+    # These block NEW entries only (they do not block reduce-only exits / risk management).
+    entry_blocklist_spot_symbols: List[str] = Field(
+        default_factory=list,
+        description="Do not open NEW positions for these spot symbols (case-insensitive), e.g. ['USDT/USD']",
+    )
+    entry_blocklist_bases: List[str] = Field(
+        default_factory=list,
+        description="Do not open NEW positions for these base assets (case-insensitive), e.g. ['USDT']",
+    )
+
 
 class DataConfig(BaseSettings):
     """Data acquisition configuration."""

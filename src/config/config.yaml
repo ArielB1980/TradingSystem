@@ -170,6 +170,12 @@ execution:
   
   # Pyramiding
   pyramiding_enabled: false  # Default: no adding to positions
+
+  # Hard entry blocks (NEW entries only; reduce-only exits still allowed)
+  entry_blocklist_spot_symbols:
+    - "USDT/USD"
+  entry_blocklist_bases:
+    - "USDT"
   
   # TP Backfill / Reconciliation
   tp_backfill_enabled: true  # Enable TP backfill reconciliation
