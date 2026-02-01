@@ -2797,9 +2797,16 @@ class LiveTrading:
                     if not db_pos:
                         continue
                     
-                    # Check if position already has stop loss order ID
-                    if db_pos.stop_loss_order_id and not str(db_pos.stop_loss_order_id).startswith('unknown_'):
-                        # Already tracked, skip
+                    # Skip only if the DB already considers the position fully protected.
+                    # We still need to reconcile when:
+                    # - stop_loss_order_id exists but initial_stop_price is missing
+                    # - is_protected flag is stale/false even though fields exist
+                    if (
+                        db_pos.is_protected
+                        and db_pos.stop_loss_order_id
+                        and db_pos.initial_stop_price
+                        and not str(db_pos.stop_loss_order_id).startswith("unknown_")
+                    ):
                         continue
                     
                     # Look for stop loss orders for this symbol
