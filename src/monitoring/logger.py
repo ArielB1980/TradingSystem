@@ -8,6 +8,7 @@ import logging
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
+from src.monitoring.redaction import structlog_redaction_processor
 
 
 def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: str | None = None) -> None:
@@ -52,6 +53,7 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
         structlog.contextvars.merge_contextvars,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        structlog_redaction_processor,
     ]
     
     if log_format == "json":

@@ -55,6 +55,17 @@ class TakeoverCase:
     D_DUPLICATE = "D_DUPLICATE"      # Local state conflicts with exchange
 
 
+@dataclass(frozen=True)
+class StopProtection:
+    """Canonical representation of a protective stop during takeover."""
+    stop_price: Decimal
+    stop_order_id: Optional[str]
+    stop_qty: Optional[Decimal]
+    reduce_only: bool
+    source: str  # "existing" | "placed"
+    be_mode: bool = False  # stop is at/through entry (break-even/profit protection)
+
+
 class ProductionTakeover:
     """
     Executes the Production Takeover Protocol.
@@ -174,7 +185,7 @@ class ProductionTakeover:
             if symbol in self.registry._positions:
                 del self.registry._positions[symbol]
         
-        valid_stop = None
+        valid_stop: Optional[Dict] = None
         
         if classification == TakeoverCase.C_CHAOS:
             logger.warning(f"Case C: Resolving order chaos for {symbol}")
@@ -185,21 +196,21 @@ class ProductionTakeover:
             logger.info(f"Protective stop confirmed for {symbol} (Order ID: {valid_stop['id']})")
         
         # Step 4: Enforce Invariant K (Protect)
-        final_stop = await self._enforce_protection(symbol, pos_data, valid_stop)
+        stop = await self._enforce_protection(symbol, pos_data, valid_stop)
         
-        if final_stop is None:
+        if stop is None:
             # Emergency failed - validation failed and placement failed
             self.quarantined_positions.append(symbol)
             stats["quarantined"] += 1
             logger.critical(f"FLATTENED + QUARANTINED: {symbol}")
             return
         
-        if not valid_stop and final_stop is not None:
+        if not valid_stop and stop is not None:
             stats["stops_placed"] += 1
             logger.info(f"Protective stop PLACED for {symbol}")
         
         # Step 5: Import
-        await self._import_position(symbol, pos_data, final_stop)
+        await self._import_position(symbol, pos_data, stop)
         stats["imported"] += 1
         self.imported_positions.append(symbol)
 
@@ -215,7 +226,8 @@ class ProductionTakeover:
         stop_orders = []
         for o in orders:
             o_type = o.get("type", "").lower()
-            if o_type in ["stop", "stop_market", "stop-loss", "stop-loss-limit"]:
+            is_reduce_only = bool(o.get("reduceOnly") or o.get("reduce_only") or o.get("reduce_only", False))
+            if o_type in ["stop", "stop_market", "stop-loss", "stop-loss-limit"] and is_reduce_only:
                 # Basic validation: reduces position?
                 # Simplified check: just presence for now, Detailed validation in Step 4
                 stop_orders.append(o)
@@ -248,15 +260,22 @@ class ProductionTakeover:
         
         return None
 
+    def _qty_matches_with_tolerance(self, stop_qty: Optional[Decimal], pos_qty: Decimal) -> bool:
+        if stop_qty is None:
+            return False
+        # Tolerance: abs(diff) <= max(1e-8, pos_qty*1e-4)
+        tol = max(Decimal("1e-8"), abs(pos_qty) * Decimal("1e-4"))
+        return abs(stop_qty - abs(pos_qty)) <= tol
+
     async def _enforce_protection(
         self, 
         symbol: str, 
         pos_data: Dict, 
         existing_stop: Optional[Dict]
-    ) -> Optional[Decimal]:
+    ) -> Optional[StopProtection]:
         """
         Ensure valid stop exists. 
-        Returns the stop PRICE if protected, None if failed (and quarantined).
+        Returns StopProtection if protected, None if failed (and quarantined).
         """
         # Validate existing stop if Case A
         if existing_stop:
@@ -264,24 +283,32 @@ class ProductionTakeover:
             current_side = pos_data["side"]
             entry_price = pos_data["entry_price"]
             qty = pos_data["qty"]
-            stop_qty = Decimal(str(existing_stop.get("amount", 0)))
+            raw_amt = existing_stop.get("amount", existing_stop.get("size", None))
+            stop_qty = Decimal(str(raw_amt)) if raw_amt is not None else None
+            reduce_only = bool(existing_stop.get("reduceOnly") or existing_stop.get("reduce_only") or False)
             
             is_valid = True
             
-            # Direction check
-            if current_side == Side.LONG and stop_price >= entry_price:
-                 # Normally we want stop < entry, but user might have moved to profit. 
-                 # Just check it's below CURRENT price? No, we don't have current price easily.
-                 # Let's assume exchange stop is valid directionally if accepted by engine.
-                 pass
+            # Reduce-only must be true for protective exits
+            if not reduce_only:
+                logger.warning("Existing stop is not reduce-only; replacing", symbol=symbol, stop_id=existing_stop.get("id"))
+                is_valid = False
             
             # Size check
-            if stop_qty < qty:
-                logger.warning(f"Stop size {stop_qty} < Position {qty}. Invalid.")
+            if not self._qty_matches_with_tolerance(stop_qty, qty):
+                logger.warning("Stop qty does not match position qty; replacing", symbol=symbol, stop_qty=str(stop_qty), pos_qty=str(qty))
                 is_valid = False
             
             if is_valid:
-                return stop_price
+                be_mode = (current_side == Side.LONG and stop_price >= entry_price) or (current_side == Side.SHORT and stop_price <= entry_price)
+                return StopProtection(
+                    stop_price=stop_price,
+                    stop_order_id=str(existing_stop.get("id")) if existing_stop.get("id") else None,
+                    stop_qty=stop_qty,
+                    reduce_only=True,
+                    source="existing",
+                    be_mode=be_mode,
+                )
             
             # If invalid, we fall through to placement
             logger.warning(f"Existing stop {existing_stop['id']} invalid. Replacing.")
@@ -294,7 +321,7 @@ class ProductionTakeover:
         # Case B (or failed A): Place fresh stop
         return await self._place_fresh_stop(symbol, pos_data)
 
-    async def _place_fresh_stop(self, symbol: str, pos_data: Dict) -> Optional[Decimal]:
+    async def _place_fresh_stop(self, symbol: str, pos_data: Dict) -> Optional[StopProtection]:
         """Calculate and place a conservative protective stop."""
         side = pos_data["side"]
         entry_price = pos_data["entry_price"]
@@ -324,7 +351,14 @@ class ProductionTakeover:
         logger.critical(f"PLACING EMERGENCY STOP for {symbol}: {stop_price} (Size: {qty})")
         
         if self.config.dry_run:
-            return stop_price
+            return StopProtection(
+                stop_price=stop_price,
+                stop_order_id=None,
+                stop_qty=qty,
+                reduce_only=True,
+                source="placed",
+                be_mode=False,
+            )
             
         try:
             # Use gateway/client to place stop
@@ -341,7 +375,20 @@ class ProductionTakeover:
                 reduce_only=True,
                 client_order_id=client_order_id
             )
-            return stop_price
+            stop_order_id = None
+            try:
+                # CCXT often returns id at top-level; Kraken Futures may also return sendStatus.order_id
+                stop_order_id = result.get("id") or (result.get("sendStatus") or {}).get("order_id")
+            except Exception:
+                stop_order_id = None
+            return StopProtection(
+                stop_price=stop_price,
+                stop_order_id=str(stop_order_id) if stop_order_id else None,
+                stop_qty=qty,
+                reduce_only=True,
+                source="placed",
+                be_mode=False,
+            )
             
         except Exception as e:
             logger.critical(f"FAILED TO PLACE STOP for {symbol}: {e}")
@@ -367,21 +414,32 @@ class ProductionTakeover:
         except Exception as e:
              logger.critical(f"FATAL: Could not flatten {symbol}: {e}")
 
-    async def _import_position(self, symbol: str, pos_data: Dict, stop_price: Decimal) -> None:
+    async def _import_position(self, symbol: str, pos_data: Dict, stop: StopProtection) -> None:
         """Create ManagedPosition from truth."""
         if self.config.dry_run:
             return
 
         # Create Position ID
         pid = f"pos-{symbol.replace('/','')}-{self.snapshot_id}"
+
+        # For takeover positions, the original initial stop may be unknown.
+        # We must satisfy invariants: initial_stop must be on the correct side of entry,
+        # while current_stop reflects the exchange-protective stop we confirmed/placed.
+        side = pos_data["side"]
+        entry_price = pos_data["entry_price"]
+        pct = self.config.takeover_stop_pct
+        if side == Side.LONG:
+            synthesized_initial_stop = min(entry_price * (Decimal("1") - pct), stop.stop_price)
+        else:
+            synthesized_initial_stop = max(entry_price * (Decimal("1") + pct), stop.stop_price)
         
         pos = ManagedPosition(
             symbol=symbol,
-            side=pos_data["side"],
+            side=side,
             position_id=pid,
             initial_size=pos_data["qty"],
-            initial_entry_price=pos_data["entry_price"],
-            initial_stop_price=stop_price,
+            initial_entry_price=entry_price,
+            initial_stop_price=synthesized_initial_stop,
             initial_tp1_price=None,  # Unknown
             initial_tp2_price=None,
             initial_final_target=None
@@ -390,8 +448,9 @@ class ProductionTakeover:
         # Isolate Invariant C: Immutables. entry_acknowledged = True immediately
         pos.entry_acknowledged = True
         pos.intent_confirmed = True  # BE gate: takeover positions treated as confirmed
-        pos.state = PositionState.OPEN # Or PROTECTED
-        pos.current_stop_price = stop_price
+        pos.state = PositionState.PROTECTED
+        pos.current_stop_price = stop.stop_price
+        pos.stop_order_id = stop.stop_order_id
         pos.setup_type = "TAKEOVER"
         pos.trade_type = "UNKNOWN"
         

@@ -5,17 +5,45 @@ import os
 import asyncio
 import ccxt.async_support as ccxt  # Use async version
 
-# Set credentials
-os.environ['KRAKEN_FUTURES_API_KEY'] = 'uG8IoCO8CLLIIghlZVIMWoM5nbBKscc3wlJDZEMIKW4A+Cmf+fuSB+Oy'
-os.environ['KRAKEN_FUTURES_API_SECRET'] = 'MoBA5A7X1269Jv81zr+ur551GZe/nA7d5PasKu8L4M0dloy+hogmKKKePAWkBqfvxgpMEfoHpYxYFVUao010yyMb'
+# If pytest collects this module, skip by default (unless explicitly enabled).
+import sys
+if (
+    ("PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules)
+    and os.getenv("RUN_REAL_EXCHANGE_TESTS", "0").strip() not in ("1", "true", "TRUE", "yes", "YES")
+):
+    import pytest  # type: ignore
+    pytest.skip(
+        "Skipping real-exchange CCXT test (set RUN_REAL_EXCHANGE_TESTS=1 to enable)",
+        allow_module_level=True,
+    )
+
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        raise SystemExit(f"Missing required env var: {name}")
+    return v
+
+
+def _ensure_allowed() -> None:
+    """
+    Defense-in-depth: never run real-exchange tests unless explicitly enabled.
+    """
+    if os.getenv("RUN_REAL_EXCHANGE_TESTS", "0").strip() not in ("1", "true", "TRUE", "yes", "YES"):
+        raise SystemExit(
+            "Refusing to run real-exchange test. Set RUN_REAL_EXCHANGE_TESTS=1 to enable."
+        )
 
 async def test_ccxt_futures_direct():
     """Test using ccxt.krakenfutures directly."""
+    _ensure_allowed()
+    api_key = _require_env("KRAKEN_FUTURES_API_KEY")
+    api_secret = _require_env("KRAKEN_FUTURES_API_SECRET")
+
     print("\n=== Testing CCXT Kraken Futures ===\n")
     
     exchange = ccxt.krakenfutures({
-        'apiKey': os.environ['KRAKEN_FUTURES_API_KEY'],
-        'secret': os.environ['KRAKEN_FUTURES_API_SECRET'],
+        'apiKey': api_key,
+        'secret': api_secret,
         'enableRateLimit': True,
         # 'verbose': True, # Uncomment to see raw requests!
     })
@@ -35,32 +63,34 @@ async def test_ccxt_futures_direct():
         print("\n[2] Fetching balance...")
         balance = await exchange.fetch_balance()
         print("   ✅ Balance fetched")
-        
-        # 3. Create Order (Safe - limit far away)
-        print("\n[3] Placing safe limit order...")
-        price = 50000.0  # Far from ~90k
-        amount = 1.0     # 1 contract
-        
-        # CCXT unifies this: create_order(symbol, type, side, amount, price)
-        # We can see what it sends by enabling verbose, but let's just try to clear the hurdle
-        try:
-            order = await exchange.create_order(
-                symbol=symbol,
-                type='limit',
-                side='buy',
-                amount=amount,
-                price=price,
-                params={'cliOrdId': 'ccxt_test_001'} 
-            )
-            print(f"   ✅ Order placed! ID: {order['id']}")
-            
-            # Cancel it
-            print("   Cancelling...")
-            await exchange.cancel_order(order['id'], symbol)
-            print("   ✅ Order cancelled")
-            
-        except Exception as e:
-            print(f"   ❌ Order creation failed: {e}")
+
+        # 3. Order placement is intentionally disabled by default.
+        # If you want to test orders, require *additional* explicit gating.
+        if os.getenv("RUN_REAL_EXCHANGE_ORDERS", "0").strip() in ("1", "true", "TRUE", "yes", "YES"):
+            if os.getenv("CONFIRM_LIVE", "").strip().upper() != "YES":
+                raise SystemExit("Refusing to place orders: set CONFIRM_LIVE=YES as well.")
+
+            print("\n[3] Placing safe limit order (explicitly enabled)...")
+            price = 50000.0  # Far from typical BTC price; adjust for current market
+            amount = 1.0     # 1 contract
+
+            try:
+                order = await exchange.create_order(
+                    symbol=symbol,
+                    type='limit',
+                    side='buy',
+                    amount=amount,
+                    price=price,
+                    params={'cliOrdId': 'ccxt_test_001'}
+                )
+                print(f"   ✅ Order placed! ID: {order['id']}")
+
+                # Cancel it
+                print("   Cancelling...")
+                await exchange.cancel_order(order['id'], symbol)
+                print("   ✅ Order cancelled")
+            except Exception as e:
+                print(f"   ❌ Order creation failed: {e}")
 
     except Exception as e:
         print(f"   ❌ Error: {e}")

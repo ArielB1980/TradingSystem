@@ -384,49 +384,57 @@ class RiskManager:
         position_limit = self.config.auction_max_positions if self.config.auction_mode_enabled else self.config.max_concurrent_positions
         
         if len(self.current_positions) >= position_limit:
-            # OPPORTUNITY COST LOGIC (Phase 7)
-            # Check if this new trade is significantly better (>2x R:R) than the weakest existing position
-            
-            # 1. Calculate New Trade R:R
-            if signal.take_profit:
-                new_reward = abs(signal.take_profit - signal.entry_price)
-                new_risk = abs(signal.entry_price - signal.stop_loss)
-                new_rr = new_reward / new_risk if new_risk > 0 else Decimal("0")
-            else:
-                new_rr = Decimal("0")
-                
-            # 2. Find Weakest Existing Position
-            weakest_pos = None
-            lowest_rr = Decimal("9999")
-            
-            for pos in self.current_positions:
-                # Calculate existing R:R based on initial params (if available)
-                if pos.final_target_price and pos.initial_stop_price and pos.entry_price:
-                    curr_reward = abs(pos.final_target_price - pos.entry_price)
-                    curr_risk = abs(pos.entry_price - pos.initial_stop_price)
-                    curr_rr = curr_reward / curr_risk if curr_risk > 0 else Decimal("0")
-                    
-                    if curr_rr < lowest_rr:
-                        lowest_rr = curr_rr
-                        weakest_pos = pos
-            
-            # 3. Compare
-            # Threshold: New potential must be > 2.0x existing potential
-            if weakest_pos and new_rr > (lowest_rr * Decimal("2.0")):
-                should_close_existing = True
-                close_symbol = weakest_pos.symbol
-                logger.info(
-                    "Opportunity Cost Override Triggered",
-                    new_symbol=signal.symbol,
-                    new_rr=float(new_rr),
-                    weakest_symbol=weakest_pos.symbol,
-                    weakest_rr=float(lowest_rr),
-                    multiplier=float(new_rr/lowest_rr if lowest_rr > 0 else 0)
-                )
-            else:
+            # Replacement is explicitly opt-in.
+            # Default behavior (especially in prod): reject when at limit (no close-then-open race).
+            if not bool(getattr(self.config, "replacement_enabled", False)):
                 rejection_reasons.append(
                     f"Max concurrent positions ({position_limit}) reached"
                 )
+            else:
+                # OPPORTUNITY COST LOGIC (LEGACY / DEPRECATED)
+                # NOTE: This is intentionally disabled by default. If re-enabled, it should be
+                # replaced by an explicit persisted entry_score + strict guards.
+            
+                # 1. Calculate New Trade R:R
+                if signal.take_profit:
+                    new_reward = abs(signal.take_profit - signal.entry_price)
+                    new_risk = abs(signal.entry_price - signal.stop_loss)
+                    new_rr = new_reward / new_risk if new_risk > 0 else Decimal("0")
+                else:
+                    new_rr = Decimal("0")
+                
+                # 2. Find Weakest Existing Position
+                weakest_pos = None
+                lowest_rr = Decimal("9999")
+            
+                for pos in self.current_positions:
+                    # Calculate existing R:R based on initial params (if available)
+                    if pos.final_target_price and pos.initial_stop_price and pos.entry_price:
+                        curr_reward = abs(pos.final_target_price - pos.entry_price)
+                        curr_risk = abs(pos.entry_price - pos.initial_stop_price)
+                        curr_rr = curr_reward / curr_risk if curr_risk > 0 else Decimal("0")
+                        
+                        if curr_rr < lowest_rr:
+                            lowest_rr = curr_rr
+                            weakest_pos = pos
+            
+                # 3. Compare
+                # Threshold: New potential must be > 2.0x existing potential
+                if weakest_pos and new_rr > (lowest_rr * Decimal("2.0")):
+                    should_close_existing = True
+                    close_symbol = weakest_pos.symbol
+                    logger.info(
+                        "Opportunity Cost Override Triggered",
+                        new_symbol=signal.symbol,
+                        new_rr=float(new_rr),
+                        weakest_symbol=weakest_pos.symbol,
+                        weakest_rr=float(lowest_rr),
+                        multiplier=float(new_rr/lowest_rr if lowest_rr > 0 else 0)
+                    )
+                else:
+                    rejection_reasons.append(
+                        f"Max concurrent positions ({position_limit}) reached"
+                    )
         
         # Daily loss limit
         daily_loss_pct = abs(self.daily_pnl) / self.daily_start_equity if self.daily_start_equity > 0 else Decimal("0")

@@ -52,6 +52,10 @@ services:
         value: "true"
         scope: RUN_TIME
         type: GENERAL
+      - key: CONFIRM_LIVE
+        value: "YES"
+        scope: RUN_TIME
+        type: GENERAL
       - key: DRY_RUN
         value: "0"
         scope: RUN_TIME
@@ -74,5 +78,13 @@ services:
         type: GENERAL
       - key: TRADING_TRAILING_ENABLED
         value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RUN_REAL_EXCHANGE_TESTS
+        value: "0"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ACCOUNT_FINGERPRINT_SEED
+        value: "kraken:futures:primary"
         scope: RUN_TIME
         type: GENERAL
