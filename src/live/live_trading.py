@@ -2201,11 +2201,22 @@ class LiveTrading:
                     # Requires Order Management
                     # If we track SL order ID:
                     if position.stop_loss_order_id:
-                        await self.client.edit_futures_order(
+                        resp = await self.client.edit_futures_order(
                             order_id=position.stop_loss_order_id,
                             symbol=symbol,
                             stop_price=float(action.price)
                         )
+                        # If edit fell back to cancel+replace, update tracked order id.
+                        if isinstance(resp, dict):
+                            new_id = resp.get("order_id")
+                            if new_id and new_id != position.stop_loss_order_id:
+                                logger.info(
+                                    "Stop-loss order id updated after replace",
+                                    symbol=symbol,
+                                    old_order_id=position.stop_loss_order_id,
+                                    new_order_id=new_id,
+                                )
+                                position.stop_loss_order_id = new_id
                     else:
                         logger.warning("Cannot update stop - no SL Order ID tracked", symbol=symbol)
                         
