@@ -1099,7 +1099,9 @@ class LiveTrading:
                                 error=str(e),
                             )
             
-            # 2.4. Fetch open orders once, index by symbol (for position hydration)
+            # 2.4. Fetch open orders once, index by *normalized* symbol (for position hydration)
+            # This is critical because positions are PF_* while CCXT orders often use unified symbols (e.g. X/USD:USD).
+            from src.data.symbol_utils import normalize_symbol_for_position_match
             orders_by_symbol: Dict[str, List[Dict]] = {}
             try:
                 # CRITICAL: Verify client is not a mock before calling
@@ -1118,10 +1120,11 @@ class LiveTrading:
                 open_orders = await self.client.get_futures_open_orders()
                 for order in open_orders:
                     sym = order.get('symbol')
-                    if sym:
-                        if sym not in orders_by_symbol:
-                            orders_by_symbol[sym] = []
-                        orders_by_symbol[sym].append(order)
+                    key = normalize_symbol_for_position_match(sym) if sym else ""
+                    if key:
+                        if key not in orders_by_symbol:
+                            orders_by_symbol[key] = []
+                        orders_by_symbol[key].append(order)
             except RuntimeError:
                 raise  # Re-raise critical errors
             except Exception as e:
@@ -1267,7 +1270,7 @@ class LiveTrading:
                             # Load from DB first to preserve initial_stop_price
                             from src.storage.repository import get_active_position
                             db_pos = await asyncio.to_thread(get_active_position, symbol)
-                            orders_for_symbol = orders_by_symbol.get(symbol, [])
+                            orders_for_symbol = orders_by_symbol.get(normalize_symbol_for_position_match(symbol), [])
                             
                             self.managed_positions[symbol] = self._init_managed_position(
                                 position_data,
@@ -2709,8 +2712,10 @@ class LiveTrading:
                     continue
                 
                 # Get open orders for this symbol
+                # NOTE: positions use PF_* while orders may use CCXT unified symbols.
+                from src.data.symbol_utils import position_symbol_matches_order
                 open_orders = await self.client.get_futures_open_orders()
-                symbol_orders = [o for o in open_orders if o.get('symbol') == symbol]
+                symbol_orders = [o for o in open_orders if position_symbol_matches_order(symbol, o.get('symbol') or '')]
                 
                 # Step 1: Determine if TP coverage is missing
                 needs_backfill = self._needs_tp_backfill(db_pos, symbol_orders)
@@ -2769,14 +2774,16 @@ class LiveTrading:
             # Get all open orders from exchange
             open_orders = await self.client.get_futures_open_orders()
             
-            # Group orders by symbol
+            # Group orders by *normalized* symbol so PF_* positions match unified order symbols
+            from src.data.symbol_utils import normalize_symbol_for_position_match
             orders_by_symbol: Dict[str, List[Dict]] = {}
             for order in open_orders:
-                symbol = order.get('symbol')
-                if symbol:
-                    if symbol not in orders_by_symbol:
-                        orders_by_symbol[symbol] = []
-                    orders_by_symbol[symbol].append(order)
+                sym = order.get('symbol')
+                key = normalize_symbol_for_position_match(sym) if sym else ""
+                if key:
+                    if key not in orders_by_symbol:
+                        orders_by_symbol[key] = []
+                    orders_by_symbol[key].append(order)
             
             # For each position, check if we have a stop loss order on exchange
             for pos_data in raw_positions:
@@ -2796,7 +2803,7 @@ class LiveTrading:
                         continue
                     
                     # Look for stop loss orders for this symbol
-                    symbol_orders = orders_by_symbol.get(symbol, [])
+                    symbol_orders = orders_by_symbol.get(normalize_symbol_for_position_match(symbol), [])
                     stop_loss_order = None
                     
                     for order in symbol_orders:
