@@ -295,17 +295,37 @@ class LiveTrading:
     def _market_symbols(self) -> List[str]:
         """Return list of spot symbols. Handles both list (initial) and dict (after discovery). Excludes blocklist."""
         blocklist = set(
-            s.strip().upper() for s in getattr(
-                self.config.exchange, "spot_ohlcv_blocklist", []
-            ) or []
+            s.strip().upper() for s in getattr(self.config.exchange, "spot_ohlcv_blocklist", []) or []
+        )
+        # Also honor assets.blacklist (exists in config model but was not enforced here previously).
+        blocklist |= set(s.strip().upper() for s in getattr(self.config.assets, "blacklist", []) or [])
+        # Also honor execution entry blocklist for universe filtering (analysis + new entries).
+        blocklist |= set(
+            s.strip().upper().split(":")[0] for s in getattr(self.config.execution, "entry_blocklist_spot_symbols", []) or []
+        )
+        blocked_bases = set(
+            b.strip().upper() for b in getattr(self.config.execution, "entry_blocklist_bases", []) or []
         )
         if isinstance(self.markets, dict):
             raw = list(self.markets.keys())
         else:
             raw = list(self.markets)
         if not blocklist:
-            return raw
-        return [s for s in raw if (s.strip().upper() if s else "") not in blocklist]
+            if not blocked_bases:
+                return raw
+        out: List[str] = []
+        for s in raw:
+            key = (s.strip().upper().split(":")[0] if s else "")
+            if not key:
+                continue
+            if key in blocklist:
+                continue
+            if blocked_bases:
+                base = key.split("/")[0].strip() if "/" in key else key
+                if base in blocked_bases:
+                    continue
+            out.append(s)
+        return out
     
     async def _update_market_universe(self):
         """Discover and update trading universe."""
@@ -2424,6 +2444,28 @@ class LiveTrading:
                     continue
                 seen_opens.add(signal.symbol)
                 try:
+                    # Hard entry blocklist: do not open on blocked symbols (e.g. USDT/USD).
+                    spot_key = (signal.symbol or "").strip().upper().split(":")[0]
+                    base = spot_key.split("/")[0].strip() if "/" in spot_key else spot_key
+                    blocked_spot = set(
+                        s.strip().upper().split(":")[0]
+                        for s in getattr(self.config.execution, "entry_blocklist_spot_symbols", []) or []
+                    )
+                    blocked_base = set(
+                        b.strip().upper()
+                        for b in getattr(self.config.execution, "entry_blocklist_bases", []) or []
+                    )
+                    if (spot_key and spot_key in blocked_spot) or (base and base in blocked_base):
+                        opens_failed += 1
+                        reason = "ENTRY_BLOCKED"
+                        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                        logger.warning(
+                            "Auction: Open blocked by entry blocklist",
+                            symbol=signal.symbol,
+                            reason=("blocked_spot_symbol" if spot_key in blocked_spot else "blocked_base"),
+                        )
+                        continue
+
                     # Find corresponding price data and candidate
                     spot_price = None
                     mark_price = None

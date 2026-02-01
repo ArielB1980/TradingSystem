@@ -196,6 +196,23 @@ class Executor:
                 intent_hash=intent_hash,
             )
             return None
+
+        # Hard entry blocklist (NEW entries only).
+        # This prevents the system from opening positions on symbols like USDT/USD even if the
+        # universe/mapping accidentally includes them.
+        spot_symbol_raw = (order_intent.signal.symbol or "").strip()
+        spot_symbol_key = spot_symbol_raw.upper().split(":")[0].strip()
+        base = spot_symbol_key.split("/")[0].strip() if "/" in spot_symbol_key else spot_symbol_key
+        blocked_spot = {s.strip().upper().split(":")[0] for s in (self.config.entry_blocklist_spot_symbols or [])}
+        blocked_base = {b.strip().upper() for b in (self.config.entry_blocklist_bases or [])}
+        if (spot_symbol_key and spot_symbol_key in blocked_spot) or (base and base in blocked_base):
+            logger.warning(
+                "ENTRY_BLOCKLIST_SKIP",
+                spot_symbol=spot_symbol_raw,
+                base=base,
+                reason=("blocked_spot_symbol" if spot_symbol_key in blocked_spot else "blocked_base"),
+            )
+            return None
         
         futures_symbol = self.futures_adapter.map_spot_to_futures(
             order_intent.signal.symbol,
