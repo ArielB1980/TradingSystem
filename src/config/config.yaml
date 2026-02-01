@@ -20,7 +20,10 @@ exchange:
   spot_ohlcv_blocklist:
     - "2Z/USD"
     - "ANIME/USD"
-    - "USDT/USD"  # Requested: block analysis + trading for USDT
+    - "USDT/USD"
+    - "GBP/USD"
+    - "EUR/USD"
+    - "AUD/USD"
   use_futures_ohlcv_fallback: true   # Use futures OHLCV when spot unavailable (e.g. BadSymbol)
   # Credentials
   api_key: "${KRAKEN_API_KEY}"
