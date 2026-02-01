@@ -1,0 +1,144 @@
+# Safety Invariants Configuration
+# ================================
+# These are the hard limits that trigger system state changes.
+# Violation of CRITICAL thresholds will HALT the system.
+# Violation of WARNING thresholds will trigger DEGRADED mode.
+#
+# IMPORTANT: Changes to these values affect production safety!
+# Review carefully before modifying.
+
+safety:
+  invariants:
+    # ===== EQUITY-BASED LIMITS =====
+    
+    # Maximum drawdown from peak equity (CRITICAL)
+    # If equity drops more than this % from peak, system HALTS
+    # Example: 0.15 = 15% drawdown triggers halt
+    max_equity_drawdown_pct: 0.15
+    
+    # Warning level for drawdown (triggers DEGRADED)
+    # System will stop new entries but allow management
+    degraded_equity_drawdown_pct: 0.10
+    
+    # Optional absolute minimum equity floor in USD
+    # If equity drops below this, system HALTS regardless of drawdown
+    # Set to null to disable
+    min_equity_floor_usd: null  # e.g., 5000
+
+    # ===== EXPOSURE-BASED LIMITS =====
+    
+    # Maximum total notional exposure in USD (CRITICAL)
+    # Sum of all open position notional values
+    max_open_notional_usd: 500000
+    
+    # Maximum number of concurrent positions (CRITICAL)
+    max_concurrent_positions: 10
+    
+    # Warning level for concurrent positions (triggers DEGRADED)
+    degraded_concurrent_positions: 8
+    
+    # Maximum margin utilization (CRITICAL)
+    # Used margin / total margin
+    max_margin_utilization_pct: 0.85
+    
+    # Warning level for margin utilization (triggers DEGRADED)
+    degraded_margin_utilization_pct: 0.70
+    
+    # Maximum single position as % of equity
+    # Prevents over-concentration in one asset
+    max_single_position_pct_equity: 0.25
+
+    # ===== OPERATIONAL LIMITS =====
+    
+    # Maximum rejected orders per cycle (WARNING)
+    # High rejections indicate execution problems
+    max_rejected_orders_per_cycle: 5
+    
+    # Maximum API errors per minute (CRITICAL)
+    # High errors indicate connectivity issues
+    max_api_errors_per_minute: 10
+    
+    # Maximum acceptable API latency in ms
+    max_latency_ms: 5000
+
+  # ===== CYCLE GUARD SETTINGS =====
+  cycle_guard:
+    # Minimum time between trading cycles in seconds
+    min_cycle_interval_seconds: 60
+    
+    # Maximum allowed cycle duration in seconds
+    # Stale cycles are force-completed after this
+    max_cycle_duration_seconds: 300
+    
+    # Maximum age of candle data in seconds
+    # Older candles are considered stale
+    max_candle_age_seconds: 120
+    
+    # Maximum allowed clock skew in seconds
+    # Candles from the future are rejected
+    max_clock_skew_seconds: 30
+
+  # ===== POSITION DELTA RECONCILIATION =====
+  reconciliation:
+    # Minimum delta size to act on (USD)
+    # Deltas below this are ignored (dust prevention)
+    min_delta_threshold_usd: 10
+    
+    # Maximum delta per single order (USD)
+    # Large deltas will be capped
+    max_delta_per_order_usd: 50000
+    
+    # Maximum position change per order as % of current
+    max_delta_pct_of_position: 0.5
+
+  # ===== DECISION AUDIT =====
+  audit:
+    # Maximum decisions to buffer before flush
+    max_buffer_size: 100
+    
+    # Enable detailed logging of all decisions
+    enable_detailed_logging: true
+
+# ===== ENVIRONMENT-SPECIFIC OVERRIDES =====
+# These values override the defaults for specific environments
+
+environments:
+  # Production settings (most conservative)
+  prod:
+    invariants:
+      max_equity_drawdown_pct: 0.15
+      max_open_notional_usd: 500000
+      max_concurrent_positions: 10
+    cycle_guard:
+      min_cycle_interval_seconds: 60
+    reconciliation:
+      min_delta_threshold_usd: 50
+
+  # Paper trading (more relaxed for testing)
+  paper:
+    invariants:
+      max_equity_drawdown_pct: 0.25
+      max_open_notional_usd: 1000000
+      max_concurrent_positions: 20
+    cycle_guard:
+      min_cycle_interval_seconds: 30
+
+  # Development (most relaxed)
+  dev:
+    invariants:
+      max_equity_drawdown_pct: 0.50
+      max_open_notional_usd: 10000000
+      max_concurrent_positions: 50
+    cycle_guard:
+      min_cycle_interval_seconds: 5
+      max_candle_age_seconds: 300
+
+  # Local testing
+  local:
+    invariants:
+      max_equity_drawdown_pct: 0.50
+      max_open_notional_usd: 10000000
+      max_concurrent_positions: 50
+    cycle_guard:
+      min_cycle_interval_seconds: 1
+      max_candle_age_seconds: 600
