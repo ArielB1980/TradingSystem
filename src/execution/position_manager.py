@@ -2,6 +2,23 @@
 Position Manager.
 Implements Active Trade Management Rules (1-12).
 """
+import os
+
+
+def _is_prod_live() -> bool:
+    env = (os.getenv("ENVIRONMENT", "") or "").strip().lower()
+    dry = (os.getenv("DRY_RUN", os.getenv("SYSTEM_DRY_RUN", "0")) or "").strip().lower()
+    is_dry = dry in ("1", "true", "yes", "y", "on")
+    return env == "prod" and not is_dry
+
+
+# Legacy position manager must never run in production live.
+if _is_prod_live():
+    raise RuntimeError(
+        "Legacy PositionManager is disabled in production live. "
+        "Use LiveTrading with USE_STATE_MACHINE_V2=true."
+    )
+
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum

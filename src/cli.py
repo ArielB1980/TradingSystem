@@ -9,6 +9,11 @@ from typing import Optional
 from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
+
+# Explicit dotenv loading for local/dev. In prod this is a no-op.
+from src.config.dotenv_loader import load_dotenv_files
+load_dotenv_files()
+
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
 from src.storage.db import init_db
@@ -187,6 +192,20 @@ def live(
             bold=True,
         )
         raise typer.Abort()
+
+    # Production live guardrails (env-driven, fail fast)
+    try:
+        from src.runtime.guards import assert_prod_live_prereqs
+
+        assert_prod_live_prereqs()
+    except Exception as e:
+        logger.critical(
+            "PROD_LIVE_GUARD_FAILED",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
+        raise typer.Exit(1)
     
     # Safety gates
     if config.live.require_paper_success and not force:
@@ -263,6 +282,97 @@ def live(
         time.sleep(1)
         logger.info("Worker health server started", host=health_host, port=port, log_level=health_log_level)
 
+    # Prod-live distributed lock (one trading process per account)
+    # Acquire before importing the live runtime so we fail fast on duplicate workers.
+    prod_lock = None
+    try:
+        from src.runtime.guards import (
+            acquire_prod_live_lock,
+            account_fingerprint,
+            confirm_live_env,
+            is_prod_live_env,
+            is_dry_run_env,
+            use_state_machine_v2_env,
+        )
+        from src.runtime.startup_identity import sanitize_for_logging, stable_sha256_hex
+        from src.config.config import CONFIG_SCHEMA_VERSION
+
+        exchange_name = getattr(getattr(config, "exchange", None), "name", None) or "kraken"
+        prod_lock = acquire_prod_live_lock(exchange_name=str(exchange_name), market_type="futures")
+
+        # Startup identity banner (pre-runtime): runtime + env fingerprint + config hash
+        try:
+            cfg_obj = sanitize_for_logging(config.model_dump())
+            config_hash = stable_sha256_hex(cfg_obj)[:12]
+        except Exception:
+            config_hash = "unknown"
+
+        git_sha = os.getenv("GIT_SHA") or os.getenv("GITHUB_SHA") or "unknown"
+        strategy_id = os.getenv("STRATEGY_ID") or git_sha
+        prod_safe_mode = (os.getenv("PROD_LIVE_SAFE_MODE") or "").strip().upper() == "YES"
+
+        db_ident = prod_lock.db_identity() if prod_lock is not None else {}
+        db_schema = prod_lock.schema_fingerprint() if prod_lock is not None else None
+
+        logger.info(
+            "STARTUP_IDENTITY",
+            runtime="LiveTrading",
+            pid=os.getpid(),
+            env=os.getenv("ENVIRONMENT", "unknown"),
+            is_prod_live=is_prod_live_env(),
+            dry_run=is_dry_run_env(),
+            use_state_machine_v2=use_state_machine_v2_env(),
+            prod_live_safe_mode=prod_safe_mode,
+            git_sha=git_sha,
+            strategy_id=strategy_id,
+            config_version=getattr(getattr(config, "system", None), "version", "unknown"),
+            config_schema_version=CONFIG_SCHEMA_VERSION,
+            config_hash=config_hash,
+            exchange=str(exchange_name),
+            market_type="futures",
+            account_fingerprint=account_fingerprint(),
+            lock_key_short=getattr(prod_lock, "lock_key_short", None),
+            db_host=db_ident.get("db_host"),
+            db_port=db_ident.get("db_port"),
+            db_name=db_ident.get("db_name"),
+            db_user=db_ident.get("db_user"),
+            db_schema_hash=db_schema or "unknown",
+            replacement_enabled=bool(getattr(getattr(config, "risk", None), "replacement_enabled", False)),
+        )
+
+        # Prod invariant report (best-effort, fail-closed is enforced by runtime guards)
+        db_reachable = False
+        try:
+            if prod_lock is not None:
+                prod_lock.ping()
+                db_reachable = True
+        except Exception:
+            db_reachable = False
+
+        try:
+            from src.utils.kill_switch import KillSwitch
+            ks = KillSwitch()
+            ks_status = ks.get_status()
+        except Exception:
+            ks_status = {"active": None, "latched": None, "reason": None}
+
+        logger.critical(
+            "PROD_INVARIANT_REPORT",
+            lock_acquired=bool(prod_lock is not None),
+            lock_key_short=getattr(prod_lock, "lock_key_short", None),
+            confirm_live=confirm_live_env(),
+            v2_enabled=use_state_machine_v2_env(),
+            dotenv_policy="disabled_in_prod",
+            kill_switch_active=ks_status.get("active"),
+            kill_switch_latched=ks_status.get("latched"),
+            db_reachable=db_reachable,
+            exchange_reachable="unknown_pre_runtime",
+            time_sync="unknown_best_effort",
+        )
+    except Exception as e:
+        logger.critical("Failed to acquire prod-live lock", error=str(e), error_type=type(e).__name__, exc_info=True)
+        raise typer.Exit(1)
+
     # Initialize live trading engine
     import asyncio
     import traceback
@@ -305,6 +415,13 @@ def live(
         traceback.print_exc(file=sys.stderr)
         print("=" * 80, file=sys.stderr)
         raise typer.Exit(1)
+    finally:
+        try:
+            if prod_lock is not None:
+                prod_lock.release()
+        except Exception:
+            # Best effort: don't mask the original exception during shutdown.
+            pass
 
 
 @app.command()

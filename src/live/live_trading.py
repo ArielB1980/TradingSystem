@@ -1,7 +1,8 @@
 import asyncio
+import os
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, TYPE_CHECKING
 
 from src.config.config import Config
 from src.services.market_discovery import MarketDiscoveryService
@@ -14,7 +15,6 @@ from src.risk.risk_manager import RiskManager
 from src.execution.executor import Executor
 from src.execution.futures_adapter import FuturesAdapter
 from src.execution.execution_engine import ExecutionEngine
-from src.execution.position_manager import PositionManager, ActionType, ManagementAction
 # Production-Grade Position State Machine
 from src.execution.position_state_machine import (
     ManagedPosition,
@@ -50,6 +50,13 @@ from src.reconciliation.reconciler import Reconciler
 
 logger = get_logger(__name__)
 
+if TYPE_CHECKING:
+    from src.execution.position_manager import (
+        ActionType as LegacyActionType,
+        ManagementAction as LegacyManagementAction,
+        PositionManager as LegacyPositionManager,
+    )
+
 def _exchange_position_side(pos_data: Dict[str, Any]) -> str:
     """
     Determine position side from exchange position dict.
@@ -84,10 +91,13 @@ class LiveTrading:
     def __init__(self, config: Config):
         """Initialize live trading."""
         self.config = config
+
+        # ========== POSITION STATE MACHINE V2 ==========
+        # Feature flag for gradual rollout (prod live hard-requires via runtime guard)
+        self.use_state_machine_v2 = os.getenv("USE_STATE_MACHINE_V2", "false").lower() == "true"
         
         # CRITICAL: Runtime assertion - detect test mocks in production
         import sys
-        import os
         from unittest.mock import Mock, MagicMock
         
         # Check if we're in a test environment
@@ -167,7 +177,7 @@ class LiveTrading:
             logger.info("ShockGuard enabled")
         self.executor = Executor(config.execution, self.futures_adapter)
         self.execution_engine = ExecutionEngine(config)
-        self.position_manager = PositionManager()
+        self.position_manager: Optional["LegacyPositionManager"] = None
         self.kill_switch = KillSwitch(self.client)
         self.market_discovery = MarketDiscoveryService(self.client, config)
         self._last_discovery_error_log_time: Optional[datetime] = None
@@ -197,11 +207,6 @@ class LiveTrading:
                 exit_cost=config.risk.auction_exit_cost,
             )
             logger.info("Auction mode enabled", max_positions=limits.max_positions)
-        
-        # ========== POSITION STATE MACHINE V2 ==========
-        # Feature flag for gradual rollout
-        import os
-        self.use_state_machine_v2 = os.getenv("USE_STATE_MACHINE_V2", "false").lower() == "true"
         
         if self.use_state_machine_v2:
             logger.critical("🚀 POSITION STATE MACHINE V2 ENABLED")
@@ -236,9 +241,12 @@ class LiveTrading:
             self._protection_monitor = None
             self._protection_task = None
             self._order_poll_task = None
+            # Legacy manager is only constructed when V2 is disabled
+            from src.execution.position_manager import PositionManager as LegacyPositionManagerImpl
+            self.position_manager = LegacyPositionManagerImpl()
         
-        # State (Legacy - will be deprecated when V2 fully enabled)
-        self.managed_positions: Dict[str, Position] = {}  # Active Trade Management State
+        # Legacy in-memory state (only in legacy mode)
+        self.managed_positions: Optional[Dict[str, Position]] = {} if not self.use_state_machine_v2 else None
         self.active = False
         
         # Candle data managed by dedicated service
@@ -472,6 +480,34 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Position State Machine V2 startup failed", error=str(e))
 
+            # 2.6 Startup takeover & protect (V2 authoritative pass)
+            # In V2 mode, do not use the legacy Reconciler (DB-only) as the source of truth.
+            if (
+                self.use_state_machine_v2
+                and self.execution_gateway
+                and not (self.config.system.dry_run and not self.client.has_valid_futures_credentials())
+            ):
+                _recon_cfg = getattr(self.config, "reconciliation", None)
+                if _recon_cfg and getattr(_recon_cfg, "reconcile_enabled", True):
+                    try:
+                        from src.execution.production_takeover import ProductionTakeover, TakeoverConfig
+                        takeover = ProductionTakeover(
+                            self.execution_gateway,
+                            TakeoverConfig(
+                                takeover_stop_pct=Decimal(str(os.getenv("TAKEOVER_STOP_PCT", "0.02"))),
+                                stop_replace_atomically=True,
+                                dry_run=bool(self.config.system.dry_run),
+                            ),
+                        )
+                        logger.critical("Running startup takeover (V2)...")
+                        stats = await takeover.execute_takeover()
+                        logger.critical("Startup takeover complete", **stats)
+                        self.last_recon_time = datetime.now(timezone.utc)
+                    except Exception as ex:
+                        logger.critical("Startup takeover failed", error=str(ex), exc_info=True)
+                        if not self.config.system.dry_run:
+                            raise
+
             # 2.6 PositionProtectionMonitor (Invariant K) - periodic check when V2 live
             if (
                 self.use_state_machine_v2
@@ -485,7 +521,7 @@ class LiveTrading:
                         self.client, self.position_registry, enforcer
                     )
                     self._protection_task = asyncio.create_task(
-                        self._protection_monitor.run_periodic_check(interval_seconds=30)
+                        self._run_protection_checks(interval_seconds=30)
                     )
                     logger.info("PositionProtectionMonitor started (interval=30s)")
                 except Exception as e:
@@ -502,11 +538,13 @@ class LiveTrading:
                     logger.error("Failed to start order poller", error=str(e))
 
             # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt or force_close)
-            if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
+            if (not self.use_state_machine_v2) and not (
+                self.config.system.dry_run and not self.client.has_valid_futures_credentials()
+            ):
                 _recon_cfg = getattr(self.config, "reconciliation", None)
                 if _recon_cfg and getattr(_recon_cfg, "reconcile_enabled", True):
                     try:
-                        logger.info("Running startup reconciliation...")
+                        logger.info("Running startup reconciliation (legacy)...")
                         recon = self._build_reconciler()
                         await recon.reconcile_all()
                         self.last_recon_time = datetime.now(timezone.utc)
@@ -602,8 +640,13 @@ class LiveTrading:
                     run_after_orders = getattr(self, "_reconcile_requested", False)
                     if run_after_orders or (now - self.last_recon_time).total_seconds() >= recon_interval:
                         try:
-                            recon = self._build_reconciler()
-                            await recon.reconcile_all()
+                            if self.use_state_machine_v2 and self.execution_gateway:
+                                # V2: reconcile against registry/exchange (no DB-only authority)
+                                res = await self.execution_gateway.sync_with_exchange()
+                                logger.info("V2 sync_with_exchange complete", **res)
+                            else:
+                                recon = self._build_reconciler()
+                                await recon.reconcile_all()
                             self.last_recon_time = now
                             if run_after_orders:
                                 self._reconcile_requested = False
@@ -668,6 +711,33 @@ class LiveTrading:
                 raise
             except Exception as e:
                 logger.warning("Order poll failed", error=str(e))
+
+    async def _run_protection_checks(self, interval_seconds: int = 30) -> None:
+        """
+        V2 protection monitor loop with escalation policy.
+
+        If a naked position is detected in prod live, fail closed by activating the kill switch
+        (emergency flatten).
+        """
+        while self.active:
+            await asyncio.sleep(interval_seconds)
+            if not self.active:
+                break
+            if not getattr(self, "_protection_monitor", None):
+                continue
+            try:
+                results = await self._protection_monitor.check_all_positions()
+                naked = [s for s, ok in results.items() if not ok]
+                if naked:
+                    logger.critical("NAKED_POSITIONS_DETECTED", naked_symbols=naked, details=results)
+                    is_prod_live = (os.getenv("ENVIRONMENT", "").strip().lower() == "prod") and (not self.config.system.dry_run)
+                    if is_prod_live:
+                        await self.kill_switch.activate(KillSwitchReason.RECONCILIATION_FAILURE, emergency=True)
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Protection check loop failed", error=str(e), error_type=type(e).__name__)
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
@@ -778,23 +848,45 @@ class LiveTrading:
         from src.storage.repository import get_active_positions, async_record_event
         
         unprotected = []
-        
-        # Check managed_positions (in-memory state)
-        for symbol, pos in self.managed_positions.items():
-            if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
-                unprotected.append({
-                    'symbol': symbol,
-                    'source': 'managed_positions',
-                    'reason': pos.protection_reason or 'UNKNOWN',
-                    'has_sl_price': pos.initial_stop_price is not None,
-                    'has_sl_order': pos.stop_loss_order_id is not None,
-                    'is_protected': pos.is_protected
-                })
+
+        tracked_symbols: set[str] = set()
+
+        # V2: Check registry state (authoritative)
+        if self.use_state_machine_v2 and self.position_registry:
+            for p in self.position_registry.get_all_active():
+                tracked_symbols.add(p.symbol)
+                # Minimal protection invariants (full takeover invariants are handled elsewhere)
+                has_stop_price = p.current_stop_price is not None
+                has_stop_order = p.stop_order_id is not None
+                is_protected = bool(has_stop_price and has_stop_order)
+                if not is_protected:
+                    unprotected.append({
+                        "symbol": p.symbol,
+                        "source": "registry_v2",
+                        "reason": "MISSING_STOP",
+                        "has_sl_price": has_stop_price,
+                        "has_sl_order": has_stop_order,
+                        "is_protected": is_protected,
+                    })
+        else:
+            # Legacy: Check managed_positions (in-memory state)
+            assert self.managed_positions is not None, "managed_positions must exist in legacy mode"
+            for symbol, pos in self.managed_positions.items():
+                tracked_symbols.add(symbol)
+                if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
+                    unprotected.append({
+                        'symbol': symbol,
+                        'source': 'managed_positions',
+                        'reason': pos.protection_reason or 'UNKNOWN',
+                        'has_sl_price': pos.initial_stop_price is not None,
+                        'has_sl_order': pos.stop_loss_order_id is not None,
+                        'is_protected': pos.is_protected
+                    })
         
         # Also check DB positions (for positions not yet in managed_positions)
         db_positions = await asyncio.to_thread(get_active_positions)
         for pos in db_positions:
-            if pos.symbol not in self.managed_positions:
+            if pos.symbol not in tracked_symbols:
                 if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
                     unprotected.append({
                         'symbol': pos.symbol,
@@ -822,7 +914,8 @@ class LiveTrading:
             # Optional: Pause new opens (uncomment if desired)
             # self.trading_paused = True
         else:
-            logger.info("All positions are protected", total_positions=len(self.managed_positions) + len(db_positions))
+            total_tracked = len(tracked_symbols) + len(db_positions)
+            logger.info("All positions are protected", total_positions=total_tracked)
 
     async def _tick(self):
         """
@@ -1285,36 +1378,58 @@ class LiveTrading:
                     if position_data:
                         # Management Logic
                         symbol = position_data['symbol']
-                         # Ensure tracked
-                        if symbol not in self.managed_positions:
-                            # Load from DB first to preserve initial_stop_price
-                            from src.storage.repository import get_active_position
-                            db_pos = await asyncio.to_thread(get_active_position, symbol)
-                            orders_for_symbol = orders_by_symbol.get(normalize_symbol_for_position_match(symbol), [])
+
+                        # V2: State machine is the only authority.
+                        if self.use_state_machine_v2 and self.position_manager_v2 and self.execution_gateway:
+                            try:
+                                v2_actions = self.position_manager_v2.evaluate_position(
+                                    symbol=symbol,
+                                    current_price=mark_price,
+                                    current_atr=None,
+                                )
+                                if v2_actions:
+                                    await self.execution_gateway.execute_actions(v2_actions)
+                            except Exception as e:
+                                logger.error(
+                                    "V2 position evaluation failed",
+                                    symbol=symbol,
+                                    error=str(e),
+                                    error_type=type(e).__name__,
+                                )
+                        else:
+                            # Legacy: in-memory managed_positions + legacy manager actions
+                            assert self.managed_positions is not None, "managed_positions must exist in legacy mode"
+                            assert self.position_manager is not None, "position_manager must exist in legacy mode"
+                            # Ensure tracked
+                            if symbol not in self.managed_positions:
+                                # Load from DB first to preserve initial_stop_price
+                                from src.storage.repository import get_active_position
+                                db_pos = await asyncio.to_thread(get_active_position, symbol)
+                                orders_for_symbol = orders_by_symbol.get(normalize_symbol_for_position_match(symbol), [])
+                                
+                                self.managed_positions[symbol] = self._init_managed_position(
+                                    position_data,
+                                    mark_price,
+                                    db_pos=db_pos,
+                                    orders_for_symbol=orders_for_symbol
+                                )
                             
-                            self.managed_positions[symbol] = self._init_managed_position(
-                                position_data,
-                                mark_price,
-                                db_pos=db_pos,
-                                orders_for_symbol=orders_for_symbol
-                            )
-                        
-                        managed_pos = self.managed_positions[symbol]
-                        old_size = managed_pos.size
-                        managed_pos.current_mark_price = mark_price
-                        managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealized_pnl', 0))) # Key corrected from raw API
-                        managed_pos.size = Decimal(str(position_data['size']))
-                        
-                        # Update position in DB when size/margin changes (after reconciliation)
-                        if old_size != managed_pos.size or managed_pos.margin_used != Decimal(str(position_data.get('margin_used', 0))):
-                            managed_pos.margin_used = Decimal(str(position_data.get('margin_used', 0)))
-                            from src.storage.repository import save_position
-                            await asyncio.to_thread(save_position, managed_pos)
-                            logger.debug("Position updated after reconciliation", symbol=symbol, size=str(managed_pos.size))
-                        
-                        actions = self.position_manager.evaluate(managed_pos, mark_price)
-                        if actions:
-                            await self._execute_management_actions(symbol, actions, managed_pos)
+                            managed_pos = self.managed_positions[symbol]
+                            old_size = managed_pos.size
+                            managed_pos.current_mark_price = mark_price
+                            managed_pos.unrealized_pnl = Decimal(str(position_data.get('unrealized_pnl', 0))) # Key corrected from raw API
+                            managed_pos.size = Decimal(str(position_data['size']))
+                            
+                            # Update position in DB when size/margin changes (after reconciliation)
+                            if old_size != managed_pos.size or managed_pos.margin_used != Decimal(str(position_data.get('margin_used', 0))):
+                                managed_pos.margin_used = Decimal(str(position_data.get('margin_used', 0)))
+                                from src.storage.repository import save_position
+                                await asyncio.to_thread(save_position, managed_pos)
+                                logger.debug("Position updated after reconciliation", symbol=symbol, size=str(managed_pos.size))
+                            
+                            actions = self.position_manager.evaluate(managed_pos, mark_price)
+                            if actions:
+                                await self._execute_management_actions(symbol, actions, managed_pos)
                             
                     # ShockGuard: Skip signal generation if entries paused
                     if self.shock_guard and self.shock_guard.should_pause_entries():
@@ -1579,6 +1694,9 @@ class LiveTrading:
     async def _validate_position_protection_legacy(self):
         """CRITICAL: Ensure all open positions have stop loss orders (legacy method - replaced by _validate_position_protection)."""
         try:
+            if self.managed_positions is None:
+                logger.debug("Legacy protection validation skipped (V2 enabled)")
+                return
             all_positions = await self.client.get_all_futures_positions()
             
             for pos in all_positions:
@@ -1723,7 +1841,7 @@ class LiveTrading:
                 try:
                     await self.client.close_position(decision.close_symbol)
                     # Force remove from local state to clear slot immediately
-                    if decision.close_symbol in self.managed_positions:
+                    if self.managed_positions is not None and decision.close_symbol in self.managed_positions:
                         del self.managed_positions[decision.close_symbol]
                     # Also update RiskManager immediately
                     self.risk_manager.current_positions = [
@@ -1867,6 +1985,7 @@ class LiveTrading:
                  protection_reason=protection_reason
              )
              
+             assert self.managed_positions is not None, "managed_positions must exist in legacy mode"
              self.managed_positions[futures_symbol] = position_state
              logger.info("Position State initialized", symbol=futures_symbol)
              
@@ -2150,8 +2269,9 @@ class LiveTrading:
             original_size=Decimal(str(exchange_data['size'])),
         )
 
-    async def _execute_management_actions(self, symbol: str, actions: List[ManagementAction], position: Position):
-        """Execute logic actions decided by PositionManager."""
+    async def _execute_management_actions(self, symbol: str, actions: List["LegacyManagementAction"], position: Position):
+        """Execute logic actions decided by legacy PositionManager."""
+        from src.execution.position_manager import ActionType
         for action in actions:
             logger.info(f"Management Action: {action.type.value}", symbol=symbol, reason=action.reason)
             
@@ -2411,7 +2531,7 @@ class LiveTrading:
                     await self.client.close_position(symbol)
                     logger.info("Auction: Closed position", symbol=symbol)
                     # Remove from managed positions
-                    if symbol in self.managed_positions:
+                    if self.managed_positions is not None and symbol in self.managed_positions:
                         del self.managed_positions[symbol]
                 except Exception as e:
                     logger.error("Auction: Failed to close position", symbol=symbol, error=str(e))
@@ -2649,6 +2769,12 @@ class LiveTrading:
         """
         if not position or position.size == 0:
             return
+
+        # V2 uses state-machine-native management actions; legacy dynamic exits are disabled here.
+        if self.use_state_machine_v2:
+            return
+
+        from src.execution.position_manager import ActionType, ManagementAction
 
         actions = []
         
@@ -2949,7 +3075,7 @@ class LiveTrading:
                             await asyncio.to_thread(save_position, db_pos)
                             
                             # Also update managed_positions if it exists
-                            if symbol in self.managed_positions:
+                            if self.managed_positions is not None and symbol in self.managed_positions:
                                 self.managed_positions[symbol].stop_loss_order_id = sl_order_id
                                 if db_pos.initial_stop_price:
                                     self.managed_positions[symbol].is_protected = True

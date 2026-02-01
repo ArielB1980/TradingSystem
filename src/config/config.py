@@ -9,18 +9,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 from pathlib import Path
 from decimal import Decimal
-from dotenv import load_dotenv
 import os
 
-# Load .env first (default)
-load_dotenv()
-
-# Load .env.local if it exists (overrides .env)
-env_local_path = Path(__file__).parent.parent.parent / ".env.local"
-if env_local_path.exists():
-    load_dotenv(dotenv_path=env_local_path, override=True)
-
-
+CONFIG_SCHEMA_VERSION = "2026-02-01"
 
 class ExchangeConfig(BaseSettings):
     """Exchange configuration."""
@@ -87,6 +78,10 @@ class RiskConfig(BaseSettings):
     
     # Portfolio limits
     max_concurrent_positions: int = Field(default=2, ge=1, le=100)
+    replacement_enabled: bool = Field(
+        default=False,
+        description="If True, may close an existing position to make room for a new entry (disabled by default; not permitted in prod live unless explicitly enabled).",
+    )
     daily_loss_limit_pct: float = Field(default=0.02, ge=0.01, le=0.10)
     
     # Auction mode portfolio limits
@@ -440,8 +435,6 @@ class SystemConfig(BaseSettings):
 class Config(BaseSettings):
     """Main configuration class."""
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
     )

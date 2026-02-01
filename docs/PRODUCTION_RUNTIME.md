@@ -16,6 +16,23 @@ Data acquisition, strategy (SMC), risk, and execution all run inside the `LiveTr
 `python migrate_schema.py && python run.py live --force --with-health`  
 so the worker satisfies HTTP health checks. Use `python -m src.health` for a dedicated web component. Do **not** use `main_with_health` for the worker.
 
+## Production live safety requirements
+
+In production live trading, the runtime enforces these hard gates:
+
+- **Single-runtime + V2-only**:
+  - `ENVIRONMENT=prod`
+  - `DRY_RUN=0`
+  - `USE_STATE_MACHINE_V2=true`
+- **Explicit human confirmation**:
+  - `CONFIRM_LIVE=YES` (required even when `--force` is used)
+- **Single-process guard**:
+  - The worker acquires a **Postgres advisory lock** (account-scoped). If a second worker starts against the same account, it exits non-zero.
+- **Dotenv safety**:
+  - In `ENVIRONMENT=prod`, `.env` / `.env.local` are **not loaded** (secrets must come from the platform runtime env).
+- **Real-exchange tests are disabled**:
+  - Keep `RUN_REAL_EXCHANGE_TESTS=0` in prod workers.
+
 ## Deprecated / non-production
 
 ### `main.py` and `main_with_health.py`

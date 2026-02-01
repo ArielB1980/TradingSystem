@@ -92,8 +92,9 @@ async def main():
         print("   export TRADING_PARTIALS_ENABLED=false")
         print("   export TRADING_TRAILING_ENABLED=false")
         print("   export USE_STATE_MACHINE_V2=true")
+        print("   export CONFIRM_LIVE=YES")
         print("\n2. Start LiveTrading bot:")
-        print("   python -m src.main")
+        print("   python run.py live --force --with-health")
         print("="*50)
         
     finally:

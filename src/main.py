@@ -21,6 +21,13 @@ logger = get_logger("Main")
 
 async def main_async():
     setup_logging()
+    if os.getenv("ENVIRONMENT") == "prod":
+        logger.critical(
+            "main.py is NOT the production runtime. "
+            "Production uses run.py live → LiveTrading. "
+            "Refusing to start because ENVIRONMENT=prod."
+        )
+        sys.exit(1)
     logger.warning(
         "main.py (DataService+TradingService) is NOT the production runtime. "
         "Production uses run.py live → LiveTrading. See docs/PRODUCTION_RUNTIME.md."
