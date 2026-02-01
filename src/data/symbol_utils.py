@@ -24,6 +24,10 @@ def normalize_symbol_for_position_match(symbol: str) -> str:
     s = s.replace("PF_", "").replace("PI_", "").replace("FI_", "")
     s = s.split(":")[0]
     s = s.replace("/", "").replace("-", "").replace("_", "")
+    # Kraken base alias: XBT == BTC
+    # Normalize so PF_XBTUSD and BTC/USD:USD compare equal.
+    if s.startswith("XBT"):
+        s = "BTC" + s[3:]
     return s
 
 
