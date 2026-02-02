@@ -21,6 +21,7 @@ from src.execution.position_state_machine import (
     check_invariant,
     InvariantViolation
 )
+from src.data.symbol_utils import position_symbol_matches_order
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -275,11 +276,25 @@ class ProtectionEnforcer:
         # Check for valid stop order on exchange
         has_stop = False
         for order in exchange_orders:
-            if (order.get("symbol") == position.symbol and
-                order.get("type", "").lower() in ("stop", "stop_market", "stop_limit") and
-                order.get("status") == "open"):
-                has_stop = True
-                break
+            order_symbol = str(order.get("symbol") or "")
+            if not position_symbol_matches_order(position.symbol, order_symbol):
+                continue
+
+            otype = str(order.get("type") or "").lower()
+            if otype not in ("stop", "stop_market", "stop_limit", "stop-loss", "stop_loss", "stop-loss-limit"):
+                continue
+
+            # Defensive: if reduce-only is explicitly present and false, it's not protective.
+            reduce_only_present = any(k in order for k in ("reduceOnly", "reduce_only"))
+            reduce_only = bool(order.get("reduceOnly") or order.get("reduce_only") or False)
+            if reduce_only_present and not reduce_only:
+                continue
+
+            if str(order.get("status") or "").lower() != "open":
+                continue
+
+            has_stop = True
+            break
         
         if not has_stop:
             logger.critical(
