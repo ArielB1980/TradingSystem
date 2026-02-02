@@ -1,16 +1,19 @@
 """
 Risk management for position sizing, leverage control, and safety limits.
 """
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 
 from src.domain.models import Signal, RiskDecision, Position, Side
-from src.config.config import RiskConfig
+from src.config.config import RiskConfig, TierConfig, LiquidityFilters
 from src.monitoring.logger import get_logger
 from src.storage.repository import record_event
 from src.risk.basis_guard import BasisGuard
+
+if TYPE_CHECKING:
+    from src.config.config import Config
 
 logger = get_logger(__name__)
 
@@ -21,16 +24,23 @@ class RiskManager:
     
     CRITICAL: Position sizing is independent of leverage.
     Leverage determines margin usage, not risk.
+    
+    Supports tier-based sizing when liquidity_filters is provided:
+    - Tier A (high liquidity): Full leverage and size limits
+    - Tier B (medium liquidity): Reduced leverage and size
+    - Tier C (low liquidity): Most conservative limits
     """
     
-    def __init__(self, config: RiskConfig):
+    def __init__(self, config: RiskConfig, *, liquidity_filters: Optional[LiquidityFilters] = None):
         """
         Initialize risk manager.
         
         Args:
             config: Risk configuration
+            liquidity_filters: Optional liquidity filters with tier configs for tier-based sizing
         """
         self.config = config
+        self.liquidity_filters = liquidity_filters
         
         # Portfolio state tracking
         self.current_positions: List[Position] = []
@@ -43,7 +53,14 @@ class RiskManager:
         
         self.cooldown_until: Optional[datetime] = None  # Time-based cooldown
         
-        logger.info("Risk Manager initialized", config=config.model_dump())
+        tier_info = "enabled" if liquidity_filters else "disabled"
+        logger.info("Risk Manager initialized", config=config.model_dump(), tier_based_sizing=tier_info)
+    
+    def get_tier_config(self, tier: str) -> Optional[TierConfig]:
+        """Get tier-specific config if liquidity_filters is set."""
+        if self.liquidity_filters:
+            return self.liquidity_filters.get_tier_config(tier)
+        return None
     
     def validate_trade(
         self,
@@ -57,6 +74,7 @@ class RiskManager:
         available_margin: Optional[Decimal] = None,
         notional_override: Optional[Decimal] = None,
         skip_margin_check: bool = False,
+        symbol_tier: Optional[str] = None,
     ) -> RiskDecision:
         """
         Validate proposed trade against all risk limits.
@@ -151,6 +169,21 @@ class RiskManager:
         # max_leverage is the absolute cap for safety checks (10x)
         requested_leverage = Decimal(str(getattr(self.config, 'target_leverage', self.config.max_leverage)))
         
+        # Apply tier-specific leverage cap if symbol_tier is provided
+        tier_config = self.get_tier_config(symbol_tier) if symbol_tier else None
+        tier_max_leverage = Decimal(str(tier_config.max_leverage)) if tier_config else None
+        tier_max_size = tier_config.max_position_size_usd if tier_config else None
+        
+        if tier_max_leverage and requested_leverage > tier_max_leverage:
+            logger.info(
+                "Applying tier leverage cap",
+                symbol=signal.symbol,
+                tier=symbol_tier,
+                original_leverage=str(requested_leverage),
+                tier_max_leverage=str(tier_max_leverage),
+            )
+            requested_leverage = tier_max_leverage
+        
         # Get sizing method (needed for later logic even if using override)
         sizing_method = getattr(self.config, 'sizing_method', 'fixed')
         
@@ -235,10 +268,22 @@ class RiskManager:
                 else:
                     logger.debug("Volatility Sizing skipped: atr_ratio missing in Signal")
             
-            # Hard Cap: Max Notional USD
+            # Hard Cap: Max Notional USD (use tier-specific cap if available)
             max_usd = Decimal(str(self.config.max_position_size_usd))
-            if position_notional > max_usd:
-                position_notional = max_usd
+            if tier_max_size and tier_max_size < max_usd:
+                effective_max_usd = tier_max_size
+                logger.debug(
+                    "Using tier max position size",
+                    symbol=signal.symbol,
+                    tier=symbol_tier,
+                    tier_max=str(tier_max_size),
+                    global_max=str(max_usd),
+                )
+            else:
+                effective_max_usd = max_usd
+            
+            if position_notional > effective_max_usd:
+                position_notional = effective_max_usd
 
         # Hard Cap: Max Leverage Buying Power (only if not using override)
         if notional_override is None:

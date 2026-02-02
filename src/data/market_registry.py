@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timezone
 
-from src.data.kraken_client import KrakenClient
+from src.data.kraken_client import KrakenClient, FuturesTicker
 from src.monitoring.logger import get_logger
 from src.data.fiat_currencies import has_disallowed_base
 
@@ -19,14 +19,18 @@ logger = get_logger(__name__)
 
 @dataclass
 class MarketPair:
-    """Validated spot→futures market pair."""
+    """Validated spot→futures market pair with liquidity tier."""
     spot_symbol: str           # e.g., "ETH/USD"
     futures_symbol: str        # e.g., "ETHUSD-PERP"
     spot_volume_24h: Decimal
-    futures_open_interest: Optional[Decimal]
-    spread_pct: Decimal
+    futures_open_interest: Decimal  # Now required (was Optional)
+    spot_spread_pct: Decimal   # Renamed from spread_pct for clarity
+    futures_spread_pct: Decimal  # NEW: Futures bid-ask spread
+    futures_volume_24h: Decimal  # NEW: 24h futures volume
+    funding_rate: Optional[Decimal]  # NEW: Current funding rate
     is_eligible: bool
     rejection_reason: Optional[str] = None
+    liquidity_tier: str = "C"  # NEW: "A", "B", or "C" tier
     last_updated: datetime = None
 
 
@@ -112,8 +116,11 @@ class MarketRegistry:
                 spot_symbol=base_quote,
                 futures_symbol=info["symbol"],
                 spot_volume_24h=Decimal("0"),
-                futures_open_interest=None,
-                spread_pct=Decimal("0"),
+                futures_open_interest=Decimal("0"),
+                spot_spread_pct=Decimal("0"),
+                futures_spread_pct=Decimal("0"),
+                futures_volume_24h=Decimal("0"),
+                funding_rate=None,
                 is_eligible=False,
                 last_updated=datetime.now(timezone.utc),
             )
@@ -142,8 +149,11 @@ class MarketRegistry:
                     spot_symbol=spot_symbol,
                     futures_symbol=futures_info['symbol'],
                     spot_volume_24h=Decimal("0"),  # To be filled by filters
-                    futures_open_interest=None,
-                    spread_pct=Decimal("0"),
+                    futures_open_interest=Decimal("0"),  # To be filled by filters
+                    spot_spread_pct=Decimal("0"),  # To be filled by filters
+                    futures_spread_pct=Decimal("0"),  # To be filled by filters
+                    futures_volume_24h=Decimal("0"),  # To be filled by filters
+                    funding_rate=None,  # To be filled by filters
                     is_eligible=False,  # Will be set by filters
                     last_updated=datetime.now(timezone.utc)
                 )
@@ -154,81 +164,144 @@ class MarketRegistry:
         return pairs
     
     async def _apply_filters(self, pairs: Dict[str, MarketPair]) -> Dict[str, MarketPair]:
-        """Apply liquidity and spread filters."""
+        """
+        Apply liquidity and spread filters using both spot and futures data.
+        
+        Filter modes:
+        - "futures_primary": Futures filters required, spot filters optional (recommended for perp trading)
+        - "spot_and_futures": Both spot and futures filters must pass
+        """
         eligible = {}
         filters = self.config.liquidity_filters
-
-        # Performance: fetch tickers in bulk instead of sequential per-symbol calls.
-        # Sequential filtering can take many minutes due to rate limiting and blocks startup.
+        filter_mode = getattr(filters, "filter_mode", "futures_primary")
+        
         symbols = list(pairs.keys())
-        tickers: Dict[str, dict] = {}
-        if symbols:
-            # Prefer bulk method when available.
-            if hasattr(self.client, "get_spot_tickers_bulk"):
-                try:
-                    tickers = await self.client.get_spot_tickers_bulk(symbols)
-                    logger.info(
-                        "Fetched spot tickers for discovery filters",
-                        requested=len(symbols),
-                        received=len(tickers),
-                    )
-                except Exception as e:
-                    # Fail closed: treat missing tickers as ineligible rather than stalling startup.
-                    logger.error("Bulk ticker fetch failed during discovery filters", error=str(e))
-                    tickers = {}
-            else:
-                # Backwards compatible fallback for mocks/older clients used in unit tests.
-                if hasattr(self.client, "get_spot_ticker"):
-                    async def _fetch(sym: str) -> tuple[str, Optional[dict]]:
-                        try:
-                            return sym, await self.client.get_spot_ticker(sym)
-                        except Exception:
-                            return sym, None
+        if not symbols:
+            return eligible
 
-                    results = await asyncio.gather(*[_fetch(s) for s in symbols], return_exceptions=False)
-                    tickers = {s: t for (s, t) in results if t}
-                else:
-                    logger.error("No spot ticker fetch method available for discovery filters")
-                    tickers = {}
+        # Fetch spot tickers (for spot filters and price reference)
+        spot_tickers: Dict[str, dict] = {}
+        if hasattr(self.client, "get_spot_tickers_bulk"):
+            try:
+                spot_tickers = await self.client.get_spot_tickers_bulk(symbols)
+                logger.info(
+                    "Fetched spot tickers for discovery filters",
+                    requested=len(symbols),
+                    received=len(spot_tickers),
+                )
+            except Exception as e:
+                logger.error("Bulk spot ticker fetch failed during discovery filters", error=str(e))
+                spot_tickers = {}
+        
+        # Fetch futures tickers (for futures filters - primary for perp trading)
+        futures_tickers: Dict[str, FuturesTicker] = {}
+        if hasattr(self.client, "get_futures_tickers_bulk_full"):
+            try:
+                futures_tickers = await self.client.get_futures_tickers_bulk_full()
+                logger.info(
+                    "Fetched futures tickers for discovery filters",
+                    count=len(futures_tickers),
+                )
+            except Exception as e:
+                logger.error("Bulk futures ticker fetch failed during discovery filters", error=str(e))
+                futures_tickers = {}
 
         for symbol, pair in pairs.items():
             try:
-                ticker = tickers.get(symbol)
-                if not ticker:
-                    pair.is_eligible = False
-                    pair.rejection_reason = "No ticker data (bulk fetch missing)"
-                    continue
-
-                volume_24h = Decimal(str(ticker.get('quoteVolume', 0)))
-                pair.spot_volume_24h = volume_24h
+                # --- FUTURES FILTERS (primary gate for futures_primary mode) ---
+                # Look up futures ticker by multiple formats
+                fticker = (
+                    futures_tickers.get(pair.futures_symbol) or
+                    futures_tickers.get(symbol) or
+                    futures_tickers.get(f"{symbol}:USD")
+                )
                 
-                # Check minimum volume
-                if volume_24h < filters.min_spot_volume_usd_24h:
+                if not fticker:
                     pair.is_eligible = False
-                    pair.rejection_reason = f"Volume ${volume_24h:,.0f} < ${filters.min_spot_volume_usd_24h:,.0f}"
+                    pair.rejection_reason = f"No futures ticker data for {pair.futures_symbol}"
                     continue
                 
-                # Check spread (if available)
-                bid = Decimal(str(ticker.get('bid', 0)))
-                ask = Decimal(str(ticker.get('ask', 0)))
-                if bid > 0 and ask > 0:
-                    spread_pct = (ask - bid) / bid
-                    pair.spread_pct = spread_pct
+                # Populate futures fields
+                pair.futures_open_interest = fticker.open_interest
+                pair.futures_volume_24h = fticker.volume_24h
+                pair.futures_spread_pct = fticker.spread_pct
+                pair.funding_rate = fticker.funding_rate
+                
+                # Check minimum futures open interest
+                min_oi = getattr(filters, "min_futures_open_interest", Decimal("0")) or Decimal("0")
+                if fticker.open_interest < min_oi:
+                    pair.is_eligible = False
+                    pair.rejection_reason = f"OI ${fticker.open_interest:,.0f} < ${min_oi:,.0f}"
+                    continue
+                
+                # Check futures spread
+                max_futures_spread = getattr(filters, "max_futures_spread_pct", Decimal("0.003")) or Decimal("0.003")
+                if fticker.spread_pct > max_futures_spread:
+                    pair.is_eligible = False
+                    pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_futures_spread:.2%}"
+                    continue
+                
+                # Check futures volume
+                min_futures_vol = getattr(filters, "min_futures_volume_usd_24h", Decimal("0")) or Decimal("0")
+                if fticker.volume_24h < min_futures_vol:
+                    pair.is_eligible = False
+                    pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_futures_vol:,.0f}"
+                    continue
+                
+                # Check funding rate (if configured)
+                max_funding = getattr(filters, "max_funding_rate_abs", None)
+                if max_funding and fticker.funding_rate is not None:
+                    if abs(fticker.funding_rate) > max_funding:
+                        pair.is_eligible = False
+                        pair.rejection_reason = f"Funding {fticker.funding_rate:.4%} > max {max_funding:.4%}"
+                        continue
+                
+                # --- SPOT FILTERS (optional in futures_primary mode) ---
+                spot_ticker = spot_tickers.get(symbol)
+                spot_filters_passed = True
+                spot_rejection_reason = None
+                
+                if spot_ticker:
+                    # Populate spot fields
+                    pair.spot_volume_24h = Decimal(str(spot_ticker.get('quoteVolume', 0)))
                     
-                    if spread_pct > filters.max_spread_pct:
-                        pair.is_eligible = False
-                        pair.rejection_reason = f"Spread {spread_pct:.2%} > {filters.max_spread_pct:.2%}"
-                        continue
+                    bid = Decimal(str(spot_ticker.get('bid', 0)))
+                    ask = Decimal(str(spot_ticker.get('ask', 0)))
+                    if bid > 0 and ask > 0:
+                        pair.spot_spread_pct = (ask - bid) / bid
+                    
+                    # Check spot volume
+                    min_spot_vol = getattr(filters, "min_spot_volume_usd_24h", Decimal("0")) or Decimal("0")
+                    if pair.spot_volume_24h < min_spot_vol:
+                        spot_filters_passed = False
+                        spot_rejection_reason = f"Spot vol ${pair.spot_volume_24h:,.0f} < ${min_spot_vol:,.0f}"
+                    
+                    # Check spot spread
+                    max_spot_spread = getattr(filters, "max_spread_pct", Decimal("0.002")) or Decimal("0.002")
+                    if spot_filters_passed and pair.spot_spread_pct > max_spot_spread:
+                        spot_filters_passed = False
+                        spot_rejection_reason = f"Spot spread {pair.spot_spread_pct:.2%} > {max_spot_spread:.2%}"
+                    
+                    # Check minimum price
+                    min_price = getattr(filters, "min_price_usd", Decimal("0.01")) or Decimal("0.01")
+                    last_price = Decimal(str(spot_ticker.get('last', 0)))
+                    if spot_filters_passed and last_price < min_price:
+                        spot_filters_passed = False
+                        spot_rejection_reason = f"Price ${last_price} < ${min_price}"
+                else:
+                    # No spot ticker - only fail if mode requires spot
+                    if filter_mode == "spot_and_futures":
+                        spot_filters_passed = False
+                        spot_rejection_reason = "No spot ticker data"
                 
-                # Check minimum price
-                if hasattr(filters, 'min_price_usd'):
-                    last_price = Decimal(str(ticker.get('last', 0)))
-                    if last_price < filters.min_price_usd:
-                        pair.is_eligible = False
-                        pair.rejection_reason = f"Price ${last_price} < ${filters.min_price_usd}"
-                        continue
+                # Apply filter mode logic
+                if filter_mode == "spot_and_futures" and not spot_filters_passed:
+                    pair.is_eligible = False
+                    pair.rejection_reason = spot_rejection_reason
+                    continue
                 
-                # Passed all filters
+                # Passed all required filters - classify tier and mark eligible
+                pair.liquidity_tier = self._classify_tier(pair)
                 pair.is_eligible = True
                 eligible[symbol] = pair
                 
@@ -237,7 +310,35 @@ class MarketRegistry:
                 pair.is_eligible = False
                 pair.rejection_reason = f"Filter error: {str(e)}"
         
+        # Log tier distribution
+        tier_counts = {"A": 0, "B": 0, "C": 0}
+        for p in eligible.values():
+            tier_counts[p.liquidity_tier] = tier_counts.get(p.liquidity_tier, 0) + 1
+        logger.info("Filtering complete", eligible=len(eligible), tier_distribution=tier_counts)
+        
         return eligible
+    
+    def _classify_tier(self, pair: MarketPair) -> str:
+        """
+        Classify market pair into liquidity tier based on futures metrics.
+        
+        Tier A: High liquidity (BTC/ETH/SOL tier) - full size/leverage
+        Tier B: Medium liquidity - reduced size/leverage
+        Tier C: Lower liquidity - restricted size/leverage
+        """
+        oi = pair.futures_open_interest or Decimal("0")
+        vol = pair.futures_volume_24h or Decimal("0")
+        spread = pair.futures_spread_pct or Decimal("1")
+        
+        # Tier A: High liquidity - OI >= $10M, vol >= $5M, spread <= 0.10%
+        if oi >= Decimal("10000000") and vol >= Decimal("5000000") and spread <= Decimal("0.0010"):
+            return "A"
+        # Tier B: Medium liquidity - OI >= $1M, vol >= $1M, spread <= 0.25%
+        elif oi >= Decimal("1000000") and vol >= Decimal("1000000") and spread <= Decimal("0.0025"):
+            return "B"
+        # Tier C: Lower liquidity (eligible but restricted)
+        else:
+            return "C"
     
     def get_eligible_markets(
         self, 

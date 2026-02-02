@@ -217,6 +217,40 @@ data:
   
   # Storage
   database_url: "${DATABASE_URL}"  # From environment variable
+
+## Liquidity Filters (Market Discovery)
+liquidity_filters:
+  # Spot filters
+  min_spot_volume_usd_24h: 1000000  # $1M minimum (relaxed from $5M)
+  max_spread_pct: 0.0020  # 0.20% spot spread (relaxed from 0.05%)
+  min_price_usd: 0.01  # Avoid dust coins
+  
+  # Futures-specific filters
+  min_futures_open_interest: 500000  # $500k OI minimum
+  max_futures_spread_pct: 0.0030  # 0.30% perp spread
+  min_futures_volume_usd_24h: 500000  # $500k futures volume
+  max_funding_rate_abs: 0.001  # 0.1% funding cap (absolute value)
+  
+  # Filter mode: "spot_and_futures" (both must pass), "futures_primary" (futures required, spot optional)
+  filter_mode: "futures_primary"
+  
+  # Tier-specific risk limits (A=high liquidity, B=medium, C=low)
+  tier_configs:
+    A:  # High liquidity (BTC, ETH, SOL tier)
+      max_leverage: 10.0
+      max_position_size_usd: 100000
+      slippage_cap_pct: 0.001
+      allow_live_trading: true
+    B:  # Medium liquidity
+      max_leverage: 5.0
+      max_position_size_usd: 50000
+      slippage_cap_pct: 0.002
+      allow_live_trading: true
+    C:  # Lower liquidity (restricted)
+      max_leverage: 2.0
+      max_position_size_usd: 25000
+      slippage_cap_pct: 0.003
+      allow_live_trading: true
   
 ## Reconciliation
 reconciliation:

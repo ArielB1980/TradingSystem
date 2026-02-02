@@ -107,6 +107,25 @@ class RateLimiter:
             await asyncio.sleep(0.1)
 
 
+@dataclass
+class FuturesTicker:
+    """Full futures ticker data for market discovery filtering."""
+    symbol: str  # Raw symbol (e.g., "PI_ETHUSD")
+    mark_price: Decimal
+    bid: Decimal
+    ask: Decimal
+    volume_24h: Decimal  # 24h volume in quote currency
+    open_interest: Decimal  # Open interest in contracts/notional
+    funding_rate: Optional[Decimal]  # Current funding rate (perpetuals only)
+    
+    @property
+    def spread_pct(self) -> Decimal:
+        """Calculate bid-ask spread as percentage."""
+        if self.bid > 0:
+            return (self.ask - self.bid) / self.bid
+        return Decimal("1")  # Fallback: 100% spread if no bid
+
+
 class KrakenClient:
     """
     Kraken REST API client for spot and futures markets.
@@ -754,6 +773,116 @@ class KrakenClient:
             return results
         except Exception as e:
             logger.error("Failed to fetch bulk futures tickers", error=str(e))
+            raise
+
+    async def get_futures_tickers_bulk_full(self) -> Dict[str, FuturesTicker]:
+        """
+        Get ALL futures tickers with full data for market discovery filtering.
+        
+        Returns dict keyed by multiple formats for each ticker:
+        - Original raw symbol (e.g., "PI_ETHUSD")
+        - PF_{BASE}USD format (e.g., "PF_ETHUSD")
+        - CCXT unified format (e.g., "ETH/USD:USD")
+        - BASE/USD format (e.g., "ETH/USD")
+        
+        Each value is a FuturesTicker with: mark_price, bid, ask, volume_24h, open_interest, funding_rate
+        """
+        await self.public_limiter.wait_for_token()
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/tickers"
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise Exception(f"Futures API error: {await response.text()}")
+                    data = await response.json()
+
+            results: Dict[str, FuturesTicker] = {}
+            
+            def derive_base(symbol: str) -> Optional[str]:
+                """Derive base currency from symbol (e.g., PI_THETAUSD -> THETA)."""
+                base = symbol.upper()
+                for prefix in ["PI_", "PF_", "FI_"]:
+                    if base.startswith(prefix):
+                        base = base[len(prefix):]
+                        break
+                if base.endswith("USD"):
+                    base = base[:-3]
+                if base == "XBT":
+                    base = "BTC"
+                return base if base else None
+            
+            for ticker in data.get("tickers", []):
+                raw_symbol = ticker.get("symbol")
+                if not raw_symbol:
+                    continue
+                
+                # Parse all fields with safe defaults
+                mark_price = Decimal(str(ticker.get("markPrice", 0) or 0))
+                bid = Decimal(str(ticker.get("bid", 0) or 0))
+                ask = Decimal(str(ticker.get("ask", 0) or 0))
+                volume_24h = Decimal(str(ticker.get("volumeQuote", 0) or ticker.get("volume", 0) or 0))
+                open_interest = Decimal(str(ticker.get("openInterest", 0) or 0))
+                
+                # Funding rate may be None for non-perpetuals
+                funding_raw = ticker.get("fundingRate") or ticker.get("funding_rate")
+                funding_rate = Decimal(str(funding_raw)) if funding_raw is not None else None
+                
+                ft = FuturesTicker(
+                    symbol=raw_symbol,
+                    mark_price=mark_price,
+                    bid=bid,
+                    ask=ask,
+                    volume_24h=volume_24h,
+                    open_interest=open_interest,
+                    funding_rate=funding_rate,
+                )
+                
+                # Store with raw key
+                results[raw_symbol] = ft
+                
+                # Derive base and create normalized keys
+                base = derive_base(raw_symbol)
+                if base:
+                    # Add PF_{BASE}USD format
+                    pf_key = f"PF_{base}USD"
+                    if pf_key not in results:
+                        results[pf_key] = ft
+                    
+                    # Add {BASE}/USD:USD (CCXT unified)
+                    ccxt_unified = f"{base}/USD:USD"
+                    if ccxt_unified not in results:
+                        results[ccxt_unified] = ft
+                    
+                    # Add {BASE}/USD (helper format)
+                    base_usd = f"{base}/USD"
+                    if base_usd not in results:
+                        results[base_usd] = ft
+
+            # Also add CCXT unified keys from exchange markets
+            if self.futures_exchange:
+                try:
+                    if not self.futures_exchange.markets:
+                        await self.futures_exchange.load_markets()
+                    for raw, ft in list(results.items()):
+                        raw_upper = str(raw).upper()
+                        for m in self.futures_exchange.markets.values():
+                            mid = m.get("id")
+                            if not mid:
+                                continue
+                            if str(mid).upper() == raw_upper:
+                                unified = m.get("symbol")
+                                if unified and unified not in results:
+                                    results[unified] = ft
+                                break
+                except Exception as e:
+                    logger.debug("Could not add CCXT keys to bulk full futures tickers", error=str(e))
+
+            logger.info("Fetched full futures tickers", count=len(results))
+            return results
+        except Exception as e:
+            logger.error("Failed to fetch bulk full futures tickers", error=str(e))
             raise
     
     async def get_account_balance(self) -> Dict[str, Decimal]:

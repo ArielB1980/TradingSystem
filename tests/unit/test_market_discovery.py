@@ -12,6 +12,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from src.data.market_registry import MarketRegistry, MarketPair
 
 
+from decimal import Decimal
+from src.data.kraken_client import FuturesTicker
+
+
 class FakeKrakenClient:
     """Client that exposes get_spot_markets/get_futures_markets only. No spot_exchange/futures_exchange."""
 
@@ -34,6 +38,28 @@ class FakeKrakenClient:
     async def get_spot_ticker(self, symbol: str):
         return {"quoteVolume": 10_000_000, "bid": 1, "ask": 1.001, "last": 1}
 
+    async def get_spot_tickers_bulk(self, symbols):
+        """Bulk spot tickers for filtering."""
+        return {s: {"quoteVolume": 10_000_000, "bid": 50000, "ask": 50010, "last": 50005} for s in symbols}
+
+    async def get_futures_tickers_bulk_full(self):
+        """Bulk futures tickers for filtering (new method)."""
+        tickers = {}
+        for spot_symbol, info in self._futures.items():
+            futures_symbol = info.get("symbol", f"PF_{spot_symbol.replace('/', '')}")
+            tickers[futures_symbol] = FuturesTicker(
+                symbol=futures_symbol,
+                mark_price=Decimal("50000"),
+                bid=Decimal("49995"),
+                ask=Decimal("50005"),
+                volume_24h=Decimal("100000000"),  # $100M - passes filters
+                open_interest=Decimal("50000000"),  # $50M - passes filters
+                funding_rate=Decimal("0.0001"),
+            )
+            # Also add spot symbol key for lookup
+            tickers[spot_symbol] = tickers[futures_symbol]
+        return tickers
+
     def __getattr__(self, name):
         if name in ("spot_exchange", "futures_exchange"):
             raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
@@ -46,9 +72,16 @@ def mock_config():
     c.exchange = MagicMock()
     c.exchange.allow_futures_only_universe = False
     c.liquidity_filters = MagicMock()
+    # Spot filters
     c.liquidity_filters.min_spot_volume_usd_24h = Decimal("1")
     c.liquidity_filters.max_spread_pct = Decimal("0.01")
-    c.liquidity_filters.min_price_usd = Decimal("0.001")  # avoid MagicMock in comparisons
+    c.liquidity_filters.min_price_usd = Decimal("0.001")
+    # Futures filters (new)
+    c.liquidity_filters.min_futures_open_interest = Decimal("1")  # Very low for testing
+    c.liquidity_filters.max_futures_spread_pct = Decimal("0.01")
+    c.liquidity_filters.min_futures_volume_usd_24h = Decimal("1")
+    c.liquidity_filters.max_funding_rate_abs = Decimal("0.01")
+    c.liquidity_filters.filter_mode = "futures_primary"
     return c
 
 
