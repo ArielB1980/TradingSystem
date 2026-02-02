@@ -94,7 +94,7 @@ async def main():
         print("   export USE_STATE_MACHINE_V2=true")
         print("   export CONFIRM_LIVE=YES")
         print("\n2. Start LiveTrading bot:")
-        print("   python run.py live --force --with-health")
+        print("   WITH_HEALTH=1 python -m src.entrypoints.prod_live")
         print("="*50)
         
     finally:

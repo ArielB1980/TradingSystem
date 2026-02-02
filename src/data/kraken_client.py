@@ -339,6 +339,14 @@ class KrakenClient:
                 logger.error(f"Failed to fetch spot ticker for {symbol}", error=str(e))
             raise
 
+    async def get_ticker(self, symbol: str) -> Dict[str, Any]:
+        """
+        Compatibility alias used by shared helpers (e.g. equity valuation).
+
+        Prefer `get_spot_ticker` elsewhere for clarity.
+        """
+        return await self.get_spot_ticker(symbol)
+
     async def get_spot_tickers_bulk(self, symbols: List[str]) -> Dict[str, Dict]:
         """
         Get spot tickers for multiple symbols in one call.
@@ -983,6 +991,32 @@ class KrakenClient:
         except Exception as e:
             logger.error("Failed to fetch futures balance", error=str(e))
             raise Exception(f"Futures API error: {str(e)}")
+
+    @retry_on_transient_errors(max_retries=3, base_delay=1.0)
+    async def get_futures_account_info(self) -> Dict[str, Any]:
+        """
+        Get a normalized futures account snapshot for risk/hardening checks.
+
+        Returns keys used by the production hardening pre-tick check:
+        - equity
+        - availableMargin
+        - marginUsed
+        """
+        balance = await self.get_futures_balance()
+        # Local import to keep module load lightweight and avoid circular imports.
+        from src.execution.equity import calculate_effective_equity
+
+        equity, available_margin, margin_used = await calculate_effective_equity(
+            balance,
+            base_currency="USD",
+            kraken_client=self,
+        )
+        return {
+            "equity": equity,
+            "availableMargin": available_margin,
+            "marginUsed": margin_used,
+            "balance": balance,
+        }
 
     async def get_futures_open_orders(self) -> List[Dict[str, Any]]:
         """

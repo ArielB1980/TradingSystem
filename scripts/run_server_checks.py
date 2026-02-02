@@ -3,7 +3,7 @@
 Server-side status checks. Run inside the worker container (e.g. DigitalOcean Console).
 
 - No DO API token, .env.local, or .venv required.
-- Uses only stdlib (urllib). Curls the worker health server (run.py live --with-health) on
+- Uses only stdlib (urllib). Curls the worker health server (prod-live entrypoint with WITH_HEALTH=1) on
   PORT (default 8080): GET / and GET /health.
 
 Usage (in worker container):

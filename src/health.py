@@ -6,12 +6,12 @@ Two FastAPI apps are provided:
    - Used by old "web" service (now removed, but kept for backwards compatibility)
    - Comprehensive health checks with kill switch and worker liveness
    
-2. `worker_health_app` - Worker-integrated health server (for `run.py live --with-health`)
-   - Used by worker service with --with-health flag
+2. `worker_health_app` - Worker-integrated health server (for `python -m src.entrypoints.prod_live` with `WITH_HEALTH=1`)
+   - Used by prod-live worker when `WITH_HEALTH=1`
    - Includes Streamlit dashboard proxy at /dashboard
    - Simpler health checks optimized for worker context
 
-Production uses: worker_health_app (via run.py live --with-health)
+Production uses: worker_health_app (via `python -m src.entrypoints.prod_live` with `WITH_HEALTH=1`)
 Legacy/standalone: app (via python -m src.health)
 """
 import html as html_module
@@ -111,7 +111,7 @@ def _start_streamlit():
 
 def get_worker_health_app(with_dashboard: bool = True, enable_debug: bool = False) -> FastAPI:
     """
-    Health app for worker (run.py live --with-health).
+    Health app for worker (prod-live entrypoint with `WITH_HEALTH=1`).
     Serves /, /health. Also /api, /api/health, /api/debug/signals, /debug/signals
     so the default app URL (which routes to worker) can serve debug endpoints.
     Optionally serves Streamlit dashboard at /dashboard.

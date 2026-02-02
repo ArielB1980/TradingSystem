@@ -19,7 +19,7 @@ def extract_script_path(run_command: str) -> str | None:
     Extract script path from run_command.
     
     Examples:
-        "python migrate_schema.py && python run.py live" -> "migrate_schema.py"
+        "python migrate_schema.py && python -m src.entrypoints.prod_live" -> "migrate_schema.py"
         "bash scripts/run.sh" -> "scripts/run.sh"
         "python -m src.module" -> None (module, not script)
     """

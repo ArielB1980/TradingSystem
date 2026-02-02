@@ -255,6 +255,10 @@ class LiveTrading:
         
         # Legacy in-memory state (only in legacy mode)
         self.managed_positions: Optional[Dict[str, Position]] = {} if not self.use_state_machine_v2 else None
+        # Hard invariant: V2 must not have any legacy authority objects.
+        if self.use_state_machine_v2:
+            assert self.position_manager is None, "V2 mode must not initialize legacy PositionManager"
+            assert self.managed_positions is None, "V2 mode must not initialize managed_positions"
         self.active = False
         
         # Candle data managed by dedicated service
@@ -604,11 +608,11 @@ class LiveTrading:
             # 4. Start Data Acquisition
             await self.data_acq.start()
             
-            # 4.5. Run first tick to hydrate managed_positions
+            # 4.5. Run first tick to hydrate runtime state
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
                 try:
                     await self._tick()
-                    logger.info("Initial tick completed - positions hydrated")
+                    logger.info("Initial tick completed - runtime state hydrated")
                 except Exception as e:
                     logger.error("Initial tick failed", error=str(e))
             
@@ -924,20 +928,23 @@ class LiveTrading:
                         'has_sl_order': pos.stop_loss_order_id is not None,
                         'is_protected': pos.is_protected
                     })
-        
-        # Also check DB positions (for positions not yet in managed_positions)
-        db_positions = await asyncio.to_thread(get_active_positions)
-        for pos in db_positions:
-            if pos.symbol not in tracked_symbols:
-                if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
-                    unprotected.append({
-                        'symbol': pos.symbol,
-                        'source': 'database',
-                        'reason': pos.protection_reason or 'UNKNOWN',
-                        'has_sl_price': pos.initial_stop_price is not None,
-                        'has_sl_order': pos.stop_loss_order_id is not None,
-                        'is_protected': pos.is_protected
-                    })
+
+        # Legacy-only: also check DB positions (for positions not yet in managed_positions).
+        # In V2 mode the registry + exchange are authoritative; DB is for dashboard/history only.
+        db_positions = []
+        if not self.use_state_machine_v2:
+            db_positions = await asyncio.to_thread(get_active_positions)
+            for pos in db_positions:
+                if pos.symbol not in tracked_symbols:
+                    if not pos.is_protected or not pos.initial_stop_price or not pos.stop_loss_order_id:
+                        unprotected.append({
+                            'symbol': pos.symbol,
+                            'source': 'database',
+                            'reason': pos.protection_reason or 'UNKNOWN',
+                            'has_sl_price': pos.initial_stop_price is not None,
+                            'has_sl_order': pos.stop_loss_order_id is not None,
+                            'is_protected': pos.is_protected
+                        })
         
         if unprotected:
             # This is actionable (positions lack protection) but is not a crash.
@@ -956,7 +963,7 @@ class LiveTrading:
             # Optional: Pause new opens (uncomment if desired)
             # self.trading_paused = True
         else:
-            total_tracked = len(tracked_symbols) + len(db_positions)
+            total_tracked = len(tracked_symbols) + (len(db_positions) if db_positions else 0)
             logger.info("All positions are protected", total_positions=total_tracked)
 
     async def _tick(self):

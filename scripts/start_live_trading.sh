@@ -42,7 +42,7 @@ echo "   Log file: $LOG_FILE"
 echo ""
 
 # Start with nohup to run in background
-nohup python3 run.py live --force > "$STDOUT_LOG" 2> "$STDERR_LOG" &
+nohup python3 -m src.entrypoints.prod_live > "$STDOUT_LOG" 2> "$STDERR_LOG" &
 PID=$!
 
 # Save PID

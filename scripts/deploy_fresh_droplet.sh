@@ -133,7 +133,7 @@ Requires=docker.service
 Type=simple
 User=trading
 WorkingDirectory=/home/trading/TradingSystem
-ExecStart=/home/trading/TradingSystem/venv/bin/python run.py live
+ExecStart=/home/trading/TradingSystem/venv/bin/python -m src.entrypoints.prod_live
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
