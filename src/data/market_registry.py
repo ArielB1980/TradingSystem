@@ -157,11 +157,32 @@ class MarketRegistry:
         """Apply liquidity and spread filters."""
         eligible = {}
         filters = self.config.liquidity_filters
-        
+
+        # Performance: fetch tickers in bulk instead of sequential per-symbol calls.
+        # Sequential filtering can take many minutes due to rate limiting and blocks startup.
+        symbols = list(pairs.keys())
+        tickers: Dict[str, dict] = {}
+        if symbols:
+            try:
+                tickers = await self.client.get_spot_tickers_bulk(symbols)
+                logger.info(
+                    "Fetched spot tickers for discovery filters",
+                    requested=len(symbols),
+                    received=len(tickers),
+                )
+            except Exception as e:
+                # Fail closed: treat missing tickers as ineligible rather than stalling startup.
+                logger.error("Bulk ticker fetch failed during discovery filters", error=str(e))
+                tickers = {}
+
         for symbol, pair in pairs.items():
             try:
-                # Fetch 24h volume
-                ticker = await self.client.get_spot_ticker(symbol)
+                ticker = tickers.get(symbol)
+                if not ticker:
+                    pair.is_eligible = False
+                    pair.rejection_reason = "No ticker data (bulk fetch missing)"
+                    continue
+
                 volume_24h = Decimal(str(ticker.get('quoteVolume', 0)))
                 pair.spot_volume_24h = volume_24h
                 
