@@ -226,10 +226,14 @@ class ProductionTakeover:
         stop_orders = []
         for o in orders:
             o_type = o.get("type", "").lower()
+            # Kraken/CCXT can vary on reduce-only fields. For classification, include stop orders
+            # even if reduce-only is missing (validated later in _enforce_protection).
+            reduce_only_present = any(k in o for k in ("reduceOnly", "reduce_only"))
             is_reduce_only = bool(o.get("reduceOnly") or o.get("reduce_only") or o.get("reduce_only", False))
-            if o_type in ["stop", "stop_market", "stop-loss", "stop-loss-limit"] and is_reduce_only:
-                # Basic validation: reduces position?
-                # Simplified check: just presence for now, Detailed validation in Step 4
+            if o_type in ["stop", "stop_market", "stop-loss", "stop-loss-limit"]:
+                if reduce_only_present and not is_reduce_only:
+                    # Explicitly non-reduce-only stops are not protective exits.
+                    continue
                 stop_orders.append(o)
         
         if not stop_orders:
@@ -285,14 +289,28 @@ class ProductionTakeover:
             qty = pos_data["qty"]
             raw_amt = existing_stop.get("amount", existing_stop.get("size", None))
             stop_qty = Decimal(str(raw_amt)) if raw_amt is not None else None
+            reduce_only_present = any(k in existing_stop for k in ("reduceOnly", "reduce_only"))
             reduce_only = bool(existing_stop.get("reduceOnly") or existing_stop.get("reduce_only") or False)
             
             is_valid = True
             
             # Reduce-only must be true for protective exits
             if not reduce_only:
-                logger.warning("Existing stop is not reduce-only; replacing", symbol=symbol, stop_id=existing_stop.get("id"))
-                is_valid = False
+                if reduce_only_present:
+                    logger.warning(
+                        "Existing stop is not reduce-only; replacing",
+                        symbol=symbol,
+                        stop_id=existing_stop.get("id"),
+                    )
+                    is_valid = False
+                else:
+                    # Field absent: treat as unknown and allow, but log for visibility.
+                    logger.warning(
+                        "Existing stop missing reduce-only flag; treating as protective for takeover",
+                        symbol=symbol,
+                        stop_id=existing_stop.get("id"),
+                    )
+                    reduce_only = True
             
             # Size check
             if not self._qty_matches_with_tolerance(stop_qty, qty):
@@ -305,7 +323,7 @@ class ProductionTakeover:
                     stop_price=stop_price,
                     stop_order_id=str(existing_stop.get("id")) if existing_stop.get("id") else None,
                     stop_qty=stop_qty,
-                    reduce_only=True,
+                    reduce_only=bool(reduce_only),
                     source="existing",
                     be_mode=be_mode,
                 )

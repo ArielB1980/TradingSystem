@@ -10,13 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
 
-# Explicit dotenv loading for local/dev. In prod this is a no-op.
-from src.config.dotenv_loader import load_dotenv_files
-load_dotenv_files()
-
-from src.config.config import load_config
-from src.monitoring.logger import setup_logging, get_logger
-from src.storage.db import init_db
+from src.monitoring.logger import get_logger
 
 app = typer.Typer(
     name="kraken-futures-smc",
@@ -25,6 +19,28 @@ app = typer.Typer(
 )
 
 logger = get_logger(__name__)
+
+
+def _load_config(config_path: Path):
+    """
+    Lazy import: keep config loading out of module import time.
+    """
+    from src.config.config import load_config
+
+    return load_config(str(config_path))
+
+
+def _setup_logging_from_config(config, *, log_file: Optional[Path] = None) -> None:
+    """
+    Lazy import: keep logging setup out of module import time.
+    """
+    from src.monitoring.logger import setup_logging
+
+    setup_logging(
+        config.monitoring.log_level,
+        config.monitoring.log_format,
+        log_file=str(log_file) if log_file else None,
+    )
 
 
 @app.command()
@@ -41,8 +57,8 @@ def backtest(
         python src/cli.py backtest --start 2024-01-01 --end 2024-12-31 --symbol ETH/USD
     """
     # Load configuration
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    config = _load_config(config_path)
+    _setup_logging_from_config(config)
     
     logger.info("Starting backtest", start=start, end=end, symbol=symbol)
     
@@ -113,8 +129,8 @@ def paper(
         python src/cli.py paper
     """
     # Load configuration
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    config = _load_config(config_path)
+    _setup_logging_from_config(config)
     
     # Validate environment
     if config.environment != "paper":
@@ -157,7 +173,7 @@ def live(
     """
     # Load configuration with error handling
     try:
-        config = load_config(str(config_path))
+        config = _load_config(config_path)
     except Exception as e:
         import sys
         import traceback
@@ -172,7 +188,7 @@ def live(
     
     # Setup logging (may fail if config is invalid)
     try:
-        setup_logging(config.monitoring.log_level, config.monitoring.log_format, log_file=str(log_file) if log_file else None)
+        _setup_logging_from_config(config, log_file=log_file)
     except Exception as e:
         import sys
         import traceback
@@ -195,7 +211,7 @@ def live(
 
     # Production live guardrails (env-driven, fail fast)
     try:
-        from src.runtime.guards import assert_prod_live_prereqs
+        from src.runtime.guards import assert_prod_live_prereqs, is_prod_live_env
 
         assert_prod_live_prereqs()
     except Exception as e:
@@ -206,6 +222,15 @@ def live(
             exc_info=True,
         )
         raise typer.Exit(1)
+
+    # Defense-in-depth: replacement must not be enabled in prod live unless explicitly overridden.
+    if is_prod_live_env() and bool(getattr(getattr(config, "risk", None), "replacement_enabled", False)):
+        if os.getenv("ALLOW_REPLACEMENT_IN_PROD", "").strip().upper() != "YES":
+            logger.critical(
+                "PROD_LIVE_REPLACEMENT_FORBIDDEN",
+                message="replacement_enabled=true is not permitted in prod live unless ALLOW_REPLACEMENT_IN_PROD=YES is set",
+            )
+            raise typer.Exit(1)
     
     # Safety gates
     if config.live.require_paper_success and not force:
@@ -438,8 +463,8 @@ def test(
     from src.test_system import run_all_tests
     
     # Load config for logging setup
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    config = _load_config(config_path)
+    _setup_logging_from_config(config)
     
     success = asyncio.run(run_all_tests())
     if not success:
@@ -560,8 +585,8 @@ def status(
         python src/cli.py status
     """
     # Load configuration
-    config = load_config(str(config_path))
-    setup_logging(config.monitoring.log_level, config.monitoring.log_format)
+    config = _load_config(config_path)
+    _setup_logging_from_config(config)
     
     typer.echo("System Status")
     typer.echo("=" * 50)

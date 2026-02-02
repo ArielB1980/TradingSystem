@@ -1,7 +1,7 @@
 """
 Main entry point: DataService + TradingService with embedded health API.
 
-DEPRECATED for production. Production uses run.py live → LiveTrading and
+DEPRECATED for production. Production uses python -m src.entrypoints.prod_live → LiveTrading and
 src.health for the web service. Exits with code 1 if ENVIRONMENT=prod.
 See docs/PRODUCTION_RUNTIME.md.
 """

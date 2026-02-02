@@ -69,7 +69,7 @@ python scripts/backfill_historical_data.py
 **Option C: Add to worker startup** (Recommended)
 Update `.do/app.yaml` (or your app spec) to run backfill on first deployment:
 ```yaml
-run_command: python scripts/backfill_historical_data.py && python migrate_schema.py && python run.py live --force
+run_command: python scripts/backfill_historical_data.py && python migrate_schema.py && python -m src.entrypoints.prod_live
 ```
 
 ## Expected Results

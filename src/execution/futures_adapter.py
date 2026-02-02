@@ -124,36 +124,43 @@ class FuturesAdapter:
         Returns:
             Best executable futures symbol, or None if not found
         """
-        # Priority 1: Check futures_tickers using centralized candidate list (BTC/XBT handled in symbol_utils).
-        # IMPORTANT: Prefer Kraken raw symbols (PF_/PI_/FI_) when available.
-        # Market discovery / CCXT sometimes produces nonstandard unified symbols like "ADA/USD:ADA".
-        # Using PF_* is always safe because KrakenClient.place_futures_order resolves market ID -> unified.
-        if futures_tickers:
-            candidates = futures_candidate_symbols(spot_symbol)
-            
-            def _cand_rank(s: str) -> int:
-                if not s:
-                    return 999
-                if s.startswith("PF_"):
-                    return 0
-                if s.startswith(("PI_", "FI_")):
-                    return 1
-                if "/USD:USD" in s:
-                    return 2
-                if s.endswith("USD") and "/" not in s:
-                    return 3
-                return 10
-            
-            for cand in sorted(candidates, key=_cand_rank):
-                if cand in futures_tickers:
-                    return cand
-        
-        # Priority 2: Discovery override (only if tickers didn't provide a usable candidate)
+        # Priority 1: Discovery override
         override = self.spot_to_futures_override.get(spot_symbol)
         if override:
             # If tickers provided, verify override exists
             if futures_tickers is None or override in futures_tickers:
                 return override
+
+        # Priority 2: Check futures_tickers using centralized candidate list (BTC/XBT handled in symbol_utils).
+        # Prefer CCXT unified symbol for unknown tickers; prefer PF_* for known/whitelisted tickers.
+        if futures_tickers:
+            candidates = futures_candidate_symbols(spot_symbol)
+            prefer_pf = spot_symbol in FuturesAdapter.TICKER_MAP
+
+            def _cand_rank(s: str) -> int:
+                if not s:
+                    return 999
+                if prefer_pf:
+                    if s.startswith("PF_"):
+                        return 0
+                    if s.startswith(("PI_", "FI_")):
+                        return 1
+                    if "/USD:USD" in s:
+                        return 2
+                else:
+                    if "/USD:USD" in s:
+                        return 0
+                    if s.startswith("PF_"):
+                        return 1
+                    if s.startswith(("PI_", "FI_")):
+                        return 2
+                if s.endswith("USD") and "/" not in s:
+                    return 3
+                return 10
+
+            for cand in sorted(candidates, key=_cand_rank):
+                if cand in futures_tickers:
+                    return cand
         
         # Priority 3: TICKER_MAP
         mapped = FuturesAdapter.TICKER_MAP.get(spot_symbol)

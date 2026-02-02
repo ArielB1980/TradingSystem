@@ -378,7 +378,7 @@ def print_summary(freshness_data, signal_stats, candle_data, health):
         print("✅ Live trading process is RUNNING")
     else:
         print("❌ Live trading process is NOT running")
-        print("   → Start with: python3 run.py live --force")
+        print("   → Start with: python3 -m src.entrypoints.prod_live")
     
     if health['latest_trace_age_minutes'] is not None:
         age = health['latest_trace_age_minutes']
@@ -403,7 +403,7 @@ def print_summary(freshness_data, signal_stats, candle_data, health):
     
     if not health['live_trading_running']:
         print("1. ❌ CRITICAL: Start live trading to update coin data")
-        print("   → python3 run.py live --force")
+        print("   → python3 -m src.entrypoints.prod_live")
         print()
     
     if len(freshness_data['dead']) > freshness_data['total'] * 0.5:

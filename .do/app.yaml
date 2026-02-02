@@ -21,7 +21,7 @@ services:
     github:
       repo: ArielB1980/TradingSystem
       branch: main
-    run_command: python migrate_schema.py && python run.py live --force --with-health
+    run_command: python migrate_schema.py && WITH_HEALTH=1 python -m src.entrypoints.prod_live
     http_port: 8080
     instance_count: 1
     instance_size_slug: basic-xs
