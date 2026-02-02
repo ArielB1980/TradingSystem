@@ -11,7 +11,7 @@ from pathlib import Path
 
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
-from src.data.market_registry import MarketRegistry
+from src.data.market_registry import MarketRegistry, MarketPair
 
 logger = get_logger(__name__)
 
@@ -99,3 +99,20 @@ class MarketDiscoveryService:
                 return data.get("markets", [])
         except Exception:
             return None
+    
+    def get_discovered_pairs(self) -> Dict[str, MarketPair]:
+        """
+        Get the full MarketPair objects from the last discovery.
+        Returns Dict[spot_symbol, MarketPair] with tier info.
+        """
+        return self._registry.discovered_pairs
+    
+    def get_symbol_tier(self, symbol: str) -> str:
+        """
+        Get the liquidity tier for a symbol.
+        Returns "C" (most conservative) if not found.
+        """
+        pair = self._registry.discovered_pairs.get(symbol)
+        if pair:
+            return pair.liquidity_tier
+        return "C"

@@ -39,7 +39,7 @@ class PaperTrading:
             api_secret=config.exchange.api_secret if hasattr(config.exchange, "api_secret") else "",
         )
         self.smc_engine = SMCEngine(config.strategy)
-        self.risk_manager = RiskManager(config.risk)
+        self.risk_manager = RiskManager(config.risk, liquidity_filters=config.liquidity_filters)
         self.basis_guard = BasisGuard(config.risk)
         self.execution = ExecutionEngine(config)
         

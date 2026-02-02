@@ -260,12 +260,60 @@ class CoinUniverseConfig(BaseSettings):
     liquidity_tiers: Dict[str, List[str]] = Field(default_factory=lambda: {"A": ["BTC/USD"], "B": [], "C": []})
     tier_max_leverage: Dict[str, float] = Field(default_factory=lambda: {"A": 10.0, "B": 5.0, "C": 2.0}) # Global cap still applies
 
+class TierConfig(BaseSettings):
+    """Per-tier risk limits for position sizing."""
+    max_leverage: float = Field(default=10.0)  # Maximum leverage for this tier
+    max_position_size_usd: Decimal = Field(default=Decimal("100000"))  # Maximum position size in USD
+    slippage_cap_pct: Decimal = Field(default=Decimal("0.001"))  # Maximum expected slippage
+    allow_live_trading: bool = Field(default=True)  # Whether live trading is allowed for this tier
+
+
+def _default_tier_configs() -> Dict[str, TierConfig]:
+    """Default tier configurations with conservative limits for lower tiers."""
+    return {
+        "A": TierConfig(
+            max_leverage=10.0,
+            max_position_size_usd=Decimal("100000"),
+            slippage_cap_pct=Decimal("0.001"),
+            allow_live_trading=True,
+        ),
+        "B": TierConfig(
+            max_leverage=5.0,
+            max_position_size_usd=Decimal("50000"),
+            slippage_cap_pct=Decimal("0.002"),
+            allow_live_trading=True,
+        ),
+        "C": TierConfig(
+            max_leverage=2.0,
+            max_position_size_usd=Decimal("25000"),
+            slippage_cap_pct=Decimal("0.003"),
+            allow_live_trading=True,
+        ),
+    }
+
+
 class LiquidityFilters(BaseSettings):
-    """Market eligibility filters."""
-    min_spot_volume_usd_24h: Decimal = Field(default=Decimal("5000000"))  # $5M minimum
-    min_futures_open_interest: Optional[Decimal] = None
-    max_spread_pct: Decimal = Field(default=Decimal("0.0005"))  # 0.05%
+    """Market eligibility filters with tier-based risk limits."""
+    # Spot filters
+    min_spot_volume_usd_24h: Decimal = Field(default=Decimal("1000000"))  # $1M minimum (relaxed from $5M)
+    max_spread_pct: Decimal = Field(default=Decimal("0.0020"))  # 0.20% spot spread (relaxed from 0.05%)
     min_price_usd: Decimal = Field(default=Decimal("0.01"))  # Avoid dust coins
+    
+    # Futures-specific filters
+    min_futures_open_interest: Decimal = Field(default=Decimal("500000"))  # $500k OI minimum
+    max_futures_spread_pct: Decimal = Field(default=Decimal("0.0030"))  # 0.30% perp spread
+    min_futures_volume_usd_24h: Decimal = Field(default=Decimal("500000"))  # $500k futures volume
+    max_funding_rate_abs: Optional[Decimal] = Field(default=Decimal("0.001"))  # 0.1% funding cap
+    
+    # Filter mode: "spot_and_futures" (both must pass), "futures_primary" (futures required, spot optional)
+    filter_mode: str = Field(default="futures_primary")
+    
+    # Tier-specific risk limits (A=high liquidity, B=medium, C=low)
+    tier_configs: Dict[str, TierConfig] = Field(default_factory=_default_tier_configs)
+    
+    def get_tier_config(self, tier: str) -> TierConfig:
+        """Get config for a tier, defaulting to tier C (most conservative) if not found."""
+        return self.tier_configs.get(tier, self.tier_configs.get("C", TierConfig()))
 
 
 class MultiTPConfig(BaseSettings):

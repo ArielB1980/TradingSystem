@@ -100,7 +100,7 @@ class BacktestEngine:
         
         # Strategy and risk components
         self.smc_engine = SMCEngine(config.strategy)
-        self.risk_manager = RiskManager(config.risk)
+        self.risk_manager = RiskManager(config.risk, liquidity_filters=config.liquidity_filters)
         self.basis_guard = BasisGuard(config.risk)
         self.execution = ExecutionEngine(config)
         

@@ -152,7 +152,7 @@ class LiveTrading:
         )
         
         self.smc_engine = SMCEngine(config.strategy)
-        self.risk_manager = RiskManager(config.risk)
+        self.risk_manager = RiskManager(config.risk, liquidity_filters=config.liquidity_filters)
         from src.execution.instrument_specs import InstrumentSpecRegistry
         self.instrument_spec_registry = InstrumentSpecRegistry(
             get_instruments_fn=self.client.get_futures_instruments,
@@ -1916,11 +1916,15 @@ class LiveTrading:
             }
 
         # 2. Risk Validation (Safety Gate)
+        # Get symbol tier for tier-specific sizing
+        symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+        
         decision = self.risk_manager.validate_trade(
             signal, equity, spot_price, mark_price,
             available_margin=available_margin,
             notional_override=notional_override,
             skip_margin_check=skip_margin_check,
+            symbol_tier=symbol_tier,
         )
         
         if not decision.approved:
@@ -2146,9 +2150,13 @@ class LiveTrading:
             logger.error("Insufficient equity for trading", equity=str(equity))
             return _fail("Insufficient equity for trading")
         # 2. Risk Validation (Safety Gate)
+        # Get symbol tier for tier-specific sizing
+        symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+        
         decision = self.risk_manager.validate_trade(
             signal, equity, spot_price, mark_price,
             available_margin=available_margin,
+            symbol_tier=symbol_tier,
         )
         
         if not decision.approved:
@@ -2580,9 +2588,13 @@ class LiveTrading:
                             spec_summary=None,
                         )
                         continue
+                    # Get symbol tier for tier-specific sizing
+                    symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+                    
                     decision = self.risk_manager.validate_trade(
                         signal, equity, spot_price, mark_price,
                         available_margin=auction_budget_margin,
+                        symbol_tier=symbol_tier,
                     )
                     if decision.position_notional > 0 and decision.margin_required > 0:
                         stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price if signal.stop_loss else Decimal("0")

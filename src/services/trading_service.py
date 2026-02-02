@@ -78,7 +78,7 @@ class TradingService:
             self.futures_adapter
         )
         self.execution_engine = ExecutionEngine(self.config)
-        self.risk_manager = RiskManager(self.config.risk)
+        self.risk_manager = RiskManager(self.config.risk, liquidity_filters=self.config.liquidity_filters)
         self.smc_engine = SMCEngine(self.config.strategy)
         
         # Position Management V2
