@@ -20,6 +20,7 @@ from src.execution.price_converter import PriceConverter
 from src.config.config import ExecutionConfig
 from src.monitoring.logger import get_logger
 from src.data.symbol_utils import normalize_symbol_for_position_match
+from src.data.fiat_currencies import has_disallowed_base
 
 logger = get_logger(__name__)
 
@@ -101,6 +102,28 @@ class Executor:
             
             synced_count = 0
             for order_data in open_orders_data:
+                # Safety cleanup: cancel any OPEN, non-reduce-only orders on fiat-base instruments.
+                # This prevents lingering forex orders (e.g., GBP/USD perps) from staying live after a config/universe fix.
+                try:
+                    sym = (order_data.get("symbol") or "").strip()
+                    reduce_only = bool(order_data.get("reduceOnly", False))
+                    status_str0 = (order_data.get("status") or "").lower()
+                    order_id0 = str(order_data.get("id", "") or "")
+                    if sym and has_disallowed_base(sym) and (not reduce_only) and status_str0 in ("open", "pending", "submitted"):
+                        logger.critical(
+                            "CANCELLING_FIAT_BASE_OPEN_ORDER",
+                            symbol=sym,
+                            order_id=order_id0,
+                            reduce_only=reduce_only,
+                            status=status_str0,
+                        )
+                        if order_id0:
+                            await self.futures_adapter.cancel_order(order_id0, sym)
+                        # Do not sync this order into local state; it's being removed.
+                        continue
+                except Exception as e:
+                    logger.warning("Failed fiat-order cleanup during sync; continuing", error=str(e))
+
                 # Map CCXT structure to our Order domain model
                 
                 # Status
@@ -211,6 +234,16 @@ class Executor:
                 spot_symbol=spot_symbol_raw,
                 base=base,
                 reason=("blocked_spot_symbol" if spot_symbol_key in blocked_spot else "blocked_base"),
+            )
+            return None
+
+        # Global exclusion: never open NEW positions for fiat/stablecoin-base instruments (e.g., GBP/USD, USDT/USD).
+        if has_disallowed_base(spot_symbol_key):
+            logger.warning(
+                "FIAT_BASE_SKIP",
+                spot_symbol=spot_symbol_raw,
+                base=base,
+                reason="fiat_base_excluded",
             )
             return None
         

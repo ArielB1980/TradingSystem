@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime, timezone
 from src.monitoring.logger import get_logger
+from src.data.fiat_currencies import has_disallowed_base
 
 logger = get_logger(__name__)
 
@@ -21,7 +22,15 @@ def load_discovered_mapping() -> Optional[dict]:
     try:
         with open(MARKETS_FILE, "r") as f:
             data = json.load(f)
-            return data.get("mapping")
+            mapping = data.get("mapping") or None
+            if not isinstance(mapping, dict):
+                return None
+            # Filter out any excluded bases (fiat + stablecoin) from cached discovery output.
+            return {
+                spot: fut
+                for spot, fut in mapping.items()
+                if not has_disallowed_base(spot) and not has_disallowed_base(fut)
+            }
     except Exception:
         return None
 
@@ -44,6 +53,8 @@ def load_discovered_markets() -> Optional[List[str]]:
             discovered_at = data.get("discovered_at", "")
 
             if markets:
+                # Filter out any excluded bases (fiat + stablecoin) from cached discovery output.
+                markets = [m for m in markets if not has_disallowed_base(m)]
                 logger.info(
                     "Loaded discovered markets",
                     count=len(markets),

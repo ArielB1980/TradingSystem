@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import requests
 
 from src.monitoring.logger import get_logger
+from src.data.fiat_currencies import has_disallowed_base
 
 logger = get_logger(__name__)
 
@@ -76,6 +77,10 @@ class CoinClassifier:
             max_leverage = self.config.tier_max_leverage.get(tier, 5.0)
             
             for symbol in symbols:
+                # Exclude fiat + stablecoin bases (e.g., GBP/USD, USDT/USD).
+                if has_disallowed_base(symbol):
+                    logger.info("Skipping excluded-base symbol from coin universe", symbol=symbol, tier=tier)
+                    continue
                 # Derive futures symbol (simple mapping for now)
                 futures_symbol = self._get_futures_symbol(symbol)
                 

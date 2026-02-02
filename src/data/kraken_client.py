@@ -27,6 +27,7 @@ from collections import deque
 from dataclasses import dataclass
 from src.monitoring.logger import get_logger
 from src.domain.models import Candle
+from src.data.fiat_currencies import has_disallowed_base, is_disallowed_trading_base
 from src.constants import (
     PUBLIC_API_CAPACITY,
     PUBLIC_API_REFILL_RATE,
@@ -234,6 +235,10 @@ class KrakenClient:
                 for m in self.exchange.markets.values():
                     if m.get("quote") == "USD" and m.get("active", True):
                         sym = m.get("symbol", "")
+                        # Exclude fiat + stablecoin bases (e.g., GBP/USD, USDT/USD).
+                        base = m.get("base")
+                        if is_disallowed_trading_base(base):
+                            continue
                         if sym:
                             usd_markets[sym] = {
                                 "id": m.get("id"),
@@ -275,6 +280,9 @@ class KrakenClient:
                         market_id = m.get("id") or ccxt_symbol
                         base = m.get("base")
                         quote = m.get("quote")
+                        # Exclude fiat + stablecoin BASE perpetuals (e.g., GBP/USD perps, USDT/USD perps).
+                        if is_disallowed_trading_base(base):
+                            continue
 
                         # Build a stable spot-style key like "ADA/USD" (used by MarketRegistry to pair spot×futures).
                         if base and quote:
@@ -800,6 +808,11 @@ class KrakenClient:
         """
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
+
+        # Defense-in-depth: never place NEW (non-reduce-only) orders on fiat base instruments.
+        # Reduce-only exits/close operations are allowed so the system can unwind legacy exposure safely.
+        if not reduce_only and has_disallowed_base(symbol):
+            raise ValueError(f"Blocked non-reduce-only order on excluded base instrument: {symbol}")
 
         # Reject zero or negative size to avoid venue "amount must be greater than minimum" errors
         size_f = float(size)
