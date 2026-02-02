@@ -7,7 +7,7 @@ Type=simple
 User=trading
 WorkingDirectory=/home/trading/TradingSystem
 Environment="PATH=/home/trading/TradingSystem/venv/bin"
-ExecStart=/home/trading/TradingSystem/venv/bin/python run.py live --force --with-health
+ExecStart=/home/trading/TradingSystem/venv/bin/python -m src.entrypoints.prod_live
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/trading/TradingSystem/logs/trading.log

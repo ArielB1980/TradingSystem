@@ -71,14 +71,14 @@ Production uses Streamlit alone and a separate health service. Combined/unified 
 
 **Issue:**
 
-- **Production:** `run.py live` → `LiveTrading` uses **V2** (`PositionManagerV2`, `ExecutionGateway`) for entries/stops, plus **Executor** (e.g. `sync_open_orders`, `check_order_timeouts`) and **legacy** `PositionManager` for `evaluate` on `managed_pos`.
+- **Production:** `python -m src.entrypoints.prod_live` → `LiveTrading` uses **V2** (`PositionManagerV2`, `ExecutionGateway`) for entries/stops, plus **Executor** (e.g. `sync_open_orders`, `check_order_timeouts`) and **legacy** `PositionManager` for `evaluate` on `managed_pos`.
 - **Deprecated:** `main.py` / `main_with_health` → `TradingService` use **Executor** + **PositionManager** only.
 
 So we have legacy PM + Executor still in the live path alongside V2 + Gateway. `SYSTEM_AUDIT.md` already suggests retiring or unifying the non-production path.
 
 **Proposal:**
 
-- **Phase 1:** Keep `main` / `main_with_health` but clearly **deprecated** (as in `PRODUCTION_RUNTIME`). Add a short “Migration: main → run live” note if useful.
+- **Phase 1:** Keep `main` / `main_with_health` but clearly **deprecated** (as in `PRODUCTION_RUNTIME`). Add a short “Migration: main → prod_live entrypoint” note if useful.
 - **Phase 2:** In `LiveTrading`, audit every use of `PositionManager` and `Executor`. Where V2 + Gateway already cover the behavior, **remove** legacy usage and rely only on V2 + Gateway.
 - **Phase 3:** If nothing else uses `TradingService` for live execution, consider moving it to `src/legacy/` or folding any still-needed bits into `LiveTrading` and retiring the rest.
 

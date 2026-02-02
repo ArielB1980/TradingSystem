@@ -157,11 +157,48 @@ class MarketRegistry:
         """Apply liquidity and spread filters."""
         eligible = {}
         filters = self.config.liquidity_filters
-        
+
+        # Performance: fetch tickers in bulk instead of sequential per-symbol calls.
+        # Sequential filtering can take many minutes due to rate limiting and blocks startup.
+        symbols = list(pairs.keys())
+        tickers: Dict[str, dict] = {}
+        if symbols:
+            # Prefer bulk method when available.
+            if hasattr(self.client, "get_spot_tickers_bulk"):
+                try:
+                    tickers = await self.client.get_spot_tickers_bulk(symbols)
+                    logger.info(
+                        "Fetched spot tickers for discovery filters",
+                        requested=len(symbols),
+                        received=len(tickers),
+                    )
+                except Exception as e:
+                    # Fail closed: treat missing tickers as ineligible rather than stalling startup.
+                    logger.error("Bulk ticker fetch failed during discovery filters", error=str(e))
+                    tickers = {}
+            else:
+                # Backwards compatible fallback for mocks/older clients used in unit tests.
+                if hasattr(self.client, "get_spot_ticker"):
+                    async def _fetch(sym: str) -> tuple[str, Optional[dict]]:
+                        try:
+                            return sym, await self.client.get_spot_ticker(sym)
+                        except Exception:
+                            return sym, None
+
+                    results = await asyncio.gather(*[_fetch(s) for s in symbols], return_exceptions=False)
+                    tickers = {s: t for (s, t) in results if t}
+                else:
+                    logger.error("No spot ticker fetch method available for discovery filters")
+                    tickers = {}
+
         for symbol, pair in pairs.items():
             try:
-                # Fetch 24h volume
-                ticker = await self.client.get_spot_ticker(symbol)
+                ticker = tickers.get(symbol)
+                if not ticker:
+                    pair.is_eligible = False
+                    pair.rejection_reason = "No ticker data (bulk fetch missing)"
+                    continue
+
                 volume_24h = Decimal(str(ticker.get('quoteVolume', 0)))
                 pair.spot_volume_24h = volume_24h
                 

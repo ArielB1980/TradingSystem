@@ -285,7 +285,7 @@ def main():
     print("  • Keep kill switch ready")
     print()
     print("To proceed with live trading:")
-    print("  python3 run.py live --start-capital 1000 --confirm")
+    print("  python3 -m src.entrypoints.prod_live")
     print()
     print("=" * 60)
     

@@ -82,7 +82,7 @@ def component_names(app: dict[str, Any]) -> list[str]:
 
 
 def check_health(app_id: str, headers: dict[str, str]) -> bool:
-    """GET worker / and /health (run.py live --with-health); optional /api, /api/health, /dashboard.
+    """GET worker / and /health (prod-live entrypoint with WITH_HEALTH=1); optional /api, /api/health, /dashboard.
     Returns True if worker health (/ and /health) ok."""
     full = get_app(app_id, headers)
     base = full.get("default_ingress") or full.get("live_url") or full.get("live_domain")
@@ -94,7 +94,7 @@ def check_health(app_id: str, headers: dict[str, str]) -> bool:
         base = "https://" + base
     print(f"  Base: {base}")
     ok = True
-    # Worker health (run.py live --with-health): GET / and /health
+    # Worker health (prod-live entrypoint with WITH_HEALTH=1): GET / and /health
     for path in ("/", "/health"):
         url = base + path
         try:

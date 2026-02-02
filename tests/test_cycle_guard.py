@@ -222,10 +222,12 @@ class TestGlobalSingleton:
         guard = init_cycle_guard(
             min_cycle_interval_seconds=120,
             max_cycle_duration_seconds=600,
+            max_clock_skew_seconds=15,
         )
         
         assert guard.min_interval.total_seconds() == 120
         assert guard.max_duration.total_seconds() == 600
+        assert guard.max_clock_skew.total_seconds() == 15
 
 
 if __name__ == "__main__":

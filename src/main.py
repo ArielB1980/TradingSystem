@@ -1,7 +1,7 @@
 """
 Architecture v3: DataService + TradingService (single-process async).
 
-DEPRECATED for production. Use `run.py live` → LiveTrading for live trading.
+DEPRECATED for production. Use `python -m src.entrypoints.prod_live` → LiveTrading for live trading.
 See docs/PRODUCTION_RUNTIME.md.
 """
 import asyncio
@@ -24,13 +24,13 @@ async def main_async():
     if os.getenv("ENVIRONMENT") == "prod":
         logger.critical(
             "main.py is NOT the production runtime. "
-            "Production uses run.py live → LiveTrading. "
+            "Production uses python -m src.entrypoints.prod_live → LiveTrading. "
             "Refusing to start because ENVIRONMENT=prod."
         )
         sys.exit(1)
     logger.warning(
         "main.py (DataService+TradingService) is NOT the production runtime. "
-        "Production uses run.py live → LiveTrading. See docs/PRODUCTION_RUNTIME.md."
+        "Production uses python -m src.entrypoints.prod_live → LiveTrading. See docs/PRODUCTION_RUNTIME.md."
     )
     logger.info("Initializing Architecture v3 (Single Process Async)...")
     

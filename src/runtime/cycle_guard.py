@@ -354,6 +354,7 @@ def init_cycle_guard(
     min_cycle_interval_seconds: int = 60,
     max_cycle_duration_seconds: int = 300,
     max_candle_age_seconds: int = 120,
+    max_clock_skew_seconds: int = 30,
 ) -> CycleGuard:
     """Initialize global cycle guard with custom settings."""
     global _cycle_guard
@@ -361,5 +362,6 @@ def init_cycle_guard(
         min_cycle_interval_seconds=min_cycle_interval_seconds,
         max_cycle_duration_seconds=max_cycle_duration_seconds,
         max_candle_age_seconds=max_candle_age_seconds,
+        max_clock_skew_seconds=max_clock_skew_seconds,
     )
     return _cycle_guard
