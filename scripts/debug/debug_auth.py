@@ -11,12 +11,20 @@ import time
 import aiohttp
 import ssl
 
-# Credentials
-FUTURES_API_KEY = 'h9Q2qGIO3enaa1kM14e6RBNLQa5iY1RFjyCRJkuLOdq8y2BG9SVhWqh6'
-FUTURES_API_SECRET = '6F+Zm32Eog6dri8ybrqkGchcDpnHzF/irfD4RRt2HN2DdSPjkplvURBoCh12egTVPNWIzz7662MAwEQdZAVgb8uZ'
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        raise SystemExit(f"Missing required env var: {name}")
+    return v
+
+
+def _ensure_allowed() -> None:
+    if os.getenv("RUN_REAL_EXCHANGE_TESTS", "0").strip() not in ("1", "true", "TRUE", "yes", "YES"):
+        raise SystemExit("Refusing to run real-exchange debug. Set RUN_REAL_EXCHANGE_TESTS=1 to enable.")
 
 async def test_authentication():
     """Test authentication with a simple private endpoint."""
+    _ensure_allowed()
     print("\n=== Testing Kraken Futures Authentication ===\n")
     
     # Test 1: Get account info (simpler endpoint)
@@ -32,12 +40,12 @@ async def test_authentication():
     print(f"   Message: '{message}'")
     
     sha256_hash = hashlib.sha256(message.encode('utf-8')).digest()
-    secret_decoded = base64.b64decode(FUTURES_API_SECRET)
+    secret_decoded = base64.b64decode(_require_env("KRAKEN_FUTURES_API_SECRET"))
     signature = hmac.new(secret_decoded, sha256_hash, hashlib.sha512).digest()
     authent = base64.b64encode(signature).decode('utf-8')
     
     headers = {
-        'APIKey': FUTURES_API_KEY,
+        'APIKey': _require_env("KRAKEN_FUTURES_API_KEY"),
         'Authent': authent,
         'Nonce': nonce,
     }

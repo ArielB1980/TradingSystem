@@ -5,22 +5,28 @@ import os
 import asyncio
 from src.data.kraken_client import KrakenClient
 
-# Set credentials
-SPOT_KEY = 'sIHZanYflTqKAv9dsP0L5Xu+tjR2jFo5xI582NEQ2wAmqIoDIjm70MEq'
-SPOT_SECRET = 'RIpGuxXd+bfgJPeajbeKrh4FWxxXqjIsmTo3Qvfr5/B9eNJ825xL7I/ddso6rjO2UGIyaHM/ctVtJmadaDsD8A=='
-FUTURES_KEY = 'uG8IoCO8CLLIIghlZVIMWoM5nbBKscc3wlJDZEMIKW4A+Cmf+fuSB+Oy'
-FUTURES_SECRET = 'MoBA5A7X1269Jv81zr+ur551GZe/nA7d5PasKu8L4M0dloy+hogmKKKePAWkBqfvxgpMEfoHpYxYFVUao010yyMb'
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        raise SystemExit(f"Missing required env var: {name}")
+    return v
+
+
+def _ensure_allowed() -> None:
+    if os.getenv("RUN_REAL_EXCHANGE_TESTS", "0").strip() not in ("1", "true", "TRUE", "yes", "YES"):
+        raise SystemExit("Refusing to run real-exchange debug. Set RUN_REAL_EXCHANGE_TESTS=1 to enable.")
 
 async def debug_credentials():
     """Check which credentials are being used."""
+    _ensure_allowed()
     
     print("\n=== Debugging Credential Usage ===\n")
     
     client = KrakenClient(
-        api_key=SPOT_KEY,
-        api_secret=SPOT_SECRET,
-        futures_api_key=FUTURES_KEY,
-        futures_api_secret=FUTURES_SECRET,
+        api_key=_require_env("KRAKEN_API_KEY"),
+        api_secret=_require_env("KRAKEN_API_SECRET"),
+        futures_api_key=_require_env("KRAKEN_FUTURES_API_KEY"),
+        futures_api_secret=_require_env("KRAKEN_FUTURES_API_SECRET"),
     )
     
     # Check what's stored
@@ -42,9 +48,9 @@ async def debug_credentials():
     
     # Compare
     print("\n[3] Verification:")
-    if headers['APIKey'] == FUTURES_KEY:
+    if headers['APIKey'] == _require_env("KRAKEN_FUTURES_API_KEY"):
         print("   ✅ CORRECT: Using FUTURES API key")
-    elif headers['APIKey'] == SPOT_KEY:
+    elif headers['APIKey'] == _require_env("KRAKEN_API_KEY"):
         print("   ❌ WRONG: Using SPOT API key!")
     else:
         print(f"   ⚠️  UNKNOWN: Using different key: {headers['APIKey'][:20]}...")

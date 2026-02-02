@@ -237,7 +237,7 @@ def analyze_freshness():
             print("✅ Live trading process is running")
         else:
             print("❌ Live trading process is NOT running")
-            print("   → Start with: python3 run.py live --force")
+            print("   → Start with: python3 -m src.entrypoints.prod_live")
     except Exception as e:
         print(f"⚠️  Could not check process status: {e}")
     

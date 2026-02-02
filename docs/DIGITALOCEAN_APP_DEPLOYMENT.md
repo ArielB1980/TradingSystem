@@ -9,7 +9,7 @@
 Your trading system is deployed on **DigitalOcean App Platform** with 3 services:
 - **dashboard** - Streamlit dashboard (port 8080)
 - **web** - Health check API (port 8080)
-- **worker** - Trading bot (runs `python run.py live --force`)
+- **worker** - Trading bot (runs `python -m src.entrypoints.prod_live`)
 
 All services automatically pull from `github.com/ArielB1980/TradingSystem` branch `main`.
 
