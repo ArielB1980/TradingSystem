@@ -4,8 +4,8 @@
 
 set -e
 
-SERVER="root@164.92.129.140"
-SSH_KEY="$HOME/.ssh/trading_system_droplet"
+SERVER="root@207.154.193.121"
+SSH_KEY="$HOME/.ssh/trading_droplet"
 TRADING_USER="trading"
 TRADING_DIR="/home/trading/TradingSystem"
 SERVICE_NAME="trading-system.service"

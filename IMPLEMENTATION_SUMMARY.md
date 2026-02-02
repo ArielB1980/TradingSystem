@@ -47,7 +47,7 @@ All phases of the fix have been implemented and deployed.
 Run the backfill script with `--place-missing-sl` flag to place default 2% SL orders:
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~/TradingSystem
 source venv/bin/activate
 export DATABASE_URL='postgresql://dbtradingbot:AVNS_3ZbhLloQP64uLYyhxoe@localhost:5432/dbtradingbot'

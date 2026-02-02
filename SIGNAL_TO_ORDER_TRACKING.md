@@ -73,24 +73,24 @@ Most signals are being filtered out at the **strategy level** before becoming ac
 ### Real-time Log Monitoring
 ```bash
 # Watch for auction events
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log' | \
   grep -E "(Auction|Entry order|order_placed)"
 
 # Check recent auction executions
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading grep "Auction.*executed" /home/trading/TradingSystem/logs/run.log | tail -10'
 ```
 
 ### Signal Analysis
 ```bash
 # Count signals vs NO_SIGNAL
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading grep "SMC Analysis" /home/trading/TradingSystem/logs/run.log | tail -100 | \
    grep -c "NO_SIGNAL"'
 
 # Find actual SIGNAL events (LONG/SHORT)
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading grep -E "signal_type.*(LONG|SHORT)" /home/trading/TradingSystem/logs/run.log | tail -20'
 ```
 

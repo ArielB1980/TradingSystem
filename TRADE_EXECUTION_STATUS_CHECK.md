@@ -41,7 +41,7 @@ The system needs time to:
 
 **Monitor with:**
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Signal generated|Entry order submitted|Failed to submit|Auction allocation executed|Auction: Opened position'"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Signal generated|Entry order submitted|Failed to submit|Auction allocation executed|Auction: Opened position'"
 ```
 
 ### 📝 Historical Context

@@ -23,29 +23,29 @@ The script SSHs to the server, tails `logs/run.log`, and reports:
 ### Live tail
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log'
 ```
 
 ### Last N lines
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 2000 /home/trading/TradingSystem/logs/run.log'
 ```
 
 ### Check for fixed issues (should be 0)
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log' \
   | grep -c "test_db" || true
 
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log' \
   | grep -c "MagicMock" || true
 
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log' \
   | grep -c "INVARIANT VIOLATION" || true
 ```
@@ -53,7 +53,7 @@ ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
 ### Verify database in use
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log' \
   | grep "DATABASE_CONNECTION_INIT"
 ```
@@ -63,7 +63,7 @@ You should see one line per process start with `host`, `port`, `database`, `user
 ### Auction and execution
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 3000 /home/trading/TradingSystem/logs/run.log' \
   | grep -E "Auction plan generated|Auction allocation executed|Entry order placed|Auction: Opened position|TRADING PAUSED|AUCTION_END"
 ```
@@ -83,7 +83,7 @@ ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
 ## 4. Service status
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 'systemctl status trading-system.service'
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 'systemctl status trading-system.service'
 ```
 
 Expect: `Active: active (running)`.

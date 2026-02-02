@@ -14,7 +14,7 @@ The Droplet can't connect to the managed database because:
 1. Go to **DigitalOcean Dashboard → Databases → Your Database**
 2. Click **"Trusted Sources"** tab
 3. Click **"Add Trusted Source"**
-4. Add your Droplet's IP: **164.92.129.140**
+4. Add your Droplet's IP: **207.154.193.121**
 5. Or add **0.0.0.0/0** (allow all - less secure but works for testing)
 
 ### Step 2: Verify Network Connectivity
@@ -22,7 +22,7 @@ The Droplet can't connect to the managed database because:
 After adding trusted source, test from Droplet:
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 
 # Test DNS resolution
 nslookup app-65e2763f-0c06-4d87-a349-ddc49db0abf3-do-user-31978256-0.l.db.ondigitalocean.com
@@ -73,7 +73,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO dbtradingbot
 
 2. **Initialize Database:**
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~/TradingSystem
 source venv/bin/activate
 python migrate_schema.py

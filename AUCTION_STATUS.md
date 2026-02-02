@@ -55,5 +55,5 @@ The auction should:
 
 ```bash
 # Check for auction collection events
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Auction: Collecting|Auction allocation executed'"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Auction: Collecting|Auction allocation executed'"
 ```

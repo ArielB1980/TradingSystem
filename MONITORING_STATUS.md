@@ -37,17 +37,17 @@ The system needs time to:
 
 ### Real-time Monitoring
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Auction allocation executed|Entry order submitted|Failed to submit|Instrument specs'"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Auction allocation executed|Entry order submitted|Failed to submit|Instrument specs'"
 ```
 
 ### Check Recent Activity
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log | jq -r 'select(.event == \"Entry order submitted\" or .event == \"Failed to submit entry order\" or .event == \"Auction allocation executed\") | \"\(.timestamp) [\(.event)] \(.symbol // \"\")\"' 2>/dev/null | tail -n 20"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -n 5000 /home/trading/TradingSystem/logs/run.log | jq -r 'select(.event == \"Entry order submitted\" or .event == \"Failed to submit entry order\" or .event == \"Auction allocation executed\") | \"\(.timestamp) [\(.event)] \(.symbol // \"\")\"' 2>/dev/null | tail -n 20"
 ```
 
 ### Check Service Status
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "systemctl status trading-system.service"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "systemctl status trading-system.service"
 ```
 
 ## What to Watch For

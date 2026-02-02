@@ -1,8 +1,8 @@
 # Droplet Setup Instructions - Quick Reference
 
 ## Server Details
-- **IP:** 164.92.129.140
-- **SSH Key:** `~/.ssh/trading_system_droplet`
+- **IP:** 207.154.193.121
+- **SSH Key:** `~/.ssh/trading_droplet`
 - **User:** `trading` (or `root` for initial setup)
 
 ## Current Status
@@ -23,14 +23,14 @@ Since the repo is private, you need to clone it manually:
 
 **Option A: Clone via SSH (if you have SSH key on GitHub)**
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~
 git clone git@github.com:ArielB1980/TradingSystem.git
 ```
 
 **Option B: Clone via HTTPS (will prompt for credentials)**
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~
 git clone https://github.com/ArielB1980/TradingSystem.git
 # Enter your GitHub username and personal access token when prompted
@@ -43,10 +43,10 @@ cd /Users/arielbarack/Documents/TradingSystem
 tar --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.env' --exclude='logs' -czf trading-system.tar.gz .
 
 # Transfer to server:
-scp -i ~/.ssh/trading_system_droplet trading-system.tar.gz trading@164.92.129.140:~/
+scp -i ~/.ssh/trading_droplet trading-system.tar.gz trading@207.154.193.121:~/
 
 # On server:
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~
 tar -xzf trading-system.tar.gz
 mv TradingSystem TradingSystem  # If needed
@@ -55,7 +55,7 @@ mv TradingSystem TradingSystem  # If needed
 ### 2. Install Dependencies
 
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 cd ~/TradingSystem
 source venv/bin/activate
 pip install -r requirements.txt
@@ -150,7 +150,7 @@ sudo systemctl status trading-system.service
 
 ```bash
 # SSH into server
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 
 # View logs
 tail -f ~/TradingSystem/logs/trading.log

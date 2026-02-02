@@ -4,8 +4,8 @@
 
 set -e  # Exit on error
 
-SSH_KEY="${1:-~/.ssh/trading_system_droplet}"
-DROPLET_IP="${2:-164.92.129.140}"
+SSH_KEY="${1:-~/.ssh/trading_droplet}"
+DROPLET_IP="${2:-207.154.193.121}"
 DROPLET_USER="${3:-trading}"
 
 echo "=========================================="
