@@ -2,7 +2,7 @@
 
 ## ✅ What's Already Configured
 
-1. ✅ SSH key exists: `~/.ssh/trading_system_droplet`
+1. ✅ SSH key exists: `~/.ssh/trading_droplet`
 2. ✅ Git remote configured: `https://github.com/ArielB1980/TradingSystem.git`
 3. ✅ Deployment script created: `scripts/deploy.sh`
 4. ✅ Makefile targets added: `make deploy` and `make deploy-quick`
@@ -78,11 +78,11 @@ After deployment, check logs:
 
 ```bash
 # Monitor live logs
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log'
 
 # Check service status
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'systemctl status trading-system.service'
 ```
 
@@ -93,8 +93,8 @@ See `DEPLOYMENT_WORKFLOW.md` for complete documentation.
 ## ⚠️ Important Notes
 
 1. **GitHub Token**: The token you provided is already in the format needed. Just add it to `.env.local`
-2. **SSH Key**: Already configured at `~/.ssh/trading_system_droplet`
-3. **Server**: Default server is `root@164.92.129.140` (can be overridden in `.env.local`)
+2. **SSH Key**: Already configured at `~/.ssh/trading_droplet`
+3. **Server**: Default server is `root@207.154.193.121` (can be overridden in `.env.local`)
 4. **Safety**: `.env.local` is gitignored, so your token won't be committed
 
 ## 🎯 Next Steps

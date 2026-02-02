@@ -16,7 +16,7 @@ The deployment process:
 Your SSH key should already be configured. Verify:
 
 ```bash
-ls -la ~/.ssh/trading_system_droplet
+ls -la ~/.ssh/trading_droplet
 ```
 
 If the key doesn't exist, you'll need to:
@@ -46,8 +46,8 @@ If the key doesn't exist, you'll need to:
 Default server settings (can be overridden in `.env.local`):
 
 ```bash
-DEPLOY_SERVER=root@164.92.129.140
-DEPLOY_SSH_KEY=~/.ssh/trading_system_droplet
+DEPLOY_SERVER=root@207.154.193.121
+DEPLOY_SSH_KEY=~/.ssh/trading_droplet
 DEPLOY_TRADING_USER=trading
 DEPLOY_TRADING_DIR=/home/trading/TradingSystem
 DEPLOY_SERVICE_NAME=trading-system.service
@@ -136,11 +136,11 @@ After deployment, monitor the logs:
 
 ```bash
 # SSH to server and tail logs
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log'
 
 # Or check service status
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'systemctl status trading-system.service'
 ```
 
@@ -153,7 +153,7 @@ ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
 **Solution:**
 ```bash
 # Check if key exists
-ls -la ~/.ssh/trading_system_droplet
+ls -la ~/.ssh/trading_droplet
 
 # If missing, you need to set it up or update DEPLOY_SSH_KEY in .env.local
 ```
@@ -165,13 +165,13 @@ ls -la ~/.ssh/trading_system_droplet
 **Solution:**
 ```bash
 # Test SSH connection manually
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "echo 'test'"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "echo 'test'"
 
 # Check key permissions
-chmod 600 ~/.ssh/trading_system_droplet
+chmod 600 ~/.ssh/trading_droplet
 
 # Verify server is accessible
-ping 164.92.129.140
+ping 207.154.193.121
 ```
 
 ### ❌ "GITHUB_TOKEN not set"
@@ -201,11 +201,11 @@ ping 164.92.129.140
 **Solution:**
 ```bash
 # Check service logs
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'journalctl -u trading-system.service -n 50 --no-pager'
 
 # Check application logs
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 50 /home/trading/TradingSystem/logs/run.log'
 ```
 
@@ -275,11 +275,11 @@ make deploy-quick
 ./scripts/deploy.sh [--skip-tests] [--skip-commit] [--message "msg"] [--force]
 
 # Monitor logs
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log'
 
 # Check service status
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'systemctl status trading-system.service'
 ```
 

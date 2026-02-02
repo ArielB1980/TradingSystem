@@ -7,7 +7,7 @@
 set -e
 
 # Update these if your server details are different
-SERVER="root@164.92.129.140"
+SERVER="root@207.154.193.121"
 TRADING_USER="trading"
 TRADING_DIR="/home/trading/TradingSystem"
 SERVICE_NAME="trading-system.service"

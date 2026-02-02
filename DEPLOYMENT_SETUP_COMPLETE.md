@@ -9,7 +9,7 @@
 
 ## Current Status
 
-- **Server**: `164.92.129.140` (ubuntu-s-2vcpu-2gb-fra1-01)
+- **Server**: `207.154.193.121` (ubuntu-s-2vcpu-2gb-fra1-01)
 - **Service**: `trading-system.service` (active and running)
 - **Code Location**: `/home/trading/TradingSystem`
 - **Latest Commit**: `0a64e6b` - Add debug logging for futures symbol lookup failures
@@ -33,14 +33,14 @@ This should resolve the "Instrument specs for X/USD:USD not found" errors.
 
 ### Option 2: Manual deployment
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "cd /home/trading/TradingSystem && su - trading -c 'cd /home/trading/TradingSystem && git fetch origin && git reset --hard origin/main' && systemctl restart trading-system.service"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "cd /home/trading/TradingSystem && su - trading -c 'cd /home/trading/TradingSystem && git fetch origin && git reset --hard origin/main' && systemctl restart trading-system.service"
 ```
 
 ## Monitoring
 
 Monitor the logs to verify orders are being placed:
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Entry order submitted|Failed to submit|Instrument specs'"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log | grep -E 'Entry order submitted|Failed to submit|Instrument specs'"
 ```
 
 ## What to Watch For

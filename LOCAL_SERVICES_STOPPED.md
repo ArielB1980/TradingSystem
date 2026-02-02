@@ -16,7 +16,7 @@ All local trading services have been stopped. The system now runs **exclusively 
 
 ## Server Status
 
-**Production Server**: `164.92.129.140`
+**Production Server**: `207.154.193.121`
 - **Service**: `trading-system.service`
 - **Status**: ✅ Active and running
 - **Auto-start**: ✅ Enabled (starts on boot)
@@ -32,7 +32,7 @@ ps aux | grep -E "run.py live|streamlit.*dashboard" | grep -v grep
 
 To check server status:
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "systemctl status trading-system.service"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "systemctl status trading-system.service"
 ```
 
 ## Important Notes
@@ -46,17 +46,17 @@ ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "systemctl status tradi
 
 ### View Logs
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log"
 ```
 
 ### Check Service Status
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "systemctl status trading-system.service"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "systemctl status trading-system.service"
 ```
 
 ### Restart Service (if needed)
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 "systemctl restart trading-system.service"
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 "systemctl restart trading-system.service"
 ```
 
 ## Dashboard Access

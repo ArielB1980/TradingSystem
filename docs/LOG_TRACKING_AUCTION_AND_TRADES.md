@@ -50,11 +50,11 @@ So even with the BoundLogger fix, **no new trades will be opened** until either:
 
 ```bash
 # Live tail
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -f /home/trading/TradingSystem/logs/run.log'
 
 # Recent auction/trade events
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140 \
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121 \
   'sudo -u trading tail -n 3000 /home/trading/TradingSystem/logs/run.log' \
   | grep -E "Auction plan generated|Auction allocation executed|Failed to run auction|Entry order placed|Auction: Opened position|AUCTION_START|AUCTION_END|TRADING PAUSED"
 ```

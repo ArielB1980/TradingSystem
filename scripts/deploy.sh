@@ -31,8 +31,8 @@ if [ -f .env.local ]; then
 fi
 
 # Configuration (can be overridden by .env.local)
-SERVER="${DEPLOY_SERVER:-root@164.92.129.140}"
-SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/trading_system_droplet}"
+SERVER="${DEPLOY_SERVER:-root@207.154.193.121}"
+SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/trading_droplet}"
 TRADING_USER="${DEPLOY_TRADING_USER:-trading}"
 TRADING_DIR="${DEPLOY_TRADING_DIR:-/home/trading/TradingSystem}"
 SERVICE_NAME="${DEPLOY_SERVICE_NAME:-trading-system.service}"

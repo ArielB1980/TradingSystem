@@ -6,8 +6,8 @@ The trading system has been successfully deployed to the DigitalOcean Droplet wi
 
 ## Server Details
 
-- **IP Address:** 164.92.129.140
-- **SSH Key:** `~/.ssh/trading_system_droplet`
+- **IP Address:** 207.154.193.121
+- **SSH Key:** `~/.ssh/trading_droplet`
 - **User:** `trading`
 - **Database:** PostgreSQL 16 (local, on Droplet)
 
@@ -44,26 +44,26 @@ postgresql://dbtradingbot:AVNS_3ZbhLloQP64uLYyhxoe@localhost:5432/dbtradingbot
 
 ### Check Status
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121
 sudo systemctl status trading-system.service
 ```
 
 ### View Logs
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 tail -f ~/TradingSystem/logs/trading.log
 tail -f ~/TradingSystem/logs/trading-error.log
 ```
 
 ### Restart Service
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121
 sudo systemctl restart trading-system.service
 ```
 
 ### Stop Service
 ```bash
-ssh -i ~/.ssh/trading_system_droplet root@164.92.129.140
+ssh -i ~/.ssh/trading_droplet root@207.154.193.121
 sudo systemctl stop trading-system.service
 ```
 
@@ -71,20 +71,20 @@ sudo systemctl stop trading-system.service
 
 ### Connect to Database
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 psql -U dbtradingbot -d dbtradingbot
 # Password: AVNS_3ZbhLloQP64uLYyhxoe
 ```
 
 ### Backup Database
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 pg_dump -U dbtradingbot dbtradingbot > backup_$(date +%Y%m%d).sql
 ```
 
 ### Restore Database
 ```bash
-ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
 psql -U dbtradingbot dbtradingbot < backup_YYYYMMDD.sql
 ```
 
@@ -100,7 +100,7 @@ psql -U dbtradingbot dbtradingbot < backup_YYYYMMDD.sql
 
 1. **Add API Keys:** Update `.env.local` with your Kraken API credentials:
    ```bash
-   ssh -i ~/.ssh/trading_system_droplet trading@164.92.129.140
+   ssh -i ~/.ssh/trading_droplet trading@207.154.193.121
    nano ~/TradingSystem/.env.local
    # Add:
    # KRAKEN_API_KEY=your_key
