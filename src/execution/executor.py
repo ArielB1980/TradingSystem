@@ -102,8 +102,9 @@ class Executor:
             
             synced_count = 0
             for order_data in open_orders_data:
-                # Safety cleanup: cancel any OPEN, non-reduce-only orders on fiat-base instruments.
-                # This prevents lingering forex orders (e.g., GBP/USD perps) from staying live after a config/universe fix.
+                # Safety cleanup: cancel any OPEN, non-reduce-only orders on excluded-base instruments
+                # (fiat currencies + stablecoins). This prevents lingering forex/stable orders from staying live
+                # after a config/universe fix.
                 try:
                     sym = (order_data.get("symbol") or "").strip()
                     reduce_only = bool(order_data.get("reduceOnly", False))
@@ -111,7 +112,7 @@ class Executor:
                     order_id0 = str(order_data.get("id", "") or "")
                     if sym and has_disallowed_base(sym) and (not reduce_only) and status_str0 in ("open", "pending", "submitted"):
                         logger.critical(
-                            "CANCELLING_FIAT_BASE_OPEN_ORDER",
+                            "CANCELLING_EXCLUDED_BASE_OPEN_ORDER",
                             symbol=sym,
                             order_id=order_id0,
                             reduce_only=reduce_only,
@@ -122,7 +123,7 @@ class Executor:
                         # Do not sync this order into local state; it's being removed.
                         continue
                 except Exception as e:
-                    logger.warning("Failed fiat-order cleanup during sync; continuing", error=str(e))
+                    logger.warning("Failed excluded-base order cleanup during sync; continuing", error=str(e))
 
                 # Map CCXT structure to our Order domain model
                 
@@ -240,10 +241,10 @@ class Executor:
         # Global exclusion: never open NEW positions for fiat/stablecoin-base instruments (e.g., GBP/USD, USDT/USD).
         if has_disallowed_base(spot_symbol_key):
             logger.warning(
-                "FIAT_BASE_SKIP",
+                "EXCLUDED_BASE_SKIP",
                 spot_symbol=spot_symbol_raw,
                 base=base,
-                reason="fiat_base_excluded",
+                reason="excluded_base",
             )
             return None
         

@@ -809,7 +809,8 @@ class KrakenClient:
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
 
-        # Defense-in-depth: never place NEW (non-reduce-only) orders on fiat base instruments.
+        # Defense-in-depth: never place NEW (non-reduce-only) orders on excluded-base instruments
+        # (fiat currencies + stablecoins).
         # Reduce-only exits/close operations are allowed so the system can unwind legacy exposure safely.
         if not reduce_only and has_disallowed_base(symbol):
             raise ValueError(f"Blocked non-reduce-only order on excluded base instrument: {symbol}")
