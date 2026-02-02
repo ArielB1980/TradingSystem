@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from src.data.kraken_client import KrakenClient
 from src.monitoring.logger import get_logger
+from src.data.fiat_currencies import has_disallowed_base
 
 logger = get_logger(__name__)
 
@@ -104,6 +105,9 @@ class MarketRegistry:
         """Build spot_symbol -> MarketPair when only futures available (base_quote used as spot_symbol)."""
         pairs = {}
         for base_quote, info in futures_markets.items():
+            # Exclude fiat + stablecoin bases from the universe.
+            if has_disallowed_base(base_quote) or has_disallowed_base(info.get("symbol")):
+                continue
             pair = MarketPair(
                 spot_symbol=base_quote,
                 futures_symbol=info["symbol"],
@@ -125,9 +129,14 @@ class MarketRegistry:
         pairs = {}
         
         for spot_symbol, spot_info in spot_markets.items():
+            # Exclude fiat + stablecoin bases from the universe (e.g., GBP/USD, USDT/USD).
+            if has_disallowed_base(spot_symbol):
+                continue
             # Check if futures perp exists for this base
             if spot_symbol in futures_markets:
                 futures_info = futures_markets[spot_symbol]
+                if has_disallowed_base(futures_info.get("symbol")):
+                    continue
                 
                 pair = MarketPair(
                     spot_symbol=spot_symbol,

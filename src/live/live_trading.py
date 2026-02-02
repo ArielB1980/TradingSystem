@@ -7,6 +7,7 @@ from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from src.config.config import Config
 from src.services.market_discovery import MarketDiscoveryService
 from src.monitoring.logger import get_logger
+from src.data.fiat_currencies import has_disallowed_base
 from src.data.kraken_client import KrakenClient
 from src.data.data_acquisition import DataAcquisition
 from src.data.candle_manager import CandleManager
@@ -293,7 +294,8 @@ class LiveTrading:
              expanded = []
              for tier, coins in config.coin_universe.liquidity_tiers.items():
                  expanded.extend(coins)
-             self.markets = list(set(expanded)) # Deduplicate
+             # Deduplicate and exclude disallowed bases (fiat + stablecoin).
+             self.markets = [s for s in list(set(expanded)) if not has_disallowed_base(s)]
              logger.info("Coin Universe Enabled", markets=self.markets)
              
         # Update Data Acquisition with full list
@@ -351,6 +353,9 @@ class LiveTrading:
             if not key:
                 continue
             if key in blocklist:
+                continue
+            # Global exclusion: never include fiat/stablecoin-base instruments in the trading universe.
+            if has_disallowed_base(key):
                 continue
             if blocked_bases:
                 base = key.split("/")[0].strip() if "/" in key else key
@@ -1670,7 +1675,10 @@ class LiveTrading:
         if self.auction_allocator:
             self.auction_signals_this_tick = []
         
-        await asyncio.gather(*[process_coin(s) for s in self.markets], return_exceptions=True)
+        # CRITICAL: Only process the filtered universe.
+        # `self.markets` may include symbols that must be hard-blocked (e.g. fiat pairs),
+        # and `process_coin()` can still trade them via futures tickers even without spot tickers.
+        await asyncio.gather(*[process_coin(s) for s in market_symbols], return_exceptions=True)
         
         # Run auction mode allocation (if enabled) - after all signals processed
         if self.auction_allocator:
@@ -1694,13 +1702,13 @@ class LiveTrading:
         now = datetime.now(timezone.utc)
         if (now - self.last_status_summary).total_seconds() > 300:  # 5 minutes
             try:
-                total_coins = len(self.markets)
-                coins_with_candles = sum(1 for s in self.markets if len(self.candle_manager.get_candles(s, "15m")) >= 50)
+                total_coins = len(market_symbols)
+                coins_with_candles = sum(1 for s in market_symbols if len(self.candle_manager.get_candles(s, "15m")) >= 50)
                 coins_processed_recently = sum(
-                    1 for s in self.markets 
+                    1 for s in market_symbols
                     if self.coin_processing_stats.get(s, {}).get("last_processed", datetime.min.replace(tzinfo=timezone.utc)) > (now - timedelta(minutes=10))
                 )
-                coins_with_traces = len([s for s in self.markets if s in self.last_trace_log])
+                coins_with_traces = len([s for s in market_symbols if s in self.last_trace_log])
                 
                 summary = {
                     "total_coins": total_coins,
