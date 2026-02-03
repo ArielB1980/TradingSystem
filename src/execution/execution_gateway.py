@@ -785,8 +785,23 @@ class ExecutionGateway:
             if float(p.get('contracts', p.get('size', 0))) != 0
         }
         
-        # Reconcile
+        # Reconcile (this marks orphaned positions and moves them to closed)
         issues = self.registry.reconcile_with_exchange(exchange_positions, orders)
+        
+        # Persist any orphaned positions (now in closed history)
+        # This ensures they're saved as ORPHANED and won't be reloaded as ACTIVE
+        orphaned_count = 0
+        for symbol, issue in issues:
+            if "ORPHANED" in issue:
+                # Find in closed positions (just moved there by reconcile)
+                for pos in self.registry._closed_positions:
+                    if pos.symbol == symbol and pos.state.value == "orphaned":
+                        self.persistence.save_position(pos)
+                        orphaned_count += 1
+                        break
+        
+        if orphaned_count > 0:
+            logger.info("Persisted orphaned positions", count=orphaned_count)
         
         # Get corrective actions
         actions = self.position_manager.reconcile(exchange_positions, orders)

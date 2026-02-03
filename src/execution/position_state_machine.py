@@ -988,6 +988,8 @@ class PositionRegistry:
         """
         issues = []
         
+        orphaned_symbols: list[str] = []
+        
         with self._lock:
             # Check for orphaned positions (registry has, exchange doesn't)
             for symbol, pos in self._positions.items():
@@ -997,12 +999,20 @@ class PositionRegistry:
                 exchange_pos = exchange_positions.get(symbol)
                 if exchange_pos is None and pos.remaining_qty > 0:
                     pos.mark_orphaned()
+                    orphaned_symbols.append(symbol)
                     issues.append((symbol, "ORPHANED: Registry has position, exchange does not"))
                 elif exchange_pos is not None:
                     # Verify qty matches
                     exchange_qty = Decimal(str(exchange_pos.get('qty', 0)))
                     if abs(exchange_qty - pos.remaining_qty) > Decimal("0.0001"):
                         issues.append((symbol, f"QTY_MISMATCH: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+            
+            # Move orphaned positions to closed history (so they don't reappear)
+            for symbol in orphaned_symbols:
+                pos = self._positions.pop(symbol, None)
+                if pos:
+                    self._closed_positions.append(pos)
+                    logger.info("Orphaned position moved to closed history", symbol=symbol)
             
             # Check for phantom positions (exchange has, registry doesn't)
             for symbol, exchange_pos in exchange_positions.items():
