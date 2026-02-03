@@ -442,15 +442,22 @@ class PositionPersistence:
         # Load pending reversals
         registry._pending_reversals = self.get_pending_reversals()
         
-        # Separate closed positions
-        for symbol, pos in list(registry._positions.items()):
+        # Move terminal positions from _positions to _closed_positions
+        terminal_symbols = []
+        for symbol, pos in registry._positions.items():
             if pos.is_terminal:
                 registry._closed_positions.append(pos)
+                terminal_symbols.append(symbol)
+        
+        # Remove terminal positions from _positions (they're now in _closed_positions)
+        for symbol in terminal_symbols:
+            del registry._positions[symbol]
         
         logger.info(
             "Registry loaded from persistence",
-            total_positions=len(registry._positions),
-            active_positions=len(registry.get_all_active()),
+            total_positions=len(registry._positions) + len(terminal_symbols),
+            active_positions=len(registry._positions),
+            terminal_moved=len(terminal_symbols),
             pending_reversals=len(registry._pending_reversals)
         )
         

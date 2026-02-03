@@ -786,8 +786,11 @@ class TestReconciliation:
         
         assert len(issues) == 1
         assert "ORPHANED" in issues[0][1]
-        # Use _positions directly since get_position filters out terminal states
-        assert registry._positions["BTC/USD:USD"].state == PositionState.ORPHANED
+        # Orphaned positions are moved from _positions to _closed_positions
+        assert "BTC/USD:USD" not in registry._positions, "Orphaned should be removed from _positions"
+        orphaned = [p for p in registry._closed_positions if p.symbol == "BTC/USD:USD"]
+        assert len(orphaned) == 1, "Orphaned should be in _closed_positions"
+        assert orphaned[0].state == PositionState.ORPHANED
     
     def test_detect_phantom_position(self):
         """Detect position on exchange but not in registry."""
