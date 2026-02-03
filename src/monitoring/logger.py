@@ -59,7 +59,8 @@ def setup_logging(log_level: str = "INFO", log_format: str = "json", log_file: s
     if log_format == "json":
         processors.append(structlog.processors.JSONRenderer())
     else:
-        processors.append(structlog.dev.ConsoleRenderer())
+        # "text" or "plain": human-readable one line per event, no ANSI colors (good for files and tail)
+        processors.append(structlog.dev.ConsoleRenderer(colors=False))
     
     structlog.configure(
         processors=processors,
