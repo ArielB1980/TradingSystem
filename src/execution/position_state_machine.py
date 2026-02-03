@@ -983,12 +983,27 @@ class PositionRegistry:
         """
         Reconcile registry with exchange state.
         
+        Uses symbol normalization to match positions across different formats:
+        - Registry may have: ADA/USD, ADA/USD:USD, PF_ADAUSD
+        - Exchange returns: PF_ADAUSD
+        
         Returns:
             List of (symbol, issue) tuples for positions needing attention
         """
+        from src.data.symbol_utils import normalize_symbol_for_position_match
+        
         issues = []
         
         orphaned_symbols: list[str] = []
+        
+        # Build normalized lookup for exchange positions: normalized_key -> (original_symbol, pos_data)
+        exchange_normalized: Dict[str, tuple[str, Dict]] = {}
+        for ex_symbol, ex_pos in exchange_positions.items():
+            norm_key = normalize_symbol_for_position_match(ex_symbol)
+            exchange_normalized[norm_key] = (ex_symbol, ex_pos)
+        
+        # Track which normalized exchange positions we've matched (for phantom detection)
+        matched_exchange_keys: set[str] = set()
         
         with self._lock:
             # Check for orphaned positions (registry has, exchange doesn't)
@@ -996,7 +1011,22 @@ class PositionRegistry:
                 if pos.is_terminal:
                     continue
                 
+                # Try exact match first, then normalized match
                 exchange_pos = exchange_positions.get(symbol)
+                matched_key = None
+                
+                if exchange_pos is None:
+                    # Try normalized matching
+                    norm_key = normalize_symbol_for_position_match(symbol)
+                    if norm_key in exchange_normalized:
+                        matched_key = norm_key
+                        _, exchange_pos = exchange_normalized[norm_key]
+                else:
+                    matched_key = normalize_symbol_for_position_match(symbol)
+                
+                if matched_key:
+                    matched_exchange_keys.add(matched_key)
+                
                 if exchange_pos is None and pos.remaining_qty > 0:
                     pos.mark_orphaned()
                     orphaned_symbols.append(symbol)
@@ -1015,9 +1045,17 @@ class PositionRegistry:
                     logger.info("Orphaned position moved to closed history", symbol=symbol)
             
             # Check for phantom positions (exchange has, registry doesn't)
-            for symbol, exchange_pos in exchange_positions.items():
-                if symbol not in self._positions or self._positions[symbol].is_terminal:
-                    issues.append((symbol, "PHANTOM: Exchange has position, registry does not"))
+            # Use normalized keys to avoid false positives from format differences
+            registry_normalized = {
+                normalize_symbol_for_position_match(s): s 
+                for s, p in self._positions.items() 
+                if not p.is_terminal
+            }
+            
+            for ex_symbol, exchange_pos in exchange_positions.items():
+                norm_key = normalize_symbol_for_position_match(ex_symbol)
+                if norm_key not in matched_exchange_keys and norm_key not in registry_normalized:
+                    issues.append((ex_symbol, "PHANTOM: Exchange has position, registry does not"))
         
         return issues
     
