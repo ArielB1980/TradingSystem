@@ -31,6 +31,7 @@ from src.execution.position_state_machine import (
     ExitReason,
     get_position_registry
 )
+from src.data.symbol_utils import position_symbol_matches_order
 from src.domain.models import Side, OrderType
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.production_safety import AtomicStopReplacer, SafetyConfig
@@ -166,8 +167,8 @@ class ProductionTakeover:
         """Process a single position."""
         logger.info(f"Processing {symbol}...", data=pos_data)
         
-        # Filter orders for this symbol
-        symbol_orders = [o for o in all_orders if o.get("symbol") == symbol]
+        # Filter orders for this symbol (handle format mismatch: PF_SUIUSD vs SUI/USD:USD)
+        symbol_orders = [o for o in all_orders if position_symbol_matches_order(symbol, o.get("symbol", ""))]
         
         # Step 2: Classify
         classification, stop_orders = self._classify_position(pos_data, symbol_orders)
