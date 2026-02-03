@@ -939,7 +939,11 @@ class TestReconciliationRule:
         
         assert len(issues) == 1
         assert "ORPHANED" in issues[0][1]
-        assert registry._positions["BTC/USD:USD"].state == PositionState.ORPHANED
+        # Registry moves orphaned positions to closed history (no longer in _positions)
+        closed = registry.get_closed_history(limit=10)
+        assert len(closed) == 1
+        assert closed[0].symbol == "BTC/USD:USD"
+        assert closed[0].state == PositionState.ORPHANED
     
     def test_exchange_has_position_registry_missing_detected(self):
         """If exchange has position but registry doesn't, detect as PHANTOM."""

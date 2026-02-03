@@ -65,6 +65,9 @@ def mock_config():
     config.coin_universe = Mock()
     config.coin_universe.enabled = False
     
+    # Liquidity filters (used by RiskManager in LiveTrading)
+    config.liquidity_filters = None
+    
     return config
 
 

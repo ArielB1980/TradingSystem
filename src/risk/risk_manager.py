@@ -174,6 +174,14 @@ class RiskManager:
         tier_max_leverage = Decimal(str(tier_config.max_leverage)) if tier_config else None
         tier_max_size = tier_config.max_position_size_usd if tier_config else None
         
+        logger.info(
+            "Trade tier classification",
+            symbol=signal.symbol,
+            tier=symbol_tier or "none",
+            tier_max_leverage=str(tier_max_leverage) if tier_max_leverage else "global",
+            tier_max_size=str(tier_max_size) if tier_max_size else "global",
+        )
+        
         if tier_max_leverage and requested_leverage > tier_max_leverage:
             logger.info(
                 "Applying tier leverage cap",
