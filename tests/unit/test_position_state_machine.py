@@ -805,6 +805,89 @@ class TestReconciliation:
         
         assert len(issues) == 1
         assert "PHANTOM" in issues[0][1]
+    
+    def test_cross_format_symbol_matching(self):
+        """Registry uses spot format (ADA/USD), exchange uses futures format (PF_ADAUSD)."""
+        from datetime import datetime, timezone
+        registry = get_position_registry()
+        registry._positions.clear()
+        registry._closed_positions.clear()
+        
+        # Create position with SPOT format symbol
+        pos = ManagedPosition(
+            symbol="ADA/USD",  # Spot format
+            side=Side.LONG,
+            position_id="test-ada-123",
+            initial_size=Decimal("100"),
+            initial_entry_price=Decimal("0.50"),
+            initial_stop_price=Decimal("0.45"),
+            initial_tp1_price=Decimal("0.60"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        # Add entry fill so remaining_qty > 0
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-1",
+            order_id="order-1",
+            side=Side.LONG,
+            qty=Decimal("100"),
+            price=Decimal("0.50"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        registry.register_position(pos)
+        
+        # Exchange returns FUTURES format - should match via normalization
+        exchange_positions = {
+            "PF_ADAUSD": {"side": "long", "qty": "100", "entry_price": "0.50"}
+        }
+        
+        issues = registry.reconcile_with_exchange(exchange_positions, [])
+        
+        # Should NOT be orphaned (formats normalized and matched)
+        assert len(issues) == 0, f"Expected no issues but got: {issues}"
+        assert "ADA/USD" in registry._positions, "Position should still be active"
+    
+    def test_orphaned_with_symbol_normalization(self):
+        """Registry has spot format position, exchange has nothing - should orphan."""
+        from datetime import datetime, timezone
+        registry = get_position_registry()
+        registry._positions.clear()
+        registry._closed_positions.clear()
+        
+        pos = ManagedPosition(
+            symbol="ADA/USD",
+            side=Side.LONG,
+            position_id="test-ada-456",
+            initial_size=Decimal("100"),
+            initial_entry_price=Decimal("0.50"),
+            initial_stop_price=Decimal("0.45"),
+            initial_tp1_price=Decimal("0.60"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        # Add entry fill so remaining_qty > 0
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-1",
+            order_id="order-1",
+            side=Side.LONG,
+            qty=Decimal("100"),
+            price=Decimal("0.50"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        registry.register_position(pos)
+        
+        # Exchange has NO positions
+        exchange_positions = {}
+        
+        issues = registry.reconcile_with_exchange(exchange_positions, [])
+        
+        assert len(issues) == 1
+        assert "ORPHANED" in issues[0][1]
+        assert "ADA/USD" not in registry._positions
+        orphaned = [p for p in registry._closed_positions if p.symbol == "ADA/USD"]
+        assert len(orphaned) == 1
 
 
 if __name__ == "__main__":
