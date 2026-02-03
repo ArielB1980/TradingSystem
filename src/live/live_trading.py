@@ -3059,9 +3059,16 @@ class LiveTrading:
                     current_price = Decimal(str(current_price))
                 
                 # Step 4: Safety checks - skip if unsafe
-                if not db_pos.is_protected:
+                # In V2 mode, check registry for protection status (DB may be stale)
+                is_protected = db_pos.is_protected
+                if self.use_state_machine_v2 and self.position_registry:
+                    v2_pos = self.position_registry.get_position(symbol)
+                    if v2_pos and v2_pos.stop_order_id:
+                        is_protected = True  # V2 registry says it's protected
+                
+                if not is_protected:
                     skipped_not_protected.append(symbol)
-                if await self._should_skip_tp_backfill(symbol, pos_data, db_pos, current_price):
+                if await self._should_skip_tp_backfill(symbol, pos_data, db_pos, current_price, is_protected):
                     continue
                 
                 # Get open orders for this symbol
@@ -3372,7 +3379,8 @@ class LiveTrading:
                 )
 
     async def _should_skip_tp_backfill(
-        self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal
+        self, symbol: str, pos_data: Dict, db_pos: Position, current_price: Decimal,
+        is_protected: Optional[bool] = None
     ) -> bool:
         """Step 4: Don't backfill when it's unsafe."""
         # Check cooldown
@@ -3394,7 +3402,9 @@ class LiveTrading:
             return True
         
         # Require protection (not just initial_stop_price)
-        if not db_pos.is_protected:
+        # Use passed is_protected if provided (V2 mode), else fall back to db_pos
+        protected = is_protected if is_protected is not None else db_pos.is_protected
+        if not protected:
             logger.warning("TP backfill skipped: position not protected", symbol=symbol, reason=db_pos.protection_reason, has_sl_price=bool(db_pos.initial_stop_price), has_sl_order=bool(db_pos.stop_loss_order_id))
             return True
         
