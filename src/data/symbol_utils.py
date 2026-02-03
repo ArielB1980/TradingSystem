@@ -69,8 +69,8 @@ def futures_candidate_symbols(spot_symbol: str) -> List[str]:
 
 def position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bool:
     """
-    Position uses Kraken native (PF_ADAUSD); orders use CCXT unified (ADA/USD:USD).
-    Return True if they refer to the same market.
+    Position uses Kraken native (PF_ADAUSD) or unified (ADA/USD or ADA/USD:USD);
+    orders use CCXT unified (ADA/USD:USD). Return True if they refer to the same market.
     """
     if not position_symbol or not order_symbol:
         return False
@@ -79,4 +79,5 @@ def position_symbol_matches_order(position_symbol: str, order_symbol: str) -> bo
     if position_symbol.startswith("PF_") and position_symbol.endswith("USD"):
         unified = pf_to_unified(position_symbol)
         return order_symbol == unified
-    return False
+    # Registry may store unified without :USD (e.g. PEPE/USD); orders use PEPE/USD:USD
+    return normalize_symbol_for_position_match(position_symbol) == normalize_symbol_for_position_match(order_symbol)

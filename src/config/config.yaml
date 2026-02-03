@@ -262,7 +262,7 @@ reconciliation:
 monitoring:
   # Logging
   log_level: "INFO"  # DEBUG/INFO/WARNING/ERROR/CRITICAL
-  log_format: "json"
+  log_format: "text"  # text = human-readable one line per event; json = machine-parseable
   
   # Alerts
   alert_margin_usage_threshold_pct: 0.70  # 70%
