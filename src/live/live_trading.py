@@ -1490,6 +1490,7 @@ class LiveTrading:
                     
                     # Position Management
                     position_data = map_positions.get(futures_symbol)
+                    managed_pos = None  # Only set in legacy mode; V2 uses state machine
                     if position_data:
                         # Management Logic
                         symbol = position_data['symbol']
