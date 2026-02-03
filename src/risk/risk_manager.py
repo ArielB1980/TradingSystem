@@ -301,7 +301,8 @@ class RiskManager:
 
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
         # Skip margin check if skip_margin_check=True (auction already validated)
-        min_notional = Decimal("50")
+        # Note: min_notional lowered from $50 to $20 to support smaller accounts with tier C (2x leverage)
+        min_notional = Decimal("20")
         if not skip_margin_check and available_margin is not None:
             if available_margin <= 0:
                 rejection_reasons.append(
