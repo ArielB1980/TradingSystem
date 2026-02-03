@@ -901,6 +901,11 @@ class LiveTrading:
         if self.use_state_machine_v2 and self.position_registry:
             for p in self.position_registry.get_all_active():
                 tracked_symbols.add(p.symbol)
+                
+                # Skip positions with zero remaining quantity - nothing to protect
+                if p.remaining_qty <= 0:
+                    continue
+                
                 # Minimal protection invariants (full takeover invariants are handled elsewhere)
                 has_stop_price = p.current_stop_price is not None
                 has_stop_order = p.stop_order_id is not None
@@ -913,6 +918,7 @@ class LiveTrading:
                         "has_sl_price": has_stop_price,
                         "has_sl_order": has_stop_order,
                         "is_protected": is_protected,
+                        "remaining_qty": str(p.remaining_qty),
                     })
         else:
             # Legacy: Check managed_positions (in-memory state)

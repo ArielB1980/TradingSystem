@@ -1031,6 +1031,12 @@ class PositionRegistry:
                     pos.mark_orphaned()
                     orphaned_symbols.append(symbol)
                     issues.append((symbol, "ORPHANED: Registry has position, exchange does not"))
+                elif exchange_pos is None and pos.remaining_qty <= 0:
+                    # Position has no remaining qty and exchange has nothing - mark as closed
+                    pos.state = PositionState.CLOSED
+                    pos.exit_reason = ExitReason.RECONCILIATION
+                    orphaned_symbols.append(symbol)
+                    issues.append((symbol, "STALE: Registry has empty position, marking closed"))
                 elif exchange_pos is not None:
                     # Verify qty matches
                     exchange_qty = Decimal(str(exchange_pos.get('qty', 0)))
