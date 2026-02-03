@@ -367,6 +367,20 @@ class LiveTrading:
                     continue
             out.append(s)
         return out
+
+    def _get_static_tier(self, symbol: str) -> Optional[str]:
+        """
+        Look up symbol in config coin_universe.liquidity_tiers (static lists).
+        Used only for tier mismatch warning; dynamic classification is authoritative.
+        Returns "A", "B", "C", or None if not in any static tier.
+        """
+        if not getattr(self.config, "coin_universe", None) or not getattr(self.config.coin_universe, "enabled", False):
+            return None
+        tiers = getattr(self.config.coin_universe, "liquidity_tiers", None) or {}
+        for tier in ("A", "B", "C"):
+            if symbol in tiers.get(tier, []):
+                return tier
+        return None
     
     async def _update_market_universe(self):
         """Discover and update trading universe."""
@@ -1924,6 +1938,16 @@ class LiveTrading:
         # 2. Risk Validation (Safety Gate)
         # Get symbol tier for tier-specific sizing
         symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+        if symbol_tier != "A":
+            static_tier = self._get_static_tier(signal.symbol)
+            if static_tier == "A":
+                logger.warning(
+                    "Tier downgrade detected",
+                    symbol=signal.symbol,
+                    static_tier=static_tier,
+                    dynamic_tier=symbol_tier,
+                    reason="Dynamic classification is authoritative",
+                )
         
         decision = self.risk_manager.validate_trade(
             signal, equity, spot_price, mark_price,
@@ -2158,6 +2182,16 @@ class LiveTrading:
         # 2. Risk Validation (Safety Gate)
         # Get symbol tier for tier-specific sizing
         symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+        if symbol_tier != "A":
+            static_tier = self._get_static_tier(signal.symbol)
+            if static_tier == "A":
+                logger.warning(
+                    "Tier downgrade detected",
+                    symbol=signal.symbol,
+                    static_tier=static_tier,
+                    dynamic_tier=symbol_tier,
+                    reason="Dynamic classification is authoritative",
+                )
         
         decision = self.risk_manager.validate_trade(
             signal, equity, spot_price, mark_price,
@@ -2596,6 +2630,16 @@ class LiveTrading:
                         continue
                     # Get symbol tier for tier-specific sizing
                     symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
+                    if symbol_tier != "A":
+                        static_tier = self._get_static_tier(signal.symbol)
+                        if static_tier == "A":
+                            logger.warning(
+                                "Tier downgrade detected",
+                                symbol=signal.symbol,
+                                static_tier=static_tier,
+                                dynamic_tier=symbol_tier,
+                                reason="Dynamic classification is authoritative",
+                            )
                     
                     decision = self.risk_manager.validate_trade(
                         signal, equity, spot_price, mark_price,

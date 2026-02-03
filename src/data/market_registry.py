@@ -322,6 +322,13 @@ class MarketRegistry:
         """
         Classify market pair into liquidity tier based on futures metrics.
         
+        This dynamic classification is the single authority for tier, leverage,
+        and max position sizing at trade time. Static lists in
+        config.coin_universe.liquidity_tiers are used only for universe
+        selection (which symbols to consider); they do not override this.
+        If a symbol is not in discovered_pairs, callers default to Tier C
+        (most conservative).
+        
         Tier A: High liquidity (BTC/ETH/SOL tier) - full size/leverage
         Tier B: Medium liquidity - reduced size/leverage
         Tier C: Lower liquidity - restricted size/leverage
@@ -333,8 +340,8 @@ class MarketRegistry:
         # Tier A: High liquidity - OI >= $10M, vol >= $5M, spread <= 0.10%
         if oi >= Decimal("10000000") and vol >= Decimal("5000000") and spread <= Decimal("0.0010"):
             return "A"
-        # Tier B: Medium liquidity - OI >= $1M, vol >= $1M, spread <= 0.25%
-        elif oi >= Decimal("1000000") and vol >= Decimal("1000000") and spread <= Decimal("0.0025"):
+        # Tier B: Medium liquidity - OI >= $1M, vol >= $1M, spread <= 0.30%
+        elif oi >= Decimal("1000000") and vol >= Decimal("1000000") and spread <= Decimal("0.0030"):
             return "B"
         # Tier C: Lower liquidity (eligible but restricted)
         else:
