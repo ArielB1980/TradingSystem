@@ -2657,6 +2657,14 @@ class LiveTrading:
                         )
                         candidate_signals.append(candidate)
                         signal_to_candidate[signal.symbol] = candidate
+                        logger.info(
+                            "Auction candidate created",
+                            symbol=signal.symbol,
+                            score=signal.score,
+                            notional=str(decision.position_notional),
+                            margin=str(decision.margin_required),
+                            approved=decision.approved,
+                        )
                         if not decision.approved:
                             logger.debug(
                                 "Candidate included in auction despite rejection (auction can optimize)",
@@ -2664,6 +2672,16 @@ class LiveTrading:
                                 score=signal.score,
                                 rejection_reasons=decision.rejection_reasons,
                             )
+                    else:
+                        logger.warning(
+                            "Signal not added to auction candidates",
+                            symbol=signal.symbol,
+                            score=signal.score,
+                            position_notional=str(decision.position_notional),
+                            margin_required=str(decision.margin_required),
+                            approved=decision.approved,
+                            rejection_reasons=decision.rejection_reasons,
+                        )
                 except Exception as e:
                     logger.error("Failed to create candidate signal for auction", symbol=signal.symbol, error=str(e))
             
