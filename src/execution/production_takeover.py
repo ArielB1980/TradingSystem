@@ -182,9 +182,18 @@ class ProductionTakeover:
         
         # Step 3: Resolve Chaos (Case C & D)
         if classification == TakeoverCase.D_DUPLICATE:
-            logger.warning(f"Case D: Purging local state for {symbol}")
-            if symbol in self.registry._positions:
-                del self.registry._positions[symbol]
+            # Position already in registry - check if it's already protected
+            existing = self.registry._positions.get(symbol)
+            if existing and existing.stop_order_id:
+                logger.info(f"Case D: Position already in registry with stop, skipping", symbol=symbol, stop_order_id=existing.stop_order_id)
+                stats["imported"] += 1  # Count as already imported
+                self.imported_positions.append(symbol)
+                return  # Skip - already properly managed
+            else:
+                # Registry has position but no stop - purge and re-import
+                logger.warning(f"Case D: Purging local state for {symbol} (no stop in registry)")
+                if symbol in self.registry._positions:
+                    del self.registry._positions[symbol]
         
         valid_stop: Optional[Dict] = None
         
