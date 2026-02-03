@@ -652,8 +652,11 @@ class ExecutionGateway:
         
         # Determine event type
         status = order_data.get("status", "").lower()
-        filled = Decimal(str(order_data.get("filled", 0)))
-        remaining = Decimal(str(order_data.get("remaining", 0)))
+        # Handle None values: exchange may return null instead of 0
+        filled_raw = order_data.get("filled")
+        remaining_raw = order_data.get("remaining")
+        filled = Decimal(str(filled_raw if filled_raw is not None else 0))
+        remaining = Decimal(str(remaining_raw if remaining_raw is not None else 0))
         
         if status == "closed" and filled > 0:
             event_type = OrderEventType.FILLED
@@ -685,7 +688,7 @@ class ExecutionGateway:
             event_seq=next_seq,
             timestamp=datetime.now(timezone.utc),
             fill_qty=filled if event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL) else None,
-            fill_price=Decimal(str(order_data.get("average", 0))) if filled > 0 else None,
+            fill_price=Decimal(str(order_data.get("average") or 0)) if filled > 0 else None,
             fill_id=fill_id,
         )
         
