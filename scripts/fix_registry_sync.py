@@ -34,9 +34,15 @@ async def main():
     # Load config
     config = load_config()
     
-    # Initialize client
-    client = KrakenClient()
-    await client.init()
+    # Initialize client with config credentials
+    client = KrakenClient(
+        api_key=config.exchange.api_key,
+        api_secret=config.exchange.api_secret,
+        futures_api_key=config.exchange.futures_api_key,
+        futures_api_secret=config.exchange.futures_api_secret,
+        use_testnet=config.exchange.use_testnet,
+    )
+    await client.initialize()
     
     # Get exchange positions
     print("\nFetching exchange positions...")
