@@ -391,7 +391,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
                 <tr>
                     <td><strong>{s.get('symbol', '').replace('/', '')}</strong></td>
                     <td><span class="badge {badge_class}">{str(s.get('type', '')).upper()}</span></td>
-                    <td><span class="badge badge-score {score_class}">{score:.1f if score else '-'}</span></td>
+                    <td><span class="badge badge-score {score_class}">{f'{score:.1f}' if score else '-'}</span></td>
                     <td>{s.get('regime', '-')}</td>
                     <td>{s.get('entry', '-')}</td>
                     <td>{s.get('stop', '-')}</td>
