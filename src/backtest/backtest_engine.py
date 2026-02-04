@@ -282,6 +282,17 @@ class BacktestEngine:
         # Finalize metrics
         self.metrics.update()
         
+        # Validation: Check for PnL/trade count consistency
+        if self.metrics.total_pnl != 0 and self.metrics.total_trades == 0:
+            logger.error(
+                "BACKTEST CONSISTENCY ERROR: PnL recorded without trades",
+                symbol=self.symbol,
+                total_pnl=str(self.metrics.total_pnl),
+                trades=self.metrics.total_trades,
+                position_still_open=self.position is not None,
+                unrealized_pnl=str(self.position_realized_pnl) if self.position_realized_pnl else "0",
+            )
+        
         logger.info(
             "Backtest complete",
             trades=self.metrics.total_trades,
@@ -495,9 +506,29 @@ class BacktestEngine:
         
         if hits > 0:
             position.tp_order_ids = remaining_tps
-            # If size ~ 0, close full
+            # If size ~ 0, position is fully closed via TPs - record the trade
             if position.size <= Decimal("0.0001"):
+                # Record trade completion (trade count, win/loss)
+                self.metrics.total_trades += 1
+                if self.position_realized_pnl > 0:
+                    self.metrics.winning_trades += 1
+                else:
+                    self.metrics.losing_trades += 1
+                
+                self.risk_manager.record_trade_result(
+                    self.position_realized_pnl,
+                    self.current_equity,
+                    setup_type=position.setup_type if hasattr(position, 'setup_type') else None
+                )
+                
+                logger.info(
+                    "Position fully closed via TPs",
+                    symbol=position.symbol,
+                    realized_pnl=str(self.position_realized_pnl),
+                )
+                
                 self.position = None
+                self.position_realized_pnl = Decimal("0")
                 return True
                 
         return False
