@@ -91,12 +91,45 @@ def get_active_log() -> Path:
 
 
 def parse_log_line(line: str) -> dict:
-    """Parse a JSON log line into a readable format."""
+    """Parse a log line (JSON or structured text) into a dict."""
+    line = line.strip()
+    if not line:
+        return None
+    
+    # Try JSON first
     try:
-        data = json.loads(line.strip())
+        data = json.loads(line)
         return data
     except json.JSONDecodeError:
-        return {"raw": line.strip(), "level": "info"}
+        pass
+    
+    # Parse structured text format:
+    # 2026-02-04T15:36:15.421571Z [info ] Event message [module] key=value key2=value2
+    pattern = r'^(\d{4}-\d{2}-\d{2}T[\d:.]+Z?)\s+\[(\w+)\s*\]\s+(.+?)\s+\[([^\]]+)\]\s*(.*)$'
+    match = re.match(pattern, line)
+    
+    if match:
+        timestamp, level, event, logger, extras = match.groups()
+        result = {
+            "timestamp": timestamp,
+            "level": level.strip(),
+            "event": event.strip(),
+            "logger": logger.strip(),
+        }
+        
+        # Parse key=value pairs from extras
+        # Handle both simple values and complex values with spaces/brackets
+        kv_pattern = r"(\w+)=(?:'([^']*)'|\"([^\"]*)\"|(\[[^\]]*\])|(\{[^\}]*\})|(\S+))"
+        for kv_match in re.finditer(kv_pattern, extras):
+            key = kv_match.group(1)
+            # Find which group matched
+            val = kv_match.group(2) or kv_match.group(3) or kv_match.group(4) or kv_match.group(5) or kv_match.group(6) or ""
+            result[key] = val
+        
+        return result
+    
+    # Fallback - return as raw
+    return {"raw": line, "level": "info"}
 
 
 def parse_timestamp_to_cet(ts_str: str) -> str:
@@ -310,7 +343,7 @@ if LIVE_LOG and LIVE_LOG.exists():
         entries = []
         for line in reversed(log_lines):  # Most recent first
             entry = parse_log_line(line)
-            if matches_filter(entry, text_search, level_filter):
+            if entry and matches_filter(entry, text_search, level_filter):
                 entries.append(entry)
         
         # Stats bar
