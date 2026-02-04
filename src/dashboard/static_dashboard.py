@@ -162,6 +162,7 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
         "rejections": {},
     }
     errors = []
+    current_smc_symbol = None  # Track current symbol for multi-line SMC analysis
     
     import re
     
@@ -175,12 +176,13 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
             if symbol_match:
                 symbol = symbol_match.group(1)
         
-        # Track coins from SMC Analysis lines
+        # Track coins from SMC Analysis lines (first line of multi-line block)
         if "SMC Analysis" in raw:
             # Extract symbol from "SMC Analysis SYMBOL:"
             smc_match = re.search(r'SMC Analysis ([A-Z0-9/]+):', raw)
             if smc_match:
                 symbol = smc_match.group(1)
+                current_smc_symbol = symbol  # Track for subsequent lines
             
             if symbol and symbol not in coins_reviewed:
                 coins_reviewed[symbol] = {
@@ -197,12 +199,13 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
                 }
             
             if symbol and symbol in coins_reviewed:
-                # Parse analysis details
+                # Parse analysis details from this line
                 if "Bias Bullish" in raw:
                     coins_reviewed[symbol]["bias"] = "bullish"
                 elif "Bias Bearish" in raw:
                     coins_reviewed[symbol]["bias"] = "bearish"
                 
+                # Some indicators may be on same line
                 if "Order block detected" in raw or "✓ Order block" in raw:
                     coins_reviewed[symbol]["has_ob"] = True
                 if "Fair value gap" in raw or "✓ Fair value gap" in raw:
@@ -222,6 +225,26 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
                     rejection_match = re.search(r'❌ Rejected[:\s]*(.+?)(?:\[|$)', raw)
                     if rejection_match:
                         coins_reviewed[symbol]["rejection"] = rejection_match.group(1).strip()
+        
+        # Handle continuation lines (SMC indicators on separate lines)
+        elif current_smc_symbol and current_smc_symbol in coins_reviewed:
+            # Check if this is a continuation line (starts with checkmark or has indicator)
+            if raw.startswith("✓") or raw.startswith("✅") or raw.startswith("❌"):
+                if "Order block" in raw:
+                    coins_reviewed[current_smc_symbol]["has_ob"] = True
+                if "Fair value gap" in raw:
+                    coins_reviewed[current_smc_symbol]["has_fvg"] = True
+                if "Break of structure" in raw:
+                    coins_reviewed[current_smc_symbol]["has_bos"] = True
+                if "4H Decision Structure Found" in raw or "4H" in raw:
+                    coins_reviewed[current_smc_symbol]["has_4h"] = True
+                if "❌ Rejected" in raw:
+                    rejection_match = re.search(r'❌ Rejected[:\s]*(.+?)(?:\[|$)', raw)
+                    if rejection_match:
+                        coins_reviewed[current_smc_symbol]["rejection"] = rejection_match.group(1).strip()
+            else:
+                # Not a continuation line, reset current symbol
+                current_smc_symbol = None
         
         # Track signals - look for "Signal generated with 4H decision authority"
         if "Signal generated" in raw and symbol:
