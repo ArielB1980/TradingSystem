@@ -51,27 +51,78 @@ def get_db_connection():
     return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
 
 
-def fetch_latest_traces(hours: int = 1) -> List[Dict]:
-    """Fetch latest decision traces from database."""
+def parse_log_file(log_path: Path, max_lines: int = 2000) -> List[Dict]:
+    """Parse the log file to extract signal and auction information."""
+    entries = []
+    
+    if not log_path.exists():
+        return entries
+    
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        with open(log_path, 'r', errors='ignore') as f:
+            # Read last N lines
+            lines = f.readlines()[-max_lines:]
         
-        cur.execute("""
-            SELECT symbol, decision_type, payload, created_at
-            FROM decision_traces
-            WHERE created_at > NOW() - INTERVAL '%s hours'
-            ORDER BY created_at DESC
-        """, (hours,))
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            try:
+                entry = {"raw": line}
+                
+                # Extract timestamp
+                if line.startswith("20"):
+                    parts = line.split(" ", 2)
+                    if len(parts) >= 2:
+                        entry["timestamp"] = parts[0]
+                
+                # Extract log level
+                if "[info" in line.lower():
+                    entry["level"] = "info"
+                elif "[warning" in line.lower():
+                    entry["level"] = "warning"
+                elif "[error" in line.lower():
+                    entry["level"] = "error"
+                elif "[critical" in line.lower():
+                    entry["level"] = "critical"
+                
+                # Detect entry type by content
+                if "Signal generated" in line or "Signal rejected" in line:
+                    entry["type"] = "signal"
+                elif "AUCTION" in line or "Auction" in line:
+                    entry["type"] = "auction"
+                elif "SMC Analysis" in line:
+                    entry["type"] = "analysis"
+                elif "position" in line.lower():
+                    entry["type"] = "position"
+                
+                # Extract symbol
+                import re
+                symbol_match = re.search(r'symbol=([A-Z/]+)', line)
+                if symbol_match:
+                    entry["symbol"] = symbol_match.group(1)
+                
+                # Extract score
+                score_match = re.search(r'score[=:]?\s*(\d+\.?\d*)', line, re.IGNORECASE)
+                if score_match:
+                    entry["score"] = float(score_match.group(1))
+                
+                # Extract signal type
+                if "signal_type=short" in line.lower() or "type=short" in line.lower():
+                    entry["signal_type"] = "short"
+                elif "signal_type=long" in line.lower() or "type=long" in line.lower():
+                    entry["signal_type"] = "long"
+                
+                entries.append(entry)
+                
+            except Exception:
+                continue
         
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        
-        return [dict(row) for row in rows]
     except Exception as e:
-        print(f"Failed to fetch traces: {e}")
-        return []
+        print(f"Failed to parse log: {e}")
+    
+    return entries
 
 
 def fetch_positions() -> List[Dict]:
@@ -96,6 +147,125 @@ def fetch_positions() -> List[Dict]:
     except Exception as e:
         print(f"Failed to fetch positions: {e}")
         return []
+
+
+def parse_log_entries(entries: List[Dict]) -> Dict:
+    """Parse log entries into structured data."""
+    coins_reviewed = {}
+    signals_found = []
+    auction_results = {
+        "signals_collected": 0,
+        "winners": [],
+        "opens_executed": 0,
+        "opens_failed": 0,
+        "closes": [],
+        "rejections": {},
+    }
+    errors = []
+    
+    import re
+    
+    for entry in entries:
+        raw = entry.get("raw", "")
+        symbol = entry.get("symbol", "")
+        
+        # Track coins from SMC Analysis lines
+        if "SMC Analysis" in raw and symbol:
+            if symbol not in coins_reviewed:
+                coins_reviewed[symbol] = {
+                    "symbol": symbol,
+                    "bias": "",
+                    "has_ob": False,
+                    "has_fvg": False,
+                    "has_bos": False,
+                    "has_4h": False,
+                    "signal_type": "",
+                    "score": None,
+                    "regime": "",
+                    "rejection": "",
+                }
+            
+            # Parse analysis details
+            if "Bias Bullish" in raw:
+                coins_reviewed[symbol]["bias"] = "bullish"
+            elif "Bias Bearish" in raw:
+                coins_reviewed[symbol]["bias"] = "bearish"
+            
+            if "Order block detected" in raw or "✓ Order block" in raw:
+                coins_reviewed[symbol]["has_ob"] = True
+            if "Fair value gap" in raw or "✓ Fair value gap" in raw:
+                coins_reviewed[symbol]["has_fvg"] = True
+            if "Break of structure" in raw or "✓ Break of structure" in raw:
+                coins_reviewed[symbol]["has_bos"] = True
+            if "4H Decision Structure Found" in raw or "✅ 4H" in raw:
+                coins_reviewed[symbol]["has_4h"] = True
+            
+            # Extract regime
+            regime_match = re.search(r'Market Regime:\s*(\w+)', raw)
+            if regime_match:
+                coins_reviewed[symbol]["regime"] = regime_match.group(1)
+            
+            # Check for rejection reason
+            if "❌ Rejected" in raw:
+                rejection_match = re.search(r'❌ Rejected[:\s]*(.+?)(?:\[|$)', raw)
+                if rejection_match:
+                    coins_reviewed[symbol]["rejection"] = rejection_match.group(1).strip()
+        
+        # Track signals
+        if entry.get("type") == "signal" or "Signal generated" in raw:
+            signal_type = entry.get("signal_type", "")
+            score = entry.get("score")
+            
+            if symbol and signal_type:
+                if symbol in coins_reviewed:
+                    coins_reviewed[symbol]["signal_type"] = signal_type
+                    coins_reviewed[symbol]["score"] = score
+                
+                # Extract entry/stop/tp from the log line
+                entry_match = re.search(r'entry[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+                stop_match = re.search(r'stop[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+                tp_match = re.search(r'tp\d?[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+                
+                signals_found.append({
+                    "symbol": symbol,
+                    "type": signal_type,
+                    "score": score,
+                    "entry": entry_match.group(1) if entry_match else None,
+                    "stop": stop_match.group(1) if stop_match else None,
+                    "tp": tp_match.group(1) if tp_match else None,
+                    "regime": coins_reviewed.get(symbol, {}).get("regime", ""),
+                })
+        
+        # Track auction results
+        if "Auction allocation executed" in raw or "Auction plan generated" in raw:
+            opens_match = re.search(r'opens_executed[=:]?\s*(\d+)', raw)
+            fails_match = re.search(r'opens_failed[=:]?\s*(\d+)', raw)
+            signals_match = re.search(r'signals_collected[=:]?\s*(\d+)', raw)
+            
+            if opens_match:
+                auction_results["opens_executed"] = int(opens_match.group(1))
+            if fails_match:
+                auction_results["opens_failed"] = int(fails_match.group(1))
+            if signals_match:
+                auction_results["signals_collected"] = int(signals_match.group(1))
+            
+            # Extract winners
+            winners_match = re.search(r'opens_symbols=\[([^\]]*)\]', raw)
+            if winners_match:
+                winners_str = winners_match.group(1)
+                winners = [w.strip().strip("'\"") for w in winners_str.split(",") if w.strip()]
+                auction_results["winners"] = winners
+        
+        # Track errors
+        if entry.get("level") == "error":
+            errors.append(raw[:200])
+    
+    return {
+        "coins": list(coins_reviewed.values()),
+        "signals": signals_found,
+        "auction": auction_results,
+        "errors": errors[-10:],  # Keep only last 10 errors
+    }
 
 
 def parse_traces(traces: List[Dict]) -> Dict:
@@ -447,12 +617,18 @@ def update_dashboard():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Updating dashboard...")
     
     try:
-        # Fetch data
-        traces = fetch_latest_traces(hours=1)
+        # Find the active log file
+        log_dir = project_root / "logs"
+        run_log = log_dir / "run.log"
+        
+        # Parse log file
+        log_entries = parse_log_file(run_log, max_lines=3000)
+        
+        # Fetch positions from database
         positions = fetch_positions()
         
-        # Parse traces
-        data = parse_traces(traces)
+        # Parse log entries into structured data
+        data = parse_log_entries(log_entries)
         
         # Generate HTML
         html = generate_html(data, positions)
@@ -473,10 +649,12 @@ def update_dashboard():
                 "auction": data.get("auction", {}),
             }, f, indent=2, default=str)
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {len(data.get('coins', []))} coins, {len(data.get('signals', []))} signals")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {len(data.get('coins', []))} coins, {len(data.get('signals', []))} signals, {len(positions)} positions")
         
     except Exception as e:
+        import traceback
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Error updating dashboard: {e}")
+        traceback.print_exc()
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
