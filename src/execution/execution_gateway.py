@@ -857,8 +857,10 @@ class ExecutionGateway:
         Import positions that exist on exchange but not in registry.
         
         This handles the case where the bot was restarted and lost in-memory state.
+        Also handles stale positions (remaining_qty=0) by replacing them.
         """
         from src.execution.position_state_machine import ManagedPosition, PositionState, FillRecord, Side
+        from src.data.symbol_utils import normalize_symbol_for_position_match
         from datetime import datetime, timezone
         
         try:
@@ -876,10 +878,34 @@ class ExecutionGateway:
             if size == 0:
                 continue
             
-            # Check if already in registry
+            # Check if already in registry - use normalized matching
+            normalized_key = normalize_symbol_for_position_match(symbol)
             existing = self.registry.get_position(symbol)
+            stale_symbols_to_remove = []
+            
+            # Also check for normalized matches across all registry positions
+            for reg_symbol in list(self.registry._positions.keys()):
+                if normalize_symbol_for_position_match(reg_symbol) == normalized_key:
+                    reg_pos = self.registry._positions.get(reg_symbol)
+                    if reg_pos and reg_pos.remaining_qty > 0:
+                        # Found a valid existing position, skip import
+                        existing = reg_pos
+                        break
+                    elif reg_pos and reg_pos.remaining_qty <= 0:
+                        # Stale position, mark for removal
+                        stale_symbols_to_remove.append(reg_symbol)
+            
             if existing and existing.remaining_qty > 0:
                 continue
+            
+            # Remove any stale positions with same normalized key
+            for stale_symbol in stale_symbols_to_remove:
+                logger.warning("Removing stale position before phantom import", 
+                              stale_symbol=stale_symbol, new_symbol=symbol)
+                with self.registry._lock:
+                    stale_pos = self.registry._positions.pop(stale_symbol, None)
+                    if stale_pos:
+                        self.registry._closed_positions.append(stale_pos)
             
             # Need to import
             logger.warning("Importing phantom position from exchange", symbol=symbol, size=size)
