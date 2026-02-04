@@ -65,6 +65,16 @@ st.markdown("""
 .log-module { color: #555; font-size: 10px; font-style: italic; }
 .log-buy { background: linear-gradient(135deg, #2E7D32, #43A047) !important; }
 .log-sell { background: linear-gradient(135deg, #C62828, #E53935) !important; }
+.log-score { 
+    background: linear-gradient(135deg, #F57C00, #FF9800);
+    color: #000; 
+    font-weight: 700; 
+    padding: 2px 8px; 
+    border-radius: 4px;
+    font-size: 12px;
+}
+.log-score-high { background: linear-gradient(135deg, #388E3C, #4CAF50) !important; color: #fff; }
+.log-score-low { background: linear-gradient(135deg, #D32F2F, #F44336) !important; color: #fff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -177,6 +187,8 @@ def format_log_entry_html(entry: dict) -> str:
     symbol = entry.get("symbol", "")
     action = entry.get("action", "")
     side = entry.get("side", "")
+    score = entry.get("score", "")
+    signal_type = entry.get("signal_type", "")
     
     # Build header with symbol and action prominently displayed
     header_parts = []
@@ -192,8 +204,25 @@ def format_log_entry_html(entry: dict) -> str:
     if side:
         side_class = "log-buy" if side.lower() == "buy" else "log-sell"
         header_parts.append(f'<span class="log-action {side_class}">{side.upper()}</span>')
+    elif signal_type:
+        signal_class = "log-buy" if signal_type.lower() == "long" else "log-sell"
+        header_parts.append(f'<span class="log-action {signal_class}">{signal_type.upper()}</span>')
     elif action:
         header_parts.append(f'<span class="log-action">{action}</span>')
+    
+    # Score badge (if present)
+    if score:
+        try:
+            score_val = float(score)
+            if score_val >= 70:
+                score_class = "log-score log-score-high"
+            elif score_val < 50:
+                score_class = "log-score log-score-low"
+            else:
+                score_class = "log-score"
+            header_parts.append(f'<span class="{score_class}">⭐ {score_val:.0f}</span>')
+        except (ValueError, TypeError):
+            header_parts.append(f'<span class="log-score">⭐ {score}</span>')
     
     # Icon for warnings/errors
     if icon:
@@ -205,7 +234,7 @@ def format_log_entry_html(entry: dict) -> str:
     header_html = " ".join(header_parts)
     
     # Build details section (remaining fields)
-    skip_keys = {"timestamp", "level", "event", "logger", "exc_info", "symbol", "action", "side"}
+    skip_keys = {"timestamp", "level", "event", "logger", "exc_info", "symbol", "action", "side", "score", "signal_type"}
     details = {k: v for k, v in entry.items() if k not in skip_keys and v is not None and v != ""}
     
     # Format details nicely
