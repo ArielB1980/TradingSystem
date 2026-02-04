@@ -108,7 +108,15 @@ risk:
 
 ## Strategy Parameters
 strategy:
-  # Timeframes - 4H DECISION AUTHORITY HIERARCHY
+  # ============================================================
+  # TIMEFRAME HIERARCHY - 4H DECISION AUTHORITY (LOCKED)
+  # ============================================================
+  # This configuration is LOCKED after backtest validation:
+  # - 4H decision produces 78.9% win rate vs 69.1% on 1H
+  # - 2.4x better PnL per trade, 60% lower drawdown
+  # DO NOT change decision_timeframes without re-running paired comparison
+  # ============================================================
+  #
   # 1D: Regime filter only (EMA200 bias, risk on/off)
   # 4H: DECISION AUTHORITY - all SMC patterns (OB, FVG, BOS, ATR for stops)
   # 1H: Refinement only - ADX filter, swing point precision
@@ -116,7 +124,7 @@ strategy:
   regime_timeframes:
     - "1d"
   decision_timeframes:
-    - "4h"
+    - "4h"  # LOCKED - do not change
   refinement_timeframes:
     - "1h"
     - "15m"

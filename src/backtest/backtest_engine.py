@@ -42,14 +42,69 @@ class BacktestMetrics:
     equity_curve: List[Decimal] = field(default_factory=list)
     peak_equity: Decimal = Decimal("0")
     
+    # NEW: Extended metrics for portfolio analysis
+    max_concurrent_positions: int = 0  # Peak concurrent positions filled
+    calmar_ratio: float = 0.0  # PnL / Max Drawdown (risk-adjusted return)
+    trade_results: List[Decimal] = field(default_factory=list)  # Individual trade PnLs for correlation
+    trade_timestamps: List[datetime] = field(default_factory=list)  # Trade close times
+    trade_symbols: List[str] = field(default_factory=list)  # Symbols for each trade
+    loss_correlation: float = 0.0  # Correlation coefficient of consecutive losses
+    
     def update(self):
         """Update calculated metrics."""
         if self.total_trades > 0:
             self.win_rate = (self.winning_trades / self.total_trades) * 100
         
+        # Calculate Calmar ratio (PnL / Max Drawdown)
+        if self.max_drawdown > 0:
+            self.calmar_ratio = float(self.total_pnl) / float(self.max_drawdown * Decimal("100"))
+        elif float(self.total_pnl) > 0:
+            self.calmar_ratio = float("inf")  # Positive PnL with no drawdown
+        
+        # Calculate loss correlation (are losses clustered?)
+        self._calculate_loss_correlation()
+        
         if self.winning_trades > 0 and self.losing_trades > 0:
-            # Simplified tracking - would need list of trade results for accurate avg/sharpe
-            pass 
+            # Calculate avg win/loss
+            wins = [r for r in self.trade_results if r > 0]
+            losses = [r for r in self.trade_results if r < 0]
+            if wins:
+                self.avg_win = sum(wins) / len(wins)
+            if losses:
+                self.avg_loss = sum(losses) / len(losses)
+            if self.avg_loss != 0:
+                self.profit_factor = float(abs(self.avg_win * self.winning_trades) / abs(self.avg_loss * self.losing_trades))
+    
+    def _calculate_loss_correlation(self):
+        """
+        Calculate correlation of consecutive losses.
+        High positive correlation = losses tend to cluster (bad)
+        Near zero = losses are independent (neutral)
+        Negative = losses tend to alternate with wins (good)
+        """
+        if len(self.trade_results) < 3:
+            self.loss_correlation = 0.0
+            return
+        
+        # Create binary sequence: 1 = loss, 0 = win/breakeven
+        loss_sequence = [1 if r < 0 else 0 for r in self.trade_results]
+        
+        # Calculate autocorrelation at lag 1
+        n = len(loss_sequence)
+        mean = sum(loss_sequence) / n
+        
+        if mean == 0 or mean == 1:
+            self.loss_correlation = 0.0  # All wins or all losses
+            return
+        
+        # Covariance of sequence with itself shifted by 1
+        variance = sum((x - mean) ** 2 for x in loss_sequence) / n
+        if variance == 0:
+            self.loss_correlation = 0.0
+            return
+        
+        covariance = sum((loss_sequence[i] - mean) * (loss_sequence[i+1] - mean) for i in range(n-1)) / (n-1)
+        self.loss_correlation = covariance / variance 
 
 
 class BacktestEngine:
@@ -515,6 +570,11 @@ class BacktestEngine:
                 else:
                     self.metrics.losing_trades += 1
                 
+                # Record trade result for correlation analysis
+                self.metrics.trade_results.append(self.position_realized_pnl)
+                self.metrics.trade_timestamps.append(candle.timestamp)
+                self.metrics.trade_symbols.append(position.symbol)
+                
                 self.risk_manager.record_trade_result(
                     self.position_realized_pnl,
                     self.current_equity,
@@ -578,6 +638,11 @@ class BacktestEngine:
             self.metrics.winning_trades += 1
         else:
             self.metrics.losing_trades += 1
+        
+        # Record trade result for correlation analysis
+        self.metrics.trade_results.append(self.position_realized_pnl)
+        self.metrics.trade_timestamps.append(timestamp)
+        self.metrics.trade_symbols.append(self.position.symbol)
             
         self.risk_manager.record_trade_result(
             self.position_realized_pnl, 
