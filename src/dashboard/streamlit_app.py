@@ -3,6 +3,14 @@ Trading System Dashboard - Single Page Coin Monitor
 
 Displays comprehensive real-time analysis for all tracked coins.
 """
+import sys
+from pathlib import Path
+
+# Ensure project root is in path for imports
+project_root = Path(__file__).parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
