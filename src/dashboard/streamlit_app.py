@@ -5,9 +5,12 @@ Displays system logs in a human-readable format.
 """
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import re
+
+# CET timezone (UTC+1, or UTC+2 during DST)
+CET = timezone(timedelta(hours=1))
 
 # Ensure project root is in path for imports
 project_root = Path(__file__).parent.parent.parent
@@ -27,23 +30,41 @@ st.set_page_config(
 st.markdown("""
 <style>
 .log-entry {
-    padding: 8px 12px;
-    margin: 4px 0;
-    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 6px 0;
+    border-radius: 8px;
     font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
     font-size: 13px;
-    line-height: 1.5;
+    line-height: 1.6;
 }
-.log-info { background-color: #1a2332; border-left: 3px solid #4CAF50; }
-.log-warning { background-color: #2d2a1a; border-left: 3px solid #FF9800; }
-.log-error { background-color: #2d1a1a; border-left: 3px solid #f44336; }
-.log-debug { background-color: #1a1a2d; border-left: 3px solid #9E9E9E; }
-.log-time { color: #888; font-size: 12px; }
-.log-event { color: #fff; font-weight: 600; font-size: 14px; }
-.log-detail { color: #aaa; font-size: 12px; margin-top: 4px; }
-.log-symbol { color: #64B5F6; font-weight: 600; }
-.log-value { color: #81C784; }
-.log-module { color: #666; font-size: 11px; }
+.log-info { background-color: #1a2332; border-left: 4px solid #4CAF50; }
+.log-warning { background-color: #2d2a1a; border-left: 4px solid #FF9800; }
+.log-error { background-color: #2d1a1a; border-left: 4px solid #f44336; }
+.log-debug { background-color: #1a1a2d; border-left: 4px solid #9E9E9E; }
+.log-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.log-time { color: #666; font-size: 11px; min-width: 50px; }
+.log-symbol { 
+    background: linear-gradient(135deg, #1565C0, #1976D2);
+    color: #fff; 
+    font-weight: 700; 
+    padding: 2px 8px; 
+    border-radius: 4px;
+    font-size: 12px;
+}
+.log-action { 
+    background: linear-gradient(135deg, #7B1FA2, #9C27B0);
+    color: #fff; 
+    font-weight: 600; 
+    padding: 2px 8px; 
+    border-radius: 4px;
+    font-size: 12px;
+}
+.log-event { color: #e0e0e0; font-weight: 500; font-size: 13px; }
+.log-detail { color: #999; font-size: 11px; margin-top: 6px; }
+.log-value { color: #81C784; font-weight: 500; }
+.log-module { color: #555; font-size: 10px; font-style: italic; }
+.log-buy { background: linear-gradient(135deg, #2E7D32, #43A047) !important; }
+.log-sell { background: linear-gradient(135deg, #C62828, #E53935) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -78,65 +99,110 @@ def parse_log_line(line: str) -> dict:
         return {"raw": line.strip(), "level": "info"}
 
 
+def parse_timestamp_to_cet(ts_str: str) -> str:
+    """Convert ISO timestamp to clean CET format."""
+    if not ts_str:
+        return ""
+    try:
+        # Parse ISO format (e.g., 2026-02-04T15:03:42.317965Z)
+        ts_clean = ts_str.replace("Z", "+00:00")
+        if "." in ts_clean:
+            ts_clean = ts_clean.split(".")[0] + "+00:00"
+        dt = datetime.fromisoformat(ts_clean.replace("+00:00", ""))
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+        dt_cet = dt_utc.astimezone(CET)
+        return dt_cet.strftime("%H:%M:%S")
+    except Exception:
+        return ts_str[:8] if len(ts_str) >= 8 else ts_str
+
+
 def format_log_entry_html(entry: dict) -> str:
     """Format a log entry as styled HTML."""
     if "raw" in entry:
         return f'<div class="log-entry log-info">{entry["raw"]}</div>'
     
     # Extract common fields
-    timestamp = entry.get("timestamp", "")[:19].replace("T", " ").replace("Z", "")
+    timestamp = parse_timestamp_to_cet(entry.get("timestamp", ""))
     level = entry.get("level", "info").lower()
     event = entry.get("event", "")
-    logger = entry.get("logger", "").replace("src.", "").replace(".", " › ")
+    logger = entry.get("logger", "").replace("src.", "")
     
     # Determine CSS class
     level_class = f"log-{level}" if level in ["info", "warning", "error", "debug"] else "log-info"
     
     # Level icons
     level_icons = {
-        "info": "ℹ️",
+        "info": "",
         "warning": "⚠️",
         "error": "❌",
         "critical": "🔥",
         "debug": "🔍",
     }
-    icon = level_icons.get(level, "📝")
+    icon = level_icons.get(level, "")
     
-    # Build details section
-    skip_keys = {"timestamp", "level", "event", "logger", "exc_info"}
+    # Extract key fields for highlighting
+    symbol = entry.get("symbol", "")
+    action = entry.get("action", "")
+    side = entry.get("side", "")
+    
+    # Build header with symbol and action prominently displayed
+    header_parts = []
+    
+    # Time first (subtle)
+    header_parts.append(f'<span class="log-time">{timestamp}</span>')
+    
+    # Symbol badge (if present)
+    if symbol:
+        header_parts.append(f'<span class="log-symbol">{symbol}</span>')
+    
+    # Action/Side badge (if present) 
+    if side:
+        side_class = "log-buy" if side.lower() == "buy" else "log-sell"
+        header_parts.append(f'<span class="log-action {side_class}">{side.upper()}</span>')
+    elif action:
+        header_parts.append(f'<span class="log-action">{action}</span>')
+    
+    # Icon for warnings/errors
+    if icon:
+        header_parts.append(icon)
+    
+    # Event text
+    header_parts.append(f'<span class="log-event">{event}</span>')
+    
+    header_html = " ".join(header_parts)
+    
+    # Build details section (remaining fields)
+    skip_keys = {"timestamp", "level", "event", "logger", "exc_info", "symbol", "action", "side"}
     details = {k: v for k, v in entry.items() if k not in skip_keys and v is not None and v != ""}
     
     # Format details nicely
     detail_parts = []
     
     # Prioritize important fields
-    priority_fields = ["symbol", "side", "size", "price", "pnl", "action", "reason", "count"]
+    priority_fields = ["size", "price", "pnl", "reason", "count", "timeframe", "source"]
     for key in priority_fields:
         if key in details:
             val = details.pop(key)
-            if key == "symbol":
-                detail_parts.append(f'<span class="log-symbol">{val}</span>')
-            elif key in ["pnl", "price", "size"]:
+            if key in ["pnl", "price", "size"]:
                 detail_parts.append(f'{key}: <span class="log-value">{val}</span>')
             else:
                 detail_parts.append(f'{key}: {val}')
     
-    # Add remaining fields
-    for key, val in list(details.items())[:6]:
-        # Truncate long values
+    # Add remaining fields (limit to prevent overflow)
+    for key, val in list(details.items())[:4]:
         val_str = str(val)
-        if len(val_str) > 60:
-            val_str = val_str[:57] + "..."
+        if len(val_str) > 40:
+            val_str = val_str[:37] + "..."
         detail_parts.append(f'{key}: {val_str}')
     
-    details_html = " &nbsp;│&nbsp; ".join(detail_parts) if detail_parts else ""
+    details_html = ""
+    if detail_parts:
+        details_html = f'<div class="log-detail">{" · ".join(detail_parts)}</div>'
     
     html = f'''
     <div class="log-entry {level_class}">
-        <span class="log-time">{timestamp}</span> {icon}
-        <span class="log-event">{event}</span>
-        <span class="log-module">[{logger}]</span>
-        <div class="log-detail">{details_html}</div>
+        <div class="log-header">{header_html}</div>
+        {details_html}
     </div>
     '''
     return html
