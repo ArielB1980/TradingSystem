@@ -106,6 +106,11 @@ def parse_log_line(line: str) -> dict:
     if not line:
         return None
     
+    # Skip continuation lines (multi-line log output without timestamp)
+    # These start with symbols like ✓, ❌, ○, 📊, or whitespace
+    if line and line[0] in '✓❌○📊✅⚠️🔴🟢│├└─ \t':
+        return None
+    
     # Try JSON first
     try:
         data = json.loads(line)
@@ -138,8 +143,12 @@ def parse_log_line(line: str) -> dict:
         
         return result
     
-    # Fallback - return as raw
-    return {"raw": line, "level": "info"}
+    # Skip lines that don't look like proper log entries
+    if not line.startswith('20'):  # Year prefix for timestamps
+        return None
+    
+    # Fallback - return as raw but escape HTML
+    return {"raw": line.replace('<', '&lt;').replace('>', '&gt;'), "level": "info"}
 
 
 def parse_timestamp_to_cet(ts_str: str) -> str:
@@ -162,7 +171,9 @@ def parse_timestamp_to_cet(ts_str: str) -> str:
 def format_log_entry_html(entry: dict) -> str:
     """Format a log entry as styled HTML."""
     if "raw" in entry:
-        return f'<div class="log-entry log-info">{entry["raw"]}</div>'
+        # Raw entries already have HTML escaped
+        raw_text = entry["raw"]
+        return f'<div class="log-entry log-info"><span class="log-event">{raw_text}</span></div>'
     
     # Extract common fields
     timestamp = parse_timestamp_to_cet(entry.get("timestamp", ""))
