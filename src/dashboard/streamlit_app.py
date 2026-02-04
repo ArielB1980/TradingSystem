@@ -1,13 +1,13 @@
 """
-Trading System Dashboard - Simple Log Viewer
+Trading System Dashboard - Log Viewer
 
 Displays system logs in a human-readable format.
 """
 import sys
-import os
 from pathlib import Path
 from datetime import datetime
 import json
+import re
 
 # Ensure project root is in path for imports
 project_root = Path(__file__).parent.parent.parent
@@ -23,11 +23,34 @@ st.set_page_config(
     layout="wide",
 )
 
+# Custom CSS for better readability
+st.markdown("""
+<style>
+.log-entry {
+    padding: 8px 12px;
+    margin: 4px 0;
+    border-radius: 6px;
+    font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.log-info { background-color: #1a2332; border-left: 3px solid #4CAF50; }
+.log-warning { background-color: #2d2a1a; border-left: 3px solid #FF9800; }
+.log-error { background-color: #2d1a1a; border-left: 3px solid #f44336; }
+.log-debug { background-color: #1a1a2d; border-left: 3px solid #9E9E9E; }
+.log-time { color: #888; font-size: 12px; }
+.log-event { color: #fff; font-weight: 600; font-size: 14px; }
+.log-detail { color: #aaa; font-size: 12px; margin-top: 4px; }
+.log-symbol { color: #64B5F6; font-weight: 600; }
+.log-value { color: #81C784; }
+.log-module { color: #666; font-size: 11px; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("📊 Trading System Monitor")
 
 # Log file paths
 LOG_DIR = project_root / "logs"
-# Check multiple possible log files and use the most recent
 LOG_FILES = [
     LOG_DIR / "run.log",
     LOG_DIR / "live_trading.log",
@@ -45,7 +68,6 @@ def get_active_log() -> Path:
                 best = lf
     return best or LOG_FILES[0]
 
-LIVE_LOG = get_active_log()
 
 def parse_log_line(line: str) -> dict:
     """Parse a JSON log line into a readable format."""
@@ -53,46 +75,74 @@ def parse_log_line(line: str) -> dict:
         data = json.loads(line.strip())
         return data
     except json.JSONDecodeError:
-        return {"raw": line.strip()}
+        return {"raw": line.strip(), "level": "info"}
 
-def format_log_entry(entry: dict) -> str:
-    """Format a log entry for display."""
+
+def format_log_entry_html(entry: dict) -> str:
+    """Format a log entry as styled HTML."""
     if "raw" in entry:
-        return entry["raw"]
+        return f'<div class="log-entry log-info">{entry["raw"]}</div>'
     
     # Extract common fields
-    timestamp = entry.get("timestamp", "")[:19].replace("T", " ")
-    level = entry.get("level", "info").upper()
+    timestamp = entry.get("timestamp", "")[:19].replace("T", " ").replace("Z", "")
+    level = entry.get("level", "info").lower()
     event = entry.get("event", "")
-    logger = entry.get("logger", "").replace("src.", "")
+    logger = entry.get("logger", "").replace("src.", "").replace(".", " › ")
     
-    # Color coding for levels
-    level_colors = {
-        "INFO": "🟢",
-        "WARNING": "🟡", 
-        "ERROR": "🔴",
-        "CRITICAL": "🔴",
-        "DEBUG": "⚪",
+    # Determine CSS class
+    level_class = f"log-{level}" if level in ["info", "warning", "error", "debug"] else "log-info"
+    
+    # Level icons
+    level_icons = {
+        "info": "ℹ️",
+        "warning": "⚠️",
+        "error": "❌",
+        "critical": "🔥",
+        "debug": "🔍",
     }
-    level_icon = level_colors.get(level, "⚪")
+    icon = level_icons.get(level, "📝")
     
-    # Build the message
-    parts = [f"{level_icon} **{timestamp}**"]
+    # Build details section
+    skip_keys = {"timestamp", "level", "event", "logger", "exc_info"}
+    details = {k: v for k, v in entry.items() if k not in skip_keys and v is not None and v != ""}
     
-    if event:
-        parts.append(f"| {event}")
+    # Format details nicely
+    detail_parts = []
     
-    # Add key details
-    skip_keys = {"timestamp", "level", "event", "logger"}
-    details = {k: v for k, v in entry.items() if k not in skip_keys and v}
+    # Prioritize important fields
+    priority_fields = ["symbol", "side", "size", "price", "pnl", "action", "reason", "count"]
+    for key in priority_fields:
+        if key in details:
+            val = details.pop(key)
+            if key == "symbol":
+                detail_parts.append(f'<span class="log-symbol">{val}</span>')
+            elif key in ["pnl", "price", "size"]:
+                detail_parts.append(f'{key}: <span class="log-value">{val}</span>')
+            else:
+                detail_parts.append(f'{key}: {val}')
     
-    if details:
-        detail_str = " | ".join(f"`{k}`: {v}" for k, v in list(details.items())[:5])
-        parts.append(f"| {detail_str}")
+    # Add remaining fields
+    for key, val in list(details.items())[:6]:
+        # Truncate long values
+        val_str = str(val)
+        if len(val_str) > 60:
+            val_str = val_str[:57] + "..."
+        detail_parts.append(f'{key}: {val_str}')
     
-    return " ".join(parts)
+    details_html = " &nbsp;│&nbsp; ".join(detail_parts) if detail_parts else ""
+    
+    html = f'''
+    <div class="log-entry {level_class}">
+        <span class="log-time">{timestamp}</span> {icon}
+        <span class="log-event">{event}</span>
+        <span class="log-module">[{logger}]</span>
+        <div class="log-detail">{details_html}</div>
+    </div>
+    '''
+    return html
 
-def load_logs(log_file: Path, num_lines: int = 100) -> list:
+
+def load_logs(log_file: Path, num_lines: int = 200) -> list:
     """Load the last N lines from a log file."""
     if not log_file.exists():
         return []
@@ -104,22 +154,65 @@ def load_logs(log_file: Path, num_lines: int = 100) -> list:
     except Exception as e:
         return [f"Error reading log: {e}"]
 
+
+def matches_filter(entry: dict, text_filter: str, level_filter: list) -> bool:
+    """Check if entry matches the current filters."""
+    # Check level filter
+    level = entry.get("level", "info").lower()
+    if level not in [l.lower() for l in level_filter]:
+        return False
+    
+    # Check text filter
+    if text_filter:
+        text_filter_lower = text_filter.lower()
+        # Search in all string values
+        searchable = json.dumps(entry).lower()
+        if text_filter_lower not in searchable:
+            return False
+    
+    return True
+
+
 # Sidebar controls
-st.sidebar.header("Controls")
-num_lines = st.sidebar.slider("Lines to show", 20, 500, 100)
-auto_refresh = st.sidebar.checkbox("Auto-refresh (10s)", value=False)
-filter_level = st.sidebar.multiselect(
-    "Filter by level",
-    ["info", "warning", "error", "critical"],
-    default=["info", "warning", "error", "critical"]
+st.sidebar.header("🔧 Controls")
+
+# Text search
+text_search = st.sidebar.text_input(
+    "🔍 Search logs",
+    placeholder="symbol, event, message...",
+    help="Filter logs containing this text"
 )
 
+# Level filter
+level_filter = st.sidebar.multiselect(
+    "📊 Log levels",
+    ["info", "warning", "error", "debug"],
+    default=["info", "warning", "error"]
+)
+
+# Number of lines
+num_lines = st.sidebar.slider("📄 Lines to load", 50, 1000, 200)
+
+# Auto-refresh
+auto_refresh = st.sidebar.checkbox("🔄 Auto-refresh (10s)", value=False)
+
 if auto_refresh:
-    st.sidebar.info("Page will refresh every 10 seconds")
     st.markdown(
         """<meta http-equiv="refresh" content="10">""",
         unsafe_allow_html=True
     )
+
+st.sidebar.divider()
+
+# Quick filters
+st.sidebar.subheader("⚡ Quick Filters")
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("Trades Only"):
+        text_search = "signal"
+with col2:
+    if st.button("Errors Only"):
+        level_filter = ["error", "warning"]
 
 # Main content
 col1, col2 = st.columns([3, 1])
@@ -128,12 +221,19 @@ with col1:
     st.subheader("📝 Live Trading Log")
     
 with col2:
-    if st.button("🔄 Refresh"):
+    if st.button("🔄 Refresh Now"):
         st.rerun()
 
-# Refresh which log file to use
+# Get current log file
 LIVE_LOG = get_active_log()
-st.caption(f"📁 Reading from: `{LIVE_LOG.name}`")
+
+# Show log file info
+if LIVE_LOG and LIVE_LOG.exists():
+    mtime = datetime.fromtimestamp(LIVE_LOG.stat().st_mtime)
+    size_kb = LIVE_LOG.stat().st_size / 1024
+    st.caption(f"📁 `{LIVE_LOG.name}` • {size_kb:.1f} KB • Updated {mtime.strftime('%H:%M:%S')}")
+else:
+    st.warning("No log file found")
 
 # Load and display logs
 if LIVE_LOG and LIVE_LOG.exists():
@@ -144,21 +244,32 @@ if LIVE_LOG and LIVE_LOG.exists():
         entries = []
         for line in reversed(log_lines):  # Most recent first
             entry = parse_log_line(line)
-            level = entry.get("level", "info")
-            if level in filter_level:
+            if matches_filter(entry, text_search, level_filter):
                 entries.append(entry)
         
-        # Display stats
-        st.markdown(f"**Showing {len(entries)} entries** (most recent first)")
+        # Stats bar
+        total_loaded = len(log_lines)
+        shown = len(entries)
         
-        # Display logs
-        for entry in entries[:num_lines]:
-            formatted = format_log_entry(entry)
-            st.markdown(formatted)
-            
-        # Show raw JSON option
-        with st.expander("View Raw JSON (last 10 entries)"):
-            for entry in entries[:10]:
+        info_count = sum(1 for e in entries if e.get("level", "info") == "info")
+        warn_count = sum(1 for e in entries if e.get("level") == "warning")
+        error_count = sum(1 for e in entries if e.get("level") == "error")
+        
+        st.markdown(
+            f"**{shown}** entries shown (of {total_loaded} loaded) • "
+            f"ℹ️ {info_count} info • ⚠️ {warn_count} warnings • ❌ {error_count} errors"
+        )
+        
+        if text_search:
+            st.info(f"🔍 Filtered for: **{text_search}**")
+        
+        # Display logs in a scrollable container
+        log_html = "".join(format_log_entry_html(entry) for entry in entries[:num_lines])
+        st.markdown(log_html, unsafe_allow_html=True)
+        
+        # Raw JSON view
+        with st.expander("🔧 View Raw JSON (last 5 entries)"):
+            for entry in entries[:5]:
                 st.json(entry)
     else:
         st.info("No log entries found")
@@ -166,19 +277,6 @@ else:
     st.warning(f"Log file not found: {LIVE_LOG}")
     st.info("The trading system may not be running yet.")
 
-# Footer with system status
+# Footer
 st.divider()
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Log File", "live_trading.log")
-    
-with col2:
-    if LIVE_LOG.exists():
-        size = LIVE_LOG.stat().st_size / 1024
-        st.metric("Log Size", f"{size:.1f} KB")
-    else:
-        st.metric("Log Size", "N/A")
-
-with col3:
-    st.metric("Last Refresh", datetime.now().strftime("%H:%M:%S"))
+st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
