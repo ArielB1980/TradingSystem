@@ -98,13 +98,22 @@ class SMCEngine:
     def generate_signal(
         self,
         symbol: str,
-        bias_candles_4h: List[Candle],
-        bias_candles_1d: List[Candle],
-        exec_candles_15m: List[Candle],
-        exec_candles_1h: List[Candle],
+        regime_candles_1d: List[Candle],      # Regime layer: EMA200 bias
+        decision_candles_4h: List[Candle],    # Decision layer: OB/FVG/BOS detection
+        refine_candles_1h: List[Candle],      # Refinement: ADX filter, swing points
+        refine_candles_15m: List[Candle],     # Refinement: entry timing
     ) -> Signal:
         """
         Generate trading signal from spot market data.
+        
+        TIMEFRAME HIERARCHY (4H Decision Authority):
+        - 1D: Regime filter only (EMA200 bias, risk on/off)
+        - 4H: DECISION AUTHORITY - all SMC patterns (OB, FVG, BOS)
+        - 1H: Refinement only - ADX filter, swing point precision
+        - 15m: Refinement only - entry timing
+        
+        CRITICAL: 1H/15m can NEVER generate trades independently.
+        If no valid 4H structure exists, return NO_SIGNAL immediately.
         """
         # Context Variables for Trace
         decision_id = str(uuid.uuid4())
@@ -112,8 +121,7 @@ class SMCEngine:
         
         # DEFENSIVE CHECK: Data Integrity
         # Ensure we have minimum required data to function
-        if not exec_candles_15m:
-            # logger.error(f"SMC Engine Validation Failed: Missing 15m candles for {symbol}")
+        if not refine_candles_15m:
             return Signal(
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
@@ -130,8 +138,24 @@ class SMCEngine:
                 ema200_slope="flat"
             )
             
-        if not exec_candles_1h:
-             # logger.error(f"SMC Engine Validation Failed: Missing 1h candles for {symbol}")
+        if not decision_candles_4h:
+             return Signal(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                signal_type=SignalType.NO_SIGNAL,
+                entry_price=Decimal("0"),
+                stop_loss=Decimal("0"),
+                take_profit=None,
+                reasoning="ERROR: Missing 4H Data (decision timeframe required)",
+                setup_type=SetupType.TREND,
+                regime="no_data",
+                higher_tf_bias="neutral",
+                adx=Decimal("0"),
+                atr=Decimal("0"),
+                ema200_slope="flat"
+            )
+        
+        if not refine_candles_1h:
              return Signal(
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
@@ -150,6 +174,7 @@ class SMCEngine:
 
         bias = "neutral"
         structure_signal = None
+        structure_4h = None  # 4H decision structure (CRITICAL)
         adx_value = 0.0
         atr_value = Decimal("0")  # Initialize as Decimal to maintain type consistency
         atr_ratio = None
@@ -159,9 +184,9 @@ class SMCEngine:
         # Logic Flow
         signal = None
 
-        # Step 0: Calculate Indicators (ADX, ATR, Fibs) - Early Calc for Context
-        # Cache key based on symbol and last candle timestamp (optimized)
-        cache_key = self._get_cache_key(symbol, exec_candles_1h)
+        # Step 0: Calculate Indicators (ADX on 1H for fast response, ATR/Fib on 4H for decision)
+        # Cache key based on symbol and last 4H candle timestamp (decision timeframe)
+        cache_key = self._get_cache_key(symbol, decision_candles_4h)
         
         # Check cache for indicators
         cached_indicators = self.indicator_cache.get(cache_key)
@@ -172,23 +197,23 @@ class SMCEngine:
             atr_value = cached_indicators['atr']
             fib_levels = cached_indicators['fib_levels']
         else:
-            # Calculate fresh
-            adx_df = self.indicators.calculate_adx(exec_candles_1h, self.config.adx_period)
+            # ADX on 1H for faster response to trend changes (refinement layer)
+            adx_df = self.indicators.calculate_adx(refine_candles_1h, self.config.adx_period)
             if not adx_df.empty:
                 adx_column = f'ADX_{self.config.adx_period}'
                 adx_value = float(adx_df[adx_column].iloc[-1])
             else:
                 adx_value = 0.0
             
-            # ATR - keep as Decimal throughout
-            atr_df = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+            # ATR on 4H for stop sizing (decision layer)
+            atr_df = self.indicators.calculate_atr(decision_candles_4h, self.config.atr_period)
             if not atr_df.empty:
                 atr_value = Decimal(str(atr_df.iloc[-1]))
             else:
                 atr_value = Decimal("0")
             
-            # Fib Levels (pre-calculate for later use)
-            fib_levels = self.fibonacci_engine.calculate_levels(exec_candles_1h, "1h")
+            # Fib Levels on 4H for consistency with decision timeframe
+            fib_levels = self.fibonacci_engine.calculate_levels(decision_candles_4h, "4h")
             
             # Store in cache
             self.indicator_cache[cache_key] = {
@@ -202,54 +227,83 @@ class SMCEngine:
                 self._clean_cache()
         
 
-        # Step 1: Higher-timeframe bias
+        # Step 1: Higher-timeframe bias (1D EMA200)
         if signal is None:
-            bias = self._determine_bias(bias_candles_4h, bias_candles_1d, reasoning_parts)
+            bias = self._determine_bias(decision_candles_4h, regime_candles_1d, reasoning_parts)
             # Neutral bias DOES NOT block immediately - waits for Score Gate
             # unless bias determination failed completely (e.g. insufficient data)
-            if "Insufficient candles" in reasoning_parts[-1]:
+            if reasoning_parts and "Insufficient candles" in reasoning_parts[-1]:
                 signal = self._no_signal(
                     symbol, 
                     reasoning_parts, 
-                    exec_candles_1h[-1] if exec_candles_1h else None,
+                    decision_candles_4h[-1] if decision_candles_4h else None,
                     adx=adx_value,
                     atr=atr_value
                 )
 
-        # Step 1.5: Identify Structure & Regime Early (NEW)
-        # We perform this here so that even rejected signals have accurate regime info.
+        # ============================================================
+        # CRITICAL GUARD: 4H MUST HAVE VALID STRUCTURE FOR ANY TRADE
+        # ============================================================
+        # This is a HARD requirement - 1H patterns alone can NEVER generate a trade.
+        # If no valid 4H structure exists, return NO_SIGNAL immediately.
+        # This prevents future refactors from accidentally re-empowering 1H.
+        
         structures = {}
         regime_early = None
-        structure_signal = None
         
         if signal is None:
-            structure_signal = self._detect_structure(
-                exec_candles_15m,
-                exec_candles_1h,
+            # Detect 4H structure FIRST (decision authority)
+            structure_4h = self._detect_structure(
+                decision_candles_4h,  # Using 4H for structure detection
+                decision_candles_4h,
                 bias,
                 reasoning_parts,
             )
-            if structure_signal:
-                structures = structure_signal
-                regime_early = self._classify_regime_from_structure(structure_signal)
+            
+            # HARD GATE: No 4H structure = NO TRADE (regardless of 1H patterns)
+            has_4h_structure = (
+                structure_4h and 
+                (structure_4h.get('order_block') or structure_4h.get('fvg') or structure_4h.get('bos'))
+            )
+            
+            if not has_4h_structure:
+                reasoning_parts.append("❌ No valid 4H decision structure - 1H patterns insufficient")
+                logger.info(
+                    "Signal rejected: No 4H structure",
+                    symbol=symbol,
+                    decision_tf="4H",
+                    reason="4H_STRUCTURE_REQUIRED"
+                )
+                signal = self._no_signal(
+                    symbol,
+                    reasoning_parts,
+                    decision_candles_4h[-1] if decision_candles_4h else None,
+                    adx=adx_value,
+                    atr=atr_value,
+                    regime="no_4h_structure"
+                )
+            else:
+                # 4H structure is valid - proceed with this as the decision structure
+                structure_signal = structure_4h
+                structures = structure_4h
+                regime_early = self._classify_regime_from_structure(structure_4h)
+                reasoning_parts.append(f"✅ 4H Decision Structure Found")
                 reasoning_parts.append(f"📊 Market Regime: {regime_early}")
 
         import traceback
         
-        # Step 2: Market Structure Change Detection & Confirmation
-        # Require structure change confirmation + reconfirmation before entry
-        # Step 2: Market Structure Change Detection & Confirmation
+        # Step 2: Market Structure Change Detection & Confirmation (on 4H)
         # Require structure change confirmation + reconfirmation before entry
         if signal is None:
-            # Update market structure tracking
-            ms_state, ms_change = self.ms_tracker.update_structure(symbol, exec_candles_1h)
+            # Update market structure tracking using 4H (decision timeframe)
+            ms_state, ms_change = self.ms_tracker.update_structure(symbol, decision_candles_4h)
             
-            # V4: Adaptive Confirmation Logic
+            # V4: Adaptive Confirmation Logic (based on 4H ATR)
             required_candles = None
             if self.config.adaptive_enabled:
                 # Dynamic Logic based on Volatility State
                 try:
-                    atr_series = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+                    atr_series = self.indicators.calculate_atr(decision_candles_4h, self.config.atr_period)
                     if not atr_series.empty:
                         current_atr = atr_series.iloc[-1]
                         # Use 20-period moving average of ATR as baseline
@@ -264,8 +318,9 @@ class SMCEngine:
                             # atr_value is already set as Decimal in Step 0, preserve it
 
                             if ratio_val > self.config.atr_confirmation_threshold_high:
-                                required_candles = self.config.max_confirmation_candles
-                                reasoning_parts.append(f"🌊 High Volatility (ATR Ratio {ratio_val:.2f}) -> Extended Confirmation ({required_candles} candles)")
+                                # High volatility: use extended confirmation (2 candles on 4H = 8 hours)
+                                required_candles = getattr(self.config, 'ms_confirmation_candles_high_vol', 2)
+                                reasoning_parts.append(f"🌊 High Volatility (ATR Ratio {ratio_val:.2f}) -> Extended 4H Confirmation ({required_candles} candles = {required_candles * 4}h)")
                             elif ratio_val < self.config.atr_confirmation_threshold_low:
                                 required_candles = self.config.min_confirmation_candles
 
@@ -275,35 +330,30 @@ class SMCEngine:
 
             
             if ms_change:
-                # Structure change detected - check confirmation
+                # Structure change detected - check confirmation (on 4H)
                 confirmed = self.ms_tracker.check_confirmation(
                     symbol, 
-                    exec_candles_1h, 
+                    decision_candles_4h,  # Use 4H for confirmation
                     ms_change,
                     required_candles=required_candles # Dynamic
                 )
                 
                 if confirmed:
-                    # Check reconfirmation (entry ready)
-                    # Get entry zone from structure detection
-                    structure_signal = self._detect_structure(
-                        exec_candles_15m,
-                        exec_candles_1h,
-                        bias,
-                        reasoning_parts,
-                    )
+                    # Structure already detected on 4H in Step 1.5
+                    # Use structure_4h (already set above) - no need to re-detect on 1H
+                    # structure_signal is already set to structure_4h
                     
-                    # V4: RSI Divergence Check (Gate before Reconfirmation)
+                    # V4: RSI Divergence Check (Gate before Reconfirmation) - on 1H for faster response
                     if self.config.rsi_divergence_enabled:
-                         rsi_values = self.indicators.calculate_rsi(exec_candles_1h, self.config.rsi_period)
-                         divergence = self.indicators.detect_rsi_divergence(exec_candles_1h, rsi_values, self.config.rsi_divergence_lookback)
+                         rsi_values = self.indicators.calculate_rsi(refine_candles_1h, self.config.rsi_period)
+                         divergence = self.indicators.detect_rsi_divergence(refine_candles_1h, rsi_values, self.config.rsi_divergence_lookback)
                          
                          if divergence != "none":
                              # If Bias is Bullish but Bearish Divergence -> Weakness
                              if bias == "bullish" and divergence == "bearish":
                                  reasoning_parts.append(f"⚠️ Bearish RSI Divergence detected against Bullish bias")
                                  # We could reject or reduce size. For now, strict:
-                                 # signal = self._no_signal(symbol, reasoning_parts, exec_candles_1h[-1]) 
+                                 # signal = self._no_signal(symbol, reasoning_parts, refine_candles_1h[-1]) 
                                  # Let's just log it for scoring to penalize
                              
                              elif bias == "bearish" and divergence == "bullish":
@@ -313,7 +363,7 @@ class SMCEngine:
                     
                     entry_zone = None
                     if structure_signal:
-                        # Extract entry zone (order block or FVG)
+                        # Extract entry zone from 4H structure (order block or FVG)
                         if structure_signal.get('order_block'):
                             ob = structure_signal['order_block']
                             entry_zone = {'low': ob.get('low'), 'high': ob.get('high')}
@@ -321,11 +371,11 @@ class SMCEngine:
                             fvg = structure_signal['fvg']
                             entry_zone = {'bottom': fvg.get('bottom'), 'top': fvg.get('top')}
                     
-                    # Get ATR value for adaptive tolerance calculation
+                    # Get ATR value for adaptive tolerance calculation (4H ATR)
                     # Use cached atr_value if available, otherwise calculate with config period
                     if atr_value is None or atr_value == Decimal("0"):
-                        if exec_candles_1h and len(exec_candles_1h) >= self.config.atr_period:
-                            atr_series = self.indicators.calculate_atr(exec_candles_1h, self.config.atr_period)
+                        if decision_candles_4h and len(decision_candles_4h) >= self.config.atr_period:
+                            atr_series = self.indicators.calculate_atr(decision_candles_4h, self.config.atr_period)
                             if len(atr_series) > 0:
                                 atr_value = Decimal(str(atr_series.iloc[-1]))
                     
@@ -336,12 +386,12 @@ class SMCEngine:
                         # In trending markets, enter immediately after confirmation
                         reconfirmed = True
                         used_tolerance = False
-                        reasoning_parts.append(f"✅ Structure confirmed - entering on confirmation (skip reconfirmation)")
+                        reasoning_parts.append(f"✅ 4H Structure confirmed - entering on confirmation (skip reconfirmation)")
                     else:
                         # Original logic: wait for retrace to entry zone
-                        # check_reconfirmation now returns (is_reconfirmed, used_tolerance)
+                        # check_reconfirmation uses 15m for entry timing, 4H for structure context
                         reconfirmed, used_tolerance = self.ms_tracker.check_reconfirmation(
-                            symbol, exec_candles_15m, exec_candles_1h, ms_change, entry_zone, atr_value
+                            symbol, refine_candles_15m, decision_candles_4h, ms_change, entry_zone, atr_value
                         )
                         
                         # Track if tolerance was used for score adjustment later
@@ -350,24 +400,24 @@ class SMCEngine:
                     
                     if not reconfirmed:
                         reasoning_parts.append(
-                            f"⏳ Structure change confirmed, waiting for reconfirmation (retrace to entry zone)"
+                            f"⏳ 4H Structure change confirmed, waiting for reconfirmation (retrace to entry zone)"
                         )
                         signal = self._no_signal(
                             symbol, 
                             reasoning_parts, 
-                            exec_candles_1h[-1] if exec_candles_1h else None,
+                            decision_candles_4h[-1] if decision_candles_4h else None,
                             adx=adx_value,
                             atr=atr_value,
                             regime=regime_early
                         )
                 else:
                     reasoning_parts.append(
-                        f"⏳ Structure change detected ({ms_change.new_state.value}), waiting for confirmation"
+                        f"⏳ 4H Structure change detected ({ms_change.new_state.value}), waiting for confirmation"
                     )
                     signal = self._no_signal(
                         symbol, 
                         reasoning_parts, 
-                        exec_candles_1h[-1] if exec_candles_1h else None,
+                        decision_candles_4h[-1] if decision_candles_4h else None,
                         adx=adx_value,
                         atr=atr_value,
                         regime=regime_early
@@ -379,26 +429,26 @@ class SMCEngine:
                     require_ms_change = getattr(self.config, 'require_ms_change_confirmation', True)
                     if require_ms_change:
                         reasoning_parts.append(
-                            f"⏳ No market structure change detected - waiting for structure break"
+                            f"⏳ No 4H market structure change detected - waiting for structure break"
                         )
                         signal = self._no_signal(
                             symbol, 
                             reasoning_parts, 
-                            exec_candles_1h[-1] if exec_candles_1h else None,
+                            decision_candles_4h[-1] if decision_candles_4h else None,
                             adx=adx_value,
                             atr=atr_value,
                             regime=regime_early
                         )
         
-        # Step 2.5: Execution timeframe structure (Already calculated in Step 1.5)
-        # Just handle the case where no structure was found
+        # Step 2.5: 4H structure already validated in Step 1.5
+        # Just handle the case where no structure was found (should be caught by guard above)
         
         if signal is None and structure_signal is None:
-             # If we failed to find structure earlier, reject now
+             # If we failed to find 4H structure earlier, reject now
              signal = self._no_signal(
                  symbol, 
                  reasoning_parts, 
-                 exec_candles_1h[-1] if exec_candles_1h else None,
+                 decision_candles_4h[-1] if decision_candles_4h else None,
                  adx=adx_value,
                  atr=atr_value,
                  regime=regime_early
@@ -413,13 +463,13 @@ class SMCEngine:
                         # Verify the structure signal aligns with MS change direction
                         # This will be checked later when we determine signal_type
 
-        # Step 3: Filters
+        # Step 3: Filters (ADX on 1H for faster response)
         if signal is None:
             # Filters applied below using pre-calculated values
             # (Indicator calculation moved to Step 0)
 
             
-            # ADX REGIME FILTER: Skip ranging markets
+            # ADX REGIME FILTER: Skip ranging markets (1H ADX for faster response)
             adx_threshold = getattr(self.config, 'adx_threshold', 25.0)
             if adx_value < adx_threshold:
                 reasoning_parts.append(
@@ -428,34 +478,36 @@ class SMCEngine:
                 signal = self._no_signal(
                     symbol, 
                     reasoning_parts, 
-                    exec_candles_1h[-1] if exec_candles_1h else None,
+                    decision_candles_4h[-1] if decision_candles_4h else None,
                     adx=adx_value,
                     atr=atr_value,
                     regime=regime_early
                 )
             
-            # Apply other filters
-            if signal is None and not self._apply_filters(exec_candles_1h, reasoning_parts):
+            # Apply other filters (1H for faster response)
+            if signal is None and not self._apply_filters(refine_candles_1h, reasoning_parts):
                  signal = self._no_signal(
                      symbol, 
                      reasoning_parts, 
-                     exec_candles_1h[-1] if exec_candles_1h else None,
+                     decision_candles_4h[-1] if decision_candles_4h else None,
                      adx=adx_value,
                      atr=atr_value,
                      regime=regime_early
                  )
 
             # Step 4: Calculate Levels (If passed all checks)
+            # Uses 4H structure for entry zones, 1H for swing point precision
             if signal is None:
                 signal_type, entry_price, stop_loss, take_profit, tp_candidates, classification_info = self._calculate_levels(
                     structure_signal,
-                    exec_candles_1h,
+                    decision_candles_4h,  # 4H for structure/ATR
+                    refine_candles_1h,    # 1H for swing point precision
                     bias,
                     reasoning_parts,
-                    atr_value=atr_value,  # Pass cached ATR
+                    atr_value=atr_value,  # Pass cached 4H ATR
                 )
                 
-                # Step 5: Fib Validation (Gate for tight_smc) - use cached fib_levels
+                # Step 5: Fib Validation (Gate for tight_smc) - use cached 4H fib_levels
                 fib_valid = True
                 
                 setup_type = classification_info['setup_type']
@@ -487,7 +539,7 @@ class SMCEngine:
                      signal = self._no_signal(
                          symbol, 
                          reasoning_parts, 
-                         exec_candles_1h[-1],
+                         decision_candles_4h[-1],
                          adx=adx_value,
                          atr=atr_value,
                          regime=regime
@@ -507,7 +559,7 @@ class SMCEngine:
                                 signal = self._no_signal(
                                     symbol, 
                                     reasoning_parts, 
-                                    exec_candles_1h[-1] if exec_candles_1h else None,
+                                    decision_candles_4h[-1] if decision_candles_4h else None,
                                     adx=adx_value,
                                     atr=atr_value,
                                     regime=regime
@@ -519,7 +571,7 @@ class SMCEngine:
                                 signal = self._no_signal(
                                     symbol, 
                                     reasoning_parts, 
-                                    exec_candles_1h[-1] if exec_candles_1h else None,
+                                    decision_candles_4h[-1] if decision_candles_4h else None,
                                     adx=adx_value,
                                     atr=atr_value,
                                     regime=regime
@@ -531,10 +583,10 @@ class SMCEngine:
                 
                 # Step 6: Scoring & Final Validation
                 if signal is None and signal_type != SignalType.NO_SIGNAL:
-                    # Metadata
-                    current_candle = exec_candles_1h[-1]
+                    # Metadata - use 4H candle as reference (decision timeframe)
+                    current_candle = decision_candles_4h[-1]
                     timestamp = current_candle.timestamp
-                    ema_values = self.indicators.calculate_ema(bias_candles_1d, self.config.ema_period)
+                    ema_values = self.indicators.calculate_ema(regime_candles_1d, self.config.ema_period)
                     ema200_slope = self.indicators.get_ema_slope(ema_values) if not ema_values.empty else "flat"
                     
                     # Create TEMP signal for scoring
@@ -650,14 +702,14 @@ class SMCEngine:
                      signal = self._no_signal(
                          symbol, 
                          reasoning_parts, 
-                         exec_candles_1h[-1],
+                         decision_candles_4h[-1],
                          adx=adx_value,
                          atr=atr_value
                      )
 
         # If signal is still None after all steps
         if signal is None:
-            current_candle = exec_candles_1h[-1] if exec_candles_1h else None
+            current_candle = decision_candles_4h[-1] if decision_candles_4h else None
             timestamp = current_candle.timestamp if current_candle else datetime.now(timezone.utc)
             signal = self._no_signal(
                 symbol, 
@@ -675,9 +727,26 @@ class SMCEngine:
         # If you want a single source of truth, remove SIGNAL_GENERATED here and let LiveTrading handle all event recording
 
         if signal.signal_type != SignalType.NO_SIGNAL:
+            # Structured logging showing 4H decision authority hierarchy
+            structure_type = "OB" if structure_signal and structure_signal.get('order_block') else (
+                "FVG" if structure_signal and structure_signal.get('fvg') else "BOS"
+            )
+            structure_ts = None
+            if structure_signal:
+                if structure_signal.get('order_block'):
+                    structure_ts = structure_signal['order_block'].get('timestamp')
+                elif structure_signal.get('fvg'):
+                    structure_ts = structure_signal['fvg'].get('timestamp')
+            
             logger.info(
-                "Signal generated",
+                "Signal generated with 4H decision authority",
                 symbol=symbol,
+                decision_tf="4H",
+                structure_type=structure_type,
+                structure_timestamp=str(structure_ts) if structure_ts else None,
+                entry_tf="15m",
+                stop_tf="4H_ATR",
+                atr_value=str(atr_value),
                 signal_type=signal.signal_type.value,
                 entry=str(signal.entry_price),
                 stop=str(signal.stop_loss),
@@ -691,7 +760,10 @@ class SMCEngine:
                     "entry": float(signal.entry_price),
                     "stop": float(signal.stop_loss),
                     "tp": float(signal.take_profit) if signal.take_profit else None,
-                    "tp_candidates": [float(tp) for tp in signal.tp_candidates]
+                    "tp_candidates": [float(tp) for tp in signal.tp_candidates],
+                    "decision_tf": "4H",
+                    "structure_type": structure_type,
+                    "stop_tf": "4H_ATR"
                 },
                 decision_id=decision_id
             )
@@ -1025,7 +1097,8 @@ class SMCEngine:
     def _calculate_levels(
         self,
         structure: dict,
-        candles: List[Candle],
+        decision_candles_4h: List[Candle],  # 4H for structure zones and ATR
+        refine_candles_1h: List[Candle],    # 1H for swing point precision
         bias: str,
         reasoning: List[str],
         atr_value: Optional[Decimal] = None,
@@ -1033,9 +1106,12 @@ class SMCEngine:
         """
         Calculate Levels: Entry, Stop, TP.
         
+        Uses 4H for structure zones and ATR (decision authority).
+        Uses 1H for swing point detection (precision).
+        
         Regime:
-        - tight_smc: Stop = Invalid + 0.3-0.6 ATR, TP = 2.0R min
-        - wide_structure: Stop = Invalid + 1.0-1.2 ATR, TP = 1.5R min
+        - tight_smc: Stop = Invalid + 0.15-0.30 ATR (4H), TP = 2.0R min
+        - wide_structure: Stop = Invalid + 0.50-0.60 ATR (4H), TP = 1.5R min
         """
         from src.domain.models import SetupType
         
@@ -1057,12 +1133,12 @@ class SMCEngine:
             setup_type = SetupType.BOS
             regime = "wide_structure"
             
-        # 2. Get ATR (use cached if available)
+        # 2. Get ATR from 4H (decision timeframe) - use cached if available
         if atr_value is None:
-            atr_values = self.indicators.calculate_atr(candles, self.config.atr_period)
+            atr_values = self.indicators.calculate_atr(decision_candles_4h, self.config.atr_period)
             atr = Decimal(str(atr_values.iloc[-1])) if not atr_values.empty else Decimal("0")
         else:
-            atr = Decimal(str(atr_value))  # Use cached value, ensure Decimal
+            atr = Decimal(str(atr_value))  # Use cached 4H ATR value, ensure Decimal
         
         # 3. Determine Stop Multiplier based on Regime
         if regime == "tight_smc":
@@ -1077,7 +1153,7 @@ class SMCEngine:
         invalid_level = Decimal("0")
         signal_type = SignalType.NO_SIGNAL
         
-        # 4. Calculate Entry & Stop Base
+        # 4. Calculate Entry & Stop Base (from 4H structure)
         if bias == "bullish":
             signal_type = SignalType.LONG
             if setup_type == SetupType.OB:
@@ -1087,13 +1163,9 @@ class SMCEngine:
                 entry_price = fvg['top']
                 invalid_level = fvg['bottom']
             else: # BOS/Trend
-                entry_price = candles[-1].close # Market entry if confirmed? Or waiting for retrace?
-                # For V2, BOS typically implies awaiting retrace, but if no OB/FVG found...
-                # Current logic implies we only get here if valid.
-                # Let's assume retrace to recent low if BOS?
-                # Fallback: Entry at close, stop at recent swing low.
-                entry_price = candles[-1].close
-                invalid_level = min(c.low for c in candles[-20:])
+                # Fallback: Entry at 4H close, stop at recent 4H swing low
+                entry_price = decision_candles_4h[-1].close
+                invalid_level = min(c.low for c in decision_candles_4h[-20:])
                 
             stop_loss = invalid_level - (atr * stop_mult)
             
@@ -1106,8 +1178,8 @@ class SMCEngine:
                 entry_price = fvg['bottom']
                 invalid_level = fvg['top']
             else: # BOS/Trend
-                entry_price = candles[-1].close
-                invalid_level = max(c.high for c in candles[-20:])
+                entry_price = decision_candles_4h[-1].close
+                invalid_level = max(c.high for c in decision_candles_4h[-20:])
                 
             stop_loss = invalid_level + (atr * stop_mult)
             
@@ -1130,15 +1202,14 @@ class SMCEngine:
              else:
                  return SignalType.NO_SIGNAL, Decimal("0"), Decimal("0"), None, [], {}
                  
-        # 5. TP Logic
-        # Scan for swing points (optimized)
+        # 5. TP Logic - use 1H for swing point precision (finer granularity)
         lookback = 50
         risk = abs(entry_price - stop_loss)
         if risk == 0: risk = Decimal("1") # Avoid div/0
         
         if signal_type == SignalType.LONG:
-            # Use optimized vectorized swing point detection
-            swing_highs = self.indicators.find_swing_points(candles, lookback=lookback, find_highs=True)
+            # Use 1H for swing point detection (precision) 
+            swing_highs = self.indicators.find_swing_points(refine_candles_1h, lookback=lookback, find_highs=True)
             tp_candidates = sorted([h for h in swing_highs if h > entry_price])[:5]
             
             # Min RR
@@ -1154,8 +1225,8 @@ class SMCEngine:
                 take_profit = entry_price + min_tp_dist # Force Min RR
                  
         else: # SHORT
-            # Use optimized vectorized swing point detection
-            swing_lows = self.indicators.find_swing_points(candles, lookback=lookback, find_highs=False)
+            # Use 1H for swing point detection (precision)
+            swing_lows = self.indicators.find_swing_points(refine_candles_1h, lookback=lookback, find_highs=False)
             tp_candidates = sorted([l for l in swing_lows if l < entry_price], reverse=True)[:5]
             
             min_rr = getattr(self.config, 'tight_smc_min_rr_multiple', 2.0) if regime == "tight_smc" else 1.5

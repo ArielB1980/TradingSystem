@@ -135,14 +135,14 @@ class PaperTrading:
                     # Update Trailing/BE State
                     self._update_position_state(active_pos, current_price)
                     
-                # 4. Generate Signals (Only if no position)
+                # 4. Generate Signals (Only if no position) - 4H Decision Authority
                 if not active_pos:
                     signal = self.smc_engine.generate_signal(
                         symbol,
-                        bias_candles_4h=self.candles_4h.get(symbol, []),
-                        bias_candles_1d=self.candles_1d.get(symbol, []),
-                        exec_candles_15m=self.candles_15m.get(symbol, []),
-                        exec_candles_1h=self.candles_1h.get(symbol, [])
+                        regime_candles_1d=self.candles_1d.get(symbol, []),
+                        decision_candles_4h=self.candles_4h.get(symbol, []),
+                        refine_candles_1h=self.candles_1h.get(symbol, []),
+                        refine_candles_15m=self.candles_15m.get(symbol, []),
                     )
                     
                     if signal.signal_type != SignalType.NO_SIGNAL:

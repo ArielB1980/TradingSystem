@@ -108,7 +108,19 @@ risk:
 
 ## Strategy Parameters
 strategy:
-  # Timeframes
+  # Timeframes - 4H DECISION AUTHORITY HIERARCHY
+  # 1D: Regime filter only (EMA200 bias, risk on/off)
+  # 4H: DECISION AUTHORITY - all SMC patterns (OB, FVG, BOS, ATR for stops)
+  # 1H: Refinement only - ADX filter, swing point precision
+  # 15m: Refinement only - entry timing
+  regime_timeframes:
+    - "1d"
+  decision_timeframes:
+    - "4h"
+  refinement_timeframes:
+    - "1h"
+    - "15m"
+  # Legacy compatibility (deprecated - use hierarchy above)
   bias_timeframes:
     - "4h"
     - "1d"
@@ -130,12 +142,12 @@ strategy:
   fvg_min_size_pct: 0.001  # 0.1% minimum gap size
   bos_confirmation_candles: 3
   
-  # V2.3: Market Structure Change Confirmation
-  # NOTE: Temporarily disabled for trending markets (Jan 2026)
-  # Monitor for 48h; re-enable if over-trading observed
+  # V2.3: Market Structure Change Confirmation (4H Decision Authority)
+  # NOTE: Now uses 4H candles - 1 candle = 4 hours, 2 candles = 8 hours
   require_ms_change_confirmation: false  # Bypass for trend activity (original: true)
-  ms_confirmation_candles: 2  # Faster confirmation (was 3)
-  ms_reconfirmation_candles: 2  # Candles for reconfirmation (retrace)
+  ms_confirmation_candles: 1  # Base: 1 candle on 4H = 4 hours
+  ms_confirmation_candles_high_vol: 2  # High volatility: 2 candles on 4H = 8 hours
+  ms_reconfirmation_candles: 1  # Candles for reconfirmation (retrace)
   skip_reconfirmation_in_trends: true  # Enter immediately after MSS in trends
 
   # V2.3 Scoring & Regimes (Slightly relaxed)
@@ -152,11 +164,13 @@ strategy:
   entry_zone_tolerance_atr_mult: 0.3  # ATR multiplier
   entry_zone_tolerance_score_penalty: -5  # Penalty for tolerance entries
   
-  # Regime-specific stops
-  tight_smc_atr_stop_min: 0.3
-  tight_smc_atr_stop_max: 0.6
-  wide_structure_atr_stop_min: 1.0
-  wide_structure_atr_stop_max: 1.2
+  # Regime-specific stops (adjusted for 4H ATR - roughly halved since 4H ATR is ~2-3x larger)
+  # tight_smc: Order Block / FVG entries with precise zones
+  tight_smc_atr_stop_min: 0.15  # Was 0.3 on 1H ATR
+  tight_smc_atr_stop_max: 0.30  # Was 0.6 on 1H ATR
+  # wide_structure: BOS/Trend entries with wider invalidation
+  wide_structure_atr_stop_min: 0.50  # Was 1.0 on 1H ATR
+  wide_structure_atr_stop_max: 0.60  # Was 1.2 on 1H ATR
 
 ## Execution Settings
 execution:

@@ -459,12 +459,13 @@ class TradingService:
              last_candle_repr = str(c1h[-1]) if c1h else "None"
              # logger.debug(f"Analyzing {symbol}: 15m={len(c15m)}, 1h={len(c1h)}")
 
+             # 4H DECISION AUTHORITY HIERARCHY
              signal = self.smc_engine.generate_signal(
                  symbol=symbol,
-                 exec_candles_15m=c15m,
-                 exec_candles_1h=c1h,
-                 bias_candles_4h=c4h,
-                 bias_candles_1d=c1d
+                 regime_candles_1d=c1d,
+                 decision_candles_4h=c4h,
+                 refine_candles_1h=c1h,
+                 refine_candles_15m=c15m,
              )
              
              # Current Price (from last candle) - Define BEFORE checking signal type
