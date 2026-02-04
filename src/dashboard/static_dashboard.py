@@ -152,7 +152,7 @@ def fetch_positions() -> List[Dict]:
 def parse_log_entries(entries: List[Dict]) -> Dict:
     """Parse log entries into structured data."""
     coins_reviewed = {}
-    signals_found = []
+    signals_seen = {}  # For deduplication: symbol -> signal data
     auction_results = {
         "signals_collected": 0,
         "winners": [],
@@ -169,9 +169,20 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
         raw = entry.get("raw", "")
         symbol = entry.get("symbol", "")
         
+        # Also extract symbol from raw line if not in entry
+        if not symbol:
+            symbol_match = re.search(r'symbol=([A-Z0-9/]+)', raw)
+            if symbol_match:
+                symbol = symbol_match.group(1)
+        
         # Track coins from SMC Analysis lines
-        if "SMC Analysis" in raw and symbol:
-            if symbol not in coins_reviewed:
+        if "SMC Analysis" in raw:
+            # Extract symbol from "SMC Analysis SYMBOL:"
+            smc_match = re.search(r'SMC Analysis ([A-Z0-9/]+):', raw)
+            if smc_match:
+                symbol = smc_match.group(1)
+            
+            if symbol and symbol not in coins_reviewed:
                 coins_reviewed[symbol] = {
                     "symbol": symbol,
                     "bias": "",
@@ -185,56 +196,72 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
                     "rejection": "",
                 }
             
-            # Parse analysis details
-            if "Bias Bullish" in raw:
-                coins_reviewed[symbol]["bias"] = "bullish"
-            elif "Bias Bearish" in raw:
-                coins_reviewed[symbol]["bias"] = "bearish"
-            
-            if "Order block detected" in raw or "✓ Order block" in raw:
-                coins_reviewed[symbol]["has_ob"] = True
-            if "Fair value gap" in raw or "✓ Fair value gap" in raw:
-                coins_reviewed[symbol]["has_fvg"] = True
-            if "Break of structure" in raw or "✓ Break of structure" in raw:
-                coins_reviewed[symbol]["has_bos"] = True
-            if "4H Decision Structure Found" in raw or "✅ 4H" in raw:
-                coins_reviewed[symbol]["has_4h"] = True
-            
-            # Extract regime
-            regime_match = re.search(r'Market Regime:\s*(\w+)', raw)
-            if regime_match:
-                coins_reviewed[symbol]["regime"] = regime_match.group(1)
-            
-            # Check for rejection reason
-            if "❌ Rejected" in raw:
-                rejection_match = re.search(r'❌ Rejected[:\s]*(.+?)(?:\[|$)', raw)
-                if rejection_match:
-                    coins_reviewed[symbol]["rejection"] = rejection_match.group(1).strip()
+            if symbol and symbol in coins_reviewed:
+                # Parse analysis details
+                if "Bias Bullish" in raw:
+                    coins_reviewed[symbol]["bias"] = "bullish"
+                elif "Bias Bearish" in raw:
+                    coins_reviewed[symbol]["bias"] = "bearish"
+                
+                if "Order block detected" in raw or "✓ Order block" in raw:
+                    coins_reviewed[symbol]["has_ob"] = True
+                if "Fair value gap" in raw or "✓ Fair value gap" in raw:
+                    coins_reviewed[symbol]["has_fvg"] = True
+                if "Break of structure" in raw or "✓ Break of structure" in raw:
+                    coins_reviewed[symbol]["has_bos"] = True
+                if "4H Decision Structure Found" in raw or "✅ 4H" in raw:
+                    coins_reviewed[symbol]["has_4h"] = True
+                
+                # Extract regime
+                regime_match = re.search(r'Market Regime:\s*(\w+)', raw)
+                if regime_match:
+                    coins_reviewed[symbol]["regime"] = regime_match.group(1)
+                
+                # Check for rejection reason
+                if "❌ Rejected" in raw:
+                    rejection_match = re.search(r'❌ Rejected[:\s]*(.+?)(?:\[|$)', raw)
+                    if rejection_match:
+                        coins_reviewed[symbol]["rejection"] = rejection_match.group(1).strip()
         
-        # Track signals
-        if entry.get("type") == "signal" or "Signal generated" in raw:
-            signal_type = entry.get("signal_type", "")
-            score = entry.get("score")
+        # Track signals - look for "Signal generated with 4H decision authority"
+        if "Signal generated" in raw and symbol:
+            signal_type = ""
+            score = None
             
-            if symbol and signal_type:
-                if symbol in coins_reviewed:
-                    coins_reviewed[symbol]["signal_type"] = signal_type
-                    coins_reviewed[symbol]["score"] = score
-                
-                # Extract entry/stop/tp from the log line
-                entry_match = re.search(r'entry[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
-                stop_match = re.search(r'stop[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
-                tp_match = re.search(r'tp\d?[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
-                
-                signals_found.append({
+            # Extract signal type
+            if "signal_type=short" in raw or "type=short" in raw:
+                signal_type = "short"
+            elif "signal_type=long" in raw or "type=long" in raw:
+                signal_type = "long"
+            
+            # Extract score from atr_value or score field
+            score_match = re.search(r'score[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+            if score_match:
+                try:
+                    score = float(score_match.group(1))
+                except:
+                    pass
+            
+            # Extract entry/stop from the log line
+            entry_match = re.search(r'entry[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+            stop_match = re.search(r'stop[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
+            
+            if signal_type:
+                # Deduplicate - only keep latest signal per symbol
+                signals_seen[symbol] = {
                     "symbol": symbol,
                     "type": signal_type,
                     "score": score,
                     "entry": entry_match.group(1) if entry_match else None,
                     "stop": stop_match.group(1) if stop_match else None,
-                    "tp": tp_match.group(1) if tp_match else None,
+                    "tp": None,
                     "regime": coins_reviewed.get(symbol, {}).get("regime", ""),
-                })
+                }
+                
+                # Update coins_reviewed
+                if symbol in coins_reviewed:
+                    coins_reviewed[symbol]["signal_type"] = signal_type
+                    coins_reviewed[symbol]["score"] = score
         
         # Track auction results
         if "Auction allocation executed" in raw or "Auction plan generated" in raw:
@@ -256,15 +283,17 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
                 winners = [w.strip().strip("'\"") for w in winners_str.split(",") if w.strip()]
                 auction_results["winners"] = winners
         
-        # Track errors
-        if entry.get("level") == "error":
-            errors.append(raw[:200])
+        # Track errors (only recent, critical ones)
+        if entry.get("level") == "error" and "QTY_MISMATCH" not in raw:
+            # Skip common non-critical errors
+            if not any(skip in raw for skip in ["SPEC_SANITY", "Failed to cancel"]):
+                errors.append(raw[:200])
     
     return {
         "coins": list(coins_reviewed.values()),
-        "signals": signals_found,
+        "signals": list(signals_seen.values()),  # Deduplicated signals
         "auction": auction_results,
-        "errors": errors[-10:],  # Keep only last 10 errors
+        "errors": errors[-5:],  # Keep only last 5 errors
     }
 
 
