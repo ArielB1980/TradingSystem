@@ -1372,10 +1372,12 @@ class LiveTrading:
                         else:
                             current_prices_map[symbol] = Decimal(str(pos_data.get('markPrice', pos_data.get('mark_price', pos_data.get('entryPrice', 0)))))
                 
-                await self._reconcile_protective_orders(all_raw_positions, current_prices_map)
-                
-                # Reconcile stop loss order IDs from exchange
+                # Reconcile stop loss order IDs from exchange FIRST
+                # This updates is_protected flag based on actual exchange orders
                 await self._reconcile_stop_loss_order_ids(all_raw_positions)
+                
+                # THEN do TP backfill (which checks is_protected)
+                await self._reconcile_protective_orders(all_raw_positions, current_prices_map)
 
                 # Auto-place missing stops for unprotected positions (rate-limited per tick)
                 await self._place_missing_stops_for_unprotected(all_raw_positions, max_per_tick=3)
