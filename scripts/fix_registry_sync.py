@@ -98,9 +98,15 @@ async def main():
                 break
         
         if stop_order:
-            stop_price = Decimal(str(stop_order.get("stopPrice", stop_order.get("price", 0))))
+            # Handle various price field names and potential None values
+            raw_stop_price = stop_order.get("stopPrice") or stop_order.get("price") or stop_order.get("triggerPrice") or 0
+            try:
+                stop_price = Decimal(str(raw_stop_price)) if raw_stop_price else Decimal("0")
+            except Exception:
+                stop_price = Decimal("0")
             stop_id = stop_order.get("id", "")
             print(f"    Found stop: {stop_price} (id={stop_id})")
+            print(f"    Stop order raw: {stop_order}")
         else:
             # Calculate a default stop (2% from entry)
             pct = Decimal("0.02")
