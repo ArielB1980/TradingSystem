@@ -843,11 +843,131 @@ class ExecutionGateway:
         # Sync with exchange
         sync_result = await self.sync_with_exchange()
         
+        # Auto-import phantom positions (exchange has, registry doesn't)
+        await self._import_phantom_positions()
+        
         logger.info(
             "ExecutionGateway startup complete",
             positions=len(self.registry.get_all_active()),
             issues=len(sync_result.get("issues", []))
         )
+    
+    async def _import_phantom_positions(self) -> None:
+        """
+        Import positions that exist on exchange but not in registry.
+        
+        This handles the case where the bot was restarted and lost in-memory state.
+        """
+        from src.execution.position_state_machine import ManagedPosition, PositionState, FillRecord, Side
+        from datetime import datetime, timezone
+        
+        try:
+            positions = await self.client.get_all_futures_positions()
+            orders = await self.client.get_futures_open_orders()
+        except Exception as e:
+            logger.error("Failed to fetch positions for phantom import", error=str(e))
+            return
+        
+        imported = 0
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            size = abs(float(pos.get("size", pos.get("contracts", 0))))
+            
+            if size == 0:
+                continue
+            
+            # Check if already in registry
+            existing = self.registry.get_position(symbol)
+            if existing and existing.remaining_qty > 0:
+                continue
+            
+            # Need to import
+            logger.warning("Importing phantom position from exchange", symbol=symbol, size=size)
+            
+            side_str = pos.get("side", "long").lower()
+            side = Side.LONG if side_str == "long" else Side.SHORT
+            entry_price = Decimal(str(pos.get("entryPrice", pos.get("entry_price", 0))))
+            qty = Decimal(str(size))
+            
+            # Find stop order
+            stop_order = None
+            stop_price = None
+            stop_id = None
+            
+            for order in orders:
+                order_symbol = order.get("symbol", "")
+                order_type = order.get("type", "").lower()
+                is_reduce = order.get("reduceOnly", False)
+                
+                # Normalize symbols for matching
+                sym1 = symbol.replace("PF_", "").replace("USD", "").upper()
+                sym2 = order_symbol.replace("/USD:USD", "").replace("/USD", "").replace("_", "").upper()
+                
+                if sym1 in sym2 and "stop" in order_type and is_reduce:
+                    stop_order = order
+                    break
+            
+            if stop_order:
+                raw_price = stop_order.get("price") or stop_order.get("stopPrice") or stop_order.get("triggerPrice") or 0
+                try:
+                    stop_price = Decimal(str(raw_price)) if raw_price else None
+                except Exception:
+                    stop_price = None
+                stop_id = stop_order.get("id")
+            
+            # Calculate default stop if none found
+            if not stop_price or stop_price == 0:
+                pct = Decimal("0.02")
+                if side == Side.LONG:
+                    stop_price = entry_price * (1 - pct)
+                else:
+                    stop_price = entry_price * (1 + pct)
+            
+            # Create position
+            pid = f"pos-{symbol.replace('/', '')}-import-{int(datetime.now().timestamp())}"
+            
+            managed_pos = ManagedPosition(
+                symbol=symbol,
+                side=side,
+                position_id=pid,
+                initial_size=qty,
+                initial_entry_price=entry_price,
+                initial_stop_price=stop_price,
+                initial_tp1_price=None,
+                initial_tp2_price=None,
+                initial_final_target=None,
+            )
+            
+            managed_pos.entry_acknowledged = True
+            managed_pos.intent_confirmed = True
+            managed_pos.state = PositionState.PROTECTED if stop_id else PositionState.PENDING_PROTECTION
+            managed_pos.current_stop_price = stop_price
+            managed_pos.stop_order_id = stop_id
+            managed_pos.setup_type = "AUTO_IMPORT"
+            managed_pos.trade_type = "UNKNOWN"
+            
+            # Add fill record
+            fill = FillRecord(
+                fill_id=f"import-fill-{pid}",
+                order_id="AUTO_IMPORT",
+                side=side,
+                qty=qty,
+                price=entry_price,
+                timestamp=datetime.now(timezone.utc),
+                is_entry=True,
+            )
+            managed_pos.entry_fills.append(fill)
+            
+            try:
+                self.registry.register_position(managed_pos)
+                self.persistence.save_position(managed_pos)
+                imported += 1
+                logger.info("Phantom position imported", symbol=symbol, qty=str(qty), stop=str(stop_price))
+            except Exception as e:
+                logger.error("Failed to import phantom position", symbol=symbol, error=str(e))
+        
+        if imported > 0:
+            logger.info("Phantom positions imported", count=imported)
     
     def get_metrics(self) -> Dict:
         """Get gateway metrics."""
