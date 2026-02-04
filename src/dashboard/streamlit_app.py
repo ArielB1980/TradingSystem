@@ -210,7 +210,7 @@ def format_log_entry_html(entry: dict) -> str:
     elif action:
         header_parts.append(f'<span class="log-action">{action}</span>')
     
-    # Score badge (if present)
+    # Score badge (if present) - show the actual number prominently
     if score:
         try:
             score_val = float(score)
@@ -220,9 +220,9 @@ def format_log_entry_html(entry: dict) -> str:
                 score_class = "log-score log-score-low"
             else:
                 score_class = "log-score"
-            header_parts.append(f'<span class="{score_class}">⭐ {score_val:.0f}</span>')
+            header_parts.append(f'<span class="{score_class}">SCORE: {score_val:.1f}</span>')
         except (ValueError, TypeError):
-            header_parts.append(f'<span class="log-score">⭐ {score}</span>')
+            header_parts.append(f'<span class="log-score">SCORE: {score}</span>')
     
     # Icon for warnings/errors
     if icon:
@@ -283,12 +283,28 @@ def load_logs(log_file: Path, num_lines: int = 200) -> list:
         return [f"Error reading log: {e}"]
 
 
-def matches_filter(entry: dict, text_filter: str, level_filter: list) -> bool:
+def matches_filter(entry: dict, text_filter: str, level_filter: list, signals_only: bool = False) -> bool:
     """Check if entry matches the current filters."""
     # Check level filter
     level = entry.get("level", "info").lower()
     if level not in [l.lower() for l in level_filter]:
         return False
+    
+    # Check signals only filter
+    if signals_only:
+        event = entry.get("event", "").lower()
+        # Match signal-related events
+        signal_keywords = [
+            "signal", "score", "auction", "candidate", 
+            "entry", "approved", "rejected", "contender",
+            "winner", "generated", "smc analysis"
+        ]
+        has_score = bool(entry.get("score"))
+        has_signal_type = bool(entry.get("signal_type"))
+        event_matches = any(kw in event for kw in signal_keywords)
+        
+        if not (has_score or has_signal_type or event_matches):
+            return False
     
     # Check text filter
     if text_filter:
@@ -334,13 +350,18 @@ st.sidebar.divider()
 
 # Quick filters
 st.sidebar.subheader("⚡ Quick Filters")
+
+# Signals only filter
+signals_only = st.sidebar.checkbox("📊 Signals Only", value=False, help="Show only signal-related entries (scores, signals, auctions)")
+
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    if st.button("Trades Only"):
-        text_search = "signal"
-with col2:
     if st.button("Errors Only"):
         level_filter = ["error", "warning"]
+with col2:
+    if st.button("Clear Filters"):
+        text_search = ""
+        signals_only = False
 
 # Main content
 col1, col2 = st.columns([3, 1])
@@ -372,7 +393,7 @@ if LIVE_LOG and LIVE_LOG.exists():
         entries = []
         for line in reversed(log_lines):  # Most recent first
             entry = parse_log_line(line)
-            if entry and matches_filter(entry, text_search, level_filter):
+            if entry and matches_filter(entry, text_search, level_filter, signals_only):
                 entries.append(entry)
         
         # Stats bar
