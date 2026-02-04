@@ -27,7 +27,25 @@ st.title("📊 Trading System Monitor")
 
 # Log file paths
 LOG_DIR = project_root / "logs"
-LIVE_LOG = LOG_DIR / "live_trading.log"
+# Check multiple possible log files and use the most recent
+LOG_FILES = [
+    LOG_DIR / "run.log",
+    LOG_DIR / "live_trading.log",
+]
+
+def get_active_log() -> Path:
+    """Get the most recently modified log file."""
+    best = None
+    best_time = 0
+    for lf in LOG_FILES:
+        if lf.exists():
+            mtime = lf.stat().st_mtime
+            if mtime > best_time:
+                best_time = mtime
+                best = lf
+    return best or LOG_FILES[0]
+
+LIVE_LOG = get_active_log()
 
 def parse_log_line(line: str) -> dict:
     """Parse a JSON log line into a readable format."""
@@ -113,8 +131,12 @@ with col2:
     if st.button("🔄 Refresh"):
         st.rerun()
 
+# Refresh which log file to use
+LIVE_LOG = get_active_log()
+st.caption(f"📁 Reading from: `{LIVE_LOG.name}`")
+
 # Load and display logs
-if LIVE_LOG.exists():
+if LIVE_LOG and LIVE_LOG.exists():
     log_lines = load_logs(LIVE_LOG, num_lines)
     
     if log_lines:
