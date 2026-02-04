@@ -237,14 +237,14 @@ class BacktestEngine:
                              self.position.stop_loss_order_id = f"SL-{new_sl}"
                              # logger.debug(f"Trailing SL Updated: {new_sl}")
 
-            # Generate signal (only if no position)
+            # Generate signal (only if no position) - 4H Decision Authority
             if not self.position:
                 signal = self.smc_engine.generate_signal(
                     symbol=self.symbol,  # V2: Use configured symbol
-                    bias_candles_4h=hist_4h,
-                    bias_candles_1d=hist_1d,
-                    exec_candles_15m=hist_15m,
-                    exec_candles_1h=hist_1h,
+                    regime_candles_1d=hist_1d,
+                    decision_candles_4h=hist_4h,
+                    refine_candles_1h=hist_1h,
+                    refine_candles_15m=hist_15m,
                 )
                 
                 # Process signal

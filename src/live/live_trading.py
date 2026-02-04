@@ -1613,14 +1613,17 @@ class LiveTrading:
                                 logger.error("Failed to record monitoring trace", symbol=spot_symbol, error=str(e))
                         return
 
-                    # Corrected Argument Mapping:
-                    # generate_signal(symbol, bias_4h, bias_1d, exec_15m, exec_1h)
+                    # 4H DECISION AUTHORITY HIERARCHY:
+                    # 1D: Regime filter (EMA200 bias)
+                    # 4H: Decision authority (OB/FVG/BOS, ATR for stops)
+                    # 1H: Refinement (ADX, swing points)
+                    # 15m: Refinement (entry timing)
                     signal = self.smc_engine.generate_signal(
                         symbol=spot_symbol,
-                        bias_candles_4h=self.candle_manager.get_candles(spot_symbol, "4h"),
-                        bias_candles_1d=self.candle_manager.get_candles(spot_symbol, "1d"),
-                        exec_candles_15m=candles,
-                        exec_candles_1h=self.candle_manager.get_candles(spot_symbol, "1h")
+                        regime_candles_1d=self.candle_manager.get_candles(spot_symbol, "1d"),
+                        decision_candles_4h=self.candle_manager.get_candles(spot_symbol, "4h"),
+                        refine_candles_1h=self.candle_manager.get_candles(spot_symbol, "1h"),
+                        refine_candles_15m=candles,
                     )
                     
                     # Pass context to signal for execution (mark price for futures)

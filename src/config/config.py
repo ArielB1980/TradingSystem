@@ -157,7 +157,15 @@ class RiskConfig(BaseSettings):
 
 class StrategyConfig(BaseSettings):
     """Strategy parameters configuration."""
-    # Timeframes
+    # Timeframes - 4H DECISION AUTHORITY HIERARCHY
+    # 1D: Regime filter only (EMA200 bias)
+    # 4H: DECISION AUTHORITY - all SMC patterns (OB, FVG, BOS, ATR for stops)
+    # 1H: Refinement only - ADX filter, swing point precision
+    # 15m: Refinement only - entry timing
+    regime_timeframes: List[str] = ["1d"]
+    decision_timeframes: List[str] = ["4h"]
+    refinement_timeframes: List[str] = ["1h", "15m"]
+    # Legacy compatibility (deprecated)
     bias_timeframes: List[str] = ["4h", "1d"]
     execution_timeframes: List[str] = ["15m", "1h"]
     
@@ -167,13 +175,14 @@ class StrategyConfig(BaseSettings):
     adx_threshold: float = Field(default=20.0, ge=10.0, le=40.0)
     atr_period: int = Field(default=14, ge=7, le=30)
     
-    # Stop buffering (Regime specific ranges)
-    # tight_smc: 0.3-0.6 ATR
-    # wide_structure: 1.0-1.2 ATR
-    tight_smc_atr_stop_min: float = Field(default=0.3, ge=0.1, le=1.0)
-    tight_smc_atr_stop_max: float = Field(default=0.6, ge=0.1, le=1.0)
-    wide_structure_atr_stop_min: float = Field(default=1.0, ge=0.5, le=2.0)
-    wide_structure_atr_stop_max: float = Field(default=1.2, ge=0.5, le=2.0)
+    # Stop buffering (Regime specific ranges - adjusted for 4H ATR)
+    # 4H ATR is ~2-3x larger than 1H ATR, so multipliers are reduced
+    # tight_smc: 0.15-0.30 ATR (4H) - was 0.3-0.6 on 1H
+    # wide_structure: 0.50-0.60 ATR (4H) - was 1.0-1.2 on 1H
+    tight_smc_atr_stop_min: float = Field(default=0.15, ge=0.05, le=1.0)
+    tight_smc_atr_stop_max: float = Field(default=0.30, ge=0.05, le=1.0)
+    wide_structure_atr_stop_min: float = Field(default=0.50, ge=0.2, le=2.0)
+    wide_structure_atr_stop_max: float = Field(default=0.60, ge=0.2, le=2.0)
     
     # Legacy fallbacks
     atr_multiplier_stop: float = Field(default=1.5, ge=1.0, le=3.0)
@@ -205,10 +214,12 @@ class StrategyConfig(BaseSettings):
     fib_proximity_bps: float = Field(default=20.0, ge=0.0, le=100.0) # 0.2%
 
 
-    # Market Structure Change Confirmation
+    # Market Structure Change Confirmation (4H Decision Authority)
+    # Now uses 4H candles - 1 candle = 4 hours, 2 candles = 8 hours
     require_ms_change_confirmation: bool = Field(default=True)
-    ms_confirmation_candles: int = Field(default=3, ge=1, le=10)
-    ms_reconfirmation_candles: int = Field(default=2, ge=1, le=10)
+    ms_confirmation_candles: int = Field(default=1, ge=1, le=5)  # Base: 1 on 4H = 4 hours
+    ms_confirmation_candles_high_vol: int = Field(default=2, ge=1, le=5)  # High vol: 2 on 4H = 8 hours
+    ms_reconfirmation_candles: int = Field(default=1, ge=1, le=5)  # 1 on 4H = 4 hours
     
     # Adaptive Strategy Logic
     adaptive_enabled: bool = True

@@ -87,28 +87,30 @@ class MarketStructureTracker:
     def update_structure(
         self,
         symbol: str,
-        candles_1h: list[Candle],
+        candles_4h: list[Candle],
         lookback: int = 20
     ) -> Tuple[MarketStructureState, Optional[StructureChange]]:
         """
         Update market structure for symbol and detect changes.
         
+        Uses 4H candles for structure analysis (decision authority).
+        
         Args:
             symbol: Trading symbol
-            candles_1h: 1h candles for structure analysis
+            candles_4h: 4H candles for structure analysis (decision timeframe)
             lookback: Lookback period for swing detection
             
         Returns:
             (current_state, latest_change_or_none)
         """
-        if len(candles_1h) < lookback + 5:
+        if len(candles_4h) < lookback + 5:
             # Not enough data
             current_state = self.structure_state.get(symbol, MarketStructureState.NEUTRAL)
             return current_state, None
         
-        # Detect swing points
-        swing_highs = self.indicators.find_swing_points(candles_1h, lookback=lookback, find_highs=True)
-        swing_lows = self.indicators.find_swing_points(candles_1h, lookback=lookback, find_highs=False)
+        # Detect swing points on 4H (decision timeframe)
+        swing_highs = self.indicators.find_swing_points(candles_4h, lookback=lookback, find_highs=True)
+        swing_lows = self.indicators.find_swing_points(candles_4h, lookback=lookback, find_highs=False)
         
         if not swing_highs or not swing_lows:
             current_state = self.structure_state.get(symbol, MarketStructureState.NEUTRAL)
@@ -127,24 +129,24 @@ class MarketStructureTracker:
         # Check for structure change
         structure_change = None
         if current_state != previous_state and previous_state != MarketStructureState.NEUTRAL:
-            # Structure change detected
-            current_price = candles_1h[-1].close
+            # Structure change detected on 4H
+            current_price = candles_4h[-1].close
             
             if current_state == MarketStructureState.BULLISH and previous_state == MarketStructureState.BEARISH:
-                # Bearish to bullish change (break of swing high)
+                # Bearish to bullish change (break of swing high on 4H)
                 break_price = recent_high if recent_high else current_price
                 structure_change = StructureChange(
-                    timestamp=candles_1h[-1].timestamp,
+                    timestamp=candles_4h[-1].timestamp,
                     previous_state=previous_state,
                     new_state=current_state,
                     break_price=break_price,
                     break_type="swing_high"
                 )
             elif current_state == MarketStructureState.BEARISH and previous_state == MarketStructureState.BULLISH:
-                # Bullish to bearish change (break of swing low)
+                # Bullish to bearish change (break of swing low on 4H)
                 break_price = recent_low if recent_low else current_price
                 structure_change = StructureChange(
-                    timestamp=candles_1h[-1].timestamp,
+                    timestamp=candles_4h[-1].timestamp,
                     previous_state=previous_state,
                     new_state=current_state,
                     break_price=break_price,
@@ -176,18 +178,19 @@ class MarketStructureTracker:
     def check_confirmation(
         self,
         symbol: str,
-        candles_1h: list[Candle],
+        candles_4h: list[Candle],
         structure_change: StructureChange,
         required_candles: Optional[int] = None 
     ) -> bool:
         """
-        Check if structure change is confirmed.
+        Check if structure change is confirmed on 4H.
         
-        Confirmation: Price holds above/below break for N candles.
+        Confirmation: Price holds above/below break for N candles on 4H.
+        1 candle = 4 hours, 2 candles = 8 hours.
         
         Args:
             symbol: Trading symbol
-            candles_1h: Recent candles
+            candles_4h: 4H candles (decision timeframe)
             structure_change: The structure change to confirm
             required_candles: Override default confirmation candles (Adaptive Strategy)
             
@@ -199,11 +202,11 @@ class MarketStructureTracker:
         
         threshold = required_candles if required_candles is not None else self.confirmation_candles
         
-        if len(candles_1h) < threshold:
+        if len(candles_4h) < threshold:
             return False
         
-        # Check if price has held above/below break
-        recent_candles = candles_1h[-threshold:]
+        # Check if price has held above/below break on 4H
+        recent_candles = candles_4h[-threshold:]
         break_price = Decimal(str(structure_change.break_price))
         
         if structure_change.new_state == MarketStructureState.BULLISH:
@@ -243,7 +246,7 @@ class MarketStructureTracker:
         self,
         symbol: str,
         candles_15m: list[Candle],
-        candles_1h: list[Candle],
+        candles_4h: list[Candle],
         structure_change: StructureChange,
         entry_zone: Optional[dict] = None,
         atr_value: Optional[Decimal] = None
@@ -251,16 +254,17 @@ class MarketStructureTracker:
         """
         Check if structure change is reconfirmed (ready for entry).
         
+        Uses 15m for entry timing precision, 4H for structure context.
         Reconfirmation: Price retraces to entry zone (OB/FVG) after confirmation.
         Now supports configurable tolerance for "near zone" entries.
         
         Args:
             symbol: Trading symbol
-            candles_15m: 15m candles for entry timing
-            candles_1h: 1h candles for structure
+            candles_15m: 15m candles for entry timing (refinement)
+            candles_4h: 4H candles for structure context (decision)
             structure_change: The confirmed structure change
-            entry_zone: Optional entry zone (order block or FVG)
-            atr_value: Optional ATR value for adaptive tolerance
+            entry_zone: Optional entry zone (order block or FVG from 4H)
+            atr_value: Optional 4H ATR value for adaptive tolerance
             
         Returns:
             Tuple of (is_reconfirmed, used_tolerance)

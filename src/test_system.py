@@ -213,14 +213,14 @@ async def test_signal_processing(config):
         
         print(f"  ✅ Got candles: 15m={len(candles_15m)}, 1h={len(candles_1h)}, 4h={len(candles_4h)}, 1d={len(candles_1d)}")
         
-        # Generate signal
+        # Generate signal (4H Decision Authority)
         print("  Generating signal...")
         signal = smc_engine.generate_signal(
             symbol=test_symbol,
-            bias_candles_4h=candles_4h,
-            bias_candles_1d=candles_1d,
-            exec_candles_15m=candles_15m,
-            exec_candles_1h=candles_1h
+            regime_candles_1d=candles_1d,
+            decision_candles_4h=candles_4h,
+            refine_candles_1h=candles_1h,
+            refine_candles_15m=candles_15m,
         )
         
         print(f"  ✅ Signal generated:")
