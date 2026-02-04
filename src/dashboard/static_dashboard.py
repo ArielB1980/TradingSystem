@@ -226,7 +226,6 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
         # Track signals - look for "Signal generated with 4H decision authority"
         if "Signal generated" in raw and symbol:
             signal_type = ""
-            score = None
             
             # Extract signal type
             if "signal_type=short" in raw or "type=short" in raw:
@@ -234,34 +233,44 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
             elif "signal_type=long" in raw or "type=long" in raw:
                 signal_type = "long"
             
-            # Extract score from atr_value or score field
-            score_match = re.search(r'score[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
-            if score_match:
-                try:
-                    score = float(score_match.group(1))
-                except:
-                    pass
-            
             # Extract entry/stop from the log line
             entry_match = re.search(r'entry[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
             stop_match = re.search(r'stop[=:]?\s*(\d+\.?\d*)', raw, re.IGNORECASE)
             
             if signal_type:
                 # Deduplicate - only keep latest signal per symbol
-                signals_seen[symbol] = {
-                    "symbol": symbol,
-                    "type": signal_type,
-                    "score": score,
-                    "entry": entry_match.group(1) if entry_match else None,
-                    "stop": stop_match.group(1) if stop_match else None,
-                    "tp": None,
-                    "regime": coins_reviewed.get(symbol, {}).get("regime", ""),
-                }
+                # Score will be updated from Auction candidate lines
+                if symbol not in signals_seen:
+                    signals_seen[symbol] = {
+                        "symbol": symbol,
+                        "type": signal_type,
+                        "score": None,
+                        "entry": entry_match.group(1) if entry_match else None,
+                        "stop": stop_match.group(1) if stop_match else None,
+                        "tp": None,
+                        "regime": coins_reviewed.get(symbol, {}).get("regime", ""),
+                    }
+                else:
+                    # Update existing with latest entry/stop
+                    signals_seen[symbol]["entry"] = entry_match.group(1) if entry_match else signals_seen[symbol]["entry"]
+                    signals_seen[symbol]["stop"] = stop_match.group(1) if stop_match else signals_seen[symbol]["stop"]
                 
                 # Update coins_reviewed
                 if symbol in coins_reviewed:
                     coins_reviewed[symbol]["signal_type"] = signal_type
-                    coins_reviewed[symbol]["score"] = score
+        
+        # Extract score from Auction candidate lines
+        if "Auction candidate created" in raw and symbol:
+            score_match = re.search(r'score=(\d+\.?\d*)', raw)
+            if score_match:
+                try:
+                    score = float(score_match.group(1))
+                    if symbol in signals_seen:
+                        signals_seen[symbol]["score"] = score
+                    if symbol in coins_reviewed:
+                        coins_reviewed[symbol]["score"] = score
+                except:
+                    pass
         
         # Track auction results
         if "Auction allocation executed" in raw or "Auction plan generated" in raw:
