@@ -261,6 +261,24 @@ class BacktestEngine:
                     if drawdown > self.metrics.max_drawdown:
                         self.metrics.max_drawdown = drawdown
         
+        # Close any remaining open position at end of backtest
+        if self.position:
+            final_candle = candles_1h[-1] if candles_1h else None
+            if final_candle:
+                logger.info(
+                    "Closing open position at backtest end",
+                    symbol=self.position.symbol,
+                    side=self.position.side.value,
+                    entry_price=str(self.position.entry_price),
+                    exit_price=str(final_candle.close),
+                )
+                self._close_position(
+                    final_candle.close,
+                    "backtest_end",
+                    final_candle.timestamp,
+                    self.position.size
+                )
+        
         # Finalize metrics
         self.metrics.update()
         
