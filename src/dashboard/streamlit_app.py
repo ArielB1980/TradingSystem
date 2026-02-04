@@ -4,12 +4,19 @@ Trading System Dashboard - Single Page Coin Monitor
 Displays comprehensive real-time analysis for all tracked coins.
 """
 import sys
+import os
 from pathlib import Path
 
 # Ensure project root is in path for imports
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+# Load environment variables from .env file
+env_file = project_root / ".env"
+if env_file.exists():
+    from dotenv import load_dotenv
+    load_dotenv(env_file)
 
 import streamlit as st
 import pandas as pd
