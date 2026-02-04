@@ -132,11 +132,11 @@ def fetch_positions() -> List[Dict]:
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT symbol, side, state, initial_size, initial_entry_price,
-                   current_stop_price, stop_order_id, created_at
+            SELECT symbol, side, size, entry_price, initial_stop_price,
+                   stop_loss_order_id, is_protected, unrealized_pnl, opened_at
             FROM positions
-            WHERE state NOT IN ('CLOSED', 'CANCELLED', 'REJECTED')
-            ORDER BY created_at DESC
+            WHERE size != 0 AND size IS NOT NULL
+            ORDER BY opened_at DESC
         """)
         
         rows = cur.fetchall()
@@ -423,19 +423,21 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
         for p in positions:
             side = str(p.get("side", "")).lower()
             side_badge = "badge-long" if side == "long" else "badge-short"
-            is_protected = bool(p.get("stop_order_id"))
+            is_protected = bool(p.get("is_protected") or p.get("stop_loss_order_id"))
             protected_html = '<span class="badge badge-protected">Protected</span>' if is_protected else '<span style="color: #d29922;">Unprotected</span>'
             symbol = str(p.get("symbol", "")).replace("PF_", "").replace("USD", "")
+            pnl = p.get("unrealized_pnl", 0) or 0
+            pnl_color = "#3fb950" if float(pnl) >= 0 else "#f85149"
             
             positions_rows += f"""
                 <tr>
                     <td><strong>{symbol}</strong></td>
                     <td><span class="badge {side_badge}">{side.upper()}</span></td>
-                    <td>{p.get('initial_size', '-')}</td>
-                    <td>{p.get('initial_entry_price', '-')}</td>
-                    <td>{p.get('current_stop_price', '-')}</td>
+                    <td>{p.get('size', '-')}</td>
+                    <td>{p.get('entry_price', '-')}</td>
+                    <td>{p.get('initial_stop_price', '-')}</td>
+                    <td style="color: {pnl_color};">{pnl}</td>
                     <td>{protected_html}</td>
-                    <td>{p.get('state', '-')}</td>
                 </tr>
             """
         positions_html = f"""
@@ -443,7 +445,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
             <div class="section-header">💼 Open Positions <span>{len(positions)} positions</span></div>
             <div class="section-content">
                 <table>
-                    <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Stop</th><th>Status</th><th>State</th></tr></thead>
+                    <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Stop</th><th>PnL</th><th>Status</th></tr></thead>
                     <tbody>{positions_rows}</tbody>
                 </table>
             </div>
