@@ -552,16 +552,23 @@ class Executor:
                 # Place new TP ladder
                 new_tp_ids = []
                 # Use actual position size if provided (for proper TP sizing)
-                # For reduce-only orders, exchange will handle sizing if 0, but passing actual size is safer
-                tp_size = position_size_notional if position_size_notional else Decimal("0")
+                # CRITICAL: Apply TP splits so total reduce-only size doesn't exceed position
+                # Kraken rejects orders with "wouldNotReducePosition" if we exceed position size
+                tp_splits = getattr(self.config, 'tp_splits', [Decimal("0.35"), Decimal("0.35"), Decimal("0.30")])
+                base_size = position_size_notional if position_size_notional else Decimal("0")
                 
                 for i, tp_price in enumerate(new_tp_prices):
                     try:
-                        # Place TP order with position size (reduce-only will close appropriate amount)
+                        # Apply TP split percentage for this level
+                        # Ensures total reduce-only size doesn't exceed position size
+                        split_pct = Decimal(str(tp_splits[i])) if i < len(tp_splits) else Decimal("0.33")
+                        tp_size = base_size * split_pct
+                        
+                        # Place TP order with split size
                         tp_order = await self.futures_adapter.place_order(
                             symbol=symbol,
                             side=protective_side,
-                            size_notional=tp_size,  # Use actual position size for safety
+                            size_notional=tp_size,
                             leverage=Decimal("1"),
                             order_type=OrderType.TAKE_PROFIT,
                             price=tp_price,
