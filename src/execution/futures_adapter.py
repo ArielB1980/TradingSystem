@@ -420,17 +420,28 @@ class FuturesAdapter:
             )
             
             # Extract order details from response
-            send_status = response.get("sendStatus", {})
-            order_id = send_status.get("order_id", f"unknown_{uuid.uuid4().hex[:16]}")
-            status_str = send_status.get("status", "placed")
+            # CCXT returns order_id at top level 'id', not in 'sendStatus'
+            order_id = response.get("id")
+            if not order_id:
+                # Fallback to legacy sendStatus format (should not happen with CCXT)
+                send_status = response.get("sendStatus", {})
+                order_id = send_status.get("order_id", f"unknown_{uuid.uuid4().hex[:16]}")
+            
+            # Get status from CCXT response
+            status_str = response.get("status", "open")
             
             # Map status to our OrderStatus enum
+            # CCXT returns: "open", "closed", "canceled"
+            # Legacy sendStatus may return: "placed", "cancelled", "filled"
             status_map = {
-                "placed": OrderStatus.SUBMITTED,
+                "open": OrderStatus.SUBMITTED,
+                "closed": OrderStatus.FILLED,
+                "canceled": OrderStatus.CANCELLED,
                 "cancelled": OrderStatus.CANCELLED,
+                "placed": OrderStatus.SUBMITTED,
                 "filled": OrderStatus.FILLED,
             }
-            status = status_map.get(status_str, OrderStatus.SUBMITTED)
+            status = status_map.get(status_str.lower() if status_str else "", OrderStatus.SUBMITTED)
             
             # Create Order object
             order = Order(

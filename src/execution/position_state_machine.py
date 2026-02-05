@@ -24,8 +24,17 @@ import json
 
 from src.domain.models import Side, OrderType
 from src.monitoring.logger import get_logger
+from src.data.symbol_utils import normalize_symbol_for_position_match
 
 logger = get_logger(__name__)
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize symbol for consistent position lookup across formats.
+    
+    Handles: PF_TRXUSD, TRX/USD, TRX/USD:USD -> TRXUSD
+    """
+    return normalize_symbol_for_position_match(symbol)
 
 
 # ============ INVARIANT CHECKING ============
@@ -803,28 +812,46 @@ class PositionRegistry:
     # ========== INVARIANT A: Single position per symbol ==========
     
     def _check_invariant_a(self, symbol: str) -> None:
-        """Invariant A: At most one non-terminal position per symbol."""
+        """Invariant A: At most one non-terminal position per symbol (using normalized matching)."""
+        target_norm = _normalize_symbol(symbol)
         positions = [
             p for p in self._positions.values()
-            if p.symbol == symbol and not p.is_terminal
+            if _normalize_symbol(p.symbol) == target_norm and not p.is_terminal
         ]
         check_invariant(
             len(positions) <= 1,
-            f"INVARIANT A VIOLATION: Multiple active positions for {symbol}"
+            f"INVARIANT A VIOLATION: Multiple active positions for {symbol} (normalized: {target_norm})"
         )
     
     # ========== POSITION ACCESS ==========
     
+    def _find_position_by_normalized(self, symbol: str) -> Optional[ManagedPosition]:
+        """Find position by normalized symbol (handles PF_*, /, :USD formats).
+        
+        MUST be called under lock.
+        """
+        # Try exact match first
+        pos = self._positions.get(symbol)
+        if pos is not None:
+            return pos
+        
+        # Search by normalized symbol
+        target_norm = _normalize_symbol(symbol)
+        for stored_symbol, pos in self._positions.items():
+            if _normalize_symbol(stored_symbol) == target_norm:
+                return pos
+        return None
+    
     def has_position(self, symbol: str) -> bool:
-        """Check if symbol has an active position."""
+        """Check if symbol has an active position (handles symbol format variants)."""
         with self._lock:
-            pos = self._positions.get(symbol)
+            pos = self._find_position_by_normalized(symbol)
             return pos is not None and not pos.is_terminal
     
     def get_position(self, symbol: str) -> Optional[ManagedPosition]:
-        """Get active position for symbol."""
+        """Get active position for symbol (handles symbol format variants)."""
         with self._lock:
-            pos = self._positions.get(symbol)
+            pos = self._find_position_by_normalized(symbol)
             if pos and not pos.is_terminal:
                 return pos
             return None
@@ -845,11 +872,15 @@ class PositionRegistry:
         """
         Check if a new position can be opened (Invariant E).
         
+        Uses normalized symbol matching to handle format variants:
+        - PF_TRXUSD, TRX/USD, TRX/USD:USD all refer to the same market
+        
         Returns:
             (allowed, reason)
         """
         with self._lock:
-            existing = self._positions.get(symbol)
+            # Use normalized lookup to catch format variants
+            existing = self._find_position_by_normalized(symbol)
             
             if existing is None:
                 return True, "No existing position"
@@ -857,8 +888,12 @@ class PositionRegistry:
             if existing.is_terminal:
                 return True, "Previous position terminal"
             
-            # Check if reversal is pending
-            if symbol in self._pending_reversals:
+            # Check if reversal is pending (use normalized key)
+            target_norm = _normalize_symbol(symbol)
+            reversal_pending = any(
+                _normalize_symbol(s) == target_norm for s in self._pending_reversals
+            )
+            if reversal_pending:
                 return False, f"Reversal pending for {symbol}, waiting for close confirmation"
             
             # Position exists and is active
@@ -875,11 +910,14 @@ class PositionRegistry:
         IDEMPOTENT: If the SAME position (same position_id) is registered twice,
         treat as no-op (duplicate registration from concurrent tasks).
         
+        Uses normalized symbol matching to detect conflicts across format variants.
+        
         Raises:
             InvariantViolation if a DIFFERENT position tries to register for the same symbol
         """
         with self._lock:
-            existing = self._positions.get(position.symbol)
+            # Use normalized lookup to find existing position across format variants
+            existing = self._find_position_by_normalized(position.symbol)
             
             if existing is not None:
                 # IDEMPOTENT HANDLING: Same position (same position_id) registered twice
@@ -900,17 +938,22 @@ class PositionRegistry:
                     # This is a real conflict - raise invariant violation
                     check_invariant(False, f"Cannot register position: {reason}")
             
-            # Archive old terminal position if exists
-            old_pos = self._positions.get(position.symbol)
+            # Archive old terminal position if exists (check both exact and normalized)
+            old_pos = self._find_position_by_normalized(position.symbol)
             if old_pos and old_pos.is_terminal:
                 self._closed_positions.append(old_pos)
+                # Remove by the key it was stored under
+                if old_pos.symbol in self._positions:
+                    del self._positions[old_pos.symbol]
             
             self._positions[position.symbol] = position
             self._check_invariant_a(position.symbol)
             
-            # Clear any pending reversal
-            if position.symbol in self._pending_reversals:
-                del self._pending_reversals[position.symbol]
+            # Clear any pending reversal (by normalized key)
+            target_norm = _normalize_symbol(position.symbol)
+            to_remove = [s for s in self._pending_reversals if _normalize_symbol(s) == target_norm]
+            for s in to_remove:
+                del self._pending_reversals[s]
             
             logger.info(
                 "Position registered",
