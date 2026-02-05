@@ -2570,8 +2570,24 @@ class LiveTrading:
                     continue
                 try:
                     pos = self._convert_to_position(pos_data)
-                    # Check if protective orders are live
                     futures_symbol = pos.symbol
+                    
+                    # CRITICAL FIX: Merge protection status from database
+                    # _convert_to_position creates a fresh object with is_protected=False
+                    # We need to copy over the reconciled protection status from DB
+                    try:
+                        db_pos = await asyncio.to_thread(get_active_position, futures_symbol)
+                        if db_pos:
+                            pos.is_protected = db_pos.is_protected
+                            pos.protection_reason = db_pos.protection_reason
+                            pos.stop_loss_order_id = db_pos.stop_loss_order_id
+                            pos.initial_stop_price = db_pos.initial_stop_price
+                            if hasattr(db_pos, 'tp_order_ids'):
+                                pos.tp_order_ids = db_pos.tp_order_ids
+                    except Exception as e:
+                        logger.warning("Failed to fetch DB position for protection merge", symbol=futures_symbol, error=str(e))
+                    
+                    # Check if protective orders are live
                     is_protective_live = (
                         pos.stop_loss_order_id is not None or
                         (hasattr(pos, 'tp_order_ids') and pos.tp_order_ids)

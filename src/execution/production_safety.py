@@ -280,8 +280,25 @@ class ProtectionEnforcer:
             if not position_symbol_matches_order(position.symbol, order_symbol):
                 continue
 
-            otype = str(order.get("type") or "").lower()
-            if otype not in ("stop", "stop_market", "stop_limit", "stop-loss", "stop_loss", "stop-loss-limit"):
+            # Check order type - look in both top-level 'type' and 'info.orderType' (Kraken puts it there)
+            info = order.get("info") or {}
+            otype = str(
+                order.get("type") 
+                or info.get("orderType") 
+                or info.get("type") 
+                or ""
+            ).lower()
+            
+            # Use substring matching to catch variations (stop, stop_market, stp, stop-loss, etc.)
+            is_stop_type = any(
+                stop_term in otype 
+                for stop_term in ('stop', 'stop-loss', 'stop_loss', 'stp')
+            )
+            # Exclude take-profit orders that might contain 'stop' substring
+            if 'take_profit' in otype or 'take-profit' in otype:
+                is_stop_type = False
+            
+            if not is_stop_type:
                 continue
 
             # Defensive: if reduce-only is explicitly present and false, it's not protective.
