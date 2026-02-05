@@ -588,6 +588,26 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
     </div>
     """
     
+    # Errors section (shows last 5 errors with details)
+    if errors:
+        errors_rows = ""
+        for err in errors:
+            # Truncate long error messages
+            err_display = err[:300] + "..." if len(err) > 300 else err
+            # Escape HTML
+            err_display = err_display.replace("<", "&lt;").replace(">", "&gt;")
+            errors_rows += f'<li>{err_display}</li>'
+        errors_html = f"""
+        <div class="section">
+            <div class="section-header" style="background: #2d1a1a; border-bottom-color: #f85149;">❌ Recent Errors <span style="color: #f85149;">{len(errors)} errors</span></div>
+            <div class="section-content">
+                <ul class="error-list">{errors_rows}</ul>
+            </div>
+        </div>
+        """
+    else:
+        errors_html = ""
+    
     # Full HTML
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -637,6 +657,8 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
         .auction-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
         .auction-list {{ list-style: none; }}
         .auction-list li {{ padding: 8px 12px; background: #21262d; margin: 5px 0; border-radius: 6px; display: flex; justify-content: space-between; }}
+        .error-list {{ list-style: none; }}
+        .error-list li {{ padding: 10px 12px; background: #2d1a1a; margin: 5px 0; border-radius: 6px; font-size: 12px; font-family: 'SF Mono', 'Monaco', monospace; word-break: break-all; border-left: 3px solid #f85149; color: #f0a0a0; }}
         .footer {{ text-align: center; padding: 20px; color: #484f58; font-size: 12px; }}
         @media (max-width: 768px) {{ .auction-grid {{ grid-template-columns: 1fr; }} .stats-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
     </style>
@@ -652,6 +674,8 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
         </div>
         
         {status_html}
+        
+        {errors_html}
         
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-value">{len(coins)}</div><div class="stat-label">Coins Reviewed</div></div>
