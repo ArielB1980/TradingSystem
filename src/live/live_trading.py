@@ -2619,8 +2619,30 @@ class LiveTrading:
             candidate_signals = []
             signal_to_candidate = {}
             requested_leverage = int(getattr(self.config.risk, "target_leverage", 7) or 7)
+            
+            # Import symbol cooldown checker
+            from src.risk.symbol_cooldown import check_symbol_cooldown
+            
             for signal, spot_price, mark_price in self.auction_signals_this_tick:
                 try:
+                    # Check symbol-level cooldown (repeated losses)
+                    if getattr(self.config.strategy, 'symbol_loss_cooldown_enabled', True):
+                        is_on_cooldown, cooldown_reason = check_symbol_cooldown(
+                            symbol=signal.symbol,
+                            lookback_hours=getattr(self.config.strategy, 'symbol_loss_lookback_hours', 24),
+                            loss_threshold=getattr(self.config.strategy, 'symbol_loss_threshold', 3),
+                            cooldown_hours=getattr(self.config.strategy, 'symbol_loss_cooldown_hours', 12),
+                            min_pnl_pct=getattr(self.config.strategy, 'symbol_loss_min_pnl_pct', -0.5),
+                        )
+                        if is_on_cooldown:
+                            logger.warning(
+                                "AUCTION_OPEN_REJECTED",
+                                symbol=signal.symbol,
+                                reason="SYMBOL_COOLDOWN",
+                                details=cooldown_reason,
+                            )
+                            continue
+                    
                     futures_symbol = self.futures_adapter.map_spot_to_futures(
                         signal.symbol, futures_tickers=self.latest_futures_tickers
                     )
