@@ -7,6 +7,7 @@ No futures prices, funding data, or order book data may be accessed.
 from typing import List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
+import os
 import pandas as pd
 from src.domain.models import Candle, Signal, SignalType, SetupType
 from src.strategy.indicators import Indicators
@@ -16,6 +17,54 @@ from src.storage.repository import record_event
 import uuid
 
 logger = get_logger(__name__)
+
+
+def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
+    """
+    Query database for recent stop-outs on a symbol.
+    
+    Args:
+        symbol: Trading symbol (e.g., 'WIF/USD' or 'PF_WIFUSD')
+        lookback_hours: Hours to look back for stop-outs
+        
+    Returns:
+        Number of stop-outs in the lookback period
+    """
+    try:
+        import psycopg2
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            return 0
+            
+        conn = psycopg2.connect(database_url)
+        cur = conn.cursor()
+        
+        # Normalize symbol for matching (handle both WIF/USD and PF_WIFUSD formats)
+        base_symbol = symbol.replace("PF_", "").replace("USD", "/USD").replace("//", "/")
+        futures_symbol = "PF_" + symbol.replace("/", "").replace("PF_", "")
+        
+        # Query trades table for stop-outs
+        cur.execute("""
+            SELECT COUNT(*) FROM trades 
+            WHERE (symbol LIKE %s OR symbol LIKE %s)
+            AND exit_reason LIKE 'Stop Loss%%'
+            AND exited_at >= NOW() - INTERVAL '%s hours'
+        """, (f"%{base_symbol}%", f"%{futures_symbol}%", lookback_hours))
+        
+        result = cur.fetchone()
+        count = result[0] if result else 0
+        
+        cur.close()
+        conn.close()
+        
+        if count > 0:
+            logger.info("Recent stop-outs detected", symbol=symbol, count=count, lookback_hours=lookback_hours)
+        
+        return count
+        
+    except Exception as e:
+        logger.warning("Failed to query stop-outs", symbol=symbol, error=str(e))
+        return 0
 
 
 class SMCEngine:
@@ -518,6 +567,7 @@ class SMCEngine:
                     bias,
                     reasoning_parts,
                     atr_value=atr_value,  # Pass cached 4H ATR
+                    symbol=symbol,  # For stop widening after recent stop-outs
                 )
                 
                 # Step 5: Fib Validation (Gate for tight_smc) - use cached 4H fib_levels
@@ -1115,6 +1165,7 @@ class SMCEngine:
         bias: str,
         reasoning: List[str],
         atr_value: Optional[Decimal] = None,
+        symbol: Optional[str] = None,
     ) -> Tuple[SignalType, Decimal, Decimal, Optional[Decimal], List[Decimal], Dict]:
         """
         Calculate Levels: Entry, Stop, TP.
@@ -1160,6 +1211,37 @@ class SMCEngine:
             stop_mult = Decimal(str((self.config.tight_smc_atr_stop_min + self.config.tight_smc_atr_stop_max) / 2))
         else:
             stop_mult = Decimal(str((self.config.wide_structure_atr_stop_min + self.config.wide_structure_atr_stop_max) / 2))
+        
+        # 3b. Apply stop widening if symbol has recent stop-outs
+        if getattr(self.config, 'stop_widen_enabled', True) and symbol:
+            recent_stopouts = get_recent_stopouts(
+                symbol, 
+                lookback_hours=getattr(self.config, 'stop_widen_lookback_hours', 24)
+            )
+            threshold = getattr(self.config, 'stop_widen_threshold', 2)
+            
+            if recent_stopouts >= threshold:
+                # Calculate widening factor
+                base_factor = Decimal(str(getattr(self.config, 'stop_widen_factor', 1.5)))
+                increment = Decimal(str(getattr(self.config, 'stop_widen_increment', 0.25)))
+                max_factor = Decimal(str(getattr(self.config, 'stop_widen_max_factor', 2.0)))
+                
+                # Add increment for each stop-out above threshold
+                extra_stopouts = recent_stopouts - threshold
+                widen_factor = min(base_factor + (increment * extra_stopouts), max_factor)
+                
+                original_mult = stop_mult
+                stop_mult = stop_mult * widen_factor
+                
+                logger.warning(
+                    "Stop widening applied due to recent stop-outs",
+                    symbol=symbol,
+                    recent_stopouts=recent_stopouts,
+                    threshold=threshold,
+                    widen_factor=float(widen_factor),
+                    original_mult=float(original_mult),
+                    new_mult=float(stop_mult)
+                )
             
         tp_candidates = []
         entry_price = Decimal("0")
