@@ -195,6 +195,13 @@ class StrategyConfig(BaseSettings):
     stop_widen_max_factor: float = Field(default=2.0, ge=1.5, le=3.0, description="Maximum widening factor")
     stop_widen_increment: float = Field(default=0.25, ge=0.1, le=0.5, description="Additional factor per stop-out above threshold")
     
+    # Symbol-level loss tracking and cooldown
+    symbol_loss_cooldown_enabled: bool = Field(default=True, description="Pause trading on symbols with repeated losses")
+    symbol_loss_lookback_hours: int = Field(default=24, ge=6, le=72, description="Hours to look back for losses")
+    symbol_loss_threshold: int = Field(default=3, ge=2, le=10, description="Consecutive losses before cooldown")
+    symbol_loss_cooldown_hours: int = Field(default=12, ge=4, le=48, description="Hours to pause trading after threshold")
+    symbol_loss_min_pnl_pct: float = Field(default=-0.5, ge=-5.0, le=0.0, description="Min loss % to count as a loss (-0.5 = -0.5%)")
+    
     rsi_period: int = Field(default=14, ge=7, le=30)
 
     rsi_divergence_enabled: bool = False  # Single flag for RSI divergence (removed duplicate rsi_divergence_check)
