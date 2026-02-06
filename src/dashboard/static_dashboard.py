@@ -759,17 +759,18 @@ def update_dashboard():
             f.write(html)
         
         # Also save JSON
+        coins_count = int(data.get("coins_reviewed_count", len(data.get("coins", []))) or 0)
         with open(JSON_FILE, "w") as f:
             json.dump({
                 "timestamp": datetime.now(CET).isoformat(),
-                "coins_count": int(data.get("coins_reviewed_count", len(data.get("coins", []))) or 0),
+                "coins_count": coins_count,
                 "signals_count": len(data.get("signals", [])),
                 "positions_count": len(positions),
                 "signals": data.get("signals", []),
                 "auction": data.get("auction", {}),
             }, f, indent=2, default=str)
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {len(data.get('coins', []))} coins, {len(data.get('signals', []))} signals, {len(positions)} positions")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {coins_count} coins, {len(data.get('signals', []))} signals, {len(positions)} positions")
         
     except Exception as e:
         import traceback
