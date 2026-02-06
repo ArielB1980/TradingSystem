@@ -100,6 +100,23 @@ class MarketRegistry:
         futures_base = cls._normalize_base_symbol(futures_symbol)
         return spot_base in cls._PINNED_TIER_A_BASES or futures_base in cls._PINNED_TIER_A_BASES
     
+    def _is_config_tier_a(self, symbol: str) -> bool:
+        """
+        Check if symbol is in the config's Tier A list.
+        
+        This allows all Tier A coins to bypass OI filters since Kraken
+        misreports open interest for some major coins.
+        """
+        try:
+            coin_universe = getattr(self.config, 'coin_universe', None)
+            if not coin_universe:
+                return False
+            liquidity_tiers = getattr(coin_universe, 'liquidity_tiers', {})
+            tier_a_symbols = liquidity_tiers.get('A', [])
+            return symbol in tier_a_symbols
+        except Exception:
+            return False
+    
     async def discover_markets(self) -> Dict[str, MarketPair]:
         """
         Discover all eligible market pairs via client.get_spot_markets / get_futures_markets.
@@ -303,12 +320,26 @@ class MarketRegistry:
                 pair.funding_rate = fticker.funding_rate
                 
                 # Check minimum futures open interest
+                # Tier A coins bypass OI filter - Kraken misreports OI for some majors (including BTC)
+                is_config_tier_a = self._is_config_tier_a(symbol)
+                is_pinned = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
+                skip_oi_filter = is_config_tier_a or is_pinned
+                
                 min_oi = getattr(filters, "min_futures_open_interest", Decimal("0")) or Decimal("0")
-                if fticker.open_interest < min_oi:
+                if fticker.open_interest < min_oi and not skip_oi_filter:
                     pair.is_eligible = False
                     pair.rejection_reason = f"OI ${fticker.open_interest:,.0f} < ${min_oi:,.0f}"
                     rejected[symbol] = pair.rejection_reason
                     continue
+                elif skip_oi_filter and fticker.open_interest < min_oi:
+                    logger.warning(
+                        "Tier A coin bypassing OI filter (Kraken misreporting suspected)",
+                        symbol=symbol,
+                        reported_oi=str(fticker.open_interest),
+                        min_oi=str(min_oi),
+                        is_config_tier_a=is_config_tier_a,
+                        is_pinned=is_pinned,
+                    )
                 
                 # Check futures spread
                 max_futures_spread = getattr(filters, "max_futures_spread_pct", Decimal("0.003")) or Decimal("0.003")
