@@ -7,7 +7,7 @@ and applies liquidity filters to determine eligible trading pairs.
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
 
 from src.data.kraken_client import KrakenClient, FuturesTicker
@@ -31,6 +31,7 @@ class MarketPair:
     is_eligible: bool
     rejection_reason: Optional[str] = None
     liquidity_tier: str = "C"  # NEW: "A", "B", or "C" tier
+    source: str = "spot_mapped"  # "spot_mapped" or "futures_only"
     last_updated: datetime = None
 
 
@@ -51,6 +52,8 @@ class MarketRegistry:
         self.config = config
         self.discovered_pairs: Dict[str, MarketPair] = {}
         self.last_discovery: Optional[datetime] = None
+        self.last_discovery_report: Dict[str, Any] = {}
+        self._last_seen_futures_symbols: Set[str] = set()
     
     async def discover_markets(self) -> Dict[str, MarketPair]:
         """
@@ -67,13 +70,22 @@ class MarketRegistry:
         futures_markets = await self._fetch_futures_markets()
         logger.info("Found %s futures perpetuals", len(futures_markets))
 
-        # 2. Build mappings (spot×futures or, if allowed, futures-only)
-        allow_futures_only = getattr(
-            getattr(self.config, "exchange", None), "allow_futures_only_universe", False
+        # 2. Build mappings (spot×futures and, optionally, futures-only pairs)
+        exchange_cfg = getattr(self.config, "exchange", None)
+        allow_futures_only_universe = bool(
+            getattr(exchange_cfg, "allow_futures_only_universe", False)
         )
+        allow_futures_only_pairs = bool(
+            getattr(exchange_cfg, "allow_futures_only_pairs", False)
+        )
+        previous_futures_symbols = set(self._last_seen_futures_symbols)
         if spot_markets and futures_markets:
-            pairs = self._build_mappings(spot_markets, futures_markets)
-        elif not spot_markets and futures_markets and allow_futures_only:
+            pairs = self._build_mappings(
+                spot_markets,
+                futures_markets,
+                include_futures_only=allow_futures_only_pairs,
+            )
+        elif not spot_markets and futures_markets and allow_futures_only_universe:
             pairs = self._build_futures_only_mappings(futures_markets)
         else:
             pairs = self._build_mappings(spot_markets, futures_markets)
@@ -81,11 +93,27 @@ class MarketRegistry:
         logger.info("Built %s spot→futures mappings", len(pairs))
 
         # 3. Apply filters
-        eligible_pairs = await self._apply_filters(pairs)
+        eligible_pairs, rejected_reasons = await self._apply_filters(pairs)
         logger.info("%s pairs passed filters", len(eligible_pairs))
 
         self.discovered_pairs = eligible_pairs
         self.last_discovery = datetime.now(timezone.utc)
+        self._last_seen_futures_symbols = {
+            str(info.get("symbol"))
+            for info in futures_markets.values()
+            if info.get("symbol")
+        }
+        self.last_discovery_report = self._build_discovery_gap_report(
+            spot_markets=spot_markets,
+            futures_markets=futures_markets,
+            candidate_pairs=pairs,
+            eligible_pairs=eligible_pairs,
+            rejected_reasons=rejected_reasons,
+            allow_futures_only_pairs=allow_futures_only_pairs,
+            allow_futures_only_universe=allow_futures_only_universe,
+            previous_futures_symbols=previous_futures_symbols,
+        )
+        self._log_discovery_gap_summary(self.last_discovery_report)
 
         return eligible_pairs
 
@@ -112,17 +140,10 @@ class MarketRegistry:
             # Exclude fiat + stablecoin bases from the universe.
             if has_disallowed_base(base_quote) or has_disallowed_base(info.get("symbol")):
                 continue
-            pair = MarketPair(
+            pair = self._new_pair(
                 spot_symbol=base_quote,
                 futures_symbol=info["symbol"],
-                spot_volume_24h=Decimal("0"),
-                futures_open_interest=Decimal("0"),
-                spot_spread_pct=Decimal("0"),
-                futures_spread_pct=Decimal("0"),
-                futures_volume_24h=Decimal("0"),
-                funding_rate=None,
-                is_eligible=False,
-                last_updated=datetime.now(timezone.utc),
+                source="futures_only",
             )
             pairs[base_quote] = pair
         return pairs
@@ -130,7 +151,8 @@ class MarketRegistry:
     def _build_mappings(
         self, 
         spot_markets: Dict[str, dict], 
-        futures_markets: Dict[str, dict]
+        futures_markets: Dict[str, dict],
+        include_futures_only: bool = False,
     ) -> Dict[str, MarketPair]:
         """Build spot→futures mappings."""
         pairs = {}
@@ -145,25 +167,31 @@ class MarketRegistry:
                 if has_disallowed_base(futures_info.get("symbol")):
                     continue
                 
-                pair = MarketPair(
+                pair = self._new_pair(
                     spot_symbol=spot_symbol,
                     futures_symbol=futures_info['symbol'],
-                    spot_volume_24h=Decimal("0"),  # To be filled by filters
-                    futures_open_interest=Decimal("0"),  # To be filled by filters
-                    spot_spread_pct=Decimal("0"),  # To be filled by filters
-                    futures_spread_pct=Decimal("0"),  # To be filled by filters
-                    futures_volume_24h=Decimal("0"),  # To be filled by filters
-                    funding_rate=None,  # To be filled by filters
-                    is_eligible=False,  # Will be set by filters
-                    last_updated=datetime.now(timezone.utc)
+                    source="spot_mapped",
                 )
                 pairs[spot_symbol] = pair
             else:
                 logger.debug(f"No futures perp for {spot_symbol}")
         
+        # Optional: include futures contracts even when a matching spot market is absent.
+        if include_futures_only:
+            for base_quote, futures_info in futures_markets.items():
+                if base_quote in pairs:
+                    continue
+                if has_disallowed_base(base_quote) or has_disallowed_base(futures_info.get("symbol")):
+                    continue
+                pairs[base_quote] = self._new_pair(
+                    spot_symbol=base_quote,
+                    futures_symbol=futures_info["symbol"],
+                    source="futures_only",
+                )
+        
         return pairs
     
-    async def _apply_filters(self, pairs: Dict[str, MarketPair]) -> Dict[str, MarketPair]:
+    async def _apply_filters(self, pairs: Dict[str, MarketPair]) -> Tuple[Dict[str, MarketPair], Dict[str, str]]:
         """
         Apply liquidity and spread filters using both spot and futures data.
         
@@ -172,12 +200,13 @@ class MarketRegistry:
         - "spot_and_futures": Both spot and futures filters must pass
         """
         eligible = {}
+        rejected: Dict[str, str] = {}
         filters = self.config.liquidity_filters
         filter_mode = getattr(filters, "filter_mode", "futures_primary")
         
         symbols = list(pairs.keys())
         if not symbols:
-            return eligible
+            return eligible, rejected
 
         # Fetch spot tickers (for spot filters and price reference)
         spot_tickers: Dict[str, dict] = {}
@@ -219,6 +248,7 @@ class MarketRegistry:
                 if not fticker:
                     pair.is_eligible = False
                     pair.rejection_reason = f"No futures ticker data for {pair.futures_symbol}"
+                    rejected[symbol] = pair.rejection_reason
                     continue
                 
                 # Populate futures fields
@@ -232,6 +262,7 @@ class MarketRegistry:
                 if fticker.open_interest < min_oi:
                     pair.is_eligible = False
                     pair.rejection_reason = f"OI ${fticker.open_interest:,.0f} < ${min_oi:,.0f}"
+                    rejected[symbol] = pair.rejection_reason
                     continue
                 
                 # Check futures spread
@@ -239,6 +270,7 @@ class MarketRegistry:
                 if fticker.spread_pct > max_futures_spread:
                     pair.is_eligible = False
                     pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_futures_spread:.2%}"
+                    rejected[symbol] = pair.rejection_reason
                     continue
                 
                 # Check futures volume
@@ -246,6 +278,7 @@ class MarketRegistry:
                 if fticker.volume_24h < min_futures_vol:
                     pair.is_eligible = False
                     pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_futures_vol:,.0f}"
+                    rejected[symbol] = pair.rejection_reason
                     continue
                 
                 # Check funding rate (if configured)
@@ -254,6 +287,7 @@ class MarketRegistry:
                     if abs(fticker.funding_rate) > max_funding:
                         pair.is_eligible = False
                         pair.rejection_reason = f"Funding {fticker.funding_rate:.4%} > max {max_funding:.4%}"
+                        rejected[symbol] = pair.rejection_reason
                         continue
                 
                 # --- SPOT FILTERS (optional in futures_primary mode) ---
@@ -298,6 +332,7 @@ class MarketRegistry:
                 if filter_mode == "spot_and_futures" and not spot_filters_passed:
                     pair.is_eligible = False
                     pair.rejection_reason = spot_rejection_reason
+                    rejected[symbol] = pair.rejection_reason or "Spot filters failed"
                     continue
                 
                 # Passed all required filters - classify tier and mark eligible
@@ -309,6 +344,7 @@ class MarketRegistry:
                 logger.warning(f"Failed to filter {symbol}", error=str(e))
                 pair.is_eligible = False
                 pair.rejection_reason = f"Filter error: {str(e)}"
+                rejected[symbol] = pair.rejection_reason
         
         # Log tier distribution
         tier_counts = {"A": 0, "B": 0, "C": 0}
@@ -316,7 +352,157 @@ class MarketRegistry:
             tier_counts[p.liquidity_tier] = tier_counts.get(p.liquidity_tier, 0) + 1
         logger.info("Filtering complete", eligible=len(eligible), tier_distribution=tier_counts)
         
-        return eligible
+        return eligible, rejected
+
+    def _new_pair(self, spot_symbol: str, futures_symbol: str, source: str) -> MarketPair:
+        """Create a default MarketPair placeholder before filters populate metrics."""
+        return MarketPair(
+            spot_symbol=spot_symbol,
+            futures_symbol=futures_symbol,
+            spot_volume_24h=Decimal("0"),
+            futures_open_interest=Decimal("0"),
+            spot_spread_pct=Decimal("0"),
+            futures_spread_pct=Decimal("0"),
+            futures_volume_24h=Decimal("0"),
+            funding_rate=None,
+            is_eligible=False,
+            source=source,
+            last_updated=datetime.now(timezone.utc),
+        )
+
+    def _build_discovery_gap_report(
+        self,
+        *,
+        spot_markets: Dict[str, dict],
+        futures_markets: Dict[str, dict],
+        candidate_pairs: Dict[str, MarketPair],
+        eligible_pairs: Dict[str, MarketPair],
+        rejected_reasons: Dict[str, str],
+        allow_futures_only_pairs: bool,
+        allow_futures_only_universe: bool,
+        previous_futures_symbols: Set[str],
+    ) -> Dict[str, Any]:
+        """
+        Build per-futures-symbol discovery diagnostics.
+
+        Each futures market is classified as:
+        - eligible
+        - rejected_by_filters
+        - unmapped_no_spot
+        - excluded_disallowed_base
+        """
+        entries: List[Dict[str, Any]] = []
+        status_counts = {
+            "eligible": 0,
+            "rejected_by_filters": 0,
+            "unmapped_no_spot": 0,
+            "excluded_disallowed_base": 0,
+        }
+        rejection_reason_counts: Dict[str, int] = {}
+
+        for base_quote in sorted(futures_markets.keys()):
+            info = futures_markets.get(base_quote) or {}
+            futures_symbol = str(info.get("symbol") or "")
+            spot_available = base_quote in spot_markets
+            candidate = candidate_pairs.get(base_quote)
+            eligible = base_quote in eligible_pairs
+            disallowed = has_disallowed_base(base_quote) or has_disallowed_base(futures_symbol)
+
+            if disallowed:
+                status = "excluded_disallowed_base"
+                reason = "Excluded by disallowed base policy (fiat/stablecoin)."
+            elif eligible:
+                status = "eligible"
+                reason = "Passed all discovery filters."
+            elif candidate is not None:
+                status = "rejected_by_filters"
+                reason = (
+                    rejected_reasons.get(base_quote)
+                    or candidate.rejection_reason
+                    or "Rejected by filters with unknown reason."
+                )
+                rejection_reason_counts[reason] = rejection_reason_counts.get(reason, 0) + 1
+            else:
+                status = "unmapped_no_spot"
+                reason = (
+                    "No matching spot market symbol. Enable exchange.allow_futures_only_pairs "
+                    "to evaluate this futures contract directly."
+                )
+
+            status_counts[status] = status_counts.get(status, 0) + 1
+            is_new = bool(futures_symbol and futures_symbol not in previous_futures_symbols)
+            entries.append(
+                {
+                    "spot_symbol": base_quote,
+                    "futures_symbol": futures_symbol,
+                    "status": status,
+                    "reason": reason,
+                    "is_new": is_new,
+                    "spot_market_available": spot_available,
+                    "candidate_considered": candidate is not None,
+                    "candidate_source": candidate.source if candidate else None,
+                }
+            )
+
+        gaps = [e for e in entries if e["status"] != "eligible"]
+        new_entries = [e for e in entries if e["is_new"]]
+        new_gaps = [e for e in new_entries if e["status"] != "eligible"]
+        new_eligible = [e for e in new_entries if e["status"] == "eligible"]
+        top_rejection_reasons = sorted(
+            rejection_reason_counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:20]
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "config": {
+                "allow_futures_only_pairs": allow_futures_only_pairs,
+                "allow_futures_only_universe": allow_futures_only_universe,
+            },
+            "totals": {
+                "spot_markets": len(spot_markets),
+                "futures_markets": len(futures_markets),
+                "candidate_pairs": len(candidate_pairs),
+                "eligible_pairs": len(eligible_pairs),
+                "gap_count": len(gaps),
+            },
+            "status_counts": status_counts,
+            "new_futures_summary": {
+                "total": len(new_entries),
+                "eligible": len(new_eligible),
+                "gaps": len(new_gaps),
+            },
+            "top_rejection_reasons": [
+                {"reason": reason, "count": count} for reason, count in top_rejection_reasons
+            ],
+            "entries": entries,
+            "gaps": gaps,
+            "new_futures": new_entries,
+            "new_futures_gaps": new_gaps,
+        }
+
+    def _log_discovery_gap_summary(self, report: Dict[str, Any]) -> None:
+        """Emit concise summary logs for discovery coverage diagnostics."""
+        totals = report.get("totals", {})
+        status_counts = report.get("status_counts", {})
+        new_summary = report.get("new_futures_summary", {})
+        logger.info(
+            "Discovery gap report generated",
+            futures_markets=totals.get("futures_markets", 0),
+            candidate_pairs=totals.get("candidate_pairs", 0),
+            eligible_pairs=totals.get("eligible_pairs", 0),
+            rejected_by_filters=status_counts.get("rejected_by_filters", 0),
+            unmapped_no_spot=status_counts.get("unmapped_no_spot", 0),
+            excluded_disallowed_base=status_counts.get("excluded_disallowed_base", 0),
+            new_futures=new_summary.get("total", 0),
+            new_futures_eligible=new_summary.get("eligible", 0),
+            new_futures_gaps=new_summary.get("gaps", 0),
+        )
+
+    def get_last_discovery_report(self) -> Dict[str, Any]:
+        """Return last generated discovery diagnostics report."""
+        return self.last_discovery_report
     
     def _classify_tier(self, pair: MarketPair) -> str:
         """

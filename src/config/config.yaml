@@ -9,6 +9,11 @@ system:
 ## Exchange Settings
 exchange:
   name: "kraken"
+  # Discovery mode:
+  # - allow_futures_only_universe: fallback only when spot market fetch is empty.
+  # - allow_futures_only_pairs: include per-contract futures listings even without spot mapping.
+  allow_futures_only_universe: false
+  allow_futures_only_pairs: false
   spot_markets:
     - "BTC/USD"
     - "ETH/USD"
