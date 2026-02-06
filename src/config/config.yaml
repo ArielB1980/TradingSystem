@@ -249,35 +249,58 @@ data:
   database_url: "${DATABASE_URL}"  # From environment variable
 
 ## Liquidity Filters (Market Discovery)
+# ============================================================
+# V2 FILTER REDESIGN: OI and Funding REMOVED as gates
+# ============================================================
+# Key insight: Kraken misreports OI and Funding for many coins.
+# When a metric is unreliable: demote from "gate" → "hint" → remove.
+#
+# PRIMARY GATES (reliable):
+# - Futures Volume (24h)
+# - Futures Spread (bid-ask %)
+# - Price sanity ($0.01 min)
+#
+# OBSERVABILITY ONLY (unreliable, logged but not gated):
+# - Open Interest (Kraken reports $0 for BTC, ETH, DOGE, etc.)
+# - Funding Rate (Kraken reports -58% for BTC, -19% for YFI, etc.)
+#
+# ENTRY-TIME SAFETY (in execution layer):
+# - Real-time spread check before order submission
+# - Depth check: order book must support order size
+# ============================================================
 liquidity_filters:
-  # Spot filters
-  min_spot_volume_usd_24h: 1000000  # $1M minimum (relaxed from $5M)
-  max_spread_pct: 0.0020  # 0.20% spot spread (relaxed from 0.05%)
+  # Spot filters (optional in futures_primary mode)
+  min_spot_volume_usd_24h: 1000000  # $1M minimum
+  max_spread_pct: 0.0020  # 0.20% spot spread
   min_price_usd: 0.01  # Avoid dust coins
   
-  # Futures-specific filters
-  min_futures_open_interest: 500000  # $500k OI minimum
-  max_futures_spread_pct: 0.0030  # 0.30% perp spread
-  min_futures_volume_usd_24h: 500000  # $500k futures volume
-  max_funding_rate_abs: 0.001  # 0.1% funding cap (absolute value)
+  # Futures-specific filters (PRIMARY)
+  # NOTE: OI and Funding are LOGGED ONLY, not gated (see market_registry.py)
+  min_futures_open_interest: 500000  # $500k - LOGGED ONLY (Kraken misreports)
+  max_futures_spread_pct: 0.0050  # 0.50% - Tier C max (Tier B=0.25%, Tier A=bypass)
+  min_futures_volume_usd_24h: 250000  # $250k - Tier C min (Tier B=$500k, Tier A=bypass)
+  max_funding_rate_abs: 0.001  # 0.1% - LOGGED ONLY (Kraken misreports)
   
-  # Filter mode: "spot_and_futures" (both must pass), "futures_primary" (futures required, spot optional)
-  filter_mode: "futures_primary"
+  # Filter mode
+  filter_mode: "futures_primary"  # Futures required, spot optional
   
-  # Tier-specific risk limits (A=high liquidity, B=medium, C=low)
+  # Tier-specific risk limits
+  # Tier A: Trusted majors (BTC, ETH, SOL, config Tier A) - bypass filters
+  # Tier B: Main workhorse tier - strict filters, moderate risk
+  # Tier C: Opportunistic - strictest filters, minimal risk
   tier_configs:
     A:  # High liquidity (BTC, ETH, SOL tier)
       max_leverage: 10.0
       max_position_size_usd: 100000
       slippage_cap_pct: 0.001
       allow_live_trading: true
-    B:  # Medium liquidity
-      max_leverage: 5.0
+    B:  # Medium liquidity (main workhorse tier)
+      max_leverage: 5.0  # Reduced from 7x - safer for Tier B
       max_position_size_usd: 50000
       slippage_cap_pct: 0.002
       allow_live_trading: true
-    C:  # Lower liquidity (restricted)
-      max_leverage: 2.0
+    C:  # Lower liquidity (opportunistic/defensive)
+      max_leverage: 2.0  # Conservative - thin markets
       max_position_size_usd: 25000
       slippage_cap_pct: 0.003
       allow_live_trading: true
