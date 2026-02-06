@@ -32,7 +32,7 @@ load_dotenv(project_root / ".env")
 load_dotenv(project_root / ".env.local")
 
 # CET timezone
-CET = timezone(timedelta(hours=1))
+CET = timezone(timedelta(hours=1), name="CET")
 
 # Report paths
 DATA_DIR = project_root / "data"
