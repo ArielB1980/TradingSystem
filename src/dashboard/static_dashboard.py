@@ -163,6 +163,8 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
     }
     errors = []
     current_smc_symbol = None  # Track current symbol for multi-line SMC analysis
+    coins_processed_recently: Optional[int] = None
+    total_coins: Optional[int] = None
     
     import re
     
@@ -315,17 +317,39 @@ def parse_log_entries(entries: List[Dict]) -> Dict:
                 winners = [w.strip().strip("'\"") for w in winners_str.split(",") if w.strip()]
                 auction_results["winners"] = winners
         
+        # Track cycle-level reviewed coin count.
+        # This is a robust fallback when detailed per-coin SMC lines are missing
+        # from the current log tail window.
+        if "Coin processing status summary" in raw:
+            recent_match = re.search(r'coins_processed_recently[=:]?\s*(\d+)', raw)
+            total_match = re.search(r'total_coins[=:]?\s*(\d+)', raw)
+            if recent_match:
+                coins_processed_recently = int(recent_match.group(1))
+            if total_match:
+                total_coins = int(total_match.group(1))
+        
         # Track errors (only recent, critical ones)
         if entry.get("level") == "error" and "QTY_MISMATCH" not in raw:
             # Skip common non-critical errors
             if not any(skip in raw for skip in ["SPEC_SANITY", "Failed to cancel"]):
                 errors.append(raw[:200])
     
+    coins_reviewed_count = len(coins_reviewed)
+    if coins_processed_recently is not None or total_coins is not None:
+        coins_reviewed_count = max(
+            coins_reviewed_count,
+            coins_processed_recently or 0,
+            total_coins or 0,
+        )
+    
     return {
         "coins": list(coins_reviewed.values()),
         "signals": list(signals_seen.values()),  # Deduplicated signals
         "auction": auction_results,
         "errors": errors[-5:],  # Keep only last 5 errors
+        "coins_reviewed_count": coins_reviewed_count,
+        "coins_processed_recently": coins_processed_recently,
+        "total_coins": total_coins,
     }
 
 
@@ -430,6 +454,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
     signals = data.get("signals", [])
     auction = data.get("auction", {})
     errors = data.get("errors", [])
+    coins_reviewed_count = int(data.get("coins_reviewed_count", len(coins)) or 0)
     
     # Count signals by type
     long_signals = [s for s in signals if s.get("type") == "long"]
@@ -575,10 +600,18 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
                 <td style="font-size: 11px; color: #8b949e;">{rejection}</td>
             </tr>
         """
+    if not coins_rows and coins_reviewed_count > 0:
+        coins_rows = f"""
+            <tr>
+                <td colspan="9" style="text-align: center; color: #8b949e;">
+                    Reviewed {coins_reviewed_count} coins in recent cycle; detailed per-coin logs are outside the current log window.
+                </td>
+            </tr>
+        """
     
     coins_html = f"""
     <div class="section">
-        <div class="section-header">📋 Coins Reviewed <span>Top 50 of {len(coins)}</span></div>
+        <div class="section-header">📋 Coins Reviewed <span>Top 50 of {coins_reviewed_count}</span></div>
         <div class="section-content">
             <table>
                 <thead><tr><th>Symbol</th><th>Bias</th><th>OB</th><th>FVG</th><th>BOS</th><th>4H</th><th>Signal</th><th>Score</th><th>Rejection</th></tr></thead>
@@ -678,7 +711,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
         {errors_html}
         
         <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">{len(coins)}</div><div class="stat-label">Coins Reviewed</div></div>
+            <div class="stat-card"><div class="stat-value">{coins_reviewed_count}</div><div class="stat-label">Coins Reviewed</div></div>
             <div class="stat-card"><div class="stat-value {'green' if len(signals) > 0 else ''}">{len(signals)}</div><div class="stat-label">Signals Found</div></div>
             <div class="stat-card"><div class="stat-value green">{len(long_signals)}</div><div class="stat-label">Long Signals</div></div>
             <div class="stat-card"><div class="stat-value red">{len(short_signals)}</div><div class="stat-label">Short Signals</div></div>
@@ -729,7 +762,7 @@ def update_dashboard():
         with open(JSON_FILE, "w") as f:
             json.dump({
                 "timestamp": datetime.now(CET).isoformat(),
-                "coins_count": len(data.get("coins", [])),
+                "coins_count": int(data.get("coins_reviewed_count", len(data.get("coins", []))) or 0),
                 "signals_count": len(data.get("signals", [])),
                 "positions_count": len(positions),
                 "signals": data.get("signals", []),
