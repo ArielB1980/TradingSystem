@@ -143,3 +143,27 @@ async def test_sync_with_exchange_runs_single_reconcile_and_reuses_issues():
         ("ENA/USD", "STALE_ZERO_QTY: Registry 0 vs Exchange 111")
     ]
     assert result["issues"] == [("ENA/USD", "STALE_ZERO_QTY: Registry 0 vs Exchange 111")]
+
+
+@pytest.mark.asyncio
+async def test_sync_with_exchange_persists_qty_synced_positions():
+    gateway = _build_gateway()
+    gateway.client.get_all_futures_positions.return_value = [
+        {"symbol": "PF_ENAUSD", "side": "short", "contracts": 72, "entryPrice": "0.1546"}
+    ]
+    gateway.client.get_futures_open_orders.return_value = []
+    gateway.registry.reconcile_with_exchange.return_value = [
+        ("ENA/USD", "QTY_SYNCED: exit+39 local=111 exchange=72 price=0.1546")
+    ]
+    synced_pos = MagicMock()
+    gateway.registry.get_position.return_value = synced_pos
+    gateway.position_manager.reconcile.return_value = []
+    gateway.registry.get_all_active.return_value = [synced_pos]
+
+    result = await gateway.sync_with_exchange()
+
+    gateway.registry.reconcile_with_exchange.assert_called_once()
+    gateway.persistence.save_position.assert_called_with(synced_pos)
+    assert result["issues"] == [
+        ("ENA/USD", "QTY_SYNCED: exit+39 local=111 exchange=72 price=0.1546")
+    ]

@@ -837,6 +837,7 @@ class ExecutionGateway:
         # Persist any orphaned positions (now in closed history)
         # This ensures they're saved as ORPHANED and won't be reloaded as ACTIVE
         orphaned_count = 0
+        qty_synced_count = 0
         for symbol, issue in issues:
             if "ORPHANED" in issue:
                 # Find in closed positions (just moved there by reconcile)
@@ -845,9 +846,23 @@ class ExecutionGateway:
                         self.persistence.save_position(pos)
                         orphaned_count += 1
                         break
+            elif "QTY_SYNCED" in issue:
+                pos = self.registry.get_position(symbol)
+                if pos:
+                    self.persistence.save_position(pos)
+                    qty_synced_count += 1
+                else:
+                    # Reconciliation may close/move the position to history.
+                    for closed_pos in self.registry._closed_positions:
+                        if closed_pos.symbol == symbol:
+                            self.persistence.save_position(closed_pos)
+                            qty_synced_count += 1
+                            break
         
         if orphaned_count > 0:
             logger.info("Persisted orphaned positions", count=orphaned_count)
+        if qty_synced_count > 0:
+            logger.warning("Persisted quantity-synced positions", count=qty_synced_count)
         
         # Get corrective actions
         actions = self.position_manager.reconcile(exchange_positions, orders, issues=issues)
