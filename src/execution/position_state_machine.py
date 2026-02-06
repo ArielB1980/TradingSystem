@@ -692,6 +692,79 @@ class ManagedPosition:
         self.state = PositionState.ORPHANED
         self.updated_at = datetime.now(timezone.utc)
         logger.critical(f"Position marked ORPHANED: {self.symbol}")
+
+    def reconcile_quantity_to_exchange(
+        self,
+        exchange_qty: Decimal,
+        exchange_entry_price: Optional[Decimal],
+        qty_epsilon: Decimal,
+    ) -> Optional[str]:
+        """
+        Converge local remaining quantity to exchange truth.
+
+        This prevents perpetual reconciliation loops when a fill/update was missed.
+        Returns a short summary string when a mutation is applied.
+        """
+        if self.is_terminal:
+            return None
+
+        local_qty = self.remaining_qty
+        delta = exchange_qty - local_qty
+        if abs(delta) <= qty_epsilon:
+            return None
+
+        now = datetime.now(timezone.utc)
+        reference_price = (
+            exchange_entry_price
+            if exchange_entry_price is not None and exchange_entry_price > 0
+            else self.avg_entry_price or self.initial_entry_price
+        )
+
+        if delta > 0:
+            # Exchange has larger exposure than local registry: add synthetic entry fill.
+            fill_qty = delta
+            fill = FillRecord(
+                fill_id=f"reconcile-entry-{int(now.timestamp() * 1000)}-{len(self.entry_fills) + 1}",
+                order_id="reconcile-sync",
+                side=self.side,
+                qty=fill_qty,
+                price=reference_price,
+                timestamp=now,
+                is_entry=True,
+            )
+            self.entry_fills.append(fill)
+            self._update_state_after_entry_fill()
+            self.updated_at = now
+            _ = self.remaining_qty  # Re-assert invariant B
+            return (
+                f"entry+{fill_qty} local={local_qty} exchange={exchange_qty} "
+                f"price={reference_price}"
+            )
+
+        # delta < 0: exchange has smaller exposure, apply synthetic exit fill.
+        fill_qty = min(abs(delta), local_qty)
+        if fill_qty <= 0:
+            return None
+        fill = FillRecord(
+            fill_id=f"reconcile-exit-{int(now.timestamp() * 1000)}-{len(self.exit_fills) + 1}",
+            order_id="reconcile-sync",
+            side=Side.SHORT if self.side == Side.LONG else Side.LONG,
+            qty=fill_qty,
+            price=reference_price,
+            timestamp=now,
+            is_entry=False,
+        )
+        self.exit_fills.append(fill)
+        if self.remaining_qty <= qty_epsilon:
+            self.state = PositionState.CLOSED
+            self.exit_reason = ExitReason.RECONCILIATION
+            self.exit_time = now
+        self.updated_at = now
+        _ = self.remaining_qty  # Re-assert invariant B
+        return (
+            f"exit+{fill_qty} local={local_qty} exchange={exchange_qty} "
+            f"price={reference_price}"
+        )
     
     # ========== PRICE CHECKS ==========
     
@@ -1143,7 +1216,25 @@ class PositionRegistry:
                         orphaned_symbols.append(symbol)
                         issues.append((symbol, f"STALE_ZERO_QTY: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
                     elif abs(exchange_qty - pos.remaining_qty) > qty_epsilon:
-                        issues.append((symbol, f"QTY_MISMATCH: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+                        exchange_entry_price_raw = exchange_pos.get("entry_price")
+                        exchange_entry_price: Optional[Decimal] = None
+                        if exchange_entry_price_raw is not None:
+                            try:
+                                exchange_entry_price = Decimal(str(exchange_entry_price_raw))
+                            except Exception:
+                                exchange_entry_price = None
+
+                        sync_summary = pos.reconcile_quantity_to_exchange(
+                            exchange_qty=exchange_qty,
+                            exchange_entry_price=exchange_entry_price,
+                            qty_epsilon=qty_epsilon,
+                        )
+                        if sync_summary:
+                            issues.append((symbol, f"QTY_SYNCED: {sync_summary}"))
+                            if pos.state == PositionState.CLOSED:
+                                orphaned_symbols.append(symbol)
+                        else:
+                            issues.append((symbol, f"QTY_MISMATCH: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
             
             # Move orphaned positions to closed history (so they don't reappear)
             for symbol in orphaned_symbols:

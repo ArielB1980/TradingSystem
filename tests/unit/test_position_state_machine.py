@@ -899,6 +899,58 @@ class TestReconciliation:
         stale = [p for p in registry._closed_positions if p.symbol == "ENA/USD"]
         assert len(stale) == 1
         assert stale[0].state == PositionState.CLOSED
+
+    def test_qty_mismatch_is_reconciled_to_exchange_without_repeating_error(self):
+        """Qty drifts should converge to exchange qty using synthetic reconciliation fills."""
+        registry = get_position_registry()
+        registry._positions.clear()
+        registry._closed_positions.clear()
+
+        pos = ManagedPosition(
+            symbol="ENA/USD",
+            side=Side.SHORT,
+            position_id="test-ena-reconcile",
+            initial_size=Decimal("111"),
+            initial_entry_price=Decimal("0.1546"),
+            initial_stop_price=Decimal("0.1596"),
+            initial_tp1_price=Decimal("0.1490"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.OPEN
+        pos.entry_fills.append(FillRecord(
+            fill_id="entry-1",
+            order_id="entry-order-1",
+            side=Side.SHORT,
+            qty=Decimal("111"),
+            price=Decimal("0.1546"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        registry.register_position(pos)
+
+        issues = registry.reconcile_with_exchange(
+            {"PF_ENAUSD": {"side": "short", "qty": "72", "entry_price": "0.1546"}},
+            [],
+        )
+
+        assert len(issues) == 1
+        assert issues[0][0] == "ENA/USD"
+        assert "QTY_SYNCED" in issues[0][1]
+        assert "QTY_MISMATCH" not in issues[0][1]
+
+        updated = registry.get_position("ENA/USD")
+        assert updated is not None
+        assert updated.remaining_qty == Decimal("72")
+        assert updated.state == PositionState.OPEN
+        assert len(updated.exit_fills) == 1
+
+        # Reconciliation should be stable on subsequent passes.
+        issues_again = registry.reconcile_with_exchange(
+            {"PF_ENAUSD": {"side": "short", "qty": "72", "entry_price": "0.1546"}},
+            [],
+        )
+        assert issues_again == []
     
     def test_orphaned_with_symbol_normalization(self):
         """Registry has spot format position, exchange has nothing - should orphan."""
