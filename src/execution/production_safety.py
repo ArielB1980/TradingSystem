@@ -748,8 +748,17 @@ class PositionProtectionMonitor:
         """
         Check all positions for protection.
         
+        CRITICAL FIX: Verify position actually exists on exchange before
+        flagging as naked. When a stop loss is filled:
+        1. Stop order disappears (filled)
+        2. Position closes on exchange (size = 0)
+        3. Registry may still show position as active (not yet synced)
+        4. Without this check: false "NAKED POSITION" alert
+        
         Returns {symbol: is_protected}
         """
+        from src.data.symbol_utils import normalize_symbol_for_position_match
+        
         results = {}
         
         try:
@@ -758,8 +767,41 @@ class PositionProtectionMonitor:
             logger.error(f"Failed to fetch orders for protection check: {e}")
             return results
         
+        # CRITICAL: Fetch actual positions from exchange to verify they exist
+        try:
+            exchange_positions = await self.client.get_futures_positions()
+        except Exception as e:
+            logger.error(f"Failed to fetch positions for protection check: {e}")
+            # If we can't verify positions, assume protected to avoid false positives
+            return results
+        
+        # Build map of exchange positions by normalized symbol
+        exchange_position_map = {}
+        for pos in exchange_positions:
+            pos_symbol = pos.get("symbol") or ""
+            pos_size = abs(float(pos.get("contracts") or pos.get("size") or 0))
+            if pos_size > 0:
+                normalized = normalize_symbol_for_position_match(pos_symbol)
+                exchange_position_map[normalized] = pos_size
+        
         for position in self.registry.get_all_active():
             if position.remaining_qty > 0:
+                # CRITICAL CHECK: Verify position actually exists on exchange
+                normalized_sym = normalize_symbol_for_position_match(position.symbol)
+                exchange_size = exchange_position_map.get(normalized_sym, 0)
+                
+                if exchange_size == 0:
+                    # Position closed on exchange but registry not updated yet
+                    # This is NOT a naked position - it's a closed position!
+                    logger.info(
+                        "Position closed on exchange (stop filled?), skipping protection check",
+                        symbol=position.symbol,
+                        registry_qty=str(position.remaining_qty),
+                        exchange_qty=0
+                    )
+                    results[position.symbol] = True  # Treat as protected (closed)
+                    continue
+                
                 is_protected = await self.enforcer.verify_protection(
                     position,
                     exchange_orders
@@ -767,11 +809,12 @@ class PositionProtectionMonitor:
                 results[position.symbol] = is_protected
                 
                 if not is_protected:
-                    # CRITICAL: Position is naked!
+                    # CRITICAL: Position is truly naked on exchange!
                     logger.critical(
                         "NAKED POSITION DETECTED",
                         symbol=position.symbol,
-                        qty=str(position.remaining_qty)
+                        qty=str(position.remaining_qty),
+                        exchange_qty=exchange_size
                     )
         
         return results
