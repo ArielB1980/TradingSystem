@@ -39,10 +39,11 @@ safety:
     
     # Maximum margin utilization (CRITICAL)
     # Used margin / total margin
-    max_margin_utilization_pct: 0.85
+    # NOTE: Must be > auction_max_margin_util (0.90) to avoid premature HALT
+    max_margin_utilization_pct: 0.92
     
     # Warning level for margin utilization (triggers DEGRADED)
-    degraded_margin_utilization_pct: 0.70
+    degraded_margin_utilization_pct: 0.85
     
     # Maximum single position as % of equity
     # Prevents over-concentration in one asset

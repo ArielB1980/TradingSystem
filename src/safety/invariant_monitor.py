@@ -78,7 +78,8 @@ class SystemInvariants:
     max_concurrent_positions: int = 10
     
     # Maximum margin utilization percentage
-    max_margin_utilization_pct: Decimal = Decimal("0.85")  # 85%
+    # NOTE: Must be > auction_max_margin_util (0.90) to avoid premature HALT
+    max_margin_utilization_pct: Decimal = Decimal("0.92")  # 92%
     
     # Maximum single position as % of equity
     max_single_position_pct_equity: Decimal = Decimal("0.25")  # 25%
@@ -96,7 +97,7 @@ class SystemInvariants:
     # ===== DEGRADED MODE THRESHOLDS =====
     # These trigger DEGRADED state (warnings) before HALTED
     degraded_equity_drawdown_pct: Decimal = Decimal("0.10")  # 10% - WARNING
-    degraded_margin_utilization_pct: Decimal = Decimal("0.70")  # 70%
+    degraded_margin_utilization_pct: Decimal = Decimal("0.85")  # 85%
     degraded_concurrent_positions: int = 8
 
 
