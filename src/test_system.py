@@ -122,10 +122,11 @@ async def test_data_acquisition(config):
         
         # Test getting candles for a few coins
         test_symbols = ["BTC/USD", "ETH/USD"]
-        if hasattr(config, 'coin_universe') and hasattr(config.coin_universe, 'liquidity_tiers'):
-            # Use tier 1 coins if available
-            if 'tier_1' in config.coin_universe.liquidity_tiers:
-                 test_symbols = config.coin_universe.liquidity_tiers['tier_1'][:3]
+        if hasattr(config, 'coin_universe') and config.coin_universe.enabled:
+            # V3: Use get_all_candidates() - take first 3 for testing
+            candidates = config.coin_universe.get_all_candidates()
+            if candidates:
+                test_symbols = candidates[:3]
         elif config.exchange.spot_markets:
              test_symbols = config.exchange.spot_markets[:3]
         
@@ -186,9 +187,11 @@ async def test_signal_processing(config):
         
         # Test signal generation for a coin
         test_symbol = "BTC/USD"
-        if hasattr(config, 'coin_universe') and hasattr(config.coin_universe, 'liquidity_tiers'):
-            if 'tier_1' in config.coin_universe.liquidity_tiers:
-                 test_symbol = config.coin_universe.liquidity_tiers['tier_1'][0]
+        if hasattr(config, 'coin_universe') and config.coin_universe.enabled:
+            # V3: Use get_all_candidates() - take first for testing
+            candidates = config.coin_universe.get_all_candidates()
+            if candidates:
+                test_symbol = candidates[0]
         elif config.exchange.spot_markets:
             test_symbol = config.exchange.spot_markets[0]
         

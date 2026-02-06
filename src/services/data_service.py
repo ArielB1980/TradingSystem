@@ -91,10 +91,8 @@ class DataService:
     def _get_active_markets(self) -> List[str]:
         """Resolve list of active markets based on config."""
         if self.config.coin_universe.enabled:
-            # Aggregate all tiers
-            markets = []
-            for tier_list in self.config.coin_universe.liquidity_tiers.values():
-                markets.extend(tier_list)
+            # V3: Use get_all_candidates() - config tiers are for universe selection only
+            markets = self.config.coin_universe.get_all_candidates()
             # Dedup and sort
             return sorted(list(set(markets)))
         else:

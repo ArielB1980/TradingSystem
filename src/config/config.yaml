@@ -362,15 +362,30 @@ live:
   min_paper_trades: 50
   max_paper_drawdown_pct: 0.15  # Paper must stay within 15% DD
 
-## Coin Universe (V3 - Full Kraken Integration)
-# Total: 249 coins available on both Spot and Futures
+## Coin Universe (V3 - Single Source of Truth)
+# ============================================================
+# IMPORTANT: These are CANDIDATE SYMBOLS for discovery, NOT tier assignments.
+# Actual tier classification is done DYNAMICALLY by MarketRegistry based on:
+#   - Futures volume (24h)
+#   - Futures spread (bid-ask %)
+#
+# MarketRegistry is the SINGLE SOURCE OF TRUTH for tier classification.
+# The A/B/C grouping below is for ORGANIZATION ONLY during transition.
+# Use config.coin_universe.get_all_candidates() to get the flat list.
+#
+# DEPRECATED: liquidity_tiers will be replaced by candidate_symbols in future.
+# ============================================================
 coin_universe:
   enabled: true
   min_spot_volume_24h: 1000000  # $1M minimum
   
-  # Liquidity tiers (A = highest, B = medium, C = lower)
+  # DEPRECATED: These tiers are for UNIVERSE SELECTION only, not tier assignment
+  # Tiers are assigned dynamically by MarketRegistry based on futures metrics:
+  #   Tier A: vol >= $5M AND spread <= 0.10%
+  #   Tier B: vol >= $500k AND spread <= 0.25%
+  #   Tier C: Everything else that passes filters
   liquidity_tiers:
-    # Tier A: Top 20 major coins (20 coins)
+    # Group A: Major coins (included as candidates)
     A:
       - "BTC/USD"  # Bitcoin (Spot uses BTC, Futures uses XBT)
       - "ETH/USD"
