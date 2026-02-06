@@ -9,6 +9,9 @@ system:
 ## Exchange Settings
 exchange:
   name: "kraken"
+  use_market_discovery: true
+  discovery_refresh_hours: 24  # Refresh market discovery once per day
+  market_discovery_cache_minutes: 60
   # Discovery mode:
   # - allow_futures_only_universe: fallback only when spot market fetch is empty.
   # - allow_futures_only_pairs: include per-contract futures listings even without spot mapping.
