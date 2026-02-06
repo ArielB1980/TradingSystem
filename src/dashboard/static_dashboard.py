@@ -793,12 +793,13 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
     return html
 
 
-def _render_market_discovery_table(rows: List[Dict[str, Any]]) -> str:
+def _render_market_discovery_table(rows: List[Dict[str, Any]], show_metrics: bool = False) -> str:
     """Render common table rows for market discovery entries."""
     if not rows:
-        return """
+        colspan = "11" if show_metrics else "8"
+        return f"""
             <tr>
-                <td colspan="8" class="empty">No rows to display.</td>
+                <td colspan="{colspan}" class="empty">No rows to display.</td>
             </tr>
         """
 
@@ -808,21 +809,63 @@ def _render_market_discovery_table(rows: List[Dict[str, Any]]) -> str:
         "unmapped_no_spot": "status-unmapped",
         "excluded_disallowed_base": "status-excluded",
     }
+    tier_classes = {
+        "A": ("status-eligible", "Tier A"),
+        "B": ("status-pill", "Tier B"),
+        "C": ("status-unmapped", "Tier C"),
+    }
     rendered = []
     for entry in rows:
         status = str(entry.get("status") or "unknown")
         badge_class = status_classes.get(status, "status-unmapped")
         reason = escape(str(entry.get("reason") or "-"))
         candidate_source = escape(str(entry.get("candidate_source") or "-"))
+        
+        # Tier display
+        tier = entry.get("liquidity_tier")
+        if tier:
+            tier_class, tier_label = tier_classes.get(tier, ("status-unmapped", f"Tier {tier}"))
+            tier_html = f'<span class="status-pill {tier_class}">{tier_label}</span>'
+        else:
+            tier_html = '<span style="color: #484f58;">-</span>'
+        
+        # Metrics for eligible pairs
+        if show_metrics:
+            vol = entry.get("futures_volume_24h")
+            spread = entry.get("futures_spread_pct")
+            oi = entry.get("futures_open_interest")
+            
+            try:
+                vol_fmt = f"${float(vol):,.0f}" if vol else "-"
+            except:
+                vol_fmt = "-"
+            try:
+                spread_fmt = f"{float(spread) * 100:.3f}%" if spread else "-"
+            except:
+                spread_fmt = "-"
+            try:
+                oi_fmt = f"${float(oi):,.0f}" if oi else "-"
+            except:
+                oi_fmt = "-"
+            
+            metrics_cols = f"""
+                <td>{tier_html}</td>
+                <td>{vol_fmt}</td>
+                <td>{spread_fmt}</td>
+                <td style="color: #8b949e;">{oi_fmt}</td>
+            """
+        else:
+            metrics_cols = ""
+        
         rendered.append(
             f"""
             <tr>
                 <td><strong>{escape(str(entry.get("spot_symbol") or "-"))}</strong></td>
                 <td><code>{escape(str(entry.get("futures_symbol") or "-"))}</code></td>
                 <td><span class="status-pill {badge_class}">{escape(status)}</span></td>
+                {metrics_cols}
                 <td>{'Yes' if entry.get('is_new') else 'No'}</td>
                 <td>{'Yes' if entry.get('spot_market_available') else 'No'}</td>
-                <td>{'Yes' if entry.get('candidate_considered') else 'No'}</td>
                 <td>{candidate_source}</td>
                 <td class="reason">{reason}</td>
             </tr>
@@ -854,6 +897,11 @@ def generate_market_discovery_html(
     status_counts = (
         report.get("status_counts", {})
         if isinstance(report.get("status_counts"), dict)
+        else {}
+    )
+    tier_distribution = (
+        report.get("tier_distribution", {})
+        if isinstance(report.get("tier_distribution"), dict)
         else {}
     )
     config = report.get("config", {}) if isinstance(report.get("config"), dict) else {}
@@ -925,7 +973,7 @@ def generate_market_discovery_html(
     new_gap_rows_html = _render_market_discovery_table(new_futures_gaps)
     unmapped_rows_html = _render_market_discovery_table(unmapped_entries)
     rejected_rows_html = _render_market_discovery_table(rejected_entries)
-    eligible_rows_html = _render_market_discovery_table(eligible_entries)
+    eligible_rows_html = _render_market_discovery_table(eligible_entries, show_metrics=True)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -999,8 +1047,43 @@ def generate_market_discovery_html(
             <div class="stat-card"><div class="stat-value">{int(totals.get('gap_count', 0) or 0)}</div><div class="stat-label">Coverage Gaps</div></div>
             <div class="stat-card"><div class="stat-value">{int(status_counts.get('unmapped_no_spot', 0) or 0)}</div><div class="stat-label">Unmapped (No Spot)</div></div>
             <div class="stat-card"><div class="stat-value">{int(status_counts.get('rejected_by_filters', 0) or 0)}</div><div class="stat-label">Rejected by Filters</div></div>
-            <div class="stat-card"><div class="stat-value">{int(new_summary.get('total', 0) or 0)}</div><div class="stat-label">New Futures</div></div>
-            <div class="stat-card"><div class="stat-value">{int(new_summary.get('gaps', 0) or 0)}</div><div class="stat-label">New Futures Gaps</div></div>
+            <div class="stat-card" style="background: rgba(35, 134, 54, 0.1); border-color: #238636;"><div class="stat-value" style="color: #3fb950;">{int(tier_distribution.get('A', 0) or 0)}</div><div class="stat-label">Tier A (Majors)</div></div>
+            <div class="stat-card" style="background: rgba(88, 166, 255, 0.1); border-color: #58a6ff;"><div class="stat-value" style="color: #58a6ff;">{int(tier_distribution.get('B', 0) or 0)}</div><div class="stat-label">Tier B (Workhorse)</div></div>
+            <div class="stat-card" style="background: rgba(210, 153, 34, 0.1); border-color: #d29922;"><div class="stat-value" style="color: #d29922;">{int(tier_distribution.get('C', 0) or 0)}</div><div class="stat-label">Tier C (Opportunistic)</div></div>
+        </div>
+        
+        <div class="section" style="border-color: #58a6ff;">
+            <div class="section-header" style="background: rgba(88, 166, 255, 0.1); border-bottom-color: #58a6ff;">
+                🔧 V2 Filter Philosophy <span style="color: #58a6ff;">OI & Funding Removed as Gates</span>
+            </div>
+            <div class="section-content">
+                <div class="meta-grid">
+                    <div class="meta-card">
+                        <div style="font-weight: 600; margin-bottom: 8px; color: #3fb950;">✓ PRIMARY Gates (Reliable)</div>
+                        <ul style="list-style: none; color: #a5b4c4; font-size: 13px;">
+                            <li>• <strong>Futures Volume 24h</strong> - Tier A: bypass, Tier B: ≥$500k, Tier C: ≥$250k</li>
+                            <li>• <strong>Futures Spread</strong> - Tier A: bypass, Tier B: ≤0.25%, Tier C: ≤0.50%</li>
+                            <li>• <strong>Price Sanity</strong> - ≥$0.01 minimum</li>
+                        </ul>
+                    </div>
+                    <div class="meta-card">
+                        <div style="font-weight: 600; margin-bottom: 8px; color: #d29922;">⚠ OBSERVABILITY Only (Unreliable)</div>
+                        <ul style="list-style: none; color: #a5b4c4; font-size: 13px;">
+                            <li>• <strong>Open Interest</strong> - Kraken reports $0 for BTC, ETH, DOGE, etc.</li>
+                            <li>• <strong>Funding Rate</strong> - Kraken reports -58% for BTC, -19% for YFI, etc.</li>
+                            <li style="color: #8b949e; margin-top: 4px;">These are logged for monitoring but NOT used as eligibility gates.</li>
+                        </ul>
+                    </div>
+                    <div class="meta-card">
+                        <div style="font-weight: 600; margin-bottom: 8px; color: #58a6ff;">🛡 Entry-Time Safety (Execution Layer)</div>
+                        <ul style="list-style: none; color: #a5b4c4; font-size: 13px;">
+                            <li>• Real-time spread check before order (max 0.5%)</li>
+                            <li>• Depth ratio check (order book ≥ 2x order size)</li>
+                            <li style="color: #8b949e; margin-top: 4px;">Replaces OI as liquidity guard - more reliable than Kraken's data.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="section">
@@ -1063,12 +1146,12 @@ def generate_market_discovery_html(
             </div>
         </div>
 
-        <details>
+        <details open>
             <summary>Eligible Pairs ({len(eligible_entries)})</summary>
             <div class="section">
                 <div class="section-content">
                     <table>
-                        <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                        <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>Tier</th><th>Volume 24h</th><th>Spread</th><th>OI (logged)</th><th>New</th><th>Spot Available</th><th>Source</th><th>Reason</th></tr></thead>
                         <tbody>{eligible_rows_html}</tbody>
                     </table>
                 </div>

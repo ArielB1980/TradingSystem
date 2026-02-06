@@ -579,18 +579,31 @@ class MarketRegistry:
 
             status_counts[status] = status_counts.get(status, 0) + 1
             is_new = bool(futures_symbol and futures_symbol not in previous_futures_symbols)
-            entries.append(
-                {
-                    "spot_symbol": base_quote,
-                    "futures_symbol": futures_symbol,
-                    "status": status,
-                    "reason": reason,
-                    "is_new": is_new,
-                    "spot_market_available": spot_available,
-                    "candidate_considered": candidate is not None,
-                    "candidate_source": candidate.source if candidate else None,
-                }
-            )
+            
+            # Include tier and metrics for eligible pairs
+            eligible_pair = eligible_pairs.get(base_quote)
+            tier = eligible_pair.liquidity_tier if eligible_pair else None
+            
+            entry_data = {
+                "spot_symbol": base_quote,
+                "futures_symbol": futures_symbol,
+                "status": status,
+                "reason": reason,
+                "is_new": is_new,
+                "spot_market_available": spot_available,
+                "candidate_considered": candidate is not None,
+                "candidate_source": candidate.source if candidate else None,
+            }
+            
+            # Add tier and metrics for eligible pairs
+            if eligible_pair:
+                entry_data["liquidity_tier"] = tier
+                entry_data["futures_volume_24h"] = str(eligible_pair.futures_volume_24h)
+                entry_data["futures_spread_pct"] = str(eligible_pair.futures_spread_pct)
+                entry_data["futures_open_interest"] = str(eligible_pair.futures_open_interest)
+                entry_data["funding_rate"] = str(eligible_pair.funding_rate) if eligible_pair.funding_rate else None
+            
+            entries.append(entry_data)
 
         gaps = [e for e in entries if e["status"] != "eligible"]
         new_entries = [e for e in entries if e["is_new"]]
@@ -601,6 +614,12 @@ class MarketRegistry:
             key=lambda item: item[1],
             reverse=True,
         )[:20]
+        
+        # Calculate tier distribution for eligible pairs
+        tier_distribution = {"A": 0, "B": 0, "C": 0}
+        for pair in eligible_pairs.values():
+            tier = pair.liquidity_tier
+            tier_distribution[tier] = tier_distribution.get(tier, 0) + 1
 
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -616,6 +635,7 @@ class MarketRegistry:
                 "gap_count": len(gaps),
             },
             "status_counts": status_counts,
+            "tier_distribution": tier_distribution,  # V2: Add tier distribution
             "new_futures_summary": {
                 "total": len(new_entries),
                 "eligible": len(new_eligible),
