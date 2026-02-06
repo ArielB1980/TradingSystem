@@ -674,12 +674,14 @@ class PositionManagerV2:
     def reconcile(
         self,
         exchange_positions: Dict[str, Dict],
-        exchange_orders: List[Dict]
+        exchange_orders: List[Dict],
+        issues: Optional[List[Tuple[str, str]]] = None,
     ) -> List[ManagementAction]:
         """
         Reconcile with exchange and return corrective actions.
         """
-        issues = self.registry.reconcile_with_exchange(exchange_positions, exchange_orders)
+        if issues is None:
+            issues = self.registry.reconcile_with_exchange(exchange_positions, exchange_orders)
         actions: List[ManagementAction] = []
         
         for symbol, issue in issues:

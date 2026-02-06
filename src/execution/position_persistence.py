@@ -442,22 +442,38 @@ class PositionPersistence:
         # Load pending reversals
         registry._pending_reversals = self.get_pending_reversals()
         
-        # Move terminal positions from _positions to _closed_positions
-        terminal_symbols = []
+        # Move terminal and stale zero-qty positions out of active registry
+        terminal_symbols: List[str] = []
+        stale_zero_symbols: List[str] = []
+        qty_epsilon = Decimal("0.0001")
         for symbol, pos in registry._positions.items():
             if pos.is_terminal:
                 registry._closed_positions.append(pos)
                 terminal_symbols.append(symbol)
+                continue
+            if pos.remaining_qty <= qty_epsilon:
+                old_state = pos.state
+                pos.state = PositionState.CLOSED
+                if pos.exit_reason is None:
+                    pos.exit_reason = ExitReason.RECONCILIATION
+                registry._closed_positions.append(pos)
+                stale_zero_symbols.append(symbol)
+                logger.warning(
+                    "Recovered stale zero-qty position from persistence",
+                    symbol=symbol,
+                    previous_state=old_state.value,
+                )
         
-        # Remove terminal positions from _positions (they're now in _closed_positions)
-        for symbol in terminal_symbols:
+        # Remove non-active positions from _positions
+        for symbol in terminal_symbols + stale_zero_symbols:
             del registry._positions[symbol]
         
         logger.info(
             "Registry loaded from persistence",
-            total_positions=len(registry._positions) + len(terminal_symbols),
+            total_positions=len(registry._positions) + len(terminal_symbols) + len(stale_zero_symbols),
             active_positions=len(registry._positions),
             terminal_moved=len(terminal_symbols),
+            stale_zero_moved=len(stale_zero_symbols),
             pending_reversals=len(registry._pending_reversals)
         )
         

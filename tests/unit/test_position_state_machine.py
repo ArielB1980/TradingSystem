@@ -847,6 +847,58 @@ class TestReconciliation:
         # Should NOT be orphaned (formats normalized and matched)
         assert len(issues) == 0, f"Expected no issues but got: {issues}"
         assert "ADA/USD" in registry._positions, "Position should still be active"
+
+    def test_stale_zero_qty_entry_is_not_reported_as_qty_mismatch(self):
+        """Zero-qty non-terminal entries should be archived as stale during reconciliation."""
+        registry = get_position_registry()
+        registry._positions.clear()
+        registry._closed_positions.clear()
+
+        pos = ManagedPosition(
+            symbol="ENA/USD",
+            side=Side.SHORT,
+            position_id="test-ena-stale",
+            initial_size=Decimal("111"),
+            initial_entry_price=Decimal("0.1546"),
+            initial_stop_price=Decimal("0.1596"),
+            initial_tp1_price=Decimal("0.1490"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.OPEN
+        pos.entry_fills.append(FillRecord(
+            fill_id="entry-1",
+            order_id="entry-order-1",
+            side=Side.SHORT,
+            qty=Decimal("111"),
+            price=Decimal("0.1546"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        pos.exit_fills.append(FillRecord(
+            fill_id="exit-1",
+            order_id="exit-order-1",
+            side=Side.LONG,
+            qty=Decimal("111"),
+            price=Decimal("0.1530"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=False,
+        ))
+        registry.register_position(pos)
+
+        issues = registry.reconcile_with_exchange(
+            {"PF_ENAUSD": {"side": "short", "qty": "111", "entry_price": "0.1546"}},
+            [],
+        )
+
+        assert len(issues) == 1
+        assert issues[0][0] == "ENA/USD"
+        assert "STALE_ZERO_QTY" in issues[0][1]
+        assert "QTY_MISMATCH" not in issues[0][1]
+        assert "ENA/USD" not in registry._positions
+        stale = [p for p in registry._closed_positions if p.symbol == "ENA/USD"]
+        assert len(stale) == 1
+        assert stale[0].state == PositionState.CLOSED
     
     def test_orphaned_with_symbol_normalization(self):
         """Registry has spot format position, exchange has nothing - should orphan."""

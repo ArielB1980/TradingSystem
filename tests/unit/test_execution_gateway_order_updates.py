@@ -120,3 +120,26 @@ async def test_execute_entry_passes_action_leverage_to_client():
     assert result.success is True
     kwargs = gateway.client.create_order.call_args.kwargs
     assert kwargs["leverage"] == Decimal("3")
+
+
+@pytest.mark.asyncio
+async def test_sync_with_exchange_runs_single_reconcile_and_reuses_issues():
+    gateway = _build_gateway()
+    gateway.client.get_all_futures_positions.return_value = [
+        {"symbol": "PF_ENAUSD", "side": "short", "contracts": 111, "entryPrice": "0.1546"}
+    ]
+    gateway.client.get_futures_open_orders.return_value = []
+    gateway.registry.reconcile_with_exchange.return_value = [
+        ("ENA/USD", "STALE_ZERO_QTY: Registry 0 vs Exchange 111")
+    ]
+    gateway.position_manager.reconcile.return_value = []
+    gateway.registry.get_all_active.return_value = []
+
+    result = await gateway.sync_with_exchange()
+
+    assert gateway.registry.reconcile_with_exchange.call_count == 1
+    gateway.position_manager.reconcile.assert_called_once()
+    assert gateway.position_manager.reconcile.call_args.kwargs["issues"] == [
+        ("ENA/USD", "STALE_ZERO_QTY: Registry 0 vs Exchange 111")
+    ]
+    assert result["issues"] == [("ENA/USD", "STALE_ZERO_QTY: Registry 0 vs Exchange 111")]
