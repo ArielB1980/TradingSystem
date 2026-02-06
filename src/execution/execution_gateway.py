@@ -850,7 +850,7 @@ class ExecutionGateway:
             logger.info("Persisted orphaned positions", count=orphaned_count)
         
         # Get corrective actions
-        actions = self.position_manager.reconcile(exchange_positions, orders)
+        actions = self.position_manager.reconcile(exchange_positions, orders, issues=issues)
         
         # Execute corrective actions
         for action in actions:

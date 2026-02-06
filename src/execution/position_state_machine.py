@@ -1086,6 +1086,7 @@ class PositionRegistry:
         from src.data.symbol_utils import normalize_symbol_for_position_match
         
         issues = []
+        qty_epsilon = Decimal("0.0001")
         
         orphaned_symbols: list[str] = []
         
@@ -1133,7 +1134,15 @@ class PositionRegistry:
                 elif exchange_pos is not None:
                     # Verify qty matches
                     exchange_qty = Decimal(str(exchange_pos.get('qty', 0)))
-                    if abs(exchange_qty - pos.remaining_qty) > Decimal("0.0001"):
+                    if pos.remaining_qty <= qty_epsilon and exchange_qty > qty_epsilon:
+                        # Registry can contain stale zero-qty entries after restarts.
+                        # Close and archive them so startup import can adopt the live position
+                        # without surfacing a false-positive qty mismatch.
+                        pos.state = PositionState.CLOSED
+                        pos.exit_reason = ExitReason.RECONCILIATION
+                        orphaned_symbols.append(symbol)
+                        issues.append((symbol, f"STALE_ZERO_QTY: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+                    elif abs(exchange_qty - pos.remaining_qty) > qty_epsilon:
                         issues.append((symbol, f"QTY_MISMATCH: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
             
             # Move orphaned positions to closed history (so they don't reappear)
