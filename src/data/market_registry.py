@@ -319,52 +319,72 @@ class MarketRegistry:
                 pair.futures_spread_pct = fticker.spread_pct
                 pair.funding_rate = fticker.funding_rate
                 
-                # Check minimum futures open interest
-                # Tier A coins bypass OI filter - Kraken misreports OI for some majors (including BTC)
+                # Check if this is a Tier A coin - they bypass liquidity filters
+                # Kraken misreports OI, spread, and funding for some major coins
                 is_config_tier_a = self._is_config_tier_a(symbol)
                 is_pinned = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
-                skip_oi_filter = is_config_tier_a or is_pinned
+                is_tier_a = is_config_tier_a or is_pinned
                 
+                # Check minimum futures open interest (Tier A bypasses)
                 min_oi = getattr(filters, "min_futures_open_interest", Decimal("0")) or Decimal("0")
-                if fticker.open_interest < min_oi and not skip_oi_filter:
+                if fticker.open_interest < min_oi and not is_tier_a:
                     pair.is_eligible = False
                     pair.rejection_reason = f"OI ${fticker.open_interest:,.0f} < ${min_oi:,.0f}"
                     rejected[symbol] = pair.rejection_reason
                     continue
-                elif skip_oi_filter and fticker.open_interest < min_oi:
+                elif is_tier_a and fticker.open_interest < min_oi:
                     logger.warning(
                         "Tier A coin bypassing OI filter (Kraken misreporting suspected)",
                         symbol=symbol,
                         reported_oi=str(fticker.open_interest),
                         min_oi=str(min_oi),
-                        is_config_tier_a=is_config_tier_a,
-                        is_pinned=is_pinned,
                     )
                 
-                # Check futures spread
+                # Check futures spread (Tier A bypasses - Kraken reports 100% spread for SOL sometimes)
                 max_futures_spread = getattr(filters, "max_futures_spread_pct", Decimal("0.003")) or Decimal("0.003")
-                if fticker.spread_pct > max_futures_spread:
+                if fticker.spread_pct > max_futures_spread and not is_tier_a:
                     pair.is_eligible = False
                     pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_futures_spread:.2%}"
                     rejected[symbol] = pair.rejection_reason
                     continue
+                elif is_tier_a and fticker.spread_pct > max_futures_spread:
+                    logger.warning(
+                        "Tier A coin bypassing spread filter (Kraken misreporting suspected)",
+                        symbol=symbol,
+                        reported_spread=f"{fticker.spread_pct:.2%}",
+                        max_spread=f"{max_futures_spread:.2%}",
+                    )
                 
-                # Check futures volume
+                # Check futures volume (Tier A bypasses)
                 min_futures_vol = getattr(filters, "min_futures_volume_usd_24h", Decimal("0")) or Decimal("0")
-                if fticker.volume_24h < min_futures_vol:
+                if fticker.volume_24h < min_futures_vol and not is_tier_a:
                     pair.is_eligible = False
                     pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_futures_vol:,.0f}"
                     rejected[symbol] = pair.rejection_reason
                     continue
+                elif is_tier_a and fticker.volume_24h < min_futures_vol:
+                    logger.warning(
+                        "Tier A coin bypassing volume filter (Kraken misreporting suspected)",
+                        symbol=symbol,
+                        reported_vol=f"${fticker.volume_24h:,.0f}",
+                        min_vol=f"${min_futures_vol:,.0f}",
+                    )
                 
-                # Check funding rate (if configured)
+                # Check funding rate (Tier A bypasses - Kraken reports -58% funding for BTC sometimes)
                 max_funding = getattr(filters, "max_funding_rate_abs", None)
                 if max_funding and fticker.funding_rate is not None:
-                    if abs(fticker.funding_rate) > max_funding:
+                    if abs(fticker.funding_rate) > max_funding and not is_tier_a:
                         pair.is_eligible = False
                         pair.rejection_reason = f"Funding {fticker.funding_rate:.4%} > max {max_funding:.4%}"
                         rejected[symbol] = pair.rejection_reason
                         continue
+                    elif is_tier_a and abs(fticker.funding_rate) > max_funding:
+                        logger.warning(
+                            "Tier A coin bypassing funding filter (Kraken misreporting suspected)",
+                            symbol=symbol,
+                            reported_funding=f"{fticker.funding_rate:.4%}",
+                            max_funding=f"{max_funding:.4%}",
+                        )
                 
                 # --- SPOT FILTERS (optional in futures_primary mode) ---
                 spot_ticker = spot_tickers.get(symbol)
