@@ -124,6 +124,9 @@ class MarketDiscoveryService:
         Get the liquidity tier for a symbol.
         Returns "C" (most conservative) if not found.
         """
+        if MarketRegistry.is_pinned_tier_a_symbol(spot_symbol=symbol):
+            return "A"
+
         pair = self._registry.discovered_pairs.get(symbol)
         if pair:
             return pair.liquidity_tier

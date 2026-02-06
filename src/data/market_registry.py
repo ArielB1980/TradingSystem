@@ -54,6 +54,51 @@ class MarketRegistry:
         self.last_discovery: Optional[datetime] = None
         self.last_discovery_report: Dict[str, Any] = {}
         self._last_seen_futures_symbols: Set[str] = set()
+
+    # Permanent Tier-A universe (root-cause guard against dynamic-tier drift for core majors).
+    _PINNED_TIER_A_BASES: Set[str] = {"BTC", "ETH", "SOL", "BNB"}
+    _SYMBOL_PREFIXES_TO_STRIP: Tuple[str, ...] = ("PF_", "PI_", "FI_")
+    _SYMBOL_SUFFIXES_TO_STRIP: Tuple[str, ...] = ("-PERP", "USD")
+    _BASE_ALIASES: Dict[str, str] = {"XBT": "BTC"}
+
+    @classmethod
+    def _normalize_base_symbol(cls, symbol: Optional[str]) -> str:
+        """Normalize spot/futures symbol into canonical base code (e.g. XBT -> BTC)."""
+        raw = str(symbol or "").strip().upper()
+        if not raw:
+            return ""
+
+        # CCXT-style futures symbol suffix (e.g. ETH/USD:USD)
+        if ":" in raw:
+            raw = raw.split(":", 1)[0]
+
+        # Spot/unified form (e.g. BTC/USD)
+        if "/" in raw:
+            base = raw.split("/", 1)[0].strip()
+            return cls._BASE_ALIASES.get(base, base)
+
+        # Kraken futures IDs / internal forms (e.g. PF_XBTUSD, BTCUSD-PERP)
+        for prefix in cls._SYMBOL_PREFIXES_TO_STRIP:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
+
+        for suffix in cls._SYMBOL_SUFFIXES_TO_STRIP:
+            if raw.endswith(suffix):
+                raw = raw[: -len(suffix)]
+
+        return cls._BASE_ALIASES.get(raw, raw)
+
+    @classmethod
+    def is_pinned_tier_a_symbol(
+        cls,
+        spot_symbol: Optional[str] = None,
+        futures_symbol: Optional[str] = None,
+    ) -> bool:
+        """Return True when either symbol resolves to a permanently Tier-A base."""
+        spot_base = cls._normalize_base_symbol(spot_symbol)
+        futures_base = cls._normalize_base_symbol(futures_symbol)
+        return spot_base in cls._PINNED_TIER_A_BASES or futures_base in cls._PINNED_TIER_A_BASES
     
     async def discover_markets(self) -> Dict[str, MarketPair]:
         """
@@ -519,6 +564,9 @@ class MarketRegistry:
         Tier B: Medium liquidity - reduced size/leverage
         Tier C: Lower liquidity - restricted size/leverage
         """
+        if self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol):
+            return "A"
+
         oi = pair.futures_open_interest or Decimal("0")
         vol = pair.futures_volume_24h or Decimal("0")
         spread = pair.futures_spread_pct or Decimal("1")

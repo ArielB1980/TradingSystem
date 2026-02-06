@@ -251,6 +251,34 @@ def test_classify_tier_low_liquidity():
     assert tier == "C"
 
 
+@pytest.mark.parametrize(
+    ("spot_symbol", "futures_symbol"),
+    [
+        ("BTC/USD", "PF_XBTUSD"),
+        ("ETH/USD", "PF_ETHUSD"),
+        ("SOL/USD", "PF_SOLUSD"),
+        ("BNB/USD", "PF_BNBUSD"),
+    ],
+)
+def test_classify_tier_pinned_majors_always_tier_a(spot_symbol, futures_symbol):
+    """Pinned major bases must remain Tier A even under poor liquidity snapshots."""
+    registry = MarketRegistry(MagicMock(), MagicMock())
+
+    pair = MarketPair(
+        spot_symbol=spot_symbol,
+        futures_symbol=futures_symbol,
+        spot_volume_24h=Decimal("1"),
+        futures_open_interest=Decimal("1"),
+        spot_spread_pct=Decimal("0.05"),
+        futures_spread_pct=Decimal("0.10"),
+        futures_volume_24h=Decimal("1"),
+        funding_rate=Decimal("0.01"),
+        is_eligible=True,
+    )
+
+    assert registry._classify_tier(pair) == "A"
+
+
 # ============================================================================
 # Test MarketRegistry filtering with futures data
 # ============================================================================
