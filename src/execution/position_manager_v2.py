@@ -82,6 +82,7 @@ class ManagementAction:
     side: Optional[Side] = None
     size: Optional[Decimal] = None
     price: Optional[Decimal] = None
+    leverage: Optional[Decimal] = None
     order_type: OrderType = OrderType.MARKET
     
     # Order identification (for tracking)
@@ -197,7 +198,8 @@ class PositionManagerV2:
         tp2_price: Optional[Decimal],
         final_target: Optional[Decimal],
         position_size: Decimal,
-        trade_type: str = "tight_smc"
+        trade_type: str = "tight_smc",
+        leverage: Optional[Decimal] = None,
     ) -> Tuple[ManagementAction, Optional[ManagedPosition]]:
         """
         Evaluate whether a new position can be opened.
@@ -300,6 +302,7 @@ class PositionManagerV2:
             side=side,
             size=position_size,
             price=entry_price,
+            leverage=leverage,
             client_order_id=client_order_id,
             position_id=position_id,
             priority=10
