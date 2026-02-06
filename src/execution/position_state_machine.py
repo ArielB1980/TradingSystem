@@ -219,6 +219,7 @@ class ManagedPosition:
     tp1_order_id: Optional[str] = None
     tp2_order_id: Optional[str] = None
     pending_exit_order_id: Optional[str] = None  # For EXIT_PENDING state
+    pending_exit_client_order_id: Optional[str] = None
     
     # ========== EVENT TRACKING (for idempotency) ==========
     processed_event_hashes: Set[str] = field(default_factory=set)
@@ -338,6 +339,39 @@ class ManagedPosition:
         """Mark event as processed for idempotency."""
         self.processed_event_hashes.add(event.event_hash())
         self.updated_at = datetime.now(timezone.utc)
+
+    def _matches_entry_event(self, event: OrderEvent) -> bool:
+        """Match entry updates by exchange order id or client order id."""
+        if self.entry_order_id and event.order_id == self.entry_order_id:
+            return True
+        if self.entry_client_order_id and event.client_order_id == self.entry_client_order_id:
+            return True
+        # Compatibility: some older states stored client id in entry_order_id.
+        if self.entry_order_id and event.client_order_id == self.entry_order_id:
+            return True
+        return False
+
+    def _matches_pending_exit_event(self, event: OrderEvent) -> bool:
+        """Match pending full-exit updates by exchange/client id."""
+        if self.pending_exit_order_id and event.order_id == self.pending_exit_order_id:
+            return True
+        if self.pending_exit_client_order_id and event.client_order_id == self.pending_exit_client_order_id:
+            return True
+        # Compatibility: pending_exit_order_id may contain client id in older states.
+        if self.pending_exit_order_id and event.client_order_id == self.pending_exit_order_id:
+            return True
+        return False
+
+    def _matches_stop_event(self, event: OrderEvent) -> bool:
+        """Match stop order updates by exchange/client id."""
+        if self.stop_order_id and event.order_id == self.stop_order_id:
+            return True
+        if self.stop_client_order_id and event.client_order_id == self.stop_client_order_id:
+            return True
+        # Compatibility: stop_order_id may contain client id in older states.
+        if self.stop_order_id and event.client_order_id == self.stop_order_id:
+            return True
+        return False
     
     # ========== STATE TRANSITION METHODS ==========
     
@@ -373,7 +407,7 @@ class ManagedPosition:
     
     def _handle_acknowledged(self, event: OrderEvent) -> bool:
         """Handle order acknowledgement. Locks immutable fields."""
-        if event.order_id == self.entry_order_id:
+        if self._matches_entry_event(event):
             self.entry_acknowledged = True
             logger.info(f"Entry acknowledged for {self.symbol}, immutables locked")
             return True
@@ -384,6 +418,9 @@ class ManagedPosition:
         if event.fill_qty is None or event.fill_price is None:
             logger.error(f"Partial fill missing qty/price: {event}")
             return False
+        if event.fill_qty <= 0:
+            logger.warning(f"Ignoring non-positive partial fill qty: {event.fill_qty}")
+            return False
         
         return self._record_fill(event)
     
@@ -392,14 +429,16 @@ class ManagedPosition:
         if event.fill_qty is None or event.fill_price is None:
             logger.error(f"Fill missing qty/price: {event}")
             return False
+        if event.fill_qty <= 0:
+            logger.warning(f"Ignoring non-positive fill qty: {event.fill_qty}")
+            return False
         
         return self._record_fill(event)
     
     def _record_fill(self, event: OrderEvent) -> bool:
         """Record a fill and update state."""
-        is_entry = (event.order_id == self.entry_order_id)
-        is_exit = (event.order_id == self.pending_exit_order_id or 
-                   event.order_id == self.stop_order_id)
+        is_entry = self._matches_entry_event(event)
+        is_exit = self._matches_pending_exit_event(event) or self._matches_stop_event(event)
         
         fill = FillRecord(
             fill_id=event.fill_id or f"{event.order_id}-{event.event_seq}",
@@ -463,23 +502,24 @@ class ManagedPosition:
     
     def _handle_cancel(self, event: OrderEvent) -> bool:
         """Handle order cancellation."""
-        if event.order_id == self.entry_order_id and self.state == PositionState.PENDING:
+        if self._matches_entry_event(event) and self.state == PositionState.PENDING:
             if self.filled_entry_qty == 0:
                 self.state = PositionState.CANCELLED
                 logger.info(f"Entry cancelled for {self.symbol}")
             else:
                 # Partial fill then cancel - position is open with partial qty
                 self.state = PositionState.OPEN
-        elif event.order_id == self.pending_exit_order_id:
+        elif self._matches_pending_exit_event(event):
             # Exit cancelled - return to previous state
             if self.remaining_qty > 0:
                 self.state = PositionState.PARTIAL if self.tp1_filled else PositionState.OPEN
                 self.pending_exit_order_id = None
+                self.pending_exit_client_order_id = None
         return True
     
     def _handle_reject(self, event: OrderEvent) -> bool:
         """Handle order rejection."""
-        if event.order_id == self.entry_order_id and self.state == PositionState.PENDING:
+        if self._matches_entry_event(event) and self.state == PositionState.PENDING:
             self.state = PositionState.CANCELLED
             logger.error(f"Entry rejected for {self.symbol}: {event.error_message}")
         return True
@@ -608,7 +648,12 @@ class ManagedPosition:
     
     # ========== EXIT MANAGEMENT ==========
     
-    def initiate_exit(self, reason: ExitReason, order_id: str) -> bool:
+    def initiate_exit(
+        self,
+        reason: ExitReason,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> bool:
         """
         Initiate exit - transition to EXIT_PENDING.
         """
@@ -617,6 +662,7 @@ class ManagedPosition:
         
         self.exit_reason = reason
         self.pending_exit_order_id = order_id
+        self.pending_exit_client_order_id = client_order_id or order_id
         self.state = PositionState.EXIT_PENDING
         self.updated_at = datetime.now(timezone.utc)
         
@@ -720,6 +766,8 @@ class ManagedPosition:
             "updated_at": self.updated_at.isoformat(),
             "entry_order_id": self.entry_order_id,
             "stop_order_id": self.stop_order_id,
+            "pending_exit_order_id": self.pending_exit_order_id,
+            "pending_exit_client_order_id": self.pending_exit_client_order_id,
             "entry_fills": [
                 {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
                 for f in self.entry_fills
@@ -761,6 +809,8 @@ class ManagedPosition:
         pos.created_at = datetime.fromisoformat(data["created_at"])
         pos.updated_at = datetime.fromisoformat(data["updated_at"])
         pos.entry_order_id = data.get("entry_order_id")
+        pos.pending_exit_order_id = data.get("pending_exit_order_id")
+        pos.pending_exit_client_order_id = data.get("pending_exit_client_order_id")
         pos.stop_order_id = data.get("stop_order_id")
         
         # Restore fills

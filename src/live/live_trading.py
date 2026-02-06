@@ -2248,7 +2248,8 @@ class LiveTrading:
             tp2_price=tp2_price,
             final_target=final_target,
             position_size=position_size,
-            trade_type=signal.regime if hasattr(signal, 'regime') else "tight_smc"
+            trade_type=signal.regime if hasattr(signal, 'regime') else "tight_smc",
+            leverage=decision.leverage,
         )
         
         if action.type == ActionTypeV2.REJECT_ENTRY:
@@ -2355,9 +2356,10 @@ class LiveTrading:
             logger.error(f"Missing 'entry_price' in exchange data for {symbol}", data_keys=list(exchange_data.keys()))
             raise ValueError(f"Cannot hydrate position: missing entry_price")
         
-        # Determine side from signed size (safest, handles all Kraken formats)
+        # Determine side from explicit exchange field first.
+        # Kraken futures positions in this codebase normalize size to absolute value.
         size_raw = Decimal(str(exchange_data.get('size', 0)))
-        side = Side.LONG if size_raw > 0 else Side.SHORT
+        side = Side.LONG if _exchange_position_side(exchange_data) == "long" else Side.SHORT
         
         # Recover initial_stop_price with exact precedence
         initial_sl = None

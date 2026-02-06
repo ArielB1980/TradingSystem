@@ -1073,6 +1073,7 @@ class KrakenClient:
         amount: float,
         price: Optional[float] = None,
         params: Optional[Dict[str, Any]] = None,
+        leverage: Optional[Decimal] = None,
     ) -> Dict[str, Any]:
         """
         CCXT-style create_order for ExecutionGateway compatibility.
@@ -1086,7 +1087,9 @@ class KrakenClient:
             stop_price = Decimal(str(stop_price))
         elif type in ("stop", "stop_loss") and price is not None:
             stop_price = Decimal(str(price))
-        leverage = Decimal("7") if not reduce_only else None
+        leverage_dec: Optional[Decimal] = None
+        if not reduce_only and leverage is not None:
+            leverage_dec = Decimal(str(leverage))
         order_type = "stop" if type in ("stop", "stop_loss") else type
         size = Decimal(str(amount))
         price_dec = Decimal(str(price)) if price is not None else None
@@ -1098,7 +1101,7 @@ class KrakenClient:
             price=price_dec,
             stop_price=stop_price,
             reduce_only=reduce_only,
-            leverage=leverage,
+            leverage=leverage_dec,
             client_order_id=client_order_id,
         )
 

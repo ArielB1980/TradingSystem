@@ -1,0 +1,122 @@
+from datetime import datetime, timezone
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from src.domain.models import OrderType, Side
+from src.execution.execution_gateway import (
+    ExecutionGateway,
+    OrderPurpose,
+    PendingOrder,
+)
+from src.execution.position_manager_v2 import ActionType, ManagementAction
+
+
+def _build_gateway() -> ExecutionGateway:
+    client = AsyncMock()
+    registry = MagicMock()
+    position_manager = MagicMock()
+    persistence = MagicMock()
+    return ExecutionGateway(
+        exchange_client=client,
+        registry=registry,
+        position_manager=position_manager,
+        persistence=persistence,
+        use_safety=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_order_update_uses_incremental_fill_qty_not_cumulative():
+    gateway = _build_gateway()
+
+    pending = PendingOrder(
+        client_order_id="entry-client-1",
+        position_id="pos-1",
+        symbol="BTC/USD",
+        purpose=OrderPurpose.ENTRY,
+        side=Side.LONG,
+        size=Decimal("1"),
+        price=Decimal("50000"),
+        order_type=OrderType.LIMIT,
+        submitted_at=datetime.now(timezone.utc),
+        exchange_order_id="exchange-entry-1",
+        status="submitted",
+    )
+    gateway._pending_orders[pending.client_order_id] = pending
+    gateway._order_id_map["exchange-entry-1"] = pending.client_order_id
+    gateway.position_manager.handle_order_event.return_value = []
+    gateway.registry.get_position.return_value = None
+
+    # First poll: partial fill reports cumulative 0.4
+    await gateway.process_order_update(
+        {
+            "id": "exchange-entry-1",
+            "clientOrderId": "entry-client-1",
+            "status": "open",
+            "filled": "0.4",
+            "remaining": "0.6",
+            "average": "50010",
+            "trades": [],
+        }
+    )
+    first_event = gateway.position_manager.handle_order_event.call_args_list[0][0][1]
+    assert first_event.fill_qty == Decimal("0.4")
+
+    # Second poll: closed order reports cumulative 1.0.
+    # Gateway must emit only the delta (0.6), not 1.0.
+    await gateway.process_order_update(
+        {
+            "id": "exchange-entry-1",
+            "clientOrderId": "entry-client-1",
+            "status": "closed",
+            "filled": "1.0",
+            "remaining": "0.0",
+            "average": "50020",
+            "trades": [],
+        }
+    )
+    second_event = gateway.position_manager.handle_order_event.call_args_list[1][0][1]
+    assert second_event.fill_qty == Decimal("0.6")
+
+    # Third poll of the same closed snapshot must be ignored (no new fill delta).
+    await gateway.process_order_update(
+        {
+            "id": "exchange-entry-1",
+            "clientOrderId": "entry-client-1",
+            "status": "closed",
+            "filled": "1.0",
+            "remaining": "0.0",
+            "average": "50020",
+            "trades": [],
+        }
+    )
+    assert gateway.position_manager.handle_order_event.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_entry_passes_action_leverage_to_client():
+    gateway = _build_gateway()
+    gateway.client.create_order.return_value = {"id": "exchange-entry-2"}
+    gateway.registry.get_position.return_value = None
+
+    action = ManagementAction(
+        type=ActionType.OPEN_POSITION,
+        symbol="BTC/USD",
+        reason="test-entry",
+        side=Side.LONG,
+        size=Decimal("1"),
+        price=Decimal("50000"),
+        leverage=Decimal("3"),
+        order_type=OrderType.LIMIT,
+        client_order_id="entry-client-2",
+        position_id="pos-2",
+        priority=10,
+    )
+
+    result = await gateway.execute_action(action, order_symbol="BTC/USD:USD")
+
+    assert result.success is True
+    kwargs = gateway.client.create_order.call_args.kwargs
+    assert kwargs["leverage"] == Decimal("3")

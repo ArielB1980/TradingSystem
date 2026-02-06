@@ -71,6 +71,7 @@ class PendingOrder:
     exchange_order_id: Optional[str] = None
     status: str = "pending"
     last_event_seq: int = 0
+    last_filled_qty: Decimal = Decimal("0")
     exchange_symbol: Optional[str] = None  # Futures symbol for fetch_order (e.g. X/USD:USD)
     
 
@@ -273,13 +274,22 @@ class ExecutionGateway:
                 side=order_side,
                 amount=float(action.size),
                 price=float(action.price) if action.price and action.order_type == OrderType.LIMIT else None,
-                params={"clientOrderId": action.client_order_id}
+                params={"clientOrderId": action.client_order_id},
+                leverage=action.leverage,
             )
             
             exchange_order_id = result.get("id")
             pending.exchange_order_id = exchange_order_id
             pending.status = "submitted"
             self._order_id_map[exchange_order_id] = action.client_order_id
+
+            # Canonicalize entry identifiers on first exchange acknowledgement path:
+            # state machine should track exchange order id + stable client id.
+            position = self.registry.get_position(action.symbol)
+            if position and exchange_order_id:
+                position.entry_order_id = exchange_order_id
+                position.entry_client_order_id = action.client_order_id
+                self.persistence.save_position(position)
             
             logger.info(
                 "Entry order submitted",
@@ -334,7 +344,11 @@ class ExecutionGateway:
         # Update position state to EXIT_PENDING
         position = self.registry.get_position(action.symbol)
         if position:
-            position.initiate_exit(action.exit_reason, action.client_order_id)
+            position.initiate_exit(
+                action.exit_reason,
+                action.client_order_id,
+                client_order_id=action.client_order_id,
+            )
             self.persistence.save_position(position)
         exchange_symbol = (getattr(position, "futures_symbol", None) if position else None) or action.symbol
         
@@ -359,6 +373,12 @@ class ExecutionGateway:
             pending.status = "submitted"
             self._order_id_map[exchange_order_id] = action.client_order_id
             self._wal_mark_sent(action.client_order_id, exchange_order_id)
+
+            # Replace temporary client-id tracking with exchange id once available.
+            if position and exchange_order_id:
+                position.pending_exit_order_id = exchange_order_id
+                position.pending_exit_client_order_id = action.client_order_id
+                self.persistence.save_position(position)
             
             logger.info(
                 "Close order submitted",
@@ -421,6 +441,12 @@ class ExecutionGateway:
             pending.exchange_order_id = exchange_order_id
             self._order_id_map[exchange_order_id] = action.client_order_id
             self._wal_mark_sent(action.client_order_id, exchange_order_id)
+
+            # Keep stop identifiers synchronized for event matching.
+            if position and exchange_order_id:
+                position.stop_order_id = exchange_order_id
+                position.stop_client_order_id = action.client_order_id
+                self.persistence.save_position(position)
             
             return ExecutionResult(
                 success=True,
@@ -545,6 +571,7 @@ class ExecutionGateway:
                 )
             if ctx.new_stop_order_id:
                 position.stop_order_id = ctx.new_stop_order_id
+                position.stop_client_order_id = action.client_order_id
             self.persistence.save_position(position)
             self.metrics["orders_submitted"] += 1
             if ctx.old_stop_cancelled:
@@ -657,10 +684,23 @@ class ExecutionGateway:
         remaining_raw = order_data.get("remaining")
         filled = Decimal(str(filled_raw if filled_raw is not None else 0))
         remaining = Decimal(str(remaining_raw if remaining_raw is not None else 0))
+        fill_delta = filled - pending.last_filled_qty
+        if fill_delta < 0:
+            logger.warning(
+                "Order filled quantity moved backwards; resetting delta baseline",
+                order_id=exchange_order_id,
+                client_order_id=client_order_id,
+                previous=str(pending.last_filled_qty),
+                current=str(filled),
+            )
+            fill_delta = filled
         
         if status == "closed" and filled > 0:
+            if fill_delta <= 0:
+                pending.status = "filled"
+                return []
             event_type = OrderEventType.FILLED
-        elif filled > 0 and remaining > 0:
+        elif fill_delta > 0 and remaining > 0:
             event_type = OrderEventType.PARTIAL_FILL
         elif status == "canceled":
             event_type = OrderEventType.CANCELLED
@@ -687,8 +727,8 @@ class ExecutionGateway:
             event_type=event_type,
             event_seq=next_seq,
             timestamp=datetime.now(timezone.utc),
-            fill_qty=filled if event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL) else None,
-            fill_price=Decimal(str(order_data.get("average") or 0)) if filled > 0 else None,
+            fill_qty=fill_delta if event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL) else None,
+            fill_price=Decimal(str(order_data.get("average") or 0)) if fill_delta > 0 else None,
             fill_id=fill_id,
         )
         
@@ -700,8 +740,11 @@ class ExecutionGateway:
         
         if event_type == OrderEventType.FILLED:
             pending.status = "filled"
+            pending.last_filled_qty = filled
             self.metrics["orders_filled"] += 1
             self._wal_mark_completed(client_order_id)
+        elif event_type == OrderEventType.PARTIAL_FILL:
+            pending.last_filled_qty = filled
         elif event_type == OrderEventType.CANCELLED:
             pending.status = "cancelled"
             self.metrics["orders_cancelled"] += 1
