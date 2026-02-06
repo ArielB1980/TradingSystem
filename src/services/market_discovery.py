@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 # Persistence path (shared with dashboard / discovered_markets_loader)
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 MARKETS_FILE = DATA_DIR / "discovered_markets.json"
+DISCOVERY_GAP_FILE = DATA_DIR / "discovery_gap_report.json"
 
 
 class MarketDiscoveryService:
@@ -44,6 +45,7 @@ class MarketDiscoveryService:
             pairs = await self._registry.discover_markets()
             mapping = {spot: pair.futures_symbol for spot, pair in pairs.items()}
             sorted_spots = sorted(mapping.keys())
+            discovery_report = self._registry.get_last_discovery_report()
 
             logger.info(
                 "Market discovery complete",
@@ -51,7 +53,7 @@ class MarketDiscoveryService:
                 sample=sorted_spots[:5],
             )
 
-            self._save_to_disk(sorted_spots, mapping)
+            self._save_to_disk(sorted_spots, mapping, discovery_report)
             try:
                 from src.storage.repository import async_record_event
                 await async_record_event(
@@ -61,6 +63,8 @@ class MarketDiscoveryService:
                         "count": len(sorted_spots),
                         "markets": sorted_spots,
                         "mapping": mapping,
+                        "gap_summary": (discovery_report or {}).get("totals", {}),
+                        "gap_status_counts": (discovery_report or {}).get("status_counts", {}),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                     timestamp=datetime.now(timezone.utc),
@@ -73,8 +77,13 @@ class MarketDiscoveryService:
             logger.error("Failed to discover markets", error=str(e))
             raise
 
-    def _save_to_disk(self, symbols: List[str], mapping: Optional[Dict[str, str]] = None):
-        """Save discovered list and spot->futures mapping to disk."""
+    def _save_to_disk(
+        self,
+        symbols: List[str],
+        mapping: Optional[Dict[str, str]] = None,
+        discovery_report: Optional[Dict[str, object]] = None,
+    ):
+        """Save discovered list, spot->futures mapping, and discovery gap diagnostics to disk."""
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
@@ -86,6 +95,9 @@ class MarketDiscoveryService:
                 data["mapping"] = mapping
             with open(MARKETS_FILE, "w") as f:
                 json.dump(data, f, indent=2)
+            if discovery_report:
+                with open(DISCOVERY_GAP_FILE, "w") as f:
+                    json.dump(discovery_report, f, indent=2)
         except Exception as e:
             logger.error("Failed to save markets to disk", error=str(e))
 
@@ -116,3 +128,7 @@ class MarketDiscoveryService:
         if pair:
             return pair.liquidity_tier
         return "C"
+
+    def get_last_discovery_report(self) -> Dict[str, object]:
+        """Return last discovery diagnostics report."""
+        return self._registry.get_last_discovery_report()

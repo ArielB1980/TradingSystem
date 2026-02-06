@@ -71,6 +71,7 @@ def mock_config():
     c = MagicMock()
     c.exchange = MagicMock()
     c.exchange.allow_futures_only_universe = False
+    c.exchange.allow_futures_only_pairs = False
     c.liquidity_filters = MagicMock()
     # Spot filters
     c.liquidity_filters.min_spot_volume_usd_24h = Decimal("1")
@@ -136,6 +137,47 @@ async def test_spot_fails_futures_succeeds_disallow_futures_only(mock_config):
     pairs = await registry.discover_markets()
     # spot_markets={}, futures_markets=non-empty, allow_futures_only=False => _build_mappings({}, fut) => {}
     assert len(pairs) == 0
+
+
+@pytest.mark.asyncio
+async def test_allow_futures_only_pairs_includes_unmapped_futures(mock_config):
+    """When enabled, per-symbol futures-only contracts are included even if spot mapping is missing."""
+    mock_config.exchange.allow_futures_only_pairs = True
+    client = FakeKrakenClient(
+        spot_markets={"BTC/USD": {"id": "a", "base": "BTC", "quote": "USD", "active": True}},
+        futures_markets={
+            "BTC/USD": {"symbol": "PF_XBTUSD", "base": "XBT", "quote": "USD", "active": True},
+            "NEWTOKEN/USD": {"symbol": "PF_NEWTOKENUSD", "base": "NEWTOKEN", "quote": "USD", "active": True},
+        },
+    )
+    registry = MarketRegistry(client, mock_config)
+    pairs = await registry.discover_markets()
+
+    assert "BTC/USD" in pairs
+    assert "NEWTOKEN/USD" in pairs
+    assert pairs["NEWTOKEN/USD"].source == "futures_only"
+
+
+@pytest.mark.asyncio
+async def test_discovery_gap_report_marks_unmapped_futures_when_disabled(mock_config):
+    """Gap report should explain unmapped futures contracts when futures-only pair mode is disabled."""
+    mock_config.exchange.allow_futures_only_pairs = False
+    client = FakeKrakenClient(
+        spot_markets={"BTC/USD": {"id": "a", "base": "BTC", "quote": "USD", "active": True}},
+        futures_markets={
+            "BTC/USD": {"symbol": "PF_XBTUSD", "base": "XBT", "quote": "USD", "active": True},
+            "NEWTOKEN/USD": {"symbol": "PF_NEWTOKENUSD", "base": "NEWTOKEN", "quote": "USD", "active": True},
+        },
+    )
+    registry = MarketRegistry(client, mock_config)
+    await registry.discover_markets()
+
+    report = registry.get_last_discovery_report()
+    entries = {e["spot_symbol"]: e for e in report.get("entries", [])}
+
+    assert entries["BTC/USD"]["status"] == "eligible"
+    assert entries["NEWTOKEN/USD"]["status"] == "unmapped_no_spot"
+    assert "allow_futures_only_pairs" in entries["NEWTOKEN/USD"]["reason"]
 
 
 @pytest.mark.asyncio
