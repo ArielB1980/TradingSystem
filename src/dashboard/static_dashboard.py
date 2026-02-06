@@ -13,6 +13,7 @@ import json
 import time
 import signal
 import threading
+from html import escape
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
@@ -37,6 +38,58 @@ CET = timezone(timedelta(hours=1))
 DATA_DIR = project_root / "data"
 REPORT_FILE = DATA_DIR / "dashboard.html"
 JSON_FILE = DATA_DIR / "dashboard.json"
+DISCOVERY_GAP_FILE = DATA_DIR / "discovery_gap_report.json"
+DISCOVERY_REPORT_FILE = DATA_DIR / "market-discovery.html"
+DISCOVERY_META_FILE = DATA_DIR / "market-discovery-meta.json"
+DISCOVERY_PAGE_REFRESH_SECONDS = 24 * 3600
+
+
+def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO timestamp into timezone-aware datetime."""
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+
+def _format_timestamp(dt: Optional[datetime], tz: timezone = CET) -> str:
+    """Format timestamp for dashboard display."""
+    if not dt:
+        return "N/A"
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _format_age(seconds: Optional[float]) -> str:
+    """Human-friendly age string."""
+    if seconds is None or seconds < 0:
+        return "unknown"
+    total = int(seconds)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _load_json_file(path: Path) -> Dict[str, Any]:
+    """Load JSON file safely; return empty dict on failure."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def get_db_connection():
@@ -657,6 +710,10 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
         .header h1 {{ font-size: 24px; color: #58a6ff; }}
         .header .meta {{ text-align: right; color: #8b949e; font-size: 14px; }}
         .header .time {{ font-size: 18px; color: #c9d1d9; }}
+        .nav {{ display: flex; gap: 10px; margin-bottom: 20px; }}
+        .nav-link {{ text-decoration: none; font-size: 13px; font-weight: 600; padding: 8px 12px; border-radius: 8px; color: #c9d1d9; border: 1px solid #30363d; background: #161b22; }}
+        .nav-link:hover {{ border-color: #58a6ff; }}
+        .nav-link.active {{ background: #58a6ff; color: #0d1117; border-color: #58a6ff; }}
         .status-banner {{ padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; }}
         .status-ok {{ background: #238636; color: white; }}
         .status-warn {{ background: #9e6a03; color: white; }}
@@ -705,6 +762,10 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
                 <div>Auto-refreshes every 60 seconds</div>
             </div>
         </div>
+        <div class="nav">
+            <a class="nav-link active" href="/dashboard">Live Dashboard</a>
+            <a class="nav-link" href="/market-discovery">Market Discovery</a>
+        </div>
         
         {status_html}
         
@@ -730,6 +791,370 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
 </html>"""
     
     return html
+
+
+def _render_market_discovery_table(rows: List[Dict[str, Any]]) -> str:
+    """Render common table rows for market discovery entries."""
+    if not rows:
+        return """
+            <tr>
+                <td colspan="8" class="empty">No rows to display.</td>
+            </tr>
+        """
+
+    status_classes = {
+        "eligible": "status-eligible",
+        "rejected_by_filters": "status-rejected",
+        "unmapped_no_spot": "status-unmapped",
+        "excluded_disallowed_base": "status-excluded",
+    }
+    rendered = []
+    for entry in rows:
+        status = str(entry.get("status") or "unknown")
+        badge_class = status_classes.get(status, "status-unmapped")
+        reason = escape(str(entry.get("reason") or "-"))
+        candidate_source = escape(str(entry.get("candidate_source") or "-"))
+        rendered.append(
+            f"""
+            <tr>
+                <td><strong>{escape(str(entry.get("spot_symbol") or "-"))}</strong></td>
+                <td><code>{escape(str(entry.get("futures_symbol") or "-"))}</code></td>
+                <td><span class="status-pill {badge_class}">{escape(status)}</span></td>
+                <td>{'Yes' if entry.get('is_new') else 'No'}</td>
+                <td>{'Yes' if entry.get('spot_market_available') else 'No'}</td>
+                <td>{'Yes' if entry.get('candidate_considered') else 'No'}</td>
+                <td>{candidate_source}</td>
+                <td class="reason">{reason}</td>
+            </tr>
+            """
+        )
+    return "".join(rendered)
+
+
+def generate_market_discovery_html(
+    report: Optional[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> str:
+    """Generate market discovery diagnostics page."""
+    now_utc = now or datetime.now(timezone.utc)
+    page_timestamp = _format_timestamp(now_utc, CET)
+    report = report or {}
+
+    generated_at = _parse_iso_timestamp(report.get("generated_at"))
+    generated_at_cet = _format_timestamp(generated_at, CET)
+    generated_at_utc = _format_timestamp(generated_at, timezone.utc)
+    report_age_seconds = (
+        (now_utc - generated_at).total_seconds() if generated_at else None
+    )
+    report_age_text = _format_age(report_age_seconds)
+    stale_threshold_seconds = DISCOVERY_PAGE_REFRESH_SECONDS + 3600
+    is_stale = report_age_seconds is None or report_age_seconds > stale_threshold_seconds
+
+    totals = report.get("totals", {}) if isinstance(report.get("totals"), dict) else {}
+    status_counts = (
+        report.get("status_counts", {})
+        if isinstance(report.get("status_counts"), dict)
+        else {}
+    )
+    config = report.get("config", {}) if isinstance(report.get("config"), dict) else {}
+    new_summary = (
+        report.get("new_futures_summary", {})
+        if isinstance(report.get("new_futures_summary"), dict)
+        else {}
+    )
+    top_rejection_reasons = (
+        report.get("top_rejection_reasons", [])
+        if isinstance(report.get("top_rejection_reasons"), list)
+        else []
+    )
+    entries = report.get("entries", []) if isinstance(report.get("entries"), list) else []
+    new_futures_gaps = (
+        report.get("new_futures_gaps", [])
+        if isinstance(report.get("new_futures_gaps"), list)
+        else []
+    )
+
+    eligible_entries = [entry for entry in entries if entry.get("status") == "eligible"]
+    rejected_entries = [
+        entry for entry in entries if entry.get("status") == "rejected_by_filters"
+    ]
+    unmapped_entries = [
+        entry for entry in entries if entry.get("status") == "unmapped_no_spot"
+    ]
+    excluded_entries = [
+        entry for entry in entries if entry.get("status") == "excluded_disallowed_base"
+    ]
+
+    if entries:
+        status_html = """
+            <div class="status-banner status-ok">
+                Discovery report loaded. Market discovery is configured for once-daily refresh (24h cadence).
+            </div>
+        """
+    else:
+        status_html = """
+            <div class="status-banner status-warn">
+                No discovery report found yet. The page will populate after the next market discovery run.
+            </div>
+        """
+
+    if is_stale:
+        status_html += f"""
+            <div class="status-banner status-warn">
+                Discovery data may be stale. Last discovery update: {escape(generated_at_utc)} ({escape(report_age_text)} ago).
+            </div>
+        """
+
+    rejection_rows = ""
+    if top_rejection_reasons:
+        for item in top_rejection_reasons:
+            rejection_rows += f"""
+                <tr>
+                    <td>{escape(str(item.get('reason') or '-'))}</td>
+                    <td>{int(item.get('count', 0) or 0)}</td>
+                </tr>
+            """
+    else:
+        rejection_rows = """
+            <tr>
+                <td colspan="2" class="empty">No rejection reasons available.</td>
+            </tr>
+        """
+
+    all_rows_html = _render_market_discovery_table(entries)
+    new_gap_rows_html = _render_market_discovery_table(new_futures_gaps)
+    unmapped_rows_html = _render_market_discovery_table(unmapped_entries)
+    rejected_rows_html = _render_market_discovery_table(rejected_entries)
+    eligible_rows_html = _render_market_discovery_table(eligible_entries)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="3600">
+    <title>Market Discovery Report</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; line-height: 1.5; }}
+        .container {{ max-width: 1500px; margin: 0 auto; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; padding: 20px; background: #161b22; border-radius: 12px; margin-bottom: 20px; border: 1px solid #30363d; }}
+        .header h1 {{ font-size: 24px; color: #58a6ff; }}
+        .header .meta {{ text-align: right; color: #8b949e; font-size: 14px; }}
+        .header .time {{ font-size: 18px; color: #c9d1d9; }}
+        .nav {{ display: flex; gap: 10px; margin-bottom: 20px; }}
+        .nav-link {{ text-decoration: none; font-size: 13px; font-weight: 600; padding: 8px 12px; border-radius: 8px; color: #c9d1d9; border: 1px solid #30363d; background: #161b22; }}
+        .nav-link:hover {{ border-color: #58a6ff; }}
+        .nav-link.active {{ background: #58a6ff; color: #0d1117; border-color: #58a6ff; }}
+        .status-banner {{ padding: 15px 20px; border-radius: 8px; margin-bottom: 12px; font-weight: 600; }}
+        .status-ok {{ background: #238636; color: #fff; }}
+        .status-warn {{ background: #9e6a03; color: #fff; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin: 20px 0; }}
+        .stat-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; text-align: center; }}
+        .stat-value {{ font-size: 30px; font-weight: 700; color: #58a6ff; }}
+        .stat-label {{ font-size: 12px; color: #8b949e; margin-top: 4px; text-transform: uppercase; }}
+        .section {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; margin-bottom: 16px; overflow: hidden; }}
+        .section-header {{ padding: 14px 18px; background: #21262d; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }}
+        .section-content {{ padding: 14px 18px; overflow-x: auto; }}
+        .meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }}
+        .meta-card {{ background: #0f1620; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }}
+        .meta-row {{ display: flex; justify-content: space-between; padding: 4px 0; gap: 16px; }}
+        .meta-row .label {{ color: #8b949e; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 9px 10px; text-align: left; border-bottom: 1px solid #21262d; vertical-align: top; }}
+        th {{ background: #21262d; font-weight: 600; font-size: 11px; text-transform: uppercase; color: #8b949e; position: sticky; top: 0; }}
+        tr:hover {{ background: #1c2128; }}
+        .status-pill {{ display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }}
+        .status-eligible {{ background: rgba(35, 134, 54, 0.28); color: #3fb950; }}
+        .status-rejected {{ background: rgba(248, 81, 73, 0.20); color: #f85149; }}
+        .status-unmapped {{ background: rgba(210, 153, 34, 0.25); color: #d29922; }}
+        .status-excluded {{ background: rgba(139, 148, 158, 0.28); color: #8b949e; }}
+        .reason {{ max-width: 520px; color: #a5b4c4; font-size: 12px; }}
+        .empty {{ text-align: center; color: #8b949e; padding: 20px; }}
+        details {{ margin: 16px 0; }}
+        details summary {{ cursor: pointer; color: #58a6ff; font-weight: 600; margin-bottom: 10px; }}
+        .footer {{ text-align: center; padding: 16px; color: #6e7681; font-size: 12px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧭 Market Discovery Report</h1>
+            <div class="meta">
+                <div class="time">{page_timestamp}</div>
+                <div>Page auto-refresh: hourly</div>
+            </div>
+        </div>
+        <div class="nav">
+            <a class="nav-link" href="/dashboard">Live Dashboard</a>
+            <a class="nav-link active" href="/market-discovery">Market Discovery</a>
+        </div>
+
+        {status_html}
+
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value">{int(totals.get('futures_markets', 0) or 0)}</div><div class="stat-label">Futures Markets</div></div>
+            <div class="stat-card"><div class="stat-value">{int(totals.get('candidate_pairs', 0) or 0)}</div><div class="stat-label">Candidate Pairs</div></div>
+            <div class="stat-card"><div class="stat-value">{int(totals.get('eligible_pairs', 0) or 0)}</div><div class="stat-label">Eligible Pairs</div></div>
+            <div class="stat-card"><div class="stat-value">{int(totals.get('gap_count', 0) or 0)}</div><div class="stat-label">Coverage Gaps</div></div>
+            <div class="stat-card"><div class="stat-value">{int(status_counts.get('unmapped_no_spot', 0) or 0)}</div><div class="stat-label">Unmapped (No Spot)</div></div>
+            <div class="stat-card"><div class="stat-value">{int(status_counts.get('rejected_by_filters', 0) or 0)}</div><div class="stat-label">Rejected by Filters</div></div>
+            <div class="stat-card"><div class="stat-value">{int(new_summary.get('total', 0) or 0)}</div><div class="stat-label">New Futures</div></div>
+            <div class="stat-card"><div class="stat-value">{int(new_summary.get('gaps', 0) or 0)}</div><div class="stat-label">New Futures Gaps</div></div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">Discovery Metadata <span>Cadence: once per day</span></div>
+            <div class="section-content">
+                <div class="meta-grid">
+                    <div class="meta-card">
+                        <div class="meta-row"><span class="label">Last discovery update (UTC)</span><span>{escape(generated_at_utc)}</span></div>
+                        <div class="meta-row"><span class="label">Last discovery update (CET)</span><span>{escape(generated_at_cet)}</span></div>
+                        <div class="meta-row"><span class="label">Discovery data age</span><span>{escape(report_age_text)}</span></div>
+                        <div class="meta-row"><span class="label">Page generated</span><span>{escape(page_timestamp)}</span></div>
+                    </div>
+                    <div class="meta-card">
+                        <div class="meta-row"><span class="label">allow_futures_only_pairs</span><span>{'true' if config.get('allow_futures_only_pairs') else 'false'}</span></div>
+                        <div class="meta-row"><span class="label">allow_futures_only_universe</span><span>{'true' if config.get('allow_futures_only_universe') else 'false'}</span></div>
+                        <div class="meta-row"><span class="label">Status: eligible</span><span>{int(status_counts.get('eligible', 0) or 0)}</span></div>
+                        <div class="meta-row"><span class="label">Status: excluded disallowed base</span><span>{int(status_counts.get('excluded_disallowed_base', 0) or 0)}</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">Top Rejection Reasons <span>{len(top_rejection_reasons)} reasons</span></div>
+            <div class="section-content">
+                <table>
+                    <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+                    <tbody>{rejection_rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">New Futures with Gaps <span>{len(new_futures_gaps)} rows</span></div>
+            <div class="section-content">
+                <table>
+                    <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                    <tbody>{new_gap_rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">Unmapped Futures (No Spot) <span>{len(unmapped_entries)} rows</span></div>
+            <div class="section-content">
+                <table>
+                    <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                    <tbody>{unmapped_rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">Rejected by Filters <span>{len(rejected_entries)} rows</span></div>
+            <div class="section-content">
+                <table>
+                    <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                    <tbody>{rejected_rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <details>
+            <summary>Eligible Pairs ({len(eligible_entries)})</summary>
+            <div class="section">
+                <div class="section-content">
+                    <table>
+                        <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                        <tbody>{eligible_rows_html}</tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+
+        <details>
+            <summary>Full Discovery Catalog ({len(entries)})</summary>
+            <div class="section">
+                <div class="section-content">
+                    <table>
+                        <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                        <tbody>{all_rows_html}</tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+
+        <details>
+            <summary>Excluded by Disallowed Base ({len(excluded_entries)})</summary>
+            <div class="section">
+                <div class="section-content">
+                    <table>
+                        <thead><tr><th>Spot Symbol</th><th>Futures Symbol</th><th>Status</th><th>New</th><th>Spot Available</th><th>Candidate</th><th>Source</th><th>Reason</th></tr></thead>
+                        <tbody>{_render_market_discovery_table(excluded_entries)}</tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+
+        <div class="footer">
+            Last discovery update: {escape(generated_at_utc)} • Discovery refresh target: once per day • Page built: {escape(page_timestamp)}
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+def update_market_discovery_dashboard(force: bool = False) -> bool:
+    """
+    Update market discovery report page.
+
+    Returns True when page was written, False when skipped.
+    """
+    now_utc = datetime.now(timezone.utc)
+    report = _load_json_file(DISCOVERY_GAP_FILE)
+    meta = _load_json_file(DISCOVERY_META_FILE)
+
+    report_generated_at = _parse_iso_timestamp(
+        report.get("generated_at") if isinstance(report, dict) else None
+    )
+    report_generated_at_iso = report_generated_at.isoformat() if report_generated_at else None
+    last_page_generated_at = _parse_iso_timestamp(
+        meta.get("page_generated_at") if isinstance(meta, dict) else None
+    )
+    last_report_generated_at = (
+        meta.get("report_generated_at") if isinstance(meta, dict) else None
+    )
+
+    should_update = force or not DISCOVERY_REPORT_FILE.exists()
+    if not should_update and report_generated_at_iso and report_generated_at_iso != last_report_generated_at:
+        should_update = True
+    if not should_update and last_page_generated_at is None:
+        should_update = True
+    if not should_update and last_page_generated_at:
+        age_seconds = (now_utc - last_page_generated_at).total_seconds()
+        if age_seconds >= DISCOVERY_PAGE_REFRESH_SECONDS:
+            should_update = True
+
+    if not should_update:
+        return False
+
+    html = generate_market_discovery_html(report, now=now_utc)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DISCOVERY_REPORT_FILE, "w") as f:
+        f.write(html)
+    with open(DISCOVERY_META_FILE, "w") as f:
+        json.dump(
+            {
+                "page_generated_at": now_utc.isoformat(),
+                "report_generated_at": report_generated_at_iso,
+            },
+            f,
+            indent=2,
+        )
+    return True
 
 
 def update_dashboard():
@@ -769,13 +1194,26 @@ def update_dashboard():
                 "signals": data.get("signals", []),
                 "auction": data.get("auction", {}),
             }, f, indent=2, default=str)
-        
+
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {coins_count} coins, {len(data.get('signals', []))} signals, {len(positions)} positions")
         
     except Exception as e:
         import traceback
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Error updating dashboard: {e}")
         traceback.print_exc()
+    finally:
+        try:
+            discovery_updated = update_market_discovery_dashboard(force=False)
+            if discovery_updated:
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    "Market discovery page refreshed"
+                )
+        except Exception as discovery_error:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                f"Warning: failed to refresh discovery page: {discovery_error}"
+            )
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -785,8 +1223,11 @@ class QuietHandler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(DATA_DIR), **kwargs)
     
     def do_GET(self):
-        if self.path == "/" or self.path == "/dashboard":
+        path = self.path.split("?", 1)[0]
+        if path == "/" or path == "/dashboard":
             self.path = "/dashboard.html"
+        elif path in ("/market-discovery", "/market-discovery/", "/discovery", "/discovery/"):
+            self.path = "/market-discovery.html"
         return super().do_GET()
     
     def log_message(self, format, *args):
