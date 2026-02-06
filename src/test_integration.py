@@ -190,9 +190,8 @@ class IntegrationTest:
     def _get_test_markets(self):
         """Get list of markets to test."""
         if self.config.coin_universe.enabled:
-            markets = []
-            for tier_list in self.config.coin_universe.liquidity_tiers.values():
-                markets.extend(tier_list)
+            # V3: Use get_all_candidates() - config tiers are for universe selection only
+            markets = self.config.coin_universe.get_all_candidates()
             return sorted(list(set(markets)))
         else:
             return self.config.trading.symbols

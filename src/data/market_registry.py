@@ -33,6 +33,11 @@ class MarketPair:
     liquidity_tier: str = "C"  # NEW: "A", "B", or "C" tier
     source: str = "spot_mapped"  # "spot_mapped" or "futures_only"
     last_updated: datetime = None
+    
+    # Data quality flags (V3 - for observability, NOT gating)
+    # Values: "OK" | "UNKNOWN" | "SUSPECT"
+    oi_quality: str = "UNKNOWN"
+    funding_quality: str = "UNKNOWN"
 
 
 class MarketRegistry:
@@ -55,8 +60,10 @@ class MarketRegistry:
         self.last_discovery_report: Dict[str, Any] = {}
         self._last_seen_futures_symbols: Set[str] = set()
 
-    # Permanent Tier-A universe (root-cause guard against dynamic-tier drift for core majors).
-    _PINNED_TIER_A_BASES: Set[str] = {"BTC", "ETH", "SOL", "BNB"}
+    # Permanent Tier-A universe (minimal - only coins with verified stable Kraken data feeds).
+    # V3: Reduced from {BTC, ETH, SOL, BNB} to avoid exchange-specific major pinning.
+    # Other coins must qualify dynamically via futures volume + spread.
+    _PINNED_TIER_A_BASES: Set[str] = {"BTC", "ETH"}
     _SYMBOL_PREFIXES_TO_STRIP: Tuple[str, ...] = ("PF_", "PI_", "FI_")
     _SYMBOL_SUFFIXES_TO_STRIP: Tuple[str, ...] = ("-PERP", "USD")
     _BASE_ALIASES: Dict[str, str] = {"XBT": "BTC"}
@@ -359,23 +366,37 @@ class MarketRegistry:
                 pair.funding_rate = fticker.funding_rate
                 
                 # ============================================================
-                # TIER-AWARE FILTERING (V2 REDESIGN)
+                # DATA QUALITY ASSESSMENT (V3 - for observability, NOT gating)
                 # ============================================================
-                # Key principle: OI and Funding are UNRELIABLE on Kraken.
-                # - OI: Removed as gate (logged only for observability)
-                # - Funding: Removed as gate (logged only for observability)
-                # - Volume + Spread: PRIMARY gates with tier-specific thresholds
-                # - Price: SECONDARY sanity check ($0.01 minimum)
+                # Assess OI quality - Kraken reports $0 for known-liquid coins
+                if fticker.open_interest is None or fticker.open_interest == 0:
+                    pair.oi_quality = "SUSPECT"
+                elif fticker.open_interest < Decimal("10000"):
+                    pair.oi_quality = "SUSPECT"
+                else:
+                    pair.oi_quality = "OK"
+                
+                # Assess funding quality - extreme values are suspect
+                if fticker.funding_rate is None:
+                    pair.funding_quality = "UNKNOWN"
+                elif abs(fticker.funding_rate) > Decimal("0.10"):  # > 10% is suspect
+                    pair.funding_quality = "SUSPECT"
+                else:
+                    pair.funding_quality = "OK"
+                
+                # ============================================================
+                # TIER-AWARE FILTERING (V3 - Single Source of Truth)
+                # ============================================================
+                # Key principle: MarketRegistry is the ONLY tier authority.
+                # - Config tiers: For UNIVERSE SELECTION only, not filtering
+                # - OI: Logged only (Kraken misreports)
+                # - Funding: Logged only (Kraken misreports)
+                # - Volume + Spread: PRIMARY gates (Tier C thresholds for all)
+                # - Tier classification: AFTER passing filters, based on metrics
                 # ============================================================
                 
-                # Determine configured tier for this symbol
-                config_tier = self._get_config_tier(symbol)
-                is_pinned = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
-                is_tier_a = config_tier == 'A' or is_pinned
-                is_tier_b = config_tier == 'B'
-                
-                # Use configured tier for thresholds, or default to 'C' (most restrictive)
-                effective_tier = 'A' if is_tier_a else ('B' if is_tier_b else 'C')
+                # Only pinned Tier A (BTC, ETH) bypasses filters
+                is_pinned_tier_a = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
                 
                 # --- OI: LOG ONLY (removed as gate - Kraken misreports) ---
                 min_oi = getattr(filters, "min_futures_open_interest", Decimal("0")) or Decimal("0")
@@ -383,7 +404,7 @@ class MarketRegistry:
                     logger.debug(
                         "OI below threshold (logged only, not a gate)",
                         symbol=symbol,
-                        tier=effective_tier,
+                        oi_quality=pair.oi_quality,
                         reported_oi=f"${fticker.open_interest:,.0f}",
                         threshold=f"${min_oi:,.0f}",
                     )
@@ -395,33 +416,33 @@ class MarketRegistry:
                         logger.debug(
                             "Funding rate above threshold (logged only, not a gate)",
                             symbol=symbol,
-                            tier=effective_tier,
+                            funding_quality=pair.funding_quality,
                             reported_funding=f"{fticker.funding_rate:.4%}",
                             threshold=f"{max_funding:.4%}",
                         )
                 
-                # --- VOLUME: PRIMARY GATE (tier-specific thresholds) ---
-                # Tier A bypasses all filters (trusted majors)
-                if not is_tier_a:
-                    min_vol_tier = self._get_tier_volume_threshold(effective_tier)
-                    if fticker.volume_24h < min_vol_tier:
+                # --- VOLUME: PRIMARY GATE (Tier C threshold for all non-pinned) ---
+                # Pinned Tier A (BTC, ETH) bypasses all filters
+                if not is_pinned_tier_a:
+                    min_vol = self._get_tier_volume_threshold('C')  # Use most permissive threshold
+                    if fticker.volume_24h < min_vol:
                         pair.is_eligible = False
-                        pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_vol_tier:,.0f} (Tier {effective_tier})"
+                        pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_vol:,.0f}"
                         rejected[symbol] = pair.rejection_reason
                         continue
                 
-                # --- SPREAD: PRIMARY GATE (tier-specific thresholds) ---
-                # Tier A bypasses all filters (trusted majors)
-                if not is_tier_a:
-                    max_spread_tier = self._get_tier_spread_threshold(effective_tier)
-                    if fticker.spread_pct > max_spread_tier:
+                # --- SPREAD: PRIMARY GATE (Tier C threshold for all non-pinned) ---
+                # Pinned Tier A (BTC, ETH) bypasses all filters
+                if not is_pinned_tier_a:
+                    max_spread = self._get_tier_spread_threshold('C')  # Use most permissive threshold
+                    if fticker.spread_pct > max_spread:
                         pair.is_eligible = False
-                        pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_spread_tier:.2%} (Tier {effective_tier})"
+                        pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_spread:.2%}"
                         rejected[symbol] = pair.rejection_reason
                         continue
                 
-                # Log Tier A bypasses for visibility
-                if is_tier_a:
+                # Log Pinned Tier A bypasses for visibility
+                if is_pinned_tier_a:
                     issues = []
                     if fticker.open_interest < min_oi:
                         issues.append(f"OI=${fticker.open_interest:,.0f}")
@@ -676,20 +697,18 @@ class MarketRegistry:
         """
         Classify market pair into liquidity tier.
         
-        TIER CLASSIFICATION LOGIC (V2 - No OI, No Funding):
-        =====================================================
-        Kraken misreports OI and funding for many coins, so we use ONLY:
-        - Volume (24h futures volume)
-        - Spread (bid-ask spread %)
+        TIER CLASSIFICATION LOGIC (V3 - Single Source of Truth):
+        =========================================================
+        MarketRegistry is the ONLY authority for tier classification.
+        Config tiers are for UNIVERSE SELECTION only, not classification.
         
         Classification priority:
-        1. Pinned Tier A (BTC, ETH, SOL, BNB) - always Tier A
-        2. Config-defined tier (from config.yaml liquidity_tiers)
-        3. Dynamic classification based on volume + spread
+        1. Pinned Tier A (BTC, ETH only) - always Tier A
+        2. Dynamic classification based on futures volume AND spread
         
-        Dynamic thresholds:
-        - Tier A: vol >= $5M, spread <= 0.10%
-        - Tier B: vol >= $500k, spread <= 0.25%
+        Dynamic thresholds (BOTH conditions must be met):
+        - Tier A: vol >= $5M AND spread <= 0.10%
+        - Tier B: vol >= $500k AND spread <= 0.25%
         - Tier C: Everything else that passes filters
         
         Risk controls are applied per-tier in execution:
@@ -697,28 +716,49 @@ class MarketRegistry:
         - Tier B: 3-5x leverage, $50k max
         - Tier C: 1-2x leverage, $25k max
         """
-        # 1. Pinned Tier A (hardcoded majors)
+        # 1. Pinned Tier A (minimal - only BTC, ETH)
         if self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol):
             return "A"
         
-        # 2. Config-defined tier takes precedence
-        config_tier = self._get_config_tier(pair.spot_symbol)
-        if config_tier:
-            return config_tier
-        
-        # 3. Dynamic classification based on volume + spread (no OI)
+        # 2. Dynamic classification based on futures volume AND spread
+        # Config tiers are for universe selection only - NOT used here
         vol = pair.futures_volume_24h or Decimal("0")
         spread = pair.futures_spread_pct or Decimal("1")
         
-        # Tier A: High liquidity - vol >= $5M, spread <= 0.10%
+        # Tier A: High liquidity - vol >= $5M AND spread <= 0.10%
         if vol >= Decimal("5000000") and spread <= Decimal("0.0010"):
             return "A"
-        # Tier B: Medium liquidity - vol >= $500k, spread <= 0.25%
+        # Tier B: Medium liquidity - vol >= $500k AND spread <= 0.25%
         elif vol >= Decimal("500000") and spread <= Decimal("0.0025"):
             return "B"
         # Tier C: Lower liquidity (eligible but restricted)
         else:
             return "C"
+    
+    def tier_for(self, symbol: str) -> str:
+        """
+        Get authoritative tier for a symbol.
+        
+        This is the SINGLE SOURCE OF TRUTH for tier classification.
+        Use this instead of config lookups or static tier lists.
+        
+        Args:
+            symbol: Spot symbol (e.g., "BTC/USD")
+        
+        Returns:
+            "A", "B", or "C" - defaults to "C" (most conservative) if not found.
+        """
+        # Check pinned first
+        if self.is_pinned_tier_a_symbol(spot_symbol=symbol):
+            return "A"
+        
+        # Check discovered pairs
+        pair = self.discovered_pairs.get(symbol)
+        if pair:
+            return pair.liquidity_tier
+        
+        # Default to most conservative
+        return "C"
     
     def get_eligible_markets(
         self, 

@@ -573,7 +573,7 @@ class PositionManagerV2:
                 # Entry ack → stop placement will happen after fill
                 pass
         
-        # Handle entry fill → place stop order
+        # Handle entry fill → place stop and TP orders
         if event.event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL):
             if event.order_id == position.entry_order_id:
                 # Entry filled (or partial) → ensure stop is placed
@@ -590,6 +590,54 @@ class PositionManagerV2:
                         position_id=position.position_id,
                         priority=100
                     ))
+                
+                # V3 FIX: Place TP orders after entry fill
+                # TP1: Use partial_close_pct of position size
+                if position.initial_tp1_price and not position.tp1_order_id:
+                    tp1_size = position.remaining_qty * position.partial_close_pct
+                    if tp1_size > 0:
+                        tp1_client_id = f"tp1-{position.position_id}"
+                        follow_up_actions.append(ManagementAction(
+                            type=ActionType.PLACE_TP,
+                            symbol=symbol,
+                            reason="TP1 after entry fill",
+                            side=position.side,
+                            price=position.initial_tp1_price,
+                            size=tp1_size,
+                            client_order_id=tp1_client_id,
+                            position_id=position.position_id,
+                            priority=95
+                        ))
+                        logger.info(
+                            "Queuing TP1 placement",
+                            symbol=symbol,
+                            price=str(position.initial_tp1_price),
+                            size=str(tp1_size)
+                        )
+                
+                # TP2: Use remaining after TP1 (or configurable portion)
+                if position.initial_tp2_price and not position.tp2_order_id:
+                    # TP2 gets the remaining portion after TP1
+                    tp2_size = position.remaining_qty * (Decimal("1") - position.partial_close_pct)
+                    if tp2_size > 0:
+                        tp2_client_id = f"tp2-{position.position_id}"
+                        follow_up_actions.append(ManagementAction(
+                            type=ActionType.PLACE_TP,
+                            symbol=symbol,
+                            reason="TP2 after entry fill",
+                            side=position.side,
+                            price=position.initial_tp2_price,
+                            size=tp2_size,
+                            client_order_id=tp2_client_id,
+                            position_id=position.position_id,
+                            priority=94
+                        ))
+                        logger.info(
+                            "Queuing TP2 placement",
+                            symbol=symbol,
+                            price=str(position.initial_tp2_price),
+                            size=str(tp2_size)
+                        )
         
         # Handle exit fill → check for BE trigger
         if event.event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL):

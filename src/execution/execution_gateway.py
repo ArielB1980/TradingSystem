@@ -324,6 +324,12 @@ class ExecutionGateway:
             elif action.type == ActionType.FLATTEN_ORPHAN:
                 return await self._execute_flatten_orphan(action)
             
+            elif action.type == ActionType.PLACE_TP:
+                return await self._execute_place_tp(action)
+            
+            elif action.type == ActionType.CANCEL_TP:
+                return await self._execute_cancel_tp(action)
+            
             else:
                 logger.warning(f"Unhandled action type: {action.type}")
                 return ExecutionResult(
@@ -769,6 +775,144 @@ class ExecutionGateway:
             )
         except Exception as e:
             self._wal_mark_failed(action.client_order_id, str(e))
+            return ExecutionResult(
+                success=False,
+                client_order_id=action.client_order_id,
+                error=str(e)
+            )
+    
+    async def _execute_place_tp(self, action: ManagementAction) -> ExecutionResult:
+        """
+        Place take-profit limit order.
+        
+        V3: Added to fix V2 state machine not placing TP orders after entry fill.
+        TP orders are reduce-only limit orders at the target price.
+        """
+        position = self.registry.get_position(action.symbol)
+        if not position:
+            return ExecutionResult(
+                success=False,
+                client_order_id=action.client_order_id,
+                error="Position not found"
+            )
+        
+        if not action.price:
+            return ExecutionResult(
+                success=False,
+                client_order_id=action.client_order_id,
+                error="TP requires price"
+            )
+        
+        if not action.size or action.size <= 0:
+            return ExecutionResult(
+                success=False,
+                client_order_id=action.client_order_id,
+                error="TP requires positive size"
+            )
+        
+        # Determine TP side (opposite of position side)
+        tp_side = "sell" if position.side == Side.LONG else "buy"
+        
+        # Get futures symbol for exchange
+        exchange_symbol = position.futures_symbol or action.symbol
+        
+        self._wal_record_intent(action, "place_tp", price=action.price, size=action.size)
+        
+        try:
+            result = await self.client.create_order(
+                symbol=exchange_symbol,
+                type="limit",
+                side=tp_side,
+                amount=float(action.size),
+                price=float(action.price),
+                params={
+                    "clientOrderId": action.client_order_id,
+                    "reduceOnly": True,
+                }
+            )
+            
+            exchange_order_id = result.get("id")
+            self._order_id_map[exchange_order_id] = action.client_order_id
+            self._wal_mark_sent(action.client_order_id, exchange_order_id)
+            
+            # Track TP order ID - update specific TP slot based on client order ID
+            if action.client_order_id and action.client_order_id.startswith("tp1-"):
+                position.tp1_order_id = exchange_order_id
+            elif action.client_order_id and action.client_order_id.startswith("tp2-"):
+                position.tp2_order_id = exchange_order_id
+            
+            # Also track in tp_order_ids list for legacy compatibility
+            if not position.tp_order_ids:
+                position.tp_order_ids = []
+            if exchange_order_id not in position.tp_order_ids:
+                position.tp_order_ids.append(exchange_order_id)
+            self.persistence.save_position(position)
+            
+            self.metrics["orders_placed"] += 1
+            logger.info(
+                "TP order placed",
+                symbol=exchange_symbol,
+                price=str(action.price),
+                size=str(action.size),
+                order_id=exchange_order_id,
+                client_order_id=action.client_order_id
+            )
+            
+            return ExecutionResult(
+                success=True,
+                client_order_id=action.client_order_id,
+                exchange_order_id=exchange_order_id
+            )
+            
+        except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
+            logger.error(f"TP placement failed: {e}", symbol=action.symbol, price=str(action.price))
+            return ExecutionResult(
+                success=False,
+                client_order_id=action.client_order_id,
+                error=str(e)
+            )
+    
+    async def _execute_cancel_tp(self, action: ManagementAction) -> ExecutionResult:
+        """
+        Cancel take-profit order.
+        
+        V3: Added to complement PLACE_TP handling.
+        """
+        if not action.client_order_id:
+            return ExecutionResult(
+                success=True,
+                client_order_id=action.client_order_id or "unknown",
+                error="No TP order ID to cancel"
+            )
+        
+        self._wal_record_intent(action, "cancel_tp")
+        
+        try:
+            # Use the client_order_id as the exchange order ID to cancel
+            order_id_to_cancel = action.client_order_id
+            await self.client.cancel_order(order_id_to_cancel, action.symbol)
+            self.metrics["orders_cancelled"] += 1
+            self._wal_mark_completed(action.client_order_id)
+            
+            # Remove from position's tp_order_ids
+            position = self.registry.get_position(action.symbol)
+            if position and position.tp_order_ids:
+                position.tp_order_ids = [
+                    oid for oid in position.tp_order_ids 
+                    if oid != order_id_to_cancel
+                ]
+                self.persistence.save_position(position)
+            
+            logger.info("TP order cancelled", order_id=order_id_to_cancel, symbol=action.symbol)
+            
+            return ExecutionResult(
+                success=True,
+                client_order_id=action.client_order_id
+            )
+        except Exception as e:
+            self._wal_mark_failed(action.client_order_id, str(e))
+            logger.warning(f"Failed to cancel TP order: {e}", order_id=action.client_order_id)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,

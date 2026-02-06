@@ -4,7 +4,7 @@ Configuration models for the Kraken Futures SMC Trading System.
 Uses Pydantic for validation and type safety.
 """
 from typing import List, Literal, Optional, Dict
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 from pathlib import Path
@@ -281,11 +281,67 @@ class AssetConfig(BaseSettings):
 
 
 class CoinUniverseConfig(BaseSettings):
-    """Coin universe configuration (V2)."""
+    """
+    Coin universe configuration (V3 - Single Source of Truth).
+    
+    IMPORTANT: liquidity_tiers is DEPRECATED. Use candidate_symbols instead.
+    The tiers in liquidity_tiers are for UNIVERSE SELECTION only - actual tier
+    classification is done dynamically by MarketRegistry based on futures metrics.
+    """
     enabled: bool = True
     min_spot_volume_24h: Decimal = Field(default=Decimal("5000000"))
-    liquidity_tiers: Dict[str, List[str]] = Field(default_factory=lambda: {"A": ["BTC/USD"], "B": [], "C": []})
-    tier_max_leverage: Dict[str, float] = Field(default_factory=lambda: {"A": 10.0, "B": 5.0, "C": 2.0}) # Global cap still applies
+    
+    # NEW: Preferred field - flat list of candidate symbols
+    candidate_symbols: Optional[List[str]] = Field(default=None)
+    
+    # DEPRECATED: Keep for backward compatibility (one release)
+    # These are CANDIDATES for discovery, NOT tier assignments
+    liquidity_tiers: Optional[Dict[str, List[str]]] = Field(
+        default_factory=lambda: {"A": ["BTC/USD"], "B": [], "C": []}
+    )
+    
+    tier_max_leverage: Dict[str, float] = Field(
+        default_factory=lambda: {"A": 10.0, "B": 5.0, "C": 2.0}
+    )  # Global cap still applies
+    
+    @model_validator(mode='after')
+    def normalize_candidates(self) -> 'CoinUniverseConfig':
+        """Normalize liquidity_tiers to candidate_symbols with deprecation warning."""
+        if self.liquidity_tiers and not self.candidate_symbols:
+            import warnings
+            import logging
+            # Log deprecation warning
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "DEPRECATION: coin_universe.liquidity_tiers is deprecated. "
+                "Tiers are now assigned dynamically by MarketRegistry. "
+                "These are treated as candidate_symbols for universe selection only."
+            )
+            warnings.warn(
+                "coin_universe.liquidity_tiers is deprecated. "
+                "Use coin_universe.candidate_symbols instead. "
+                "Tiers are assigned dynamically by MarketRegistry.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+        return self
+    
+    def get_all_candidates(self) -> List[str]:
+        """
+        Get all candidate symbols for universe discovery.
+        
+        This is the ONLY method consumers should use to get symbols.
+        Returns symbols from candidate_symbols if set, otherwise flattens liquidity_tiers.
+        """
+        if self.candidate_symbols:
+            return list(self.candidate_symbols)
+        if self.liquidity_tiers:
+            flattened = []
+            for tier_list in self.liquidity_tiers.values():
+                if tier_list:
+                    flattened.extend(tier_list)
+            return list(set(flattened))
+        return []
 
 class TierConfig(BaseSettings):
     """Per-tier risk limits for position sizing."""

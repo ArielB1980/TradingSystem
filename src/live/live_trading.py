@@ -290,17 +290,17 @@ class LiveTrading:
         self.last_status_summary = datetime.min.replace(tzinfo=timezone.utc)
         
         # Market Expansion (Coin Universe)
+        # V3: Use get_all_candidates() - config tiers are for universe selection only
         self.markets = config.exchange.spot_markets
         if config.assets.mode == "whitelist":
              self.markets = config.assets.whitelist
         elif config.coin_universe and config.coin_universe.enabled:
-             # Expand from Tiers
-             expanded = []
-             for tier, coins in config.coin_universe.liquidity_tiers.items():
-                 expanded.extend(coins)
+             # Get all candidate symbols (flattened from tiers or direct list)
+             expanded = config.coin_universe.get_all_candidates()
              # Deduplicate and exclude disallowed bases (fiat + stablecoin).
              self.markets = [s for s in list(set(expanded)) if not has_disallowed_base(s)]
-             logger.info("Coin Universe Enabled", markets=self.markets)
+             logger.info("Coin Universe Enabled (V3 - dynamic tier classification)", 
+                        market_count=len(self.markets))
              
         # Update Data Acquisition with full list
         self.data_acq = DataAcquisition(
@@ -370,9 +370,16 @@ class LiveTrading:
 
     def _get_static_tier(self, symbol: str) -> Optional[str]:
         """
-        Look up symbol in config coin_universe.liquidity_tiers (static lists).
-        Used only for tier mismatch warning; dynamic classification is authoritative.
-        Returns "A", "B", "C", or None if not in any static tier.
+        DEPRECATED: Debug-only legacy tier lookup.
+        
+        This method looks up the symbol in config coin_universe.liquidity_tiers,
+        which are now CANDIDATE GROUPS, not tier assignments.
+        
+        For authoritative tier classification, use:
+            self.market_discovery.get_symbol_tier(symbol)
+        
+        This is kept only for transitional logging and debugging.
+        Returns "A", "B", "C", or None if not in any config group.
         """
         if not getattr(self.config, "coin_universe", None) or not getattr(self.config.coin_universe, "enabled", False):
             return None
