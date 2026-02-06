@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from src.data.market_registry import MarketRegistry, MarketPair
+from src.services.market_discovery import MarketDiscoveryService
 
 
 from decimal import Decimal
@@ -237,3 +238,17 @@ async def test_live_trading_keeps_existing_universe_and_logs_critical():
     critical_calls = [c for c in mock_log.method_calls if c[0] == "critical"]
     assert len(critical_calls) >= 1
     assert "Market discovery empty" in str(critical_calls[0])
+
+
+def test_market_discovery_service_pinned_majors_default_to_tier_a():
+    """Pinned majors should resolve Tier A even if discovery cache is empty."""
+    config = MagicMock()
+    config.exchange = MagicMock()
+    config.exchange.allow_futures_only_universe = False
+    config.exchange.allow_futures_only_pairs = False
+    service = MarketDiscoveryService(FakeKrakenClient(), config)
+
+    assert service.get_symbol_tier("BTC/USD") == "A"
+    assert service.get_symbol_tier("ETH/USD") == "A"
+    assert service.get_symbol_tier("SOL/USD") == "A"
+    assert service.get_symbol_tier("BNB/USD") == "A"
