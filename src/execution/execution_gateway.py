@@ -184,6 +184,112 @@ class ExecutionGateway:
         if self._wal:
             self._wal.mark_failed(intent_id, error)
     
+    # ========== ENTRY-TIME LIQUIDITY SAFETY ==========
+    
+    # Configurable thresholds for entry-time liquidity check
+    ENTRY_MAX_SPREAD_PCT = Decimal("0.005")  # 0.5% max spread at entry time
+    ENTRY_MIN_DEPTH_RATIO = Decimal("2.0")  # Order book depth must be 2x order size
+    
+    async def _check_entry_liquidity(
+        self, 
+        symbol: str, 
+        side: Side, 
+        size: Decimal
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Entry-time liquidity safety check.
+        
+        This is a critical safety net since we've removed OI as a gate.
+        Checks real-time orderbook conditions before sending entry orders.
+        
+        Returns:
+            (True, None) if liquidity is acceptable
+            (False, reason) if entry should be blocked
+        
+        Checks performed:
+        1. Effective spread: Must be <= 0.5% (prevents entering during wide spreads)
+        2. Depth check: Order book depth must support the order size
+        
+        Note: We fail OPEN on errors to be safe. Reduce-only exits always proceed.
+        """
+        try:
+            # Get real-time orderbook or ticker
+            fetch_ticker = getattr(self.client, "fetch_ticker", None)
+            if not fetch_ticker:
+                # No ticker method - skip check and proceed
+                return (True, None)
+            
+            ticker = await fetch_ticker(symbol)
+            if not ticker:
+                return (True, None)  # Can't verify - proceed with caution
+            
+            # Extract bid/ask
+            bid = ticker.get("bid")
+            ask = ticker.get("ask")
+            
+            if not bid or not ask or bid <= 0 or ask <= 0:
+                # Can't calculate spread - proceed with caution
+                logger.debug(
+                    "Entry liquidity check: missing bid/ask, skipping",
+                    symbol=symbol,
+                    bid=bid,
+                    ask=ask,
+                )
+                return (True, None)
+            
+            bid = Decimal(str(bid))
+            ask = Decimal(str(ask))
+            
+            # Calculate effective spread
+            mid = (bid + ask) / 2
+            spread_pct = (ask - bid) / mid if mid > 0 else Decimal("1")
+            
+            # Check 1: Spread threshold
+            if spread_pct > self.ENTRY_MAX_SPREAD_PCT:
+                return (
+                    False, 
+                    f"Spread {spread_pct:.4%} exceeds max {self.ENTRY_MAX_SPREAD_PCT:.2%}"
+                )
+            
+            # Check 2: Depth (if available from ticker)
+            # Some exchanges provide bidVolume/askVolume in ticker
+            bid_vol = ticker.get("bidVolume")
+            ask_vol = ticker.get("askVolume")
+            
+            if bid_vol is not None and ask_vol is not None:
+                bid_vol = Decimal(str(bid_vol))
+                ask_vol = Decimal(str(ask_vol))
+                
+                # For longs, we hit the ask; for shorts, we hit the bid
+                relevant_depth = ask_vol if side == Side.LONG else bid_vol
+                
+                if relevant_depth > 0 and size > 0:
+                    depth_ratio = relevant_depth / size
+                    if depth_ratio < self.ENTRY_MIN_DEPTH_RATIO:
+                        return (
+                            False,
+                            f"Depth ratio {depth_ratio:.2f}x < min {self.ENTRY_MIN_DEPTH_RATIO}x"
+                        )
+            
+            # Passed all checks
+            logger.debug(
+                "Entry liquidity check passed",
+                symbol=symbol,
+                spread=f"{spread_pct:.4%}",
+                bid=str(bid),
+                ask=str(ask),
+            )
+            return (True, None)
+            
+        except Exception as e:
+            # Log but don't block on errors - this is a safety net, not a gate
+            logger.warning(
+                "Entry liquidity check error",
+                symbol=symbol,
+                error=str(e),
+            )
+            return (True, None)
+    
     # ========== ORDER SUBMISSION ==========
     
     async def execute_action(
@@ -243,9 +349,53 @@ class ExecutionGateway:
     async def _execute_entry(
         self, action: ManagementAction, order_symbol: Optional[str] = None
     ) -> ExecutionResult:
-        """Execute entry order. order_symbol: futures symbol for exchange (e.g. X/USD:USD)."""
+        """
+        Execute entry order with entry-time liquidity safety check.
+        
+        order_symbol: optional futures symbol (e.g. X/USD:USD) for exchange orders.
+        
+        ENTRY-TIME LIQUIDITY SAFETY:
+        Before sending an order, we check effective spread at entry time.
+        This protects against:
+        - "looks liquid in stats, but not at this moment"
+        - Spoofed volume
+        - Stale orderbook data
+        
+        This is more reliable than Kraken's OI data.
+        """
         self.metrics["orders_submitted"] += 1
         exchange_symbol = order_symbol if order_symbol is not None else action.symbol
+        
+        # ============================================================
+        # ENTRY-TIME LIQUIDITY SAFETY CHECK
+        # ============================================================
+        # Check effective spread before sending order.
+        # This guards against momentarily illiquid conditions.
+        # ============================================================
+        try:
+            liquidity_ok, liquidity_reason = await self._check_entry_liquidity(
+                exchange_symbol, action.side, action.size
+            )
+            if not liquidity_ok:
+                logger.warning(
+                    "Entry rejected by liquidity safety check",
+                    symbol=exchange_symbol,
+                    reason=liquidity_reason,
+                    side=action.side.value,
+                    size=str(action.size),
+                )
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error=f"Liquidity check failed: {liquidity_reason}"
+                )
+        except Exception as e:
+            # Don't block entry on liquidity check errors - log and proceed
+            logger.warning(
+                "Liquidity check failed with error, proceeding with entry",
+                symbol=exchange_symbol,
+                error=str(e),
+            )
 
         # Track pending order (store exchange_symbol for order-status polling)
         pending = PendingOrder(

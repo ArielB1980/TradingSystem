@@ -100,22 +100,61 @@ class MarketRegistry:
         futures_base = cls._normalize_base_symbol(futures_symbol)
         return spot_base in cls._PINNED_TIER_A_BASES or futures_base in cls._PINNED_TIER_A_BASES
     
-    def _is_config_tier_a(self, symbol: str) -> bool:
+    def _get_config_tier(self, symbol: str) -> Optional[str]:
         """
-        Check if symbol is in the config's Tier A list.
+        Get the configured tier for a symbol from config.yaml.
         
-        This allows all Tier A coins to bypass OI filters since Kraken
-        misreports open interest for some major coins.
+        Returns 'A', 'B', 'C', or None if not found.
         """
         try:
             coin_universe = getattr(self.config, 'coin_universe', None)
             if not coin_universe:
-                return False
+                return None
             liquidity_tiers = getattr(coin_universe, 'liquidity_tiers', {})
-            tier_a_symbols = liquidity_tiers.get('A', [])
-            return symbol in tier_a_symbols
+            for tier in ['A', 'B', 'C']:
+                if symbol in liquidity_tiers.get(tier, []):
+                    return tier
+            return None
         except Exception:
-            return False
+            return None
+    
+    def _is_config_tier_a(self, symbol: str) -> bool:
+        """Check if symbol is in the config's Tier A list."""
+        return self._get_config_tier(symbol) == 'A'
+    
+    def _is_config_tier_b(self, symbol: str) -> bool:
+        """Check if symbol is in the config's Tier B list."""
+        return self._get_config_tier(symbol) == 'B'
+    
+    def _get_tier_volume_threshold(self, tier: str) -> Decimal:
+        """
+        Get minimum futures volume threshold for a tier.
+        
+        Tier A: Bypasses all filters (trusted majors)
+        Tier B: $500k minimum
+        Tier C: $250k minimum
+        """
+        tier_thresholds = {
+            'A': Decimal("0"),  # Tier A bypasses
+            'B': Decimal("500000"),
+            'C': Decimal("250000"),
+        }
+        return tier_thresholds.get(tier, Decimal("250000"))
+    
+    def _get_tier_spread_threshold(self, tier: str) -> Decimal:
+        """
+        Get maximum spread threshold for a tier.
+        
+        Tier A: Bypasses all filters (trusted majors)
+        Tier B: 0.25%
+        Tier C: 0.50%
+        """
+        tier_thresholds = {
+            'A': Decimal("1.0"),  # Tier A bypasses (100% = no limit)
+            'B': Decimal("0.0025"),  # 0.25%
+            'C': Decimal("0.0050"),  # 0.50%
+        }
+        return tier_thresholds.get(tier, Decimal("0.0050"))
     
     async def discover_markets(self) -> Dict[str, MarketPair]:
         """
@@ -319,71 +358,84 @@ class MarketRegistry:
                 pair.futures_spread_pct = fticker.spread_pct
                 pair.funding_rate = fticker.funding_rate
                 
-                # Check if this is a Tier A coin - they bypass liquidity filters
-                # Kraken misreports OI, spread, and funding for some major coins
-                is_config_tier_a = self._is_config_tier_a(symbol)
+                # ============================================================
+                # TIER-AWARE FILTERING (V2 REDESIGN)
+                # ============================================================
+                # Key principle: OI and Funding are UNRELIABLE on Kraken.
+                # - OI: Removed as gate (logged only for observability)
+                # - Funding: Removed as gate (logged only for observability)
+                # - Volume + Spread: PRIMARY gates with tier-specific thresholds
+                # - Price: SECONDARY sanity check ($0.01 minimum)
+                # ============================================================
+                
+                # Determine configured tier for this symbol
+                config_tier = self._get_config_tier(symbol)
                 is_pinned = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
-                is_tier_a = is_config_tier_a or is_pinned
+                is_tier_a = config_tier == 'A' or is_pinned
+                is_tier_b = config_tier == 'B'
                 
-                # Check minimum futures open interest (Tier A bypasses)
+                # Use configured tier for thresholds, or default to 'C' (most restrictive)
+                effective_tier = 'A' if is_tier_a else ('B' if is_tier_b else 'C')
+                
+                # --- OI: LOG ONLY (removed as gate - Kraken misreports) ---
                 min_oi = getattr(filters, "min_futures_open_interest", Decimal("0")) or Decimal("0")
-                if fticker.open_interest < min_oi and not is_tier_a:
-                    pair.is_eligible = False
-                    pair.rejection_reason = f"OI ${fticker.open_interest:,.0f} < ${min_oi:,.0f}"
-                    rejected[symbol] = pair.rejection_reason
-                    continue
-                elif is_tier_a and fticker.open_interest < min_oi:
-                    logger.warning(
-                        "Tier A coin bypassing OI filter (Kraken misreporting suspected)",
+                if fticker.open_interest < min_oi:
+                    logger.debug(
+                        "OI below threshold (logged only, not a gate)",
                         symbol=symbol,
-                        reported_oi=str(fticker.open_interest),
-                        min_oi=str(min_oi),
+                        tier=effective_tier,
+                        reported_oi=f"${fticker.open_interest:,.0f}",
+                        threshold=f"${min_oi:,.0f}",
                     )
                 
-                # Check futures spread (Tier A bypasses - Kraken reports 100% spread for SOL sometimes)
-                max_futures_spread = getattr(filters, "max_futures_spread_pct", Decimal("0.003")) or Decimal("0.003")
-                if fticker.spread_pct > max_futures_spread and not is_tier_a:
-                    pair.is_eligible = False
-                    pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_futures_spread:.2%}"
-                    rejected[symbol] = pair.rejection_reason
-                    continue
-                elif is_tier_a and fticker.spread_pct > max_futures_spread:
-                    logger.warning(
-                        "Tier A coin bypassing spread filter (Kraken misreporting suspected)",
-                        symbol=symbol,
-                        reported_spread=f"{fticker.spread_pct:.2%}",
-                        max_spread=f"{max_futures_spread:.2%}",
-                    )
-                
-                # Check futures volume (Tier A bypasses)
-                min_futures_vol = getattr(filters, "min_futures_volume_usd_24h", Decimal("0")) or Decimal("0")
-                if fticker.volume_24h < min_futures_vol and not is_tier_a:
-                    pair.is_eligible = False
-                    pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_futures_vol:,.0f}"
-                    rejected[symbol] = pair.rejection_reason
-                    continue
-                elif is_tier_a and fticker.volume_24h < min_futures_vol:
-                    logger.warning(
-                        "Tier A coin bypassing volume filter (Kraken misreporting suspected)",
-                        symbol=symbol,
-                        reported_vol=f"${fticker.volume_24h:,.0f}",
-                        min_vol=f"${min_futures_vol:,.0f}",
-                    )
-                
-                # Check funding rate (Tier A bypasses - Kraken reports -58% funding for BTC sometimes)
+                # --- FUNDING: LOG ONLY (removed as gate - Kraken misreports) ---
                 max_funding = getattr(filters, "max_funding_rate_abs", None)
                 if max_funding and fticker.funding_rate is not None:
-                    if abs(fticker.funding_rate) > max_funding and not is_tier_a:
+                    if abs(fticker.funding_rate) > max_funding:
+                        logger.debug(
+                            "Funding rate above threshold (logged only, not a gate)",
+                            symbol=symbol,
+                            tier=effective_tier,
+                            reported_funding=f"{fticker.funding_rate:.4%}",
+                            threshold=f"{max_funding:.4%}",
+                        )
+                
+                # --- VOLUME: PRIMARY GATE (tier-specific thresholds) ---
+                # Tier A bypasses all filters (trusted majors)
+                if not is_tier_a:
+                    min_vol_tier = self._get_tier_volume_threshold(effective_tier)
+                    if fticker.volume_24h < min_vol_tier:
                         pair.is_eligible = False
-                        pair.rejection_reason = f"Funding {fticker.funding_rate:.4%} > max {max_funding:.4%}"
+                        pair.rejection_reason = f"Futures vol ${fticker.volume_24h:,.0f} < ${min_vol_tier:,.0f} (Tier {effective_tier})"
                         rejected[symbol] = pair.rejection_reason
                         continue
-                    elif is_tier_a and abs(fticker.funding_rate) > max_funding:
+                
+                # --- SPREAD: PRIMARY GATE (tier-specific thresholds) ---
+                # Tier A bypasses all filters (trusted majors)
+                if not is_tier_a:
+                    max_spread_tier = self._get_tier_spread_threshold(effective_tier)
+                    if fticker.spread_pct > max_spread_tier:
+                        pair.is_eligible = False
+                        pair.rejection_reason = f"Futures spread {fticker.spread_pct:.2%} > {max_spread_tier:.2%} (Tier {effective_tier})"
+                        rejected[symbol] = pair.rejection_reason
+                        continue
+                
+                # Log Tier A bypasses for visibility
+                if is_tier_a:
+                    issues = []
+                    if fticker.open_interest < min_oi:
+                        issues.append(f"OI=${fticker.open_interest:,.0f}")
+                    if fticker.spread_pct > Decimal("0.003"):
+                        issues.append(f"spread={fticker.spread_pct:.2%}")
+                    if max_funding and fticker.funding_rate and abs(fticker.funding_rate) > max_funding:
+                        issues.append(f"funding={fticker.funding_rate:.4%}")
+                    if fticker.volume_24h < Decimal("500000"):
+                        issues.append(f"vol=${fticker.volume_24h:,.0f}")
+                    if issues:
                         logger.warning(
-                            "Tier A coin bypassing funding filter (Kraken misreporting suspected)",
+                            "Tier A coin bypassing filters (trusted major)",
                             symbol=symbol,
-                            reported_funding=f"{fticker.funding_rate:.4%}",
-                            max_funding=f"{max_funding:.4%}",
+                            issues=", ".join(issues),
                         )
                 
                 # --- SPOT FILTERS (optional in futures_primary mode) ---
@@ -602,31 +654,47 @@ class MarketRegistry:
     
     def _classify_tier(self, pair: MarketPair) -> str:
         """
-        Classify market pair into liquidity tier based on futures metrics.
+        Classify market pair into liquidity tier.
         
-        This dynamic classification is the single authority for tier, leverage,
-        and max position sizing at trade time. Static lists in
-        config.coin_universe.liquidity_tiers are used only for universe
-        selection (which symbols to consider); they do not override this.
-        If a symbol is not in discovered_pairs, callers default to Tier C
-        (most conservative).
+        TIER CLASSIFICATION LOGIC (V2 - No OI, No Funding):
+        =====================================================
+        Kraken misreports OI and funding for many coins, so we use ONLY:
+        - Volume (24h futures volume)
+        - Spread (bid-ask spread %)
         
-        Tier A: High liquidity (BTC/ETH/SOL tier) - full size/leverage
-        Tier B: Medium liquidity - reduced size/leverage
-        Tier C: Lower liquidity - restricted size/leverage
+        Classification priority:
+        1. Pinned Tier A (BTC, ETH, SOL, BNB) - always Tier A
+        2. Config-defined tier (from config.yaml liquidity_tiers)
+        3. Dynamic classification based on volume + spread
+        
+        Dynamic thresholds:
+        - Tier A: vol >= $5M, spread <= 0.10%
+        - Tier B: vol >= $500k, spread <= 0.25%
+        - Tier C: Everything else that passes filters
+        
+        Risk controls are applied per-tier in execution:
+        - Tier A: 10x leverage, $100k max
+        - Tier B: 3-5x leverage, $50k max
+        - Tier C: 1-2x leverage, $25k max
         """
+        # 1. Pinned Tier A (hardcoded majors)
         if self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol):
             return "A"
-
-        oi = pair.futures_open_interest or Decimal("0")
+        
+        # 2. Config-defined tier takes precedence
+        config_tier = self._get_config_tier(pair.spot_symbol)
+        if config_tier:
+            return config_tier
+        
+        # 3. Dynamic classification based on volume + spread (no OI)
         vol = pair.futures_volume_24h or Decimal("0")
         spread = pair.futures_spread_pct or Decimal("1")
         
-        # Tier A: High liquidity - OI >= $10M, vol >= $5M, spread <= 0.10%
-        if oi >= Decimal("10000000") and vol >= Decimal("5000000") and spread <= Decimal("0.0010"):
+        # Tier A: High liquidity - vol >= $5M, spread <= 0.10%
+        if vol >= Decimal("5000000") and spread <= Decimal("0.0010"):
             return "A"
-        # Tier B: Medium liquidity - OI >= $1M, vol >= $1M, spread <= 0.30%
-        elif oi >= Decimal("1000000") and vol >= Decimal("1000000") and spread <= Decimal("0.0030"):
+        # Tier B: Medium liquidity - vol >= $500k, spread <= 0.25%
+        elif vol >= Decimal("500000") and spread <= Decimal("0.0025"):
             return "B"
         # Tier C: Lower liquidity (eligible but restricted)
         else:
