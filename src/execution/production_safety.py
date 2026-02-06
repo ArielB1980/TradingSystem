@@ -769,7 +769,7 @@ class PositionProtectionMonitor:
         
         # CRITICAL: Fetch actual positions from exchange to verify they exist
         try:
-            exchange_positions = await self.client.get_futures_positions()
+            exchange_positions = await self.client.get_all_futures_positions()
         except Exception as e:
             logger.error(f"Failed to fetch positions for protection check: {e}")
             # If we can't verify positions, assume protected to avoid false positives
