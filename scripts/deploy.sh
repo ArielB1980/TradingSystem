@@ -35,7 +35,7 @@ SERVER="${DEPLOY_SERVER:-root@207.154.193.121}"
 SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/trading_droplet}"
 TRADING_USER="${DEPLOY_TRADING_USER:-trading}"
 TRADING_DIR="${DEPLOY_TRADING_DIR:-/home/trading/TradingSystem}"
-SERVICE_NAME="${DEPLOY_SERVICE_NAME:-trading-system.service}"
+SERVICE_NAME="${DEPLOY_SERVICE_NAME:-trading-bot.service}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 # Parse command line arguments
@@ -277,6 +277,18 @@ if [ $? -eq 0 ]; then
 else
     print_error "Failed to update code on server"
     exit 1
+fi
+
+# Resolve service name on remote host (fallback for legacy installs)
+if ! ssh -i "$SSH_KEY" "$SERVER" "systemctl cat $SERVICE_NAME >/dev/null 2>&1"; then
+    if [ -z "${DEPLOY_SERVICE_NAME:-}" ] && ssh -i "$SSH_KEY" "$SERVER" "systemctl cat trading-system.service >/dev/null 2>&1"; then
+        print_warning "Service '$SERVICE_NAME' not found; falling back to legacy 'trading-system.service'"
+        SERVICE_NAME="trading-system.service"
+    else
+        print_error "Service not found on server: $SERVICE_NAME"
+        print_warning "Set DEPLOY_SERVICE_NAME in .env.local to the correct unit (e.g., trading-bot.service)"
+        exit 1
+    fi
 fi
 
 # Step 4: Restart service
