@@ -748,14 +748,20 @@ class PositionManagerV2:
                     self.metrics["errors"] += 1
             
             elif "PHANTOM" in issue:
-                # Exchange has position we don't know about - FLATTEN
-                actions.append(ManagementAction(
-                    type=ActionType.FLATTEN_ORPHAN,
+                # Exchange has position we don't know about.
+                # DO NOT auto-flatten: these are likely real positions that survived
+                # a restart but weren't persisted. Let _import_phantom_positions()
+                # and production_takeover handle them safely with proper stop placement.
+                logger.warning(
+                    "PHANTOM position detected - deferring to import/takeover",
                     symbol=symbol,
-                    reason=f"PHANTOM position on exchange",
-                    order_type=OrderType.MARKET,
-                    exit_reason=ExitReason.ORPHAN_FLATTEN,
-                    priority=100
+                    issue=issue,
+                )
+                actions.append(ManagementAction(
+                    type=ActionType.NO_ACTION,
+                    symbol=symbol,
+                    reason=f"PHANTOM: deferred to import/takeover - {issue}",
+                    priority=0
                 ))
                 self.metrics["errors"] += 1
             
