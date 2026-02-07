@@ -764,8 +764,8 @@ class LiveTrading:
                         system_state=system_state,
                         cooldowns_active=len(self._signal_cooldown),
                     )
-                except Exception:
-                    pass  # Summary failure must never crash
+                except Exception as summary_err:
+                    logger.warning("CYCLE_SUMMARY_FAILED", error=str(summary_err), error_type=type(summary_err).__name__)
 
                 # Dynamic sleep to align with 1m intervals
                 elapsed = cycle_elapsed
