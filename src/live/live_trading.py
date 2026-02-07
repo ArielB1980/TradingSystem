@@ -785,26 +785,69 @@ class LiveTrading:
 
         If a naked position is detected in prod live, fail closed by activating the kill switch
         (emergency flatten).
+        
+        Startup grace: The first check is delayed by 3x the normal interval (90s by default)
+        to give the main tick loop time to place missing stops after a restart or kill switch
+        recovery. Without this, the monitor fires before stops can be placed, causing an
+        immediate emergency kill switch on startup.
         """
+        # Startup grace period: wait longer on first check so the tick loop can
+        # place missing stops before we start enforcing Invariant K.
+        startup_grace_seconds = interval_seconds * 3
+        logger.info(
+            "Protection monitor: startup grace period",
+            grace_seconds=startup_grace_seconds,
+            enforce_after="first check",
+        )
+        await asyncio.sleep(startup_grace_seconds)
+        
+        consecutive_naked_count: Dict[str, int] = {}  # symbol -> consecutive naked detections
+        ESCALATION_THRESHOLD = 2  # Require 2 consecutive naked detections before emergency kill
+        
         while self.active:
-            await asyncio.sleep(interval_seconds)
             if not self.active:
                 break
             if not getattr(self, "_protection_monitor", None):
+                await asyncio.sleep(interval_seconds)
                 continue
             try:
                 results = await self._protection_monitor.check_all_positions()
                 naked = [s for s, ok in results.items() if not ok]
                 if naked:
-                    logger.critical("NAKED_POSITIONS_DETECTED", naked_symbols=naked, details=results)
-                    is_prod_live = (os.getenv("ENVIRONMENT", "").strip().lower() == "prod") and (not self.config.system.dry_run)
-                    if is_prod_live:
-                        await self.kill_switch.activate(KillSwitchReason.RECONCILIATION_FAILURE, emergency=True)
-                        return
+                    # Update consecutive counts
+                    for s in naked:
+                        consecutive_naked_count[s] = consecutive_naked_count.get(s, 0) + 1
+                    
+                    # Check if any symbol has been naked for enough consecutive checks
+                    persistent_naked = [s for s in naked if consecutive_naked_count.get(s, 0) >= ESCALATION_THRESHOLD]
+                    
+                    if persistent_naked:
+                        logger.critical(
+                            "NAKED_POSITIONS_DETECTED (persistent)",
+                            naked_symbols=persistent_naked,
+                            details=results,
+                            consecutive_counts={s: consecutive_naked_count[s] for s in persistent_naked},
+                        )
+                        is_prod_live = (os.getenv("ENVIRONMENT", "").strip().lower() == "prod") and (not self.config.system.dry_run)
+                        if is_prod_live:
+                            await self.kill_switch.activate(KillSwitchReason.RECONCILIATION_FAILURE, emergency=True)
+                            return
+                    else:
+                        logger.warning(
+                            "NAKED_POSITIONS_DETECTED (first occurrence, giving time to self-heal)",
+                            naked_symbols=naked,
+                            details=results,
+                            consecutive_counts={s: consecutive_naked_count.get(s, 0) for s in naked},
+                        )
+                else:
+                    # All positions protected — reset all counters
+                    consecutive_naked_count.clear()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning("Protection check loop failed", error=str(e), error_type=type(e).__name__)
+            
+            await asyncio.sleep(interval_seconds)
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
