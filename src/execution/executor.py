@@ -517,11 +517,22 @@ class Executor:
         # 1. Update SL
         updated_sl_id = current_sl_id
         if new_sl_price:
-            try:
-                if current_sl_id:
+            # Cancel old SL first (separate try so notFound doesn't block new SL placement)
+            if current_sl_id:
+                try:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
-                
-                # Reduce-only SL: use actual position size if provided, else 0 (exchange handles sizing)
+                except Exception as e:
+                    # notFound means old SL was already cancelled (e.g. by kill switch).
+                    # This is safe to ignore — we'll place a new one below.
+                    logger.warning(
+                        "Old SL cancel failed (proceeding to place new SL)",
+                        symbol=symbol,
+                        old_sl_id=current_sl_id,
+                        error=str(e),
+                    )
+            
+            # Place new SL (MUST run even if old cancel failed)
+            try:
                 sl_size = position_size_notional if position_size_notional else Decimal("0")
                 sl_order = await self.futures_adapter.place_order(
                     symbol=symbol,
@@ -535,7 +546,7 @@ class Executor:
                 updated_sl_id = sl_order.order_id
                 logger.info("SL updated", symbol=symbol, old_id=current_sl_id, new_id=updated_sl_id, price=str(new_sl_price))
             except Exception as e:
-                logger.error("Failed to update SL", symbol=symbol, error=str(e))
+                logger.error("Failed to place new SL", symbol=symbol, error=str(e))
         
         # 2. Update TPs (TP Ladder Replacement)
         updated_tp_ids = current_tp_ids
