@@ -193,6 +193,15 @@ class LiveTrading:
         # Auction mode allocator (if enabled)
         self.auction_allocator = None
         self.auction_signals_this_tick = []  # Collect signals for auction mode
+        
+        # Signal cooldown: prevent the same signal from firing repeatedly for the same symbol.
+        # Key: symbol, Value: (signal_type, structure_timestamp, cooldown_until)
+        # A signal is considered "same" if it has the same symbol + signal_type + structure_timestamp.
+        self._signal_cooldown: Dict[str, datetime] = {}  # symbol -> cooldown expiry
+        self._signal_cooldown_hours: int = 4  # hours before same symbol can signal again
+        
+        # Auto halt recovery tracking (instance-level, not class-level)
+        self._auto_recovery_attempts: list = []
         if config.risk.auction_mode_enabled:
             from src.portfolio.auction_allocator import (
                 AuctionAllocator,
@@ -658,9 +667,16 @@ class LiveTrading:
                 loop_count += 1
 
                 if self.kill_switch.is_active():
-                    logger.critical("Kill switch active - pausing loop")
-                    await asyncio.sleep(60)
-                    continue
+                    # Attempt auto-recovery for margin_critical (the most common false-positive halt)
+                    recovered = False
+                    if self.kill_switch.reason == KillSwitchReason.MARGIN_CRITICAL:
+                        recovered = await self._try_auto_recovery()
+                    
+                    if not recovered:
+                        logger.critical("Kill switch active - pausing loop",
+                                       reason=self.kill_switch.reason.value if self.kill_switch.reason else "unknown")
+                        await asyncio.sleep(60)
+                        continue
                 
                 # Periodic Market Discovery
                 if self.config.exchange.use_market_discovery:
@@ -720,8 +736,36 @@ class LiveTrading:
                         except Exception as ex:
                             logger.warning("Reconciliation failed", error=str(ex))
 
+                # ===== CYCLE SUMMARY (single log line per tick with key metrics) =====
+                cycle_elapsed = (now - loop_start).total_seconds()
+                try:
+                    positions_count = 0
+                    if self.use_state_machine_v2 and self.execution_gateway:
+                        positions_count = len(self.execution_gateway.position_state_machine.get_all_positions())
+                    elif self.position_manager_v2:
+                        positions_count = len(self.position_manager_v2.get_all_positions())
+                    
+                    kill_active = self.kill_switch.is_active() if self.kill_switch else False
+                    system_state = "NORMAL"
+                    if kill_active:
+                        system_state = "KILL_SWITCH"
+                    elif self.hardening and self.hardening._current_state.value != "normal":
+                        system_state = self.hardening._current_state.value.upper()
+                    
+                    logger.info(
+                        "CYCLE_SUMMARY",
+                        cycle=loop_count,
+                        duration_ms=int(cycle_elapsed * 1000),
+                        positions=positions_count,
+                        universe=len(self._market_symbols()),
+                        system_state=system_state,
+                        cooldowns_active=len(self._signal_cooldown),
+                    )
+                except Exception:
+                    pass  # Summary failure must never crash
+
                 # Dynamic sleep to align with 1m intervals
-                elapsed = (now - loop_start).total_seconds()
+                elapsed = cycle_elapsed
                 sleep_time = max(5.0, 60.0 - elapsed)
                 await asyncio.sleep(sleep_time)
             
@@ -1682,22 +1726,35 @@ class LiveTrading:
                     # Signal is spot-based, execution is futures-based.
                     order_outcome = None
                     if signal.signal_type != SignalType.NO_SIGNAL:
-                        # Collect signal for auction mode (if enabled)
-                        if self.auction_allocator and is_tradable:
-                            self.auction_signals_this_tick.append((signal, spot_price, mark_price))
-                        
-                        if not is_tradable:
-                            logger.warning(
-                                "Signal skipped (not tradable)",
-                                symbol=spot_symbol,
-                                signal=signal.signal_type.value,
-                                futures_symbol=futures_symbol,
-                                skip_reason=skip_reason,
-                            )
+                        # Signal cooldown: prevent the same symbol from re-signalling
+                        # every cycle (which caused the SPX compounding bug).
+                        # Once a signal fires for a symbol, suppress re-signals for 4 hours.
+                        cooldown_until = self._signal_cooldown.get(spot_symbol)
+                        now_cd = datetime.now(timezone.utc)
+                        if cooldown_until and now_cd < cooldown_until:
+                            pass  # Signal suppressed by cooldown — skip silently
                         else:
-                            # In auction mode, skip individual signal handling - auction will decide
-                            if not self.auction_allocator:
-                                order_outcome = await self._handle_signal(signal, spot_price, mark_price)
+                            # Record cooldown for this symbol
+                            self._signal_cooldown[spot_symbol] = now_cd + timedelta(
+                                hours=self._signal_cooldown_hours
+                            )
+                        
+                            # Collect signal for auction mode (if enabled)
+                            if self.auction_allocator and is_tradable:
+                                self.auction_signals_this_tick.append((signal, spot_price, mark_price))
+                        
+                            if not is_tradable:
+                                logger.warning(
+                                    "Signal skipped (not tradable)",
+                                    symbol=spot_symbol,
+                                    signal=signal.signal_type.value,
+                                    futures_symbol=futures_symbol,
+                                    skip_reason=skip_reason,
+                                )
+                            else:
+                                # In auction mode, skip individual signal handling - auction will decide
+                                if not self.auction_allocator:
+                                    order_outcome = await self._handle_signal(signal, spot_price, mark_price)
                     
                     # V4: Dynamic Exits (Abandon Ship & Time-Based)
                     # We check this AFTER signal generation because we need the fresh Bias
@@ -1844,6 +1901,112 @@ class LiveTrading:
             self.hardening.post_tick_cleanup()
 
     # _background_hydration_task removed (Replaced by CandleManager.initialize)
+
+    # ===== AUTO HALT RECOVERY =====
+    _AUTO_RECOVERY_MAX_PER_DAY = 2
+    _AUTO_RECOVERY_COOLDOWN_SECONDS = 300  # 5 minutes since halt
+    _AUTO_RECOVERY_MARGIN_SAFE_PCT = 85  # Must be below this to recover
+
+    async def _try_auto_recovery(self) -> bool:
+        """
+        Attempt automatic recovery from kill switch (margin_critical only).
+        
+        Rules (ALL must be true):
+        1. Kill switch reason is MARGIN_CRITICAL
+        2. At least 5 minutes since the halt was activated
+        3. Current margin utilization is below 85% (well below 92% trigger)
+        4. Fewer than 2 auto-recoveries in the last 24 hours
+        
+        Returns:
+            True if recovery was successful, False otherwise
+        """
+        if not self.kill_switch or not self.kill_switch.is_active():
+            return False
+        
+        if self.kill_switch.reason != KillSwitchReason.MARGIN_CRITICAL:
+            return False
+        
+        now = datetime.now(timezone.utc)
+        
+        # Rule 2: Cooldown since halt activation
+        if self.kill_switch.activated_at:
+            elapsed = (now - self.kill_switch.activated_at).total_seconds()
+            if elapsed < self._AUTO_RECOVERY_COOLDOWN_SECONDS:
+                logger.debug(
+                    "Auto-recovery: waiting for cooldown",
+                    elapsed_seconds=int(elapsed),
+                    required_seconds=self._AUTO_RECOVERY_COOLDOWN_SECONDS,
+                )
+                return False
+        
+        # Rule 4: Max recoveries per day
+        cutoff = now - timedelta(hours=24)
+        recent_attempts = [t for t in self._auto_recovery_attempts if t > cutoff]
+        self._auto_recovery_attempts = recent_attempts  # Prune old entries
+        if len(recent_attempts) >= self._AUTO_RECOVERY_MAX_PER_DAY:
+            logger.warning(
+                "Auto-recovery: daily limit reached (system needs manual intervention)",
+                attempts_today=len(recent_attempts),
+                max_per_day=self._AUTO_RECOVERY_MAX_PER_DAY,
+            )
+            return False
+        
+        # Rule 3: Check current margin utilization
+        try:
+            account_info = await self.client.get_all_futures_account_data()
+            equity = Decimal(str(account_info.get("equity", 0)))
+            margin_used = Decimal(str(account_info.get("marginUsed", 0)))
+            
+            if equity <= 0:
+                return False
+            
+            margin_util_pct = float((margin_used / equity) * 100)
+            
+            if margin_util_pct >= self._AUTO_RECOVERY_MARGIN_SAFE_PCT:
+                logger.info(
+                    "Auto-recovery: margin still too high",
+                    margin_util_pct=f"{margin_util_pct:.1f}",
+                    required_below=self._AUTO_RECOVERY_MARGIN_SAFE_PCT,
+                )
+                return False
+            
+            # All conditions met — recover!
+            self._auto_recovery_attempts.append(now)
+            
+            logger.critical(
+                "AUTO_RECOVERY: Clearing kill switch (margin recovered)",
+                margin_util_pct=f"{margin_util_pct:.1f}",
+                recovery_attempt=len(self._auto_recovery_attempts),
+                max_per_day=self._AUTO_RECOVERY_MAX_PER_DAY,
+                halt_duration_seconds=int((now - self.kill_switch.activated_at).total_seconds())
+                    if self.kill_switch.activated_at else 0,
+            )
+            
+            # Clear kill switch
+            self.kill_switch.acknowledge()
+            
+            # Also clear hardening halt state if it exists
+            if self.hardening and self.hardening.is_halted():
+                self.hardening.clear_halt(operator="auto_recovery")
+            
+            # Send alert
+            try:
+                from src.monitoring.alerting import send_alert_sync
+                send_alert_sync(
+                    "AUTO_RECOVERY",
+                    f"System auto-recovered from MARGIN_CRITICAL\n"
+                    f"Margin utilization: {margin_util_pct:.1f}%\n"
+                    f"Recovery #{len(self._auto_recovery_attempts)} of {self._AUTO_RECOVERY_MAX_PER_DAY}/day",
+                    urgent=True,
+                )
+            except Exception:
+                pass
+            
+            return True
+            
+        except Exception as e:
+            logger.warning("Auto-recovery: failed to check margin", error=str(e))
+            return False
 
     async def _sync_account_state(self):
         """Fetch and persist real-time account state."""
@@ -2374,6 +2537,20 @@ class LiveTrading:
         
         # Note: Stop placement happens in the gateway's order event handler
         # when the entry fill is confirmed
+        
+        # Send alert for new position
+        try:
+            from src.monitoring.alerting import send_alert_sync
+            send_alert_sync(
+                "NEW_POSITION",
+                f"New {signal.signal_type.value} position\n"
+                f"Symbol: {signal.symbol}\n"
+                f"Size: {position_size} @ ${mark_price}\n"
+                f"Stop: ${position.initial_stop_price}",
+            )
+        except Exception:
+            pass  # Alert failure must never block trading
+        
         return _ok()
 
     async def _update_candles(self, symbol: str):

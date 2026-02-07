@@ -319,6 +319,18 @@ class ProductionHardeningLayer:
                 reason=reason,
                 file=str(self._state_file),
             )
+            
+            # Send alert for halt state
+            try:
+                from src.monitoring.alerting import send_alert_sync
+                violations_str = "\n".join(f"• {v}" for v in violations[:5])
+                send_alert_sync(
+                    "SYSTEM_HALTED",
+                    f"System entered HALT state!\nReason: {reason}\nViolations:\n{violations_str}",
+                    urgent=True,
+                )
+            except Exception:
+                pass  # Alert failure must never block halt persistence
         except Exception as e:
             logger.error("Failed to persist halt state", error=str(e))
     

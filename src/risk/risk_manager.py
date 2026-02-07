@@ -325,6 +325,38 @@ class RiskManager:
                 f"after equity cap (equity=${account_equity:.2f}, max_pct={max_position_pct_equity:.0%})"
             )
 
+        # Hard Cap: Aggregate notional exposure vs equity (all positions combined)
+        # Prevents runaway total exposure from compounding bugs or too many positions.
+        # This is a belt-and-suspenders guard: even if individual positions are sized
+        # correctly, the total must not exceed 200% of equity.
+        max_aggregate_pct_equity = Decimal("2.0")  # 200% of equity max total notional
+        existing_notional = sum(
+            abs(Decimal(str(p.size)) * Decimal(str(p.mark_price or p.entry_price or 0)))
+            for p in self.current_positions
+            if p.size and p.size != 0
+        )
+        projected_total = existing_notional + position_notional
+        max_aggregate_notional = account_equity * max_aggregate_pct_equity
+        if projected_total > max_aggregate_notional:
+            allowed = max(max_aggregate_notional - existing_notional, Decimal("0"))
+            if allowed < min_notional_viable:
+                rejection_reasons.append(
+                    f"Aggregate notional ${projected_total:.2f} would exceed {max_aggregate_pct_equity:.0%} of equity "
+                    f"(${max_aggregate_notional:.2f}). Existing=${existing_notional:.2f}, "
+                    f"new=${position_notional:.2f}. Headroom=${allowed:.2f} below min ${min_notional_viable}."
+                )
+            else:
+                logger.info(
+                    "Capping position notional by aggregate exposure limit",
+                    symbol=signal.symbol,
+                    existing_notional=str(existing_notional),
+                    before=str(position_notional),
+                    after=str(allowed),
+                    equity=str(account_equity),
+                    max_pct=str(max_aggregate_pct_equity),
+                )
+                position_notional = allowed
+
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
         # Skip margin check if skip_margin_check=True (auction already validated)
         # Note: min_notional lowered to $10 to support smaller accounts with tier C (2x leverage)
