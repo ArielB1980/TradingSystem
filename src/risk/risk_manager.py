@@ -331,7 +331,7 @@ class RiskManager:
         # correctly, the total must not exceed 200% of equity.
         max_aggregate_pct_equity = Decimal("2.0")  # 200% of equity max total notional
         existing_notional = sum(
-            abs(Decimal(str(p.size)) * Decimal(str(p.mark_price or p.entry_price or 0)))
+            abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
             for p in self.current_positions
             if p.size and p.size != 0
         )
