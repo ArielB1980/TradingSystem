@@ -1318,7 +1318,7 @@ class ExecutionGateway:
             
             managed_pos.entry_acknowledged = True
             managed_pos.intent_confirmed = True
-            managed_pos.state = PositionState.PROTECTED if stop_id else PositionState.PENDING_PROTECTION
+            managed_pos.state = PositionState.PROTECTED if stop_id else PositionState.OPEN
             managed_pos.current_stop_price = stop_price
             managed_pos.stop_order_id = stop_id
             managed_pos.setup_type = "AUTO_IMPORT"
