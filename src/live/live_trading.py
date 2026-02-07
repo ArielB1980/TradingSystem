@@ -613,6 +613,15 @@ class LiveTrading:
                 except Exception as e:
                     logger.error("Failed to start order poller", error=str(e))
 
+            # 2.6c Daily P&L summary (runs once per day at midnight UTC)
+            try:
+                self._daily_summary_task = asyncio.create_task(
+                    self._run_daily_summary()
+                )
+                logger.info("Daily summary task started")
+            except Exception as e:
+                logger.error("Failed to start daily summary task", error=str(e))
+
             # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt or force_close)
             if (not self.use_state_machine_v2) and not (
                 self.config.system.dry_run and not self.client.has_valid_futures_credentials()
@@ -805,6 +814,12 @@ class LiveTrading:
                     await self._order_poll_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_daily_summary_task", None) and not self._daily_summary_task.done():
+                self._daily_summary_task.cancel()
+                try:
+                    await self._daily_summary_task
+                except asyncio.CancelledError:
+                    pass
             await self.data_acq.stop()
             await self.client.close()
             logger.info("Live trading shutdown complete")
@@ -895,6 +910,94 @@ class LiveTrading:
                 logger.warning("Protection check loop failed", error=str(e), error_type=type(e).__name__)
             
             await asyncio.sleep(interval_seconds)
+
+    async def _run_daily_summary(self) -> None:
+        """
+        Send a daily P&L summary via Telegram at midnight UTC.
+        
+        Calculates: equity, daily P&L, open positions, trades today, win rate.
+        Runs in a background loop, sleeping until the next midnight.
+        """
+        from src.monitoring.alerting import send_alert
+        
+        while self.active:
+            try:
+                # Calculate seconds until next midnight UTC
+                now = datetime.now(timezone.utc)
+                tomorrow = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=5, microsecond=0
+                )
+                sleep_seconds = (tomorrow - now).total_seconds()
+                await asyncio.sleep(sleep_seconds)
+                
+                if not self.active:
+                    break
+                
+                # Gather data
+                try:
+                    account_info = await self.client.get_all_futures_account_data()
+                    equity = Decimal(str(account_info.get("equity", 0)))
+                    margin_used = Decimal(str(account_info.get("marginUsed", 0)))
+                    margin_pct = float((margin_used / equity) * 100) if equity > 0 else 0
+                    
+                    # Get open positions
+                    positions = await self.client.get_all_futures_positions()
+                    open_positions = [p for p in positions if p.get("size", 0) != 0]
+                    
+                    # Get today's trades from DB
+                    today_trades = []
+                    try:
+                        from src.storage.repository import get_trades_since
+                        since = now - timedelta(hours=24)
+                        all_trades = await asyncio.to_thread(get_trades_since, since)
+                        today_trades = all_trades if all_trades else []
+                    except Exception:
+                        pass
+                    
+                    wins = sum(1 for t in today_trades if getattr(t, 'net_pnl', 0) > 0)
+                    losses = sum(1 for t in today_trades if getattr(t, 'net_pnl', 0) <= 0)
+                    total_pnl = sum(getattr(t, 'net_pnl', Decimal("0")) for t in today_trades)
+                    win_rate = f"{(wins / (wins + losses) * 100):.0f}%" if (wins + losses) > 0 else "N/A"
+                    
+                    pnl_sign = "+" if total_pnl >= 0 else ""
+                    pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+                    
+                    # Build position list
+                    pos_lines = []
+                    for p in open_positions[:10]:  # Max 10
+                        sym = p.get('symbol', '?')
+                        side = p.get('side', '?')
+                        upnl = Decimal(str(p.get('unrealizedPnl', p.get('unrealized_pnl', 0))))
+                        upnl_sign = "+" if upnl >= 0 else ""
+                        pos_lines.append(f"  • {sym} ({side}) {upnl_sign}${upnl:.2f}")
+                    
+                    positions_str = "\n".join(pos_lines) if pos_lines else "  None"
+                    
+                    summary = (
+                        f"{pnl_emoji} Daily Summary ({now.strftime('%Y-%m-%d')})\n"
+                        f"\n"
+                        f"Equity: ${equity:.2f}\n"
+                        f"Margin used: {margin_pct:.1f}%\n"
+                        f"\n"
+                        f"Trades today: {len(today_trades)}\n"
+                        f"Win/Loss: {wins}W / {losses}L ({win_rate})\n"
+                        f"Day P&L: {pnl_sign}${total_pnl:.2f}\n"
+                        f"\n"
+                        f"Open positions ({len(open_positions)}):\n"
+                        f"{positions_str}"
+                    )
+                    
+                    await send_alert("DAILY_SUMMARY", summary, urgent=True)
+                    logger.info("Daily summary sent", equity=str(equity), trades=len(today_trades))
+                    
+                except Exception as e:
+                    logger.warning("Failed to gather daily summary data", error=str(e))
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Daily summary loop error", error=str(e))
+                await asyncio.sleep(3600)  # Retry in 1 hour
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object."""
@@ -1512,8 +1615,9 @@ class LiveTrading:
             return
 
         # 4. Parallel Analysis Loop
-        # Semaphore to control concurrency (e.g. 20 coins at a time for candle fetching)
-        sem = asyncio.Semaphore(20)
+        # Semaphore to control concurrency for candle fetching.
+        # Most time is I/O-bound (waiting on Kraken API), so higher concurrency is safe.
+        sem = asyncio.Semaphore(50)
         
         async def process_coin(spot_symbol: str):
             async with sem:
@@ -3218,6 +3322,23 @@ class LiveTrading:
                 exit_reason=exit_reason,
                 holding_hours=f"{holding_hours:.2f}"
             )
+            
+            # Send close alert via Telegram
+            try:
+                from src.monitoring.alerting import send_alert
+                pnl_sign = "+" if net_pnl >= 0 else ""
+                pnl_emoji = "✅" if net_pnl >= 0 else "❌"
+                await send_alert(
+                    "POSITION_CLOSED",
+                    f"{pnl_emoji} Position closed: {position.symbol}\n"
+                    f"Side: {position.side.value.upper()}\n"
+                    f"Entry: ${position.entry_price} → Exit: ${exit_price}\n"
+                    f"P&L: {pnl_sign}${net_pnl:.2f}\n"
+                    f"Reason: {exit_reason}\n"
+                    f"Duration: {holding_hours:.1f}h",
+                )
+            except Exception:
+                pass  # Alert failure must never block trade history
             
         except Exception as e:
             logger.error("Failed to save trade history", symbol=position.symbol, error=str(e))
