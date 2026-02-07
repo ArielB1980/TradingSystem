@@ -60,10 +60,9 @@ class MarketRegistry:
         self.last_discovery_report: Dict[str, Any] = {}
         self._last_seen_futures_symbols: Set[str] = set()
 
-    # Permanent Tier-A universe (minimal - only coins with verified stable Kraken data feeds).
-    # V3: Reduced from {BTC, ETH, SOL, BNB} to avoid exchange-specific major pinning.
-    # Other coins must qualify dynamically via futures volume + spread.
-    _PINNED_TIER_A_BASES: Set[str] = {"BTC", "ETH"}
+    # Permanent Tier-A universe - major coins that always bypass liquidity filters.
+    # These get the same treatment: pinned Tier A, bypass volume/spread gates.
+    _PINNED_TIER_A_BASES: Set[str] = {"BTC", "ETH", "SOL", "DOGE", "BNB"}
     _SYMBOL_PREFIXES_TO_STRIP: Tuple[str, ...] = ("PF_", "PI_", "FI_")
     _SYMBOL_SUFFIXES_TO_STRIP: Tuple[str, ...] = ("-PERP", "USD")
     _BASE_ALIASES: Dict[str, str] = {"XBT": "BTC"}
