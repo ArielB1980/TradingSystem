@@ -3573,29 +3573,60 @@ class LiveTrading:
             }
         )
         
-        # Sanity guards
+        # Sanity guards: filter out TPs that are too close or already passed
+        # Instead of rejecting the entire plan, skip individual TPs that can't be placed
         min_distance = current_price * Decimal(str(self.config.execution.min_tp_distance_pct))
+        valid_tps = []
         
-        if db_pos.side == Side.LONG:
-            # For LONG: require tp1 > current_price * (1 + min_tp_distance_pct)
-            if tp1 <= current_price + min_distance:
-                logger.warning("TP1 too close to current price (LONG)", symbol=symbol, tp1=str(tp1), current=str(current_price))
-                return None
-        else:  # SHORT
-            # For SHORT: require tp1 < current_price * (1 - min_tp_distance_pct)
-            if tp1 >= current_price - min_distance:
-                logger.warning("TP1 too close to current price (SHORT)", symbol=symbol, tp1=str(tp1), current=str(current_price))
-                return None
+        for i, tp in enumerate(tp_plan):
+            tp_label = f"TP{i+1}"
+            if db_pos.side == Side.LONG:
+                # For LONG: TP must be above current price + min distance
+                if tp <= current_price + min_distance:
+                    logger.warning(
+                        f"{tp_label} too close or already passed (LONG) - skipping",
+                        symbol=symbol, tp=str(tp), current=str(current_price),
+                        min_distance=str(min_distance),
+                    )
+                    continue
+            else:  # SHORT
+                # For SHORT: TP must be below current price - min distance
+                if tp >= current_price - min_distance:
+                    logger.warning(
+                        f"{tp_label} too close or already passed (SHORT) - skipping",
+                        symbol=symbol, tp=str(tp), current=str(current_price),
+                        min_distance=str(min_distance),
+                    )
+                    continue
+            valid_tps.append(tp)
+        
+        if not valid_tps:
+            logger.warning(
+                "All TP levels too close or already passed - no TPs to place",
+                symbol=symbol, side=db_pos.side.value,
+                current_price=str(current_price),
+                original_tps=[str(tp) for tp in tp_plan],
+            )
+            return None
         
         # Optional: clamp extreme TPs
         if self.config.execution.max_tp_distance_pct:
             max_distance = current_price * Decimal(str(self.config.execution.max_tp_distance_pct))
             if db_pos.side == Side.LONG:
-                tp_plan = [min(tp, current_price + max_distance) for tp in tp_plan]
+                valid_tps = [min(tp, current_price + max_distance) for tp in valid_tps]
             else:
-                tp_plan = [max(tp, current_price - max_distance) for tp in tp_plan]
+                valid_tps = [max(tp, current_price - max_distance) for tp in valid_tps]
         
-        return tp_plan
+        if len(valid_tps) < len(tp_plan):
+            logger.info(
+                "TP plan filtered - some levels already passed",
+                symbol=symbol,
+                original_count=len(tp_plan),
+                valid_count=len(valid_tps),
+                valid_tps=[str(tp) for tp in valid_tps],
+            )
+        
+        return valid_tps
 
     async def _cleanup_orphan_reduce_only_orders(self, raw_positions: List[Dict]):
         """
