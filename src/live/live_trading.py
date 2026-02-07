@@ -737,6 +737,7 @@ class LiveTrading:
                             logger.warning("Reconciliation failed", error=str(ex))
 
                 # ===== CYCLE SUMMARY (single log line per tick with key metrics) =====
+                now = datetime.now(timezone.utc)
                 cycle_elapsed = (now - loop_start).total_seconds()
                 try:
                     positions_count = 0
@@ -749,8 +750,10 @@ class LiveTrading:
                     system_state = "NORMAL"
                     if kill_active:
                         system_state = "KILL_SWITCH"
-                    elif self.hardening and self.hardening._current_state.value != "normal":
-                        system_state = self.hardening._current_state.value.upper()
+                    elif self.hardening and hasattr(self.hardening, 'invariant_monitor'):
+                        inv_state = self.hardening.invariant_monitor.state.value
+                        if inv_state != "active":
+                            system_state = inv_state.upper()
                     
                     logger.info(
                         "CYCLE_SUMMARY",
