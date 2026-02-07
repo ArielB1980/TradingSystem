@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 from src.monitoring.logger import get_logger
+from src.monitoring.alerting import send_alert_sync
 
 logger = get_logger(__name__)
 
@@ -116,12 +117,65 @@ class KillSwitch:
                 emergency=emergency,
                 timestamp=self.activated_at.isoformat(),
             )
+            
+            # Send alert notification
+            send_alert_sync(
+                "KILL_SWITCH",
+                f"Kill switch activated!\nReason: {reason.value}\nEmergency: {emergency}",
+                urgent=True,
+            )
 
             if self.client:
                 try:
-                    # 1. Cancel all open orders
-                    await self.client.cancel_all_orders()
-                    logger.info("Kill switch: All orders cancelled")
+                    # 1. Cancel non-SL orders (PRESERVE stop losses to protect positions)
+                    # Cancelling SL orders leaves positions naked and has caused
+                    # repeated losses. SL orders can only limit losses, never cause them.
+                    open_orders = await self.client.get_futures_open_orders()
+                    cancelled = 0
+                    preserved_sls = 0
+                    for order in open_orders:
+                        order_type = (order.get("type") or "").lower()
+                        # Also check the raw info for Kraken-specific order types
+                        info_type = ((order.get("info") or {}).get("orderType") or "").lower()
+                        is_reduce_only = order.get("reduceOnly", order.get("reduce_only", False))
+                        
+                        # A stop-loss is: type contains "stop" (but NOT "take_profit"),
+                        # and is reduce-only (protective, not an entry stop)
+                        is_stop_loss = (
+                            ("stop" in order_type or "stop" in info_type)
+                            and "take_profit" not in order_type
+                            and "take-profit" not in order_type
+                            and "take_profit" not in info_type
+                            and "take-profit" not in info_type
+                            and is_reduce_only
+                        )
+                        
+                        if is_stop_loss:
+                            preserved_sls += 1
+                            logger.info(
+                                "Kill switch: PRESERVING stop loss order",
+                                order_id=order.get("id"),
+                                symbol=order.get("symbol"),
+                                order_type=order_type,
+                            )
+                            continue
+                        
+                        try:
+                            await self.client.cancel_futures_order(order["id"], order.get("symbol"))
+                            cancelled += 1
+                            logger.info("Futures order cancelled", order_id=order["id"])
+                        except Exception as e:
+                            logger.warning(
+                                "Kill switch: Failed to cancel order",
+                                order_id=order.get("id"),
+                                error=str(e),
+                            )
+                    
+                    logger.info(
+                        "Kill switch: Order cleanup complete",
+                        cancelled=cancelled,
+                        preserved_stop_losses=preserved_sls,
+                    )
                     
                     # 2. If emergency: flatten all positions
                     if emergency:
