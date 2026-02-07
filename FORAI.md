@@ -1,7 +1,7 @@
 # Session Knowledge: Lessons Learned & System Memory
 
-**Last Updated:** 2026-02-07
-**Covers Sessions:** 2026-02-06 through 2026-02-07
+**Last Updated:** 2026-02-08
+**Covers Sessions:** 2026-02-06 through 2026-02-08
 
 This file captures everything learned about this trading system across debugging, deployment, and operational sessions. It serves as institutional memory for any future AI agent or developer working on this codebase.
 
@@ -47,8 +47,11 @@ grep -iE '(error|exception|traceback|HALT|kill_switch)' /home/trading/TradingSys
 # Check active positions
 grep 'Active Portfolio' /home/trading/TradingSystem/logs/run.log | tail -5
 
-# Check cycle summaries
-grep 'CYCLE_END' /home/trading/TradingSystem/logs/run.log | tail -5
+# Check cycle summaries (new format)
+journalctl -u trading-bot.service --no-pager | grep CYCLE_SUMMARY | tail -5
+
+# Check for recent alerts sent
+journalctl -u trading-bot.service --no-pager | grep 'Alert\|send_alert' | tail -10
 ```
 
 ---
@@ -75,6 +78,8 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 | `src/safety/invariant_monitor.py` | System safety invariants, halt/degraded triggers |
 | `src/config/safety.yaml` | Safety thresholds configuration |
 | `src/config/config.yaml` | Main system configuration |
+| `src/monitoring/alerting.py` | Telegram/Discord webhook alerting module |
+| `src/utils/kill_switch.py` | Kill switch with SL-preserving order cancellation |
 
 ### MarketRegistry: Single Source of Truth
 - `MarketRegistry` is THE authority for what can be traded and at what tier.
@@ -153,6 +158,102 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 
 **Lesson:** Never reference enum values without verifying they exist. This is a compile-time check in typed languages but a runtime crash in Python.
 
+### Bug 9: Aggregate Notional Cap Using Wrong Attribute Name
+**Symptom:** `'Position' object has no attribute 'mark_price'` in auction candidate creation (logged as "Failed to create candidate signal for auction").
+**Root Cause:** The aggregate notional cap code (added in the same session) referenced `p.mark_price` but the Position dataclass field is `current_mark_price`.
+**Fix:** Changed `p.mark_price` to `p.current_mark_price` in `src/risk/risk_manager.py`.
+
+**Lesson:** Always verify attribute names against the dataclass/model definition. Python won't catch typos until runtime. The `Position` class uses `current_mark_price`, not `mark_price`.
+
+### Bug 10: CYCLE_SUMMARY Silent Failures (Three Successive Errors)
+**Symptom:** CYCLE_SUMMARY never appeared in logs after deployment.
+**Root Cause (3 cascading issues):**
+1. `self.hardening._current_state` doesn't exist — the state is on `self.hardening.invariant_monitor.state`
+2. `self.execution_gateway.position_state_machine` doesn't exist — the attribute is `self.execution_gateway.registry`
+3. `PositionRegistry` doesn't have `get_all_positions()` — the method is `get_all_active()`
+
+All three were silently swallowed by `except Exception: pass`. Changed to `except Exception as e: logger.warning(...)` to make future failures visible.
+
+**Fix:** Corrected all three attribute/method names. Changed silent exception swallowing to logged warnings.
+
+**Lesson:** 
+- Never use bare `except: pass` — always log the error. Silent failures are the hardest bugs to find.
+- When referencing attributes across module boundaries (e.g., `gateway.registry.get_all_active()`), verify each link in the chain against the actual class definition.
+- The `PositionRegistry` uses `get_all_active()` (active positions only) and `get_all()` (all including terminal).
+
+---
+
+## 3b. Safety & Observability Features Added (2026-02-08 Session)
+
+### Feature 1: Kill Switch Preserves SL Orders
+**File:** `src/utils/kill_switch.py`
+**Change:** The `activate()` method no longer calls `cancel_all_orders()`. Instead, it fetches all open orders, inspects each one, and only cancels non-SL orders. Stop-loss orders (identified by type containing "stop" + `reduceOnly=True`) are preserved.
+**Why:** Cancelling SL orders was the #1 cause of losses after kill switch events — positions were left naked and could not recover.
+**Log patterns:** `Kill switch: PRESERVING stop loss order` (good), `Kill switch: Order cleanup complete, preserved_stop_losses=N` (good).
+
+### Feature 2: Signal Cooldown (4h per symbol)
+**File:** `src/live/live_trading.py`
+**Change:** `self._signal_cooldown: Dict[str, datetime]` tracks when each symbol last signalled. After a signal fires, the same symbol is suppressed for 4 hours (`self._signal_cooldown_hours = 4`).
+**Why:** The SPX compounding bug (Bug 6) was caused partly by the same signal firing every 2 minutes. Even with the state machine fix, this is belt-and-suspenders.
+**CYCLE_SUMMARY shows:** `cooldowns_active=N` — number of symbols currently in cooldown.
+
+### Feature 3: Aggregate Notional Cap (200% of equity)
+**File:** `src/risk/risk_manager.py`
+**Change:** Before the per-trade margin check, the total existing notional across all positions is computed. If adding the new position would exceed 200% of equity, the position is either capped to the remaining headroom or rejected entirely.
+**Why:** Even with individual position caps (25% each), you could still end up with 8 positions * 25% = 200% total exposure. The aggregate cap provides a hard ceiling.
+**Important:** Uses `p.current_mark_price` (NOT `p.mark_price` — see Bug 9).
+
+### Feature 4: Telegram/Discord Alerting
+**File:** `src/monitoring/alerting.py` (new)
+**Config:** `ALERT_WEBHOOK_URL` and `ALERT_CHAT_ID` environment variables.
+**Events alerting on:**
+- `KILL_SWITCH` — kill switch activated (urgent)
+- `SYSTEM_HALTED` — invariant monitor halted the system (urgent)
+- `NEW_POSITION` — new position opened
+- `POSITION_CLOSED` — position closed with P&L, exit reason, duration
+- `AUTO_RECOVERY` — system auto-recovered from margin halt (urgent)
+- `DAILY_SUMMARY` — sent at midnight UTC with equity, P&L, trades, positions
+**Rate limiting:** 1 alert per event type per 5 minutes (bypass with `urgent=True`).
+**Telegram bot:** `@My_KBot_bot`, token in server `.env` file.
+**Chat ID:** `14159355` (user's Telegram numeric ID).
+
+### Feature 5: Cycle Summary Log Line
+**File:** `src/live/live_trading.py`
+**Change:** After each tick (post-reconciliation, pre-sleep), emits a single `CYCLE_SUMMARY` log line with:
+- `cycle`: loop iteration count
+- `duration_ms`: tick duration in milliseconds
+- `positions`: number of active positions (via `registry.get_all_active()`)
+- `universe`: number of coins in the market universe
+- `system_state`: NORMAL / DEGRADED / KILL_SWITCH
+- `cooldowns_active`: number of signal cooldowns active
+**Log pattern:** `CYCLE_SUMMARY cycle=5 duration_ms=32000 positions=1 system_state=NORMAL universe=49`
+
+### Feature 6: Auto Halt Recovery
+**File:** `src/live/live_trading.py` (method `_try_auto_recovery`)
+**Rules (ALL must be true):**
+1. Kill switch reason is `MARGIN_CRITICAL` (the most common false-positive)
+2. At least 5 minutes since the halt was activated
+3. Current margin utilization is below 85% (well below the 92% trigger)
+4. Fewer than 2 auto-recoveries in the last 24 hours
+**Why:** Before this, `margin_critical` halts required SSH access to manually delete state files. With SL orders now preserved during halts, margin naturally recovers as positions hit SL or price moves. The system can safely resume without human intervention.
+**Safety:** The 2/day limit means if it keeps halting, something is genuinely wrong and human intervention is needed.
+
+### Feature 7: Concurrency Increase (Semaphore 20 → 50)
+**File:** `src/live/live_trading.py`
+**Change:** `asyncio.Semaphore(20)` → `asyncio.Semaphore(50)` for the parallel coin analysis loop.
+**Why:** Most time in the tick is I/O-bound (waiting on Kraken API responses for candle data). Higher concurrency means more coins fetched in parallel, reducing cycle time from ~66s toward ~20-30s.
+**Risk:** Minimal — Kraken's rate limits are per-API-key, not per-connection. 50 concurrent I/O tasks is well within normal async Python capacity.
+
+### Feature 8: Daily P&L Summary (Telegram, Midnight UTC)
+**File:** `src/live/live_trading.py` (method `_run_daily_summary`)
+**Change:** Background task that sleeps until midnight UTC, then sends a Telegram summary with: equity, margin used %, trades in last 24h, win/loss count, win rate, daily P&L, and list of open positions with unrealized P&L.
+**Why:** Gives the user a daily health check without needing to SSH into the server.
+
+### Feature 9: Position Close Alerts
+**File:** `src/live/live_trading.py` (in `_save_trade_history`)
+**Change:** After saving a closed trade to the database, sends a Telegram alert with: symbol, side, entry/exit prices, net P&L, exit reason, and holding duration.
+**Why:** Full trade lifecycle visibility on phone — know immediately when a position closes and whether it was profitable.
+
 ---
 
 ## 4. Safety System Architecture
@@ -181,11 +282,15 @@ If `max_margin_utilization_pct` is ever set BELOW `auction_max_margin_util`, the
 NORMAL -> DEGRADED -> HALTED
   |                      |
   +--- kill switch ------+
+                         |
+  +--- auto-recovery ----+ (margin_critical only, max 2/day)
 ```
 - **DEGRADED:** No new entries, existing positions managed normally
-- **HALTED:** Kill switch activates, all open orders cancelled, no trading
-- **Persisted halt state:** `/home/trading/.trading_system/halt_state.json` — must be manually deleted to recover
-- **Kill switch state:** `/home/trading/TradingSystem/data/kill_switch_state.json` — must be manually deleted to recover
+- **HALTED:** Kill switch activates, non-SL orders cancelled, no trading
+- **Kill switch now PRESERVES stop-loss orders** (only cancels entries and TPs)
+- **Persisted halt state:** `/home/trading/.trading_system/halt_state.json`
+- **Kill switch state:** `/home/trading/TradingSystem/data/kill_switch_state.json`
+- **Auto-recovery:** For `margin_critical` halts only — clears automatically when margin drops below 85%, after 5min cooldown, max 2x/day. All other halt reasons still require manual intervention.
 
 ---
 
@@ -216,14 +321,15 @@ Options to discuss (in order of impact):
 
 ---
 
-## 6. Account State (as of 2026-02-07 evening)
+## 6. Account State (as of 2026-02-08)
 
-- **Equity:** ~$345 (reduced slightly by SPX bug losses and fees)
-- **Open Positions:** 0 (APT was emergency-closed by kill switch, SPX was manually closed)
-- **System State:** NORMAL (no degraded, no halt)
-- **Coins Scanned:** 56 per cycle
-- **Cycle Interval:** ~60-130 seconds
-- **Note:** SPX accumulated 5257 units ($1,556 notional) from the compounding bug and was manually closed at ~$0.296. APT was emergency-closed by the kill switch at the same time.
+- **Equity:** ~$345
+- **Open Positions:** 1 (as of last CYCLE_SUMMARY)
+- **System State:** NORMAL
+- **Coins Scanned:** ~49 per cycle (universe dynamically filtered)
+- **Cycle Interval:** ~30-60 seconds (improved from ~66s via semaphore increase)
+- **Telegram Bot:** `@My_KBot_bot` connected, alerting on kill switch, halt, new positions, closes, daily summary
+- **Safety additions:** Kill switch preserves SLs, signal cooldown (4h), aggregate notional cap (200%), auto halt recovery (margin_critical only, 2x/day max)
 
 ---
 
@@ -246,8 +352,9 @@ The auction won't open trades beyond `auction_max_margin_util` (90%). But the ri
 2. `ExecutionGateway` executes these actions
 3. TP orders are stored as `tp1_order_id`, `tp2_order_id` on the position record
 4. TP backfill runs periodically to catch any missed TPs
-5. If the kill switch fires, ALL orders (including SL/TP) are cancelled — this is the most dangerous scenario for open positions
+5. If the kill switch fires, SL orders are **PRESERVED** (only entries and TPs cancelled). This is a critical safety improvement from the 2026-02-08 session.
 6. After restart: `_place_missing_stops_for_unprotected` auto-places new stops, but needs ~60-90s to run through a full tick cycle. The protection monitor has a 90s grace period to allow this.
+7. For `margin_critical` halts: auto-recovery clears the halt when margin drops below 85% (max 2x/day, 5min cooldown). Positions stay protected by their SL orders throughout.
 
 ### After a Kill Switch Recovery
 When recovering from a kill switch:
@@ -274,6 +381,14 @@ When recovering from a kill switch:
 | `Execution failed` | Actual error — investigate immediately |
 | `flatten_orphan` | Was dangerous (Bug 3), now deferred safely |
 | `Tier A coin bypassing filters` | Normal — pinned majors skipping liquidity checks |
+| `CYCLE_SUMMARY` | Per-tick health line — positions, state, duration, cooldowns |
+| `CYCLE_SUMMARY_FAILED` | Summary computation error — check the logged error message |
+| `Kill switch: PRESERVING stop loss order` | Good — SL kept alive during kill switch |
+| `Kill switch: Order cleanup complete` | Shows cancelled vs preserved SL counts |
+| `AUTO_RECOVERY: Clearing kill switch` | Auto-recovery succeeded (margin dropped below 85%) |
+| `Auto-recovery: daily limit reached` | System needs manual intervention now |
+| `Capping position notional by aggregate exposure limit` | Aggregate 200% cap engaged |
+| `Alert (no webhook configured)` | ALERT_WEBHOOK_URL env var not set on server |
 
 ---
 
@@ -308,3 +423,9 @@ When recovering from a kill switch:
 4. **"coins_processed=0" in CYCLE_END** — This can happen when the cycle only does portfolio management (sync, reconciliation) without processing new signals. It's normal during quiet periods.
 
 5. **Auction selecting "winners_selected=1"** with only 1 contender — When there's only one open position and no new signals, the auction just reaffirms the existing position. Not an error.
+
+6. **`cooldowns_active=5` in CYCLE_SUMMARY** — This means 5 symbols fired signals in the last 4 hours and are in cooldown. It does NOT mean the system is blocked from trading — only those specific symbols are temporarily suppressed.
+
+7. **No Telegram alerts for a while** — Rate limiting suppresses duplicate event types for 5 minutes. If the system is in a stable state, you won't get alerts (that's good). The daily summary at midnight UTC is always sent regardless.
+
+8. **`Kill switch: PRESERVING stop loss order`** during a kill switch event — This is intentional and correct. SL orders are protective and should never be cancelled by the kill switch.
