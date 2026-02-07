@@ -742,7 +742,7 @@ class LiveTrading:
                 try:
                     positions_count = 0
                     if self.use_state_machine_v2 and self.execution_gateway:
-                        positions_count = len(self.execution_gateway.registry.get_all_positions())
+                        positions_count = len(self.execution_gateway.registry.get_all_active())
                     elif self.position_manager_v2:
                         positions_count = len(self.position_manager_v2.get_all_positions())
                     
