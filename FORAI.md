@@ -128,6 +128,31 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 
 **Lesson:** Don't let one bad element invalidate an entire batch. Filter individually when items are independent.
 
+### Bug 6: PENDING Position Race Condition (Compounding Entries)
+**Symptom:** SPX/USD accumulated 5257 units (434% of equity) from a single ~$52 intended trade. Kill switch fired, cancelling ALL orders including other positions' SL/TP.
+**Root Cause:** Race condition between market order fills and `sync_with_exchange`. When a market order fills instantly, the position is still PENDING (remaining_qty=0) in the registry. `reconcile_with_exchange` sees `registry qty=0, exchange qty=174` and classifies it as `STALE_ZERO_QTY`, archiving the position. The registry loses track. Next cycle, a new signal fires, `can_open_position` says "no existing position" -> approved -> another entry. This repeats every 2 minutes, compounding exposure until the invariant monitor halts.
+**Fix (two layers):**
+- Layer 1: PENDING positions with zero remaining_qty are no longer archived as STALE_ZERO_QTY. Instead, the exchange quantity is adopted via a synthetic fill, transitioning the position to OPEN.
+- Layer 2: Defense-in-depth `_known_exchange_symbols` set in `can_open_position()`. Even if the registry loses a position, the guard checks exchange positions (updated each reconciliation) and blocks new entries for symbols with live exposure.
+
+**Lesson:** Reconciliation logic must be state-aware. A position in PENDING state with zero qty is expected (awaiting fill), not stale. Never make destructive decisions about in-flight positions.
+
+### Bug 7: SL Cancel NotFound Aborting New SL Placement
+**Symptom:** After a kill switch recovery, positions had no stop loss on the exchange. The protection monitor (Invariant K) detected "naked positions" and fired another emergency kill switch, closing all positions.
+**Root Cause:** In `executor.py:update_protective_orders()`, the old SL cancel and new SL placement were in the same try block. When the old SL cancel threw `notFound` (because the kill switch had already cancelled it), the entire block aborted. The new SL was never placed, leaving the position naked.
+**Fix (two layers):**
+- Layer 1: Separated SL cancel and SL place into independent try blocks. If the cancel fails (e.g., old order already gone), it's logged as a warning and the new SL placement proceeds anyway.
+- Layer 2: Protection monitor now has a 90-second startup grace period and requires 2 consecutive naked detections before triggering emergency kill switch. This gives the tick loop time to place missing stops after restart.
+
+**Lesson:** Never put "cancel old" and "place new" in the same try block. A cancel failure for a stale order is informational, not fatal. The placement must always proceed.
+
+### Bug 8: PositionState.PENDING_PROTECTION Doesn't Exist
+**Symptom:** Phantom position import crashed on startup with `AttributeError: type object 'PositionState' has no attribute 'PENDING_PROTECTION'`.
+**Root Cause:** The phantom import code referenced a state enum value that was never added.
+**Fix:** Changed to `PositionState.OPEN` (position exists but may not have stop confirmed yet — the protection monitor handles this).
+
+**Lesson:** Never reference enum values without verifying they exist. This is a compile-time check in typed languages but a runtime crash in Python.
+
 ---
 
 ## 4. Safety System Architecture
@@ -191,14 +216,14 @@ Options to discuss (in order of impact):
 
 ---
 
-## 6. Account State (as of 2026-02-07)
+## 6. Account State (as of 2026-02-07 evening)
 
-- **Equity:** ~$345
-- **Available Margin:** ~$296
-- **Open Positions:** 1 (PF_APTUSD / APT)
+- **Equity:** ~$345 (reduced slightly by SPX bug losses and fees)
+- **Open Positions:** 0 (APT was emergency-closed by kill switch, SPX was manually closed)
 - **System State:** NORMAL (no degraded, no halt)
 - **Coins Scanned:** 56 per cycle
 - **Cycle Interval:** ~60-130 seconds
+- **Note:** SPX accumulated 5257 units ($1,556 notional) from the compounding bug and was manually closed at ~$0.296. APT was emergency-closed by the kill switch at the same time.
 
 ---
 
@@ -222,6 +247,15 @@ The auction won't open trades beyond `auction_max_margin_util` (90%). But the ri
 3. TP orders are stored as `tp1_order_id`, `tp2_order_id` on the position record
 4. TP backfill runs periodically to catch any missed TPs
 5. If the kill switch fires, ALL orders (including SL/TP) are cancelled — this is the most dangerous scenario for open positions
+6. After restart: `_place_missing_stops_for_unprotected` auto-places new stops, but needs ~60-90s to run through a full tick cycle. The protection monitor has a 90s grace period to allow this.
+
+### After a Kill Switch Recovery
+When recovering from a kill switch:
+1. All SL/TP order IDs in the registry are now stale (the kill switch cancelled them)
+2. On restart, the SL update will try to cancel old IDs -> `notFound` -> this is normal and handled gracefully
+3. New SL/TP orders are placed automatically by the tick cycle and TP backfill
+4. The protection monitor waits 90s before enforcing, giving time for new stops to be placed
+5. If recovery fails, manually run `make place-missing-stops-live` to protect all positions
 
 ### Log Patterns to Watch For
 | Pattern | Meaning |
@@ -230,6 +264,11 @@ The auction won't open trades beyond `auction_max_margin_util` (90%). But the ri
 | `DEGRADED` | System in warning state, no new entries |
 | `PHANTOM` | Exchange has a position the bot doesn't know about |
 | `ORPHAN` | Bot thinks it has a position that doesn't exist on exchange |
+| `PENDING_ADOPTED` | Race condition fixed: PENDING position adopted exchange qty (Bug 6 fix) |
+| `Exchange has live exposure...Blocking` | Defense guard prevented duplicate entry (Bug 6 fix) |
+| `Old SL cancel failed (proceeding to place new SL)` | Normal after kill switch recovery (Bug 7 fix) |
+| `NAKED_POSITIONS_DETECTED (first occurrence)` | Warning, monitor giving time to self-heal |
+| `NAKED_POSITIONS_DETECTED (persistent)` | CRITICAL — will trigger emergency kill switch |
 | `4H_STRUCTURE_REQUIRED` | Normal — strategy filtering, not an error |
 | `entry not in OTE/Key Fib` | Normal — strategy filtering, not an error |
 | `Execution failed` | Actual error — investigate immediately |
