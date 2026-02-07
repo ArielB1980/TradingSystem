@@ -299,6 +299,32 @@ class RiskManager:
             if position_notional > buying_power:
                  position_notional = buying_power
 
+        # Hard Cap: Max single position as % of equity (pre-trade enforcement)
+        # This prevents opening positions larger than 25% of equity (notional basis).
+        # The invariant monitor checks this post-trade (pos_notional / equity),
+        # so we enforce the same formula here pre-trade.
+        # IMPORTANT: This applies to ALL paths including auction overrides.
+        max_position_pct_equity = Decimal("0.25")  # 25% of equity max per position (notional)
+        max_notional_from_equity = account_equity * max_position_pct_equity
+        if position_notional > max_notional_from_equity:
+            logger.info(
+                "Capping position notional by max_single_position_pct_equity",
+                symbol=signal.symbol,
+                before=str(position_notional),
+                after=str(max_notional_from_equity),
+                equity=str(account_equity),
+                max_pct=str(max_position_pct_equity),
+            )
+            position_notional = max_notional_from_equity
+        
+        # Reject if capped notional is below minimum viable size
+        min_notional_viable = Decimal("10")
+        if position_notional < min_notional_viable:
+            rejection_reasons.append(
+                f"Position notional ${position_notional:.2f} below minimum ${min_notional_viable} "
+                f"after equity cap (equity=${account_equity:.2f}, max_pct={max_position_pct_equity:.0%})"
+            )
+
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
         # Skip margin check if skip_margin_check=True (auction already validated)
         # Note: min_notional lowered to $10 to support smaller accounts with tier C (2x leverage)

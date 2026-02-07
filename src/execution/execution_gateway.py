@@ -165,7 +165,7 @@ class ExecutionGateway:
             position_id=action.position_id or "",
             action_type=action_type,
             symbol=action.symbol,
-            side=action.side.value,
+            side=action.side.value if action.side else "unknown",
             size=str(size if size is not None else action.size),
             price=str(price) if price is not None else (str(action.price) if action.price else None),
             created_at=datetime.now(timezone.utc),
