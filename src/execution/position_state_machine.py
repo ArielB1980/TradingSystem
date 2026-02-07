@@ -931,6 +931,10 @@ class PositionRegistry:
         self._lock = threading.RLock()
         self._pending_reversals: Dict[str, Side] = {}  # symbol -> pending new side
         self._closed_positions: List[ManagedPosition] = []  # History
+        # Exchange-side positions snapshot (updated by reconcile_with_exchange).
+        # Used as defense-in-depth guard: even if the registry loses track of a
+        # position, we still know the exchange has one and block duplicate entries.
+        self._known_exchange_symbols: Set[str] = set()  # normalized symbols with live exposure
     
     # ========== INVARIANT A: Single position per symbol ==========
     
@@ -998,6 +1002,9 @@ class PositionRegistry:
         Uses normalized symbol matching to handle format variants:
         - PF_TRXUSD, TRX/USD, TRX/USD:USD all refer to the same market
         
+        Defense-in-depth: Also checks _known_exchange_symbols to block entries
+        when the exchange has live exposure the registry lost track of.
+        
         Returns:
             (allowed, reason)
         """
@@ -1006,9 +1013,26 @@ class PositionRegistry:
             existing = self._find_position_by_normalized(symbol)
             
             if existing is None:
+                # Defense-in-depth: Even if registry has no position, check if
+                # the exchange has live exposure for this symbol. This prevents
+                # the catastrophic compounding bug where a PENDING position gets
+                # archived by STALE_ZERO_QTY, and new entries pile on every cycle.
+                norm_key = _normalize_symbol(symbol)
+                if norm_key in self._known_exchange_symbols:
+                    return False, (
+                        f"Exchange has live exposure for {symbol} but registry has no position. "
+                        f"Blocking new entry to prevent duplicate/compounding exposure."
+                    )
                 return True, "No existing position"
             
             if existing.is_terminal:
+                # Same defense-in-depth check for terminal positions
+                norm_key = _normalize_symbol(symbol)
+                if norm_key in self._known_exchange_symbols:
+                    return False, (
+                        f"Exchange has live exposure for {symbol} (registry position is terminal). "
+                        f"Blocking new entry to prevent duplicate/compounding exposure."
+                    )
                 return True, "Previous position terminal"
             
             # Check if reversal is pending (use normalized key)
@@ -1169,6 +1193,12 @@ class PositionRegistry:
             norm_key = normalize_symbol_for_position_match(ex_symbol)
             exchange_normalized[norm_key] = (ex_symbol, ex_pos)
         
+        # Update known exchange symbols for the duplicate-entry guard.
+        # This is the defense-in-depth: even if the registry loses a position,
+        # can_open_position() will still block new entries for symbols with
+        # live exchange exposure.
+        self._known_exchange_symbols = set(exchange_normalized.keys())
+        
         # Track which normalized exchange positions we've matched (for phantom detection)
         matched_exchange_keys: set[str] = set()
         
@@ -1208,13 +1238,57 @@ class PositionRegistry:
                     # Verify qty matches
                     exchange_qty = Decimal(str(exchange_pos.get('qty', 0)))
                     if pos.remaining_qty <= qty_epsilon and exchange_qty > qty_epsilon:
-                        # Registry can contain stale zero-qty entries after restarts.
-                        # Close and archive them so startup import can adopt the live position
-                        # without surfacing a false-positive qty mismatch.
-                        pos.state = PositionState.CLOSED
-                        pos.exit_reason = ExitReason.RECONCILIATION
-                        orphaned_symbols.append(symbol)
-                        issues.append((symbol, f"STALE_ZERO_QTY: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+                        # Exchange has quantity but registry shows zero.
+                        # CRITICAL: If the position is PENDING, this is a race condition —
+                        # a market order was filled on the exchange before the fill event
+                        # reached the state machine. We MUST adopt the exchange qty into
+                        # this position, NOT archive it. Archiving a PENDING position
+                        # causes the system to lose track of the position and re-enter
+                        # the same symbol every cycle, compounding exposure until halt.
+                        if pos.state == PositionState.PENDING:
+                            # Race condition: market order filled before fill event processed.
+                            # Adopt exchange quantity into this position via synthetic fill.
+                            exchange_entry_price_raw = exchange_pos.get("entry_price")
+                            ref_price = pos.initial_entry_price
+                            if exchange_entry_price_raw is not None:
+                                try:
+                                    ref_price = Decimal(str(exchange_entry_price_raw))
+                                except Exception:
+                                    pass
+                            now = datetime.now(timezone.utc)
+                            fill = FillRecord(
+                                fill_id=f"sync-adopt-{int(now.timestamp() * 1000)}-{len(pos.entry_fills) + 1}",
+                                order_id=pos.entry_order_id or "sync-adopted",
+                                side=pos.side,
+                                qty=exchange_qty,
+                                price=ref_price,
+                                timestamp=now,
+                                is_entry=True,
+                            )
+                            pos.entry_fills.append(fill)
+                            pos._update_state_after_entry_fill()
+                            pos.updated_at = datetime.now(timezone.utc)
+                            logger.warning(
+                                "PENDING position adopted exchange qty (race condition fix)",
+                                symbol=symbol,
+                                adopted_qty=str(exchange_qty),
+                                entry_price=str(ref_price),
+                                new_state=pos.state.value,
+                            )
+                            issues.append((symbol, f"PENDING_ADOPTED: Registry adopted {exchange_qty} from exchange (was PENDING)"))
+                        else:
+                            # Non-PENDING zero-qty position: truly stale from prior restart.
+                            # Close and archive so startup import can adopt the live position.
+                            pos.state = PositionState.CLOSED
+                            pos.exit_reason = ExitReason.RECONCILIATION
+                            orphaned_symbols.append(symbol)
+                            issues.append((symbol, f"STALE_ZERO_QTY: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
+                            logger.info(
+                                "Stale zero-qty position archived",
+                                symbol=symbol,
+                                state=pos.state.value,
+                                exchange_qty=str(exchange_qty),
+                            )
                     elif abs(exchange_qty - pos.remaining_qty) > qty_epsilon:
                         exchange_entry_price_raw = exchange_pos.get("entry_price")
                         exchange_entry_price: Optional[Decimal] = None
