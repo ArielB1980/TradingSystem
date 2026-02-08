@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -31,6 +31,8 @@ help:
 	@echo "  make cancel-all-place-stops-live  Cancel ALL orders, then place SL per position (STOP_PCT=2)"
 	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
 	@echo "  make test          Run unit tests"
+	@echo "  make lint          Lint code with ruff"
+	@echo "  make format        Format code with ruff"
 	@echo "  make logs          Tail run logs"
 	@echo "  make smoke-logs    Tail smoke logs"
 	@echo "  make status        Check if bot is running"
@@ -271,6 +273,14 @@ check-signals:
 test:
 	@echo "Running unit tests..."
 	$(PYTHON) -m pytest tests/ -v
+
+lint:
+	@echo "Running ruff linter..."
+	$(PYTHON) -m ruff check src/ tests/ --fix
+
+format:
+	@echo "Formatting code with ruff..."
+	$(PYTHON) -m ruff format src/ tests/
 
 logs:
 	@if [ -f logs/run.log ]; then \
