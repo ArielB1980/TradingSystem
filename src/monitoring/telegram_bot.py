@@ -115,6 +115,8 @@ class TelegramCommandHandler:
                 await self._handle_status()
             elif text in ("/positions", "/pos", "/p"):
                 await self._handle_positions()
+            elif text in ("/trades", "/t"):
+                await self._handle_trades()
             elif text in ("/help", "/start"):
                 await self._handle_help()
             # Silently ignore unknown commands
@@ -142,6 +144,7 @@ class TelegramCommandHandler:
             "🤖 <b>KBot Commands</b>\n\n"
             "/status - Equity, margin, system state\n"
             "/positions - Open positions with P&L\n"
+            "/trades - Last 5 closed trades\n"
             "/help - This message"
         )
     
@@ -227,5 +230,63 @@ class TelegramCommandHandler:
                 f"  Size: {size} ({leverage}x)\n"
                 f"  {pnl_emoji} P&L: {upnl_sign}${upnl:.2f} ({pnl_pct_sign}{pnl_pct:.1f}%)\n"
             )
+        
+        await self._send_message("\n".join(lines))
+
+    async def _handle_trades(self) -> None:
+        """Respond to /trades with recent closed trades."""
+        try:
+            import asyncio
+            from src.storage.repository import get_all_trades
+            
+            trades = await asyncio.to_thread(get_all_trades)
+            trades = trades[:5]  # Last 5
+        except Exception as e:
+            await self._send_message(f"❌ Failed to fetch trades: {e}")
+            return
+        
+        if not trades:
+            await self._send_message("📋 No closed trades yet")
+            return
+        
+        lines = ["📋 <b>Recent Trades</b>\n"]
+        total_pnl = Decimal("0")
+        wins = 0
+        
+        for t in trades:
+            pnl = t.net_pnl
+            total_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            pnl_sign = "+" if pnl >= 0 else ""
+            side_emoji = "📈" if t.side.value.upper() == "LONG" else "📉"
+            
+            # Duration
+            if t.entered_at and t.exited_at:
+                duration = t.exited_at - t.entered_at
+                hours = duration.total_seconds() / 3600
+                if hours < 1:
+                    dur_str = f"{duration.total_seconds() / 60:.0f}m"
+                elif hours < 24:
+                    dur_str = f"{hours:.1f}h"
+                else:
+                    dur_str = f"{hours / 24:.1f}d"
+            else:
+                dur_str = "?"
+            
+            lines.append(
+                f"{side_emoji} <b>{t.symbol}</b> ({t.side.value.upper()})\n"
+                f"  {pnl_emoji} {pnl_sign}${pnl:.2f} | {dur_str} | {t.exit_reason or '?'}\n"
+            )
+        
+        # Summary
+        total_sign = "+" if total_pnl >= 0 else ""
+        total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(
+            f"\n{total_emoji} <b>Total: {total_sign}${total_pnl:.2f}</b> "
+            f"({wins}/{len(trades)} wins)"
+        )
         
         await self._send_message("\n".join(lines))
