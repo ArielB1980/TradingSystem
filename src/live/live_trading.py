@@ -425,12 +425,37 @@ class LiveTrading:
                     self._last_discovery_error_log_time = now
                 return
             
-            # Trim to Kraken-supported only; log any symbols we drop
+            # Shrink protection: if new universe is <50% of old, something is wrong
+            # (API issue, temporary outage). Keep old universe and log critical.
             prev_symbols = set(self._market_symbols())
+            prev_count = len(prev_symbols)
+            new_count = len(mapping)
+            if prev_count > 10 and new_count < prev_count * 0.5:
+                logger.critical(
+                    "UNIVERSE_SHRINK_REJECTED: new universe is <50% of old — likely API issue, keeping old universe",
+                    old_count=prev_count,
+                    new_count=new_count,
+                    dropped_pct=f"{(1 - new_count / prev_count) * 100:.0f}%",
+                )
+                try:
+                    from src.monitoring.alerting import send_alert
+                    await send_alert(
+                        "UNIVERSE_SHRINK",
+                        f"Discovery returned {new_count} coins vs {prev_count} current — rejected (keeping old universe)",
+                        urgent=True,
+                    )
+                except Exception:
+                    pass
+                return
+
+            # Log removed symbols
             supported = set(mapping.keys())
             dropped = prev_symbols - supported
+            added = supported - prev_symbols
             for sym in sorted(dropped):
-                logger.warning("SYMBOL REMOVED (unsupported on Kraken)", symbol=sym)
+                logger.warning("SYMBOL_REMOVED", symbol=sym)
+            for sym in sorted(added):
+                logger.info("SYMBOL_ADDED", symbol=sym)
             
             # Update internal state (Maintain Spot -> Futures mapping)
             self.markets = mapping
@@ -1916,6 +1941,32 @@ class LiveTrading:
                         if cooldown_until and now_cd < cooldown_until:
                             pass  # Signal suppressed by cooldown — skip silently
                         else:
+                            # Pre-entry spread check (fail-open: if anything fails, allow the trade).
+                            # Uses already-fetched spot ticker bid/ask — zero new API calls.
+                            spread_ok = True
+                            try:
+                                st = map_spot_tickers.get(spot_symbol)
+                                if st:
+                                    bid = Decimal(str(st.get("bid", 0) or 0))
+                                    ask = Decimal(str(st.get("ask", 0) or 0))
+                                    if bid > 0 and ask > 0:
+                                        live_spread = (ask - bid) / bid
+                                        max_entry_spread = Decimal("0.010")  # 1.0% — reject extreme spreads only
+                                        if live_spread > max_entry_spread:
+                                            spread_ok = False
+                                            logger.warning(
+                                                "SIGNAL_REJECTED_SPREAD: live spread too wide for entry",
+                                                symbol=spot_symbol,
+                                                spread=f"{live_spread:.3%}",
+                                                threshold=f"{max_entry_spread:.3%}",
+                                                signal=signal.signal_type.value,
+                                            )
+                            except Exception:
+                                pass  # Fail-open: allow trade if check errors
+
+                            if not spread_ok:
+                                return  # Skip this coin — spread too wide right now
+
                             # Record cooldown for this symbol
                             self._signal_cooldown[spot_symbol] = now_cd + timedelta(
                                 hours=self._signal_cooldown_hours

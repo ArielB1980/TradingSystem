@@ -147,8 +147,33 @@ class CandleManager:
 
         async def fetch_tf(tf: str, interval_min: int):
             last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
-            if (now - last_update).total_seconds() < (interval_min * 60):
-                return
+            elapsed = (now - last_update).total_seconds()
+            
+            # Smart candle-boundary caching: only refetch when a new bar has likely closed.
+            # For 15m: refetch only if we haven't fetched since the last 15m boundary.
+            # For 1h/4h/1d: use boundary-aware check too.
+            # First fetch always proceeds (last_update is datetime.min).
+            if elapsed < 30:
+                return  # Hard floor: never refetch within 30 seconds
+            
+            if elapsed < (interval_min * 60):
+                # Within the normal throttle. But check if a new bar boundary crossed.
+                # If yes, we should refetch to get the newly closed candle.
+                tf_minutes = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}.get(tf, interval_min)
+                last_boundary_min = (now.minute // tf_minutes) * tf_minutes if tf_minutes <= 60 else 0
+                
+                # For sub-hourly timeframes, check if minute boundary crossed
+                if tf_minutes <= 60:
+                    # Current bar start
+                    current_bar_start = now.replace(
+                        minute=last_boundary_min, second=0, microsecond=0
+                    )
+                    # Did we fetch BEFORE this bar started? If so, a new bar closed.
+                    if last_update >= current_bar_start:
+                        return  # Already fetched this bar period
+                # For 4h and 1d, the simple time throttle is fine
+                else:
+                    return
             buffer = self.candles[tf]
             last_ts = None
             existing = buffer.get(symbol, [])

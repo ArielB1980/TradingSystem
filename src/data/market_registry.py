@@ -394,7 +394,7 @@ class MarketRegistry:
                 # - Tier classification: AFTER passing filters, based on metrics
                 # ============================================================
                 
-                # Only pinned Tier A (BTC, ETH) bypasses filters
+                # Only pinned Tier A (BTC, ETH, SOL, DOGE, BNB) bypasses filters
                 is_pinned_tier_a = self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol)
                 
                 # --- OI: LOG ONLY (removed as gate - Kraken misreports) ---
@@ -421,7 +421,7 @@ class MarketRegistry:
                         )
                 
                 # --- VOLUME: PRIMARY GATE (Tier C threshold for all non-pinned) ---
-                # Pinned Tier A (BTC, ETH) bypasses all filters
+                # Pinned Tier A (BTC, ETH, SOL, DOGE, BNB) bypasses all filters
                 if not is_pinned_tier_a:
                     min_vol = self._get_tier_volume_threshold('C')  # Use most permissive threshold
                     if fticker.volume_24h < min_vol:
@@ -431,7 +431,7 @@ class MarketRegistry:
                         continue
                 
                 # --- SPREAD: PRIMARY GATE (Tier C threshold for all non-pinned) ---
-                # Pinned Tier A (BTC, ETH) bypasses all filters
+                # Pinned Tier A (BTC, ETH, SOL, DOGE, BNB) bypasses all filters
                 if not is_pinned_tier_a:
                     max_spread = self._get_tier_spread_threshold('C')  # Use most permissive threshold
                     if fticker.spread_pct > max_spread:
@@ -702,7 +702,7 @@ class MarketRegistry:
         Config tiers are for UNIVERSE SELECTION only, not classification.
         
         Classification priority:
-        1. Pinned Tier A (BTC, ETH only) - always Tier A
+        1. Pinned Tier A (BTC, ETH, SOL, DOGE, BNB) - always Tier A
         2. Dynamic classification based on futures volume AND spread
         
         Dynamic thresholds (BOTH conditions must be met):
@@ -715,7 +715,7 @@ class MarketRegistry:
         - Tier B: 3-5x leverage, $50k max
         - Tier C: 1-2x leverage, $25k max
         """
-        # 1. Pinned Tier A (minimal - only BTC, ETH)
+        # 1. Pinned Tier A (BTC, ETH, SOL, DOGE, BNB)
         if self.is_pinned_tier_a_symbol(pair.spot_symbol, pair.futures_symbol):
             return "A"
         
