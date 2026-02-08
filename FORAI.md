@@ -437,7 +437,30 @@ When recovering from a kill switch:
 
 ---
 
-## 11. Telegram Bot Commands
+## 11. Trading Performance (as of Feb 8 2026)
+
+**Closed trades: 4** (all LTC/USD SHORT, all stopped out on Feb 2)
+- Win rate: 0/4 (0%)
+- Total P&L: -$1.80
+- Average loss: -$0.45 per trade
+
+**Signal distribution (last 24h):**
+- 12,115 NO_SIGNAL decisions (vast majority — strategy is very selective)
+- 137 LONG signals generated
+- 60 SHORT signals generated
+- Most rejections are `4H_STRUCTURE_REQUIRED` — no valid order block on the 4H decision timeframe
+
+**Currently open:**
+- PF_PAXGUSD LONG (entry $4979.60, SL $4880.00) — opened Feb 7
+- PF_BNBUSD SHORT (entry $647.35, SL $660.30) — opened Feb 8
+
+**Key insight:** The SMC 4H decision authority is extremely selective. With 45 coins and ~22 cycles/hour, the system evaluates ~990 coin-analyses/hour but generates only ~8 signals/hour. Most coins don't have valid 4H structure. This is by design (78.9% backtest win rate) but means the system needs time to prove itself.
+
+**Database:** Trade history in PostgreSQL (`kraken_futures_trading`), position state machine in SQLite (`data/positions.db`).
+
+---
+
+## 12. Telegram Bot Commands
 
 The system runs an interactive Telegram bot alongside the alert system. It polls for messages every 5 seconds from the authorized `ALERT_CHAT_ID`.
 
@@ -445,6 +468,7 @@ The system runs an interactive Telegram bot alongside the alert system. It polls
 |---------|---------|-------------|
 | `/status` | `/s` | Equity, margin %, unrealized P&L, system state, positions count, universe size, cycle count, cooldowns |
 | `/positions` | `/pos`, `/p` | Detailed list of open positions with entry/mark price, size, leverage, P&L ($, %) |
+| `/trades` | `/t` | Last 5 closed trades with P&L, duration, exit reason, win summary |
 | `/help` | `/start` | List available commands |
 
 **Implementation:** `src/monitoring/telegram_bot.py` → `TelegramCommandHandler`
