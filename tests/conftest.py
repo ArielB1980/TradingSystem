@@ -5,6 +5,16 @@ import pytest
 from unittest.mock import patch
 
 
+def pytest_addoption(parser):
+    """Register custom CLI options."""
+    parser.addoption(
+        "--regenerate-golden",
+        action="store_true",
+        default=False,
+        help="Regenerate golden fixture files for snapshot tests",
+    )
+
+
 def pytest_configure(config):
     """Register custom marks. Async tests require pytest-asyncio (see requirements.txt)."""
     config.addinivalue_line("markers", "asyncio: mark test as async (pytest-asyncio).")

@@ -1,0 +1,17 @@
+{
+  "adx": "78.99981476320606",
+  "atr": "825.7019886257444",
+  "ema200_slope": "flat",
+  "entry_price": "0",
+  "higher_tf_bias": "neutral",
+  "reasoning": "\u2713 Bias Bullish: Price $53436.01249957282200458854710 > EMA $48222.939112446955\n\u274c No valid order block found\n\u274c No valid 4H decision structure",
+  "regime": "no_4h_structure",
+  "score": 0.0,
+  "score_breakdown": {},
+  "setup_type": "trend",
+  "signal_type": "no_signal",
+  "stop_loss": "0",
+  "symbol": "BTC/USD",
+  "take_profit": null,
+  "tp_candidates": []
+}
