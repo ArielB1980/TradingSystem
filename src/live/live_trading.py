@@ -622,6 +622,19 @@ class LiveTrading:
             except Exception as e:
                 logger.error("Failed to start daily summary task", error=str(e))
 
+            # 2.6d Telegram command handler (/status, /positions, /help)
+            try:
+                from src.monitoring.telegram_bot import TelegramCommandHandler
+                self._telegram_handler = TelegramCommandHandler(
+                    data_provider=self._get_system_status
+                )
+                self._telegram_cmd_task = asyncio.create_task(
+                    self._telegram_handler.run()
+                )
+                logger.info("Telegram command handler started")
+            except Exception as e:
+                logger.error("Failed to start Telegram command handler", error=str(e))
+
             # 2.7 One-time startup reconciliation (ghost/zombie positions, adopt or force_close)
             if (not self.use_state_machine_v2) and not (
                 self.config.system.dry_run and not self.client.has_valid_futures_credentials()
@@ -674,6 +687,7 @@ class LiveTrading:
                     break
                 
                 loop_count += 1
+                self._last_cycle_count = loop_count
 
                 if self.kill_switch.is_active():
                     # Attempt auto-recovery for margin_critical (the most common false-positive halt)
@@ -820,6 +834,14 @@ class LiveTrading:
                     await self._daily_summary_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_telegram_cmd_task", None) and not self._telegram_cmd_task.done():
+                if getattr(self, "_telegram_handler", None):
+                    self._telegram_handler.stop()
+                self._telegram_cmd_task.cancel()
+                try:
+                    await self._telegram_cmd_task
+                except asyncio.CancelledError:
+                    pass
             await self.data_acq.stop()
             await self.client.close()
             logger.info("Live trading shutdown complete")
@@ -911,6 +933,56 @@ class LiveTrading:
             
             await asyncio.sleep(interval_seconds)
 
+    async def _get_system_status(self) -> dict:
+        """
+        Data provider for Telegram command handler.
+        Returns current system state for /status and /positions commands.
+        """
+        from src.execution.equity import calculate_effective_equity
+        
+        result: dict = {
+            "equity": Decimal("0"),
+            "margin_used": Decimal("0"),
+            "margin_pct": 0.0,
+            "positions": [],
+            "system_state": "UNKNOWN",
+            "kill_switch_active": False,
+            "cycle_count": getattr(self, "_last_cycle_count", 0),
+            "cooldowns_active": len(self._signal_cooldown),
+            "universe_size": len(self._market_symbols()),
+        }
+        
+        try:
+            balance = await self.client.get_futures_balance()
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity, available_margin, margin_used = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
+            result["equity"] = equity
+            result["margin_used"] = margin_used
+            result["margin_pct"] = float((margin_used / equity) * 100) if equity > 0 else 0
+        except Exception as e:
+            logger.warning("Status: failed to get equity", error=str(e))
+        
+        try:
+            positions = await self.client.get_all_futures_positions()
+            result["positions"] = [p for p in positions if p.get("size", 0) != 0]
+        except Exception as e:
+            logger.warning("Status: failed to get positions", error=str(e))
+        
+        # System state
+        kill_active = self.kill_switch.is_active() if self.kill_switch else False
+        result["kill_switch_active"] = kill_active
+        if kill_active:
+            result["system_state"] = "KILL_SWITCH"
+        elif self.hardening and hasattr(self.hardening, 'invariant_monitor'):
+            inv_state = self.hardening.invariant_monitor.state.value
+            result["system_state"] = inv_state.upper() if inv_state != "active" else "NORMAL"
+        else:
+            result["system_state"] = "NORMAL"
+        
+        return result
+
     async def _run_daily_summary(self) -> None:
         """
         Send a daily P&L summary via Telegram at midnight UTC.
@@ -989,6 +1061,9 @@ class LiveTrading:
                     
                     await send_alert("DAILY_SUMMARY", summary, urgent=True)
                     logger.info("Daily summary sent", equity=str(equity), trades=len(today_trades))
+                    
+                    # Reset daily loss tracking for new day
+                    self.risk_manager.reset_daily_metrics(equity)
                     
                 except Exception as e:
                     logger.warning("Failed to gather daily summary data", error=str(e))
@@ -2137,6 +2212,11 @@ class LiveTrading:
                 available_margin=avail_margin,
                 unrealized_pnl=Decimal("0.0") # Included in portfolioValue usually
             )
+            
+            # 4. Initialize daily loss tracking if not set
+            if self.risk_manager.daily_start_equity <= 0:
+                self.risk_manager.reset_daily_metrics(equity)
+                logger.info("Daily loss tracking initialized", starting_equity=str(equity))
             
         except Exception as e:
             logger.error("Failed to sync account state", error=str(e))
@@ -3311,6 +3391,33 @@ class LiveTrading:
             
             # Save to database
             await asyncio.to_thread(save_trade, trade)
+            
+            # Update daily P&L tracking in risk manager
+            try:
+                setup_type = getattr(position, 'setup_type', None)
+                balance = await self.client.get_futures_balance()
+                base = getattr(self.config.exchange, "base_currency", "USD")
+                equity_now, _, _ = await calculate_effective_equity(
+                    balance, base_currency=base, kraken_client=self.client
+                )
+                self.risk_manager.record_trade_result(net_pnl, equity_now, setup_type)
+                
+                # Alert if daily loss limit approached or exceeded
+                daily_loss_pct = abs(self.risk_manager.daily_pnl) / self.risk_manager.daily_start_equity \
+                    if self.risk_manager.daily_start_equity > 0 and self.risk_manager.daily_pnl < 0 \
+                    else Decimal("0")
+                if daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct * 0.7)):
+                    from src.monitoring.alerting import send_alert
+                    limit_pct = self.config.risk.daily_loss_limit_pct * 100
+                    await send_alert(
+                        "DAILY_LOSS_WARNING",
+                        f"Daily loss at {daily_loss_pct:.1%} of equity\n"
+                        f"Limit: {limit_pct:.0f}%\n"
+                        f"Daily P&L: ${self.risk_manager.daily_pnl:.2f}",
+                        urgent=daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct)),
+                    )
+            except Exception as e:
+                logger.warning("Failed to update daily P&L tracking", error=str(e))
             
             logger.info(
                 "Trade saved to history",
