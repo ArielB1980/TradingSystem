@@ -2032,7 +2032,13 @@ class LiveTrading:
                                         trace_details["order_fail_reason"] = order_outcome["reason"]
 
                             if signal.signal_type == SignalType.NO_SIGNAL and signal.reasoning:
-                                logger.info(f"SMC Analysis {spot_symbol}: NO_SIGNAL -> {signal.reasoning}")
+                                # Downgrade to debug: this fires for most coins every cycle.
+                                # Reasoning is still captured in DECISION_TRACE event below.
+                                logger.debug(
+                                    "SMC Analysis: NO_SIGNAL",
+                                    symbol=spot_symbol,
+                                    reasoning=signal.reasoning.replace("\n", " | "),
+                                )
                             
                             await async_record_event(
                                 event_type="DECISION_TRACE",
