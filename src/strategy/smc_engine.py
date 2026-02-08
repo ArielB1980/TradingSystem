@@ -13,7 +13,7 @@ from src.domain.models import Candle, Signal, SignalType, SetupType
 from src.strategy.indicators import Indicators
 from src.config.config import StrategyConfig
 from src.monitoring.logger import get_logger
-from src.storage.repository import record_event
+from src.domain.protocols import EventRecorder, _noop_event_recorder
 import uuid
 
 logger = get_logger(__name__)
@@ -78,15 +78,17 @@ class SMCEngine:
     - All parameters configurable (no hardcoded values)
     """
     
-    def __init__(self, config: StrategyConfig):
+    def __init__(self, config: StrategyConfig, *, event_recorder: EventRecorder = _noop_event_recorder):
         """
         Initialize SMC engine.
         
         Args:
             config: Strategy configuration
+            event_recorder: Callable for recording system events (injected; defaults to no-op)
         """
         self.config = config
         self.indicators = Indicators()
+        self._record_event = event_recorder
 
         # Per-symbol caching for multi-asset support (optimized with tuple keys)
         self.indicator_cache: Dict[Tuple[str, datetime], Dict] = {}
@@ -815,7 +817,7 @@ class SMCEngine:
                 stop=str(signal.stop_loss),
             )
             # Record explicit signal event (design choice: signal source records its own generation)
-            record_event(
+            self._record_event(
                 "SIGNAL_GENERATED", 
                 symbol, 
                 {

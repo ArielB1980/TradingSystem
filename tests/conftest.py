@@ -23,13 +23,14 @@ def pytest_configure(config):
 @pytest.fixture(autouse=True)
 def _mock_db_and_events_for_unit(request):
     """
-    Auto-mock record_event and DB access in unit tests so they run without a real DB.
+    Auto-mock async_record_event in unit tests so they run without a real DB.
     Skip for integration tests (they use their own mocks).
+
+    Note: SMCEngine and RiskManager use constructor-injected event recorders
+    that default to no-op, so they no longer need patching here.
     """
     if "integration" in str(request.node.fspath):
         yield
         return
-    with patch("src.risk.risk_manager.record_event"), patch(
-        "src.strategy.smc_engine.record_event"
-    ), patch("src.storage.repository.async_record_event"):
+    with patch("src.storage.repository.async_record_event"):
         yield

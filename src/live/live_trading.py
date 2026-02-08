@@ -144,8 +144,9 @@ class LiveTrading:
             futures_symbols=config.exchange.futures_markets
         )
         
-        self.smc_engine = SMCEngine(config.strategy)
-        self.risk_manager = RiskManager(config.risk, liquidity_filters=config.liquidity_filters)
+        from src.storage.repository import record_event
+        self.smc_engine = SMCEngine(config.strategy, event_recorder=record_event)
+        self.risk_manager = RiskManager(config.risk, liquidity_filters=config.liquidity_filters, event_recorder=record_event)
         from src.execution.instrument_specs import InstrumentSpecRegistry
         self.instrument_spec_registry = InstrumentSpecRegistry(
             get_instruments_fn=self.client.get_futures_instruments,

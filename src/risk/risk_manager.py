@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from src.domain.models import Signal, RiskDecision, Position, Side
 from src.config.config import RiskConfig, TierConfig, LiquidityFilters
 from src.monitoring.logger import get_logger
-from src.storage.repository import record_event
+from src.domain.protocols import EventRecorder, _noop_event_recorder
 from src.risk.basis_guard import BasisGuard
 
 if TYPE_CHECKING:
@@ -31,16 +31,24 @@ class RiskManager:
     - Tier C (low liquidity): Most conservative limits
     """
     
-    def __init__(self, config: RiskConfig, *, liquidity_filters: Optional[LiquidityFilters] = None):
+    def __init__(
+        self,
+        config: RiskConfig,
+        *,
+        liquidity_filters: Optional[LiquidityFilters] = None,
+        event_recorder: EventRecorder = _noop_event_recorder,
+    ):
         """
         Initialize risk manager.
         
         Args:
             config: Risk configuration
             liquidity_filters: Optional liquidity filters with tier configs for tier-based sizing
+            event_recorder: Callable for recording system events (injected; defaults to no-op)
         """
         self.config = config
         self.liquidity_filters = liquidity_filters
+        self._record_event = event_recorder
         
         # Portfolio state tracking
         self.current_positions: List[Position] = []
@@ -673,7 +681,7 @@ class RiskManager:
             }
         }
         
-        record_event("RISK_VALIDATION", signal.symbol, validation_data)
+        self._record_event("RISK_VALIDATION", signal.symbol, validation_data)
         
         return decision
     
