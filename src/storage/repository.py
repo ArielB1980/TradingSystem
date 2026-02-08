@@ -99,6 +99,7 @@ class TradeModel(Base):
     __table_args__ = (
         # Indexes for common query patterns
         Index('idx_trade_symbol_date', 'symbol', 'entered_at'),
+        Index('idx_trade_symbol_exited', 'symbol', 'exited_at'),  # stopout/loss queries
         Index('idx_trade_exit_reason', 'exit_reason'),
         Index('idx_trade_pnl', 'net_pnl'),
     )
@@ -502,7 +503,7 @@ def save_position(position: Position) -> None:
         with db.get_session() as session:
             position_model = session.query(PositionModel).filter(
                 PositionModel.symbol == position.symbol
-            ).first()
+            ).with_for_update().first()
             
             if position_model:
                 # Update existing
@@ -578,20 +579,19 @@ def sync_active_positions(positions: List[Position]) -> None:
     """
     db = get_db()
     with db.get_session() as session:
-        # 1. Get all DB positions
+        # 1. Get all DB positions in a single query (avoid N+1)
         db_positions = session.query(PositionModel).all()
-        db_symbols = {p.symbol for p in db_positions}
+        db_by_symbol = {p.symbol: p for p in db_positions}
         active_symbols = {p.symbol for p in positions}
         
         # 2. Identify positions to remove (in DB but not in active list)
-        to_remove = db_symbols - active_symbols
+        to_remove = set(db_by_symbol.keys()) - active_symbols
         if to_remove:
             session.query(PositionModel).filter(PositionModel.symbol.in_(to_remove)).delete(synchronize_session=False)
             
-        # 3. Update/Create active positions
+        # 3. Update/Create active positions (O(1) lookup per symbol via dict)
         for pos in positions:
-            # We can reuse save_position logic but optimized within this session
-            pm = session.query(PositionModel).filter(PositionModel.symbol == pos.symbol).first()
+            pm = db_by_symbol.get(pos.symbol)
             
             if pm:
                 # Update
@@ -937,29 +937,45 @@ def get_recent_events(limit: int = 50, event_type: Optional[str] = None, symbol:
 
 def get_last_signal_per_symbol(limit_events: int = 2000) -> Dict[str, datetime]:
     """
-    Latest LONG/SHORT DECISION_TRACE timestamp per symbol.
+    Latest LONG/SHORT SIGNAL_GENERATED timestamp per symbol.
+    Uses SQL aggregation instead of Python-side filtering.
     Used for dashboard last_signal (last non-NO_SIGNAL).
     """
-    events = get_recent_events(limit=limit_events, event_type="DECISION_TRACE")
-    out: Dict[str, datetime] = {}
-    for ev in events:
-        sym = ev.get("symbol")
-        if not sym:
-            continue
-        details = ev.get("details") or {}
-        sig = (details.get("signal") or "").strip().upper()
-        if sig not in ("LONG", "SHORT"):
-            continue
-        ts_str = ev.get("timestamp")
-        if not ts_str:
-            continue
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            continue
-        if sym not in out or ts > out[sym]:
-            out[sym] = ts
-    return out
+    from sqlalchemy import text, func
+
+    try:
+        db = get_db()
+        with db.get_session() as session:
+            # Use SQL aggregation: MAX(timestamp) GROUP BY symbol
+            # Filter for SIGNAL_GENERATED events which only exist for LONG/SHORT
+            rows = session.execute(
+                text("""
+                    SELECT symbol, MAX(timestamp) as last_ts
+                    FROM system_events
+                    WHERE event_type = 'SIGNAL_GENERATED'
+                    AND symbol IS NOT NULL
+                    GROUP BY symbol
+                    ORDER BY last_ts DESC
+                    LIMIT :limit
+                """),
+                {"limit": limit_events},
+            ).fetchall()
+
+            out: Dict[str, datetime] = {}
+            for row in rows:
+                sym = row[0]
+                ts = row[1]
+                if sym and ts:
+                    if isinstance(ts, str):
+                        try:
+                            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        except (ValueError, TypeError):
+                            continue
+                    out[sym] = ts
+            return out
+    except Exception as e:
+        logger.warning("get_last_signal_per_symbol failed, falling back to empty", error=str(e))
+        return {}
 
 
 def get_event_stats(symbol: str) -> Dict[str, Any]:

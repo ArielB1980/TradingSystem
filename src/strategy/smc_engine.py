@@ -19,9 +19,14 @@ import uuid
 logger = get_logger(__name__)
 
 
+_stopout_cache: dict = {}  # key: (symbol, lookback_hours) -> (count, expires_at)
+_STOPOUT_CACHE_TTL = 300  # 5 minutes
+
+
 def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
     """
     Query database for recent stop-outs on a symbol.
+    Uses SQLAlchemy connection pool (not raw psycopg2) and a 5-minute TTL cache.
     
     Args:
         symbol: Trading symbol (e.g., 'WIF/USD' or 'PF_WIFUSD')
@@ -30,32 +35,40 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
     Returns:
         Number of stop-outs in the lookback period
     """
+    import time as _time
+
+    cache_key = (symbol, lookback_hours)
+    cached = _stopout_cache.get(cache_key)
+    if cached and _time.monotonic() < cached[1]:
+        return cached[0]
+
     try:
-        import psycopg2
+        from sqlalchemy import text
+        from src.storage.db import get_db
+        
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             return 0
-            
-        conn = psycopg2.connect(database_url)
-        cur = conn.cursor()
+        
+        db = get_db()
         
         # Normalize symbol for matching (handle both WIF/USD and PF_WIFUSD formats)
         base_symbol = symbol.replace("PF_", "").replace("USD", "/USD").replace("//", "/")
         futures_symbol = "PF_" + symbol.replace("/", "").replace("PF_", "")
         
-        # Query trades table for stop-outs
-        cur.execute("""
-            SELECT COUNT(*) FROM trades 
-            WHERE (symbol LIKE %s OR symbol LIKE %s)
-            AND exit_reason LIKE 'Stop Loss%%'
-            AND exited_at >= NOW() - INTERVAL '%s hours'
-        """, (f"%{base_symbol}%", f"%{futures_symbol}%", lookback_hours))
+        with db.get_session() as session:
+            result = session.execute(
+                text("""
+                    SELECT COUNT(*) FROM trades 
+                    WHERE (symbol LIKE :base OR symbol LIKE :futures)
+                    AND exit_reason LIKE 'Stop Loss%%'
+                    AND exited_at >= NOW() - INTERVAL :hours
+                """),
+                {"base": f"%{base_symbol}%", "futures": f"%{futures_symbol}%", "hours": f"{lookback_hours} hours"},
+            )
+            count = result.scalar() or 0
         
-        result = cur.fetchone()
-        count = result[0] if result else 0
-        
-        cur.close()
-        conn.close()
+        _stopout_cache[cache_key] = (count, _time.monotonic() + _STOPOUT_CACHE_TTL)
         
         if count > 0:
             logger.info("Recent stop-outs detected", symbol=symbol, count=count, lookback_hours=lookback_hours)
