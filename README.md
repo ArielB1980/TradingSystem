@@ -70,7 +70,7 @@ See [Configuration Guide](docs/configuration.md) for details (coming soon).
 
 ### Production runtime
 
-Live trading in production runs **`run.py live`** → `LiveTrading` (`src/live/live_trading.py`). The `main.py` (DataService + TradingService) path is an alternative architecture and is **not** used in production. See [docs/PRODUCTION_RUNTIME.md](docs/PRODUCTION_RUNTIME.md).
+Live trading in production runs **`run.py live`** → `LiveTrading` (`src/live/live_trading.py`). See [docs/PRODUCTION_RUNTIME.md](docs/PRODUCTION_RUNTIME.md).
 
 ## Usage
 
