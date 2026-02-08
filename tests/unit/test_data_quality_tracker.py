@@ -237,13 +237,18 @@ class TestPersistence:
         assert t2.get_state("X") == SymbolHealthState.DEGRADED
         assert t2.get_state("Y") == SymbolHealthState.HEALTHY  # not persisted
 
-    def test_persist_skips_healthy(self, tracker, tmp_path):
-        """Only non-HEALTHY symbols should be in the JSON file."""
-        tracker.record_result("X", passed=True)
+    def test_persist_skips_healthy_without_history(self, tracker, tmp_path):
+        """HEALTHY symbols with no trust history should not be persisted.
+
+        Note: HEALTHY symbols WITH trust history are persisted so
+        the trust score survives restarts.
+        """
+        # A symbol that was only queried (never record_result'd) has no history
+        tracker._get("X")  # create record without recording a result
         tracker.force_persist()
 
         data = json.loads((tmp_path / "state.json").read_text())
-        assert len(data) == 0
+        assert "X" not in data
 
     def test_restore_nonexistent_file(self, tmp_path):
         """Restoring from missing file should not crash."""
@@ -279,7 +284,7 @@ class TestStatusSummary:
 
     def test_empty_tracker(self, tracker):
         s = tracker.get_status_summary()
-        assert s == {"healthy": 0, "degraded": [], "suspended": []}
+        assert s == {"healthy": 0, "degraded": [], "suspended": [], "trust_scores": {}}
 
     def test_mixed_states(self, tracker):
         # Y: healthy
@@ -303,3 +308,112 @@ class TestStatusSummary:
 
         s = tracker.get_status_summary()
         assert "Z" in s["suspended"]
+
+
+# -------------------------------------------------------
+# Trust Score
+# -------------------------------------------------------
+
+class TestTrustScore:
+    """Tests for the rolling data trust score."""
+
+    @pytest.fixture
+    def tracker(self, tmp_path):
+        return DataQualityTracker(
+            state_file=str(tmp_path / "state.json"),
+            suspend_after_seconds=100,
+            trust_window_seconds=3600,  # 1 hour for easier testing
+        )
+
+    def test_no_data_returns_perfect_score(self, tracker):
+        """A symbol with no history should have score 1.0 (benefit of doubt)."""
+        score = tracker.get_trust_score("NEW_SYM")
+        assert score["score"] == 1.0
+        assert score["total_checks"] == 0
+        assert score["healthy_checks"] == 0
+
+    def test_all_pass_returns_perfect(self, tracker):
+        for _ in range(10):
+            tracker.record_result("X", passed=True)
+        score = tracker.get_trust_score("X")
+        assert score["score"] == 1.0
+        assert score["total_checks"] == 10
+        assert score["healthy_checks"] == 10
+
+    def test_all_fail_returns_zero(self, tracker):
+        for _ in range(10):
+            tracker.record_result("X", passed=False, reason="bad")
+        score = tracker.get_trust_score("X")
+        assert score["score"] == 0.0
+        assert score["total_checks"] == 10
+        assert score["healthy_checks"] == 0
+
+    def test_mixed_results(self, tracker):
+        """7 pass + 3 fail = 70% trust."""
+        for _ in range(7):
+            tracker.record_result("X", passed=True)
+        for _ in range(3):
+            tracker.record_result("X", passed=False, reason="bad")
+        score = tracker.get_trust_score("X")
+        assert score["score"] == 0.7
+        assert score["total_checks"] == 10
+
+    def test_window_prunes_old_entries(self, tracker):
+        """Entries older than the window are pruned."""
+        now = time.time()
+
+        # Inject old failures (2 hours ago -- outside 1-hour window)
+        rec = tracker._get("X")
+        for i in range(5):
+            rec.trust_history.append((now - 7200 + i, False))
+
+        # Record fresh passes
+        for _ in range(5):
+            tracker.record_result("X", passed=True)
+
+        score = tracker.get_trust_score("X")
+        # Old failures should be pruned; only 5 recent passes remain
+        assert score["total_checks"] == 5
+        assert score["score"] == 1.0
+
+    def test_trust_scores_in_status_summary(self, tracker):
+        """Degraded symbols should show in trust_scores."""
+        for _ in range(3):
+            tracker.record_result("BAD", passed=False, reason="bad")
+        tracker.record_result("GOOD", passed=True)
+
+        s = tracker.get_status_summary()
+        assert "BAD" in s["trust_scores"]
+        assert s["trust_scores"]["BAD"] == 0.0
+        # GOOD has score 1.0, so NOT included in trust_scores
+        assert "GOOD" not in s["trust_scores"]
+
+    def test_trust_score_persists_and_restores(self, tracker, tmp_path):
+        """Trust history survives persist/restore cycle."""
+        for _ in range(5):
+            tracker.record_result("X", passed=True)
+        for _ in range(5):
+            tracker.record_result("X", passed=False, reason="bad")
+
+        tracker.force_persist()
+
+        # Restore into fresh tracker
+        tracker2 = DataQualityTracker(
+            state_file=str(tmp_path / "state.json"),
+            trust_window_seconds=3600,
+        )
+        tracker2.restore()
+
+        score = tracker2.get_trust_score("X")
+        assert score["total_checks"] == 10
+        assert score["score"] == 0.5
+
+    def test_get_trust_scores_all(self, tracker):
+        tracker.record_result("A", passed=True)
+        tracker.record_result("B", passed=False, reason="bad")
+
+        all_scores = tracker.get_trust_scores_all()
+        assert "A" in all_scores
+        assert "B" in all_scores
+        assert all_scores["A"]["score"] == 1.0
+        assert all_scores["B"]["score"] == 0.0

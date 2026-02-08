@@ -5,6 +5,12 @@ Tracks consecutive failures, manages state transitions
 (HEALTHY -> DEGRADED -> SUSPENDED), controls analysis eligibility,
 and provides unified rate-limited logging.
 
+Also maintains a rolling **data trust score** per symbol: the fraction
+of sanity checks that passed over a configurable window (default 7 days).
+The trust score is read-only / informational today.  A future enhancement
+may use it for risk-weight scaling (never for hard exclusion -- that is
+the sanity gate's job).
+
 Persists non-HEALTHY state to ``.local/data_quality_state.json``
 every 5 minutes so SUSPENDED/DEGRADED symbols survive restarts.
 """
@@ -13,10 +19,11 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from src.monitoring.logger import get_logger
 
@@ -34,6 +41,7 @@ DEFAULT_LOG_COOLDOWN_SECONDS = 1800       # 30 minutes
 DEFAULT_DEGRADED_SKIP_RATIO = 4           # analyze 1 in 4 cycles
 DEFAULT_PERSIST_INTERVAL_SECONDS = 5 * 60 # 5 minutes
 DEFAULT_STATE_FILE = ".local/data_quality_state.json"
+DEFAULT_TRUST_WINDOW_SECONDS = 7 * 24 * 3600  # 7 days
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +68,9 @@ class _SymbolRecord:
     first_failure_ts: float = 0.0      # time.time() of first failure in current streak
     last_probe_ts: float = 0.0         # last time we allowed a probe in SUSPENDED
     cycle_counter: int = 0             # used for DEGRADED skip ratio
+    # Rolling trust score history: deque of (ts, passed) tuples.
+    # Entries older than the trust window are pruned on each insertion.
+    trust_history: Deque[Tuple[float, bool]] = field(default_factory=deque)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +92,7 @@ class DataQualityTracker:
         persist_interval_seconds: float = DEFAULT_PERSIST_INTERVAL_SECONDS,
         state_file: str = DEFAULT_STATE_FILE,
         clock: Optional[Callable[[], float]] = None,
+        trust_window_seconds: float = DEFAULT_TRUST_WINDOW_SECONDS,
     ) -> None:
         self.degraded_after_failures = degraded_after_failures
         self.suspend_after_seconds = suspend_after_seconds
@@ -91,6 +103,7 @@ class DataQualityTracker:
         self.persist_interval_seconds = persist_interval_seconds
         self.state_file = Path(state_file)
         self._clock: Callable[[], float] = clock or time.time
+        self.trust_window_seconds = trust_window_seconds
 
         self._symbols: Dict[str, _SymbolRecord] = {}
         self._log_cooldowns: Dict[str, float] = {}   # symbol -> last log ts
@@ -139,7 +152,7 @@ class DataQualityTracker:
     def record_result(self, symbol: str, passed: bool, reason: str = "") -> None:
         """Record whether the latest sanity check passed or failed.
 
-        Handles all state transitions.
+        Handles all state transitions and updates the rolling trust score.
         """
         rec = self._get(symbol)
         now = self._clock()
@@ -149,15 +162,23 @@ class DataQualityTracker:
         else:
             self._handle_fail(rec, symbol, now, reason)
 
+        # --- Update rolling trust history ---
+        rec.trust_history.append((now, passed))
+        self._prune_trust_history(rec, now)
+
     def get_state(self, symbol: str) -> SymbolHealthState:
         return self._get(symbol).state
 
     def get_status_summary(self) -> Dict[str, Any]:
-        """Snapshot for health-check / Telegram status."""
+        """Snapshot for health-check / Telegram status.
+
+        Includes per-symbol trust scores for any symbol below 1.0.
+        """
         summary: Dict[str, Any] = {
             "healthy": 0,
             "degraded": [],
             "suspended": [],
+            "trust_scores": {},   # symbol -> score (only those < 1.0)
         }
         for sym, rec in self._symbols.items():
             if rec.state == SymbolHealthState.HEALTHY:
@@ -166,7 +187,69 @@ class DataQualityTracker:
                 summary["degraded"].append(sym)
             elif rec.state == SymbolHealthState.SUSPENDED:
                 summary["suspended"].append(sym)
+
+            score_info = self.get_trust_score(sym)
+            if score_info["total_checks"] > 0 and score_info["score"] < 1.0:
+                summary["trust_scores"][sym] = score_info["score"]
+
         return summary
+
+    # ------------------------------------------------------------------
+    # Data trust score (read-only / informational)
+    # ------------------------------------------------------------------
+
+    def get_trust_score(
+        self,
+        symbol: str,
+        window_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Return the data trust score for *symbol*.
+
+        The trust score is the fraction of sanity checks that passed
+        within the rolling window (default: ``trust_window_seconds``).
+
+        Returns a dict with::
+
+            {
+                "score": float,         # 0.0 – 1.0
+                "total_checks": int,
+                "healthy_checks": int,
+                "window_seconds": float,
+            }
+
+        This is **read-only / informational**.  No gating or eligibility
+        decisions are made from this value today.
+
+        .. note::
+           Future enhancement: risk-weight scaling based on trust score.
+           The trust score should **never** hard-exclude a symbol; hard
+           exclusion is the sanity gate's responsibility.
+        """
+        window = window_seconds if window_seconds is not None else self.trust_window_seconds
+        rec = self._get(symbol)
+        now = self._clock()
+        self._prune_trust_history(rec, now)
+
+        total = len(rec.trust_history)
+        healthy = sum(1 for _, passed in rec.trust_history if passed)
+        score = healthy / total if total > 0 else 1.0  # assume healthy if no data
+
+        return {
+            "score": round(score, 4),
+            "total_checks": total,
+            "healthy_checks": healthy,
+            "window_seconds": window,
+        }
+
+    def get_trust_scores_all(self) -> Dict[str, Dict[str, Any]]:
+        """Return trust scores for all tracked symbols."""
+        return {sym: self.get_trust_score(sym) for sym in self._symbols}
+
+    def _prune_trust_history(self, rec: _SymbolRecord, now: float) -> None:
+        """Remove entries older than the trust window from the deque."""
+        cutoff = now - self.trust_window_seconds
+        while rec.trust_history and rec.trust_history[0][0] < cutoff:
+            rec.trust_history.popleft()
 
     # ------------------------------------------------------------------
     # Unified logging with per-symbol cooldown
@@ -215,15 +298,23 @@ class DataQualityTracker:
 
     def _do_persist(self) -> None:
         data: Dict[str, Any] = {}
+        now = self._clock()
         for sym, rec in self._symbols.items():
-            if rec.state == SymbolHealthState.HEALTHY:
+            # Persist non-HEALTHY symbols AND any symbol with trust history
+            has_trust_data = len(rec.trust_history) > 0
+            if rec.state == SymbolHealthState.HEALTHY and not has_trust_data:
                 continue
-            data[sym] = {
+            entry: Dict[str, Any] = {
                 "state": rec.state.value,
                 "consecutive_failures": rec.consecutive_failures,
                 "first_failure_ts": rec.first_failure_ts,
                 "last_probe_ts": rec.last_probe_ts,
             }
+            # Save trust history (pruned)
+            if has_trust_data:
+                self._prune_trust_history(rec, now)
+                entry["trust_history"] = list(rec.trust_history)
+            data[sym] = entry
 
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -247,6 +338,7 @@ class DataQualityTracker:
             return
 
         restored = 0
+        now = self._clock()
         for sym, info in raw.items():
             rec = self._get(sym)
             try:
@@ -256,6 +348,13 @@ class DataQualityTracker:
             rec.consecutive_failures = info.get("consecutive_failures", 0)
             rec.first_failure_ts = info.get("first_failure_ts", 0.0)
             rec.last_probe_ts = info.get("last_probe_ts", 0.0)
+            # Restore trust history (prune stale entries)
+            saved_history = info.get("trust_history", [])
+            if saved_history:
+                rec.trust_history = deque(
+                    (ts, passed) for ts, passed in saved_history
+                )
+                self._prune_trust_history(rec, now)
             restored += 1
 
         logger.info(
