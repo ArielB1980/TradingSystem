@@ -192,6 +192,13 @@ async def get_system_status(lt: "LiveTrading") -> dict:
     else:
         result["system_state"] = "NORMAL"
 
+    # Connection pool health
+    try:
+        from src.storage.db import get_pool_status
+        result["db_pool"] = get_pool_status()
+    except Exception:
+        pass
+
     return result
 
 
