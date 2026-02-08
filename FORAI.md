@@ -429,3 +429,46 @@ When recovering from a kill switch:
 7. **No Telegram alerts for a while** — Rate limiting suppresses duplicate event types for 5 minutes. If the system is in a stable state, you won't get alerts (that's good). The daily summary at midnight UTC is always sent regardless.
 
 8. **`Kill switch: PRESERVING stop loss order`** during a kill switch event — This is intentional and correct. SL orders are protective and should never be cancelled by the kill switch.
+
+---
+
+## 11. Telegram Bot Commands
+
+The system runs an interactive Telegram bot alongside the alert system. It polls for messages every 5 seconds from the authorized `ALERT_CHAT_ID`.
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `/status` | `/s` | Equity, margin %, unrealized P&L, system state, positions count, universe size, cycle count, cooldowns |
+| `/positions` | `/pos`, `/p` | Detailed list of open positions with entry/mark price, size, leverage, P&L ($, %) |
+| `/help` | `/start` | List available commands |
+
+**Implementation:** `src/monitoring/telegram_bot.py` → `TelegramCommandHandler`
+- Extracts bot token from `ALERT_WEBHOOK_URL` env var
+- Only responds to messages from `ALERT_CHAT_ID` (security)
+- Data fetched live from exchange via `_get_system_status()` in `live_trading.py`
+- Crash-safe: errors are logged, never propagated to trading loop
+
+---
+
+## 12. Daily Loss Enforcement
+
+The daily loss limit (`daily_loss_limit_pct` in risk config, default 5%) is now actively enforced end-to-end:
+
+1. **Initialization:** At startup, `_sync_account_state()` calls `risk_manager.reset_daily_metrics(equity)` to set the day's starting equity.
+2. **Tracking:** On every trade close, `_save_trade_history()` calls `risk_manager.record_trade_result(net_pnl, equity, setup_type)` to update `daily_pnl`.
+3. **Enforcement:** `risk_manager.validate_trade()` rejects new entries when `|daily_pnl| / daily_start_equity > daily_loss_limit_pct`.
+4. **Early warning:** At 70% of the limit, a `DAILY_LOSS_WARNING` Telegram alert is sent. At 100%, the alert is marked `urgent`.
+5. **Reset:** At midnight UTC, `_run_daily_summary()` resets the daily metrics.
+
+### Bug History
+Previously (before this fix), `daily_pnl` and `daily_start_equity` were always 0 because `record_trade_result()` and `reset_daily_metrics()` were never called from `live_trading.py`. The limit existed in config but was never enforced.
+
+---
+
+## 13. Cycle Time Analysis
+
+As of Feb 2026, cycle times are:
+- **~65 seconds** (normal tick): 48 coins × 4+ timeframes each, fetched with `Semaphore(50)` concurrency. Bottleneck is per-coin Kraken API latency (~1-1.5s per coin).
+- **~124 seconds** (reconciliation tick): Every ~120s, a full `sync_with_exchange` adds position/order reconciliation, doubling the cycle.
+
+The semaphore increase from 20→50 helped (coins run truly in parallel), but each coin's API calls are serial (multiple timeframes). Further improvement would require batch OHLCV endpoints or caching.
