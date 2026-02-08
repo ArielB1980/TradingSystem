@@ -935,7 +935,7 @@ class LiveTrading:
                 
                 # Gather data
                 try:
-                    account_info = await self.client.get_all_futures_account_data()
+                    account_info = await self.client.get_futures_account_info()
                     equity = Decimal(str(account_info.get("equity", 0)))
                     margin_used = Decimal(str(account_info.get("marginUsed", 0)))
                     margin_pct = float((margin_used / equity) * 100) if equity > 0 else 0
@@ -2060,7 +2060,7 @@ class LiveTrading:
         
         # Rule 3: Check current margin utilization
         try:
-            account_info = await self.client.get_all_futures_account_data()
+            account_info = await self.client.get_futures_account_info()
             equity = Decimal(str(account_info.get("equity", 0)))
             margin_used = Decimal(str(account_info.get("marginUsed", 0)))
             
