@@ -425,30 +425,34 @@ class LiveTrading:
                     self._last_discovery_error_log_time = now
                 return
             
-            # Shrink protection: if new universe is <50% of old, something is wrong
-            # (API issue, temporary outage). Keep old universe and log critical.
-            prev_symbols = set(self._market_symbols())
-            prev_count = len(prev_symbols)
+            # Shrink protection: if new universe is <50% of LAST DISCOVERED universe,
+            # something is wrong (API issue, temporary outage). Keep old universe.
+            # Only applies after first successful discovery (initial config list is much larger).
+            last_discovered_count = getattr(self, "_last_discovered_count", 0)
             new_count = len(mapping)
-            if prev_count > 10 and new_count < prev_count * 0.5:
+            if last_discovered_count > 10 and new_count < last_discovered_count * 0.5:
                 logger.critical(
-                    "UNIVERSE_SHRINK_REJECTED: new universe is <50% of old — likely API issue, keeping old universe",
-                    old_count=prev_count,
+                    "UNIVERSE_SHRINK_REJECTED: new universe is <50% of last discovery — likely API issue, keeping old universe",
+                    last_discovered=last_discovered_count,
                     new_count=new_count,
-                    dropped_pct=f"{(1 - new_count / prev_count) * 100:.0f}%",
+                    dropped_pct=f"{(1 - new_count / last_discovered_count) * 100:.0f}%",
                 )
                 try:
                     from src.monitoring.alerting import send_alert
                     await send_alert(
                         "UNIVERSE_SHRINK",
-                        f"Discovery returned {new_count} coins vs {prev_count} current — rejected (keeping old universe)",
+                        f"Discovery returned {new_count} coins vs {last_discovered_count} last discovery — rejected",
                         urgent=True,
                     )
                 except Exception:
                     pass
                 return
 
-            # Log removed symbols
+            # Track last successful discovery count for future shrink checks
+            self._last_discovered_count = new_count
+
+            # Log added/removed symbols vs current universe
+            prev_symbols = set(self._market_symbols())
             supported = set(mapping.keys())
             dropped = prev_symbols - supported
             added = supported - prev_symbols
