@@ -389,6 +389,11 @@ When recovering from a kill switch:
 | `Auto-recovery: daily limit reached` | System needs manual intervention now |
 | `Capping position notional by aggregate exposure limit` | Aggregate 200% cap engaged |
 | `Alert (no webhook configured)` | ALERT_WEBHOOK_URL env var not set on server |
+| `UNIVERSE_SHRINK_REJECTED` | Discovery returned <50% of last discovery — kept old universe |
+| `SYMBOL_ADDED` / `SYMBOL_REMOVED` | Coin entered/left the discovered universe |
+| `SIGNAL_REJECTED_SPREAD` | Live spread too wide for entry (>1.0%) — signal skipped |
+| `Daily loss tracking initialized` | Starting equity recorded for daily P&L tracking |
+| `DAILY_LOSS_WARNING` | Daily loss approaching or exceeding limit |
 
 ---
 
@@ -468,7 +473,28 @@ Previously (before this fix), `daily_pnl` and `daily_start_equity` were always 0
 ## 13. Cycle Time Analysis
 
 As of Feb 2026, cycle times are:
-- **~65 seconds** (normal tick): 48 coins × 4+ timeframes each, fetched with `Semaphore(50)` concurrency. Bottleneck is per-coin Kraken API latency (~1-1.5s per coin).
+- **~62 seconds** (normal tick): 45 coins with `Semaphore(50)` concurrency and smart candle-boundary caching.
 - **~124 seconds** (reconciliation tick): Every ~120s, a full `sync_with_exchange` adds position/order reconciliation, doubling the cycle.
 
-The semaphore increase from 20→50 helped (coins run truly in parallel), but each coin's API calls are serial (multiple timeframes). Further improvement would require batch OHLCV endpoints or caching.
+**Candle caching (Feb 8 fix):** Instead of fetching all timeframes every cycle, the candle manager now checks if a new bar boundary has crossed since the last fetch. For 15m candles, this means ~15 of 45 coins actually fetch per cycle (those whose 15m bar just closed), not all 45. Higher timeframes (1h, 4h, 1d) are skipped even more aggressively.
+
+## 14. Universe Hardening (Feb 8)
+
+Five improvements to coin universe management:
+
+1. **Discovery refresh: 24h → 4h** (`config.yaml`). Catches liquidity changes, new listings, and delistings faster.
+
+2. **Universe shrink protection** (`live_trading.py → _update_market_universe`). If a new discovery returns <50% of the LAST discovered universe, it's rejected as a likely API issue. Sends `UNIVERSE_SHRINK` Telegram alert. Compares against last discovery, not the initial config list (which has 243 symbols vs ~45 eligible).
+
+3. **Pre-entry spread check** (`live_trading.py → process_coin`). Before a signal leads to entry:
+   - Uses already-fetched spot ticker bid/ask (zero new API calls)
+   - Rejects signals when live spread > 1.0% (extreme spreads only)
+   - **Fail-open**: any error in the check → allow trade
+   - Logs `SIGNAL_REJECTED_SPREAD` when triggered
+
+4. **Pinned Tier A comments fixed**. All comments now correctly say "BTC, ETH, SOL, DOGE, BNB" instead of "BTC, ETH only".
+
+5. **Smart candle-boundary caching** (`candle_manager.py`). 
+   - 30s hard floor on all refetches
+   - For 15m/1h: only refetch when a new bar boundary has crossed since last fetch
+   - Eliminates ~2/3 of redundant API calls per cycle
