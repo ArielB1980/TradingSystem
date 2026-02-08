@@ -215,6 +215,58 @@ def parse_log_file(log_path: Path, max_lines: int = 2000) -> List[Dict]:
     return entries
 
 
+def _futures_symbol_to_spot(futures_symbol: str) -> str:
+    """Convert a futures symbol to a spot symbol for candle lookups.
+
+    Examples:
+        PF_XBTUSD  -> BTC/USD
+        PF_BNBUSD  -> BNB/USD
+        PF_ETHUSD  -> ETH/USD
+        PF_PAXGUSD -> PAXG/USD
+    """
+    s = futures_symbol.upper()
+    # Strip PF_ prefix
+    if s.startswith("PF_"):
+        s = s[3:]
+    # Strip trailing USD
+    if s.endswith("USD"):
+        s = s[:-3]
+    # XBT -> BTC alias
+    if s == "XBT":
+        s = "BTC"
+    return f"{s}/USD"
+
+
+def _fetch_latest_candle_prices(symbols: List[str]) -> Dict[str, Decimal]:
+    """Fetch the latest candle close price for each spot symbol.
+
+    Returns a dict of spot_symbol -> close_price.
+    """
+    if not symbols:
+        return {}
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Use DISTINCT ON to get the most recent candle per symbol
+        cur.execute("""
+            SELECT DISTINCT ON (symbol) symbol, close
+            FROM candles
+            WHERE symbol = ANY(%s)
+            ORDER BY symbol, timestamp DESC
+        """, (symbols,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {
+            row["symbol"]: Decimal(str(row["close"]))
+            for row in rows
+            if row["close"]
+        }
+    except Exception as e:
+        print(f"Failed to fetch candle prices: {e}")
+        return {}
+
+
 def fetch_positions() -> List[Dict]:
     """Fetch current positions from database, with calculated PnL."""
     try:
@@ -234,26 +286,48 @@ def fetch_positions() -> List[Dict]:
         cur.close()
         conn.close()
 
-        positions = []
-        for row in rows:
-            pos = dict(row)
-            # Calculate PnL from mark price if the stored value is 0/NULL
-            pnl = pos.get("unrealized_pnl") or Decimal("0")
-            if pnl == 0:
-                try:
-                    mark = Decimal(str(pos.get("current_mark_price") or 0))
-                    entry = Decimal(str(pos.get("entry_price") or 0))
-                    size = Decimal(str(pos.get("size") or 0))
-                    side = str(pos.get("side", "")).lower()
-                    if mark > 0 and entry > 0 and size != 0:
-                        if side == "long":
-                            pnl = (mark - entry) * abs(size)
-                        elif side == "short":
-                            pnl = (entry - mark) * abs(size)
-                except Exception:
-                    pass
+        # Collect spot symbols so we can look up latest candle prices
+        positions = [dict(row) for row in rows]
+        spot_symbols = []
+        for pos in positions:
+            spot = _futures_symbol_to_spot(str(pos.get("symbol", "")))
+            pos["_spot_symbol"] = spot
+            spot_symbols.append(spot)
+
+        # Fetch latest candle close prices as mark price proxy
+        candle_prices = _fetch_latest_candle_prices(spot_symbols)
+
+        for pos in positions:
+            # Use candle close as live mark price when available
+            live_mark = candle_prices.get(pos.get("_spot_symbol"))
+            db_mark = pos.get("current_mark_price")
+            entry = pos.get("entry_price")
+
+            # Prefer candle price (it's more recent than the DB mark which may
+            # be stale/equal to entry).  Fall back to DB mark if no candle.
+            if live_mark and live_mark > 0:
+                mark = Decimal(str(live_mark))
+            elif db_mark and Decimal(str(db_mark)) > 0:
+                mark = Decimal(str(db_mark))
+            else:
+                mark = Decimal("0")
+
+            pos["current_mark_price"] = mark
+
+            # Calculate PnL
+            pnl = Decimal("0")
+            try:
+                entry_d = Decimal(str(entry or 0))
+                size_d = Decimal(str(pos.get("size") or 0))
+                side = str(pos.get("side", "")).lower()
+                if mark > 0 and entry_d > 0 and size_d != 0:
+                    if side == "long":
+                        pnl = (mark - entry_d) * abs(size_d)
+                    elif side == "short":
+                        pnl = (entry_d - mark) * abs(size_d)
+            except Exception:
+                pass
             pos["calculated_pnl"] = pnl
-            positions.append(pos)
 
         return positions
     except Exception as e:
