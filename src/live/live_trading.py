@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import List, Dict, Optional, Any
 
 from src.config.config import Config
-from src.services.market_discovery import MarketDiscoveryService
+from src.data.market_discovery import MarketDiscoveryService
 from src.monitoring.logger import get_logger
 from src.data.fiat_currencies import has_disallowed_base
 from src.data.kraken_client import KrakenClient

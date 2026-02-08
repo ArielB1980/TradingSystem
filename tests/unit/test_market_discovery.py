@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from src.data.market_registry import MarketRegistry, MarketPair
-from src.services.market_discovery import MarketDiscoveryService
+from src.data.market_discovery import MarketDiscoveryService
 
 
 from decimal import Decimal
