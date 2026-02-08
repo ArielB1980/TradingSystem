@@ -65,6 +65,43 @@ def _format_timestamp(dt: Optional[datetime], tz: timezone = CET) -> str:
     return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def _format_price(value) -> str:
+    """Format a price for display with reasonable precision.
+
+    Rules:
+      - >= $1:    2 decimal places (e.g. 4728.69)
+      - >= $0.01: 4 decimal places
+      - < $0.01:  6 decimal places (microcaps)
+      - None/invalid: '-'
+    """
+    if value is None:
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if num == 0:
+        return "0.00"
+    abs_val = abs(num)
+    if abs_val >= 1:
+        return f"{num:,.2f}"
+    if abs_val >= 0.01:
+        return f"{num:,.4f}"
+    return f"{num:,.6f}"
+
+
+def _format_pnl(value) -> str:
+    """Format PnL for display (always show $ sign and sign)."""
+    if value is None:
+        return "$0.00"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "$0.00"
+    sign = "+" if num > 0 else ""
+    return f"{sign}${num:,.2f}"
+
+
 def _format_age(seconds: Optional[float]) -> str:
     """Human-friendly age string."""
     if seconds is None or seconds < 0:
@@ -179,24 +216,46 @@ def parse_log_file(log_path: Path, max_lines: int = 2000) -> List[Dict]:
 
 
 def fetch_positions() -> List[Dict]:
-    """Fetch current positions from database."""
+    """Fetch current positions from database, with calculated PnL."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
+
         cur.execute("""
             SELECT symbol, side, size, entry_price, initial_stop_price,
-                   stop_loss_order_id, is_protected, unrealized_pnl, opened_at
+                   stop_loss_order_id, is_protected, unrealized_pnl,
+                   current_mark_price, opened_at
             FROM positions
             WHERE size != 0 AND size IS NOT NULL
             ORDER BY opened_at DESC
         """)
-        
+
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        
-        return [dict(row) for row in rows]
+
+        positions = []
+        for row in rows:
+            pos = dict(row)
+            # Calculate PnL from mark price if the stored value is 0/NULL
+            pnl = pos.get("unrealized_pnl") or Decimal("0")
+            if pnl == 0:
+                try:
+                    mark = Decimal(str(pos.get("current_mark_price") or 0))
+                    entry = Decimal(str(pos.get("entry_price") or 0))
+                    size = Decimal(str(pos.get("size") or 0))
+                    side = str(pos.get("side", "")).lower()
+                    if mark > 0 and entry > 0 and size != 0:
+                        if side == "long":
+                            pnl = (mark - entry) * abs(size)
+                        elif side == "short":
+                            pnl = (entry - mark) * abs(size)
+                except Exception:
+                    pass
+            pos["calculated_pnl"] = pnl
+            positions.append(pos)
+
+        return positions
     except Exception as e:
         print(f"Failed to fetch positions: {e}")
         return []
@@ -526,15 +585,22 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
             badge_class = "badge-long" if s.get("type") == "long" else "badge-short"
             score = s.get("score")
             score_class = "high" if (score or 0) >= 75 else "medium" if (score or 0) >= 60 else "low"
+            regime = s.get("regime") or "-"
+            # Regime should be a label (bullish/bearish), not a number
+            try:
+                float(regime)
+                regime = "-"  # Reset if it's accidentally a price
+            except (TypeError, ValueError):
+                pass
             signals_rows += f"""
                 <tr>
                     <td><strong>{s.get('symbol', '').replace('/', '')}</strong></td>
                     <td><span class="badge {badge_class}">{str(s.get('type', '')).upper()}</span></td>
                     <td><span class="badge badge-score {score_class}">{f'{score:.1f}' if score else '-'}</span></td>
-                    <td>{s.get('regime', '-')}</td>
-                    <td>{s.get('entry', '-')}</td>
-                    <td>{s.get('stop', '-')}</td>
-                    <td>{s.get('tp', '-')}</td>
+                    <td>{regime}</td>
+                    <td>{_format_price(s.get('entry'))}</td>
+                    <td>{_format_price(s.get('stop'))}</td>
+                    <td>{_format_price(s.get('tp'))}</td>
                 </tr>
             """
         signals_html = f"""
@@ -558,6 +624,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
     
     # Positions table
     positions_rows = ""
+    total_pnl = Decimal("0")
     if positions:
         for p in positions:
             side = str(p.get("side", "")).lower()
@@ -565,26 +632,33 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
             is_protected = bool(p.get("is_protected") or p.get("stop_loss_order_id"))
             protected_html = '<span class="badge badge-protected">Protected</span>' if is_protected else '<span style="color: #d29922;">Unprotected</span>'
             symbol = str(p.get("symbol", "")).replace("PF_", "").replace("USD", "")
-            pnl = p.get("unrealized_pnl", 0) or 0
-            pnl_color = "#3fb950" if float(pnl) >= 0 else "#f85149"
-            
+            pnl = p.get("calculated_pnl", Decimal("0"))
+            try:
+                total_pnl += Decimal(str(pnl))
+            except Exception:
+                pass
+            pnl_val = float(pnl)
+            pnl_color = "#3fb950" if pnl_val >= 0 else "#f85149"
+
             positions_rows += f"""
                 <tr>
                     <td><strong>{symbol}</strong></td>
                     <td><span class="badge {side_badge}">{side.upper()}</span></td>
                     <td>{p.get('size', '-')}</td>
-                    <td>{p.get('entry_price', '-')}</td>
-                    <td>{p.get('initial_stop_price', '-')}</td>
-                    <td style="color: {pnl_color};">{pnl}</td>
+                    <td>{_format_price(p.get('entry_price'))}</td>
+                    <td>{_format_price(p.get('current_mark_price'))}</td>
+                    <td>{_format_price(p.get('initial_stop_price'))}</td>
+                    <td style="color: {pnl_color}; font-weight: 600;">{_format_pnl(pnl)}</td>
                     <td>{protected_html}</td>
                 </tr>
             """
+        total_pnl_color = "#3fb950" if total_pnl >= 0 else "#f85149"
         positions_html = f"""
         <div class="section">
-            <div class="section-header">💼 Open Positions <span>{len(positions)} positions</span></div>
+            <div class="section-header">💼 Open Positions <span>{len(positions)} positions &bull; Total: <span style="color: {total_pnl_color}; font-weight: 700;">{_format_pnl(total_pnl)}</span></span></div>
             <div class="section-content">
                 <table>
-                    <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Stop</th><th>PnL</th><th>Status</th></tr></thead>
+                    <thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>Stop</th><th>PnL</th><th>Status</th></tr></thead>
                     <tbody>{positions_rows}</tbody>
                 </table>
             </div>
@@ -1245,12 +1319,21 @@ def update_dashboard():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Updating dashboard...")
     
     try:
-        # Find the active log file
+        # Find the active log file.
+        # systemd writes to trading.log; `make run` writes to run.log.
         log_dir = project_root / "logs"
+        trading_log = log_dir / "trading.log"
         run_log = log_dir / "run.log"
-        
+
+        if trading_log.exists():
+            active_log = trading_log
+        elif run_log.exists():
+            active_log = run_log
+        else:
+            active_log = trading_log  # Will gracefully return []
+
         # Parse log file
-        log_entries = parse_log_file(run_log, max_lines=3000)
+        log_entries = parse_log_file(active_log, max_lines=3000)
         
         # Fetch positions from database
         positions = fetch_positions()
