@@ -1,6 +1,6 @@
 # Session Knowledge: Lessons Learned & System Memory
 
-**Last Updated:** 2026-02-08
+**Last Updated:** 2026-02-08 (session 2)
 **Covers Sessions:** 2026-02-06 through 2026-02-08
 
 This file captures everything learned about this trading system across debugging, deployment, and operational sessions. It serves as institutional memory for any future AI agent or developer working on this codebase.
@@ -87,7 +87,7 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 - Other coins must qualify dynamically via futures volume and spread metrics.
 - Tiers: A (best liquidity), B (good), C (marginal).
 - The old `CoinClassifier` in `src/data/coin_universe.py` was deleted; everything goes through `MarketRegistry` now.
-- `CoinUniverseConfig` supports both `candidate_symbols` (new) and `liquidity_tiers` (deprecated, auto-normalized).
+- `CoinUniverseConfig` uses `candidate_symbols` (flat list). The old `liquidity_tiers` dict was removed from config.yaml on Feb 8.
 
 ---
 
@@ -321,15 +321,18 @@ Options to discuss (in order of impact):
 
 ---
 
-## 6. Account State (as of 2026-02-08)
+## 6. Account State (as of 2026-02-08 session 2)
 
-- **Equity:** ~$345
-- **Open Positions:** 1 (as of last CYCLE_SUMMARY)
+- **Equity:** ~$345.75
+- **Open Positions:** 2 (PF_PAXGUSD LONG, PF_BNBUSD SHORT) — both protected with SL orders
 - **System State:** NORMAL
-- **Coins Scanned:** ~49 per cycle (universe dynamically filtered)
-- **Cycle Interval:** ~30-60 seconds (improved from ~66s via semaphore increase)
-- **Telegram Bot:** `@My_KBot_bot` connected, alerting on kill switch, halt, new positions, closes, daily summary
-- **Safety additions:** Kill switch preserves SLs, signal cooldown (4h), aggregate notional cap (200%), auto halt recovery (margin_critical only, 2x/day max)
+- **Coins Scanned:** 45 per cycle (universe dynamically filtered from 246 candidates)
+- **Cycle Interval:** ~62s normal, ~116s reconciliation tick (every ~120s)
+- **Telegram Bot:** `@My_KBot_bot` connected — push alerts + interactive commands (`/status`, `/positions`, `/trades`, `/help`)
+- **Discovery refresh:** Every 4 hours (was 24h)
+- **Safety additions:** Kill switch preserves SLs, signal cooldown (4h), aggregate notional cap (200%), auto halt recovery (margin_critical only, 2x/day max), pre-entry spread check (fail-open), universe shrink protection, daily loss enforcement
+- **Database:** PostgreSQL for trades/events/candles, SQLite for position state machine
+- **Python venv on server:** `/home/trading/TradingSystem/venv/bin/python3`
 
 ---
 
@@ -479,7 +482,7 @@ The system runs an interactive Telegram bot alongside the alert system. It polls
 
 ---
 
-## 12. Daily Loss Enforcement
+## 13. Daily Loss Enforcement
 
 The daily loss limit (`daily_loss_limit_pct` in risk config, default 5%) is now actively enforced end-to-end:
 
@@ -494,7 +497,7 @@ Previously (before this fix), `daily_pnl` and `daily_start_equity` were always 0
 
 ---
 
-## 13. Cycle Time Analysis
+## 14. Cycle Time Analysis
 
 As of Feb 2026, cycle times are:
 - **~62 seconds** (normal tick): 45 coins with `Semaphore(50)` concurrency and smart candle-boundary caching.
@@ -502,7 +505,7 @@ As of Feb 2026, cycle times are:
 
 **Candle caching (Feb 8 fix):** Instead of fetching all timeframes every cycle, the candle manager now checks if a new bar boundary has crossed since the last fetch. For 15m candles, this means ~15 of 45 coins actually fetch per cycle (those whose 15m bar just closed), not all 45. Higher timeframes (1h, 4h, 1d) are skipped even more aggressively.
 
-## 14. Universe Hardening (Feb 8)
+## 15. Universe Hardening (Feb 8)
 
 Five improvements to coin universe management:
 
@@ -522,3 +525,68 @@ Five improvements to coin universe management:
    - 30s hard floor on all refetches
    - For 15m/1h: only refetch when a new bar boundary has crossed since last fetch
    - Eliminates ~2/3 of redundant API calls per cycle
+
+---
+
+## 16. Config Migration: liquidity_tiers → candidate_symbols (Feb 8)
+
+The `coin_universe` section in `config.yaml` was migrated from the deprecated `liquidity_tiers` (nested A/B/C dict) to `candidate_symbols` (flat list of 246 symbols). This eliminates the `DEPRECATION: coin_universe.liquidity_tiers is deprecated` warning that fired on every startup.
+
+**Before:**
+```yaml
+coin_universe:
+  liquidity_tiers:
+    A: ["BTC/USD", "ETH/USD", ...]
+    B: ["ARB/USD", ...]
+    C: ["2Z/USD", ...]
+```
+
+**After:**
+```yaml
+coin_universe:
+  candidate_symbols:
+    - "BTC/USD"
+    - "ETH/USD"
+    - ...  # 246 total
+```
+
+The tier classification is still done dynamically by `MarketRegistry` based on live futures volume and spread — it was never actually using the A/B/C grouping in the config for classification (only for discovery candidates).
+
+**Backward compatibility:** The `CoinUniverseConfig` model in `config.py` still supports `liquidity_tiers` and auto-flattens it into `candidate_symbols` via `normalize_candidates()`. But since config.yaml no longer uses it, the deprecation code path is never hit.
+
+---
+
+## 17. Log Noise Reduction (Feb 8)
+
+**Problem:** The `SMC Analysis: NO_SIGNAL` log line fired for nearly every coin on every cycle (~12,000 lines/day). Each reasoning string contained newlines, so lines like `❌ No valid order block found` appeared as separate journalctl entries with no module tag, making logs hard to grep.
+
+**Fix:**
+1. Downgraded from `logger.info()` to `logger.debug()` — NO_SIGNAL decisions are normal operation, not noteworthy events. The reasoning is still captured in DECISION_TRACE events in PostgreSQL.
+2. Changed reasoning separator from `\n` to ` | ` so the entire reasoning appears on one line.
+3. Used structured logging format (`logger.debug("SMC Analysis: NO_SIGNAL", symbol=..., reasoning=...)`) instead of f-string interpolation.
+
+**Result:** Zero `❌` lines in journalctl after deployment. Logs are now dominated by actionable info: cycle summaries, ticker fetches, signal events, and position management.
+
+---
+
+## 18. Current System Status & What Comes Next
+
+**As of Feb 8, 2026 (end of session 2):**
+
+The system is **stable and fully operational**. All safety, monitoring, and alerting systems are deployed and verified. The 4 closed trades (all LTC/USD SHORT, Feb 2) are pre-fix data — the system has changed so much since then that they aren't a meaningful performance sample.
+
+**The 2 open positions (PAXG LONG, BNB SHORT) are the first real test of the post-fix system.** No code changes are needed right now. The system needs runtime to generate meaningful performance data.
+
+**When to intervene:**
+- If both positions get stopped out → investigate whether 4H ATR stop multipliers (0.15-0.30x) are too tight
+- If daily loss limit fires → check if the limit (5%) is appropriate for the account size
+- If universe shrink protection fires → check Kraken API health
+- If kill switch fires → check logs for the specific invariant that triggered it
+
+**What NOT to change without data:**
+- Strategy parameters (score thresholds, ATR multipliers, Fibonacci gates)
+- Tier classification thresholds ($5M/$500K/$250K)
+- Signal cooldown duration (4h)
+- Any safety thresholds in `safety.yaml`
+
+These were set based on backtests showing 78.9% win rate. Changing them without new forward-test data would be premature optimization.
