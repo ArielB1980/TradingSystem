@@ -55,30 +55,9 @@ from src.safety.integration import (
     HardeningDecision,
 )
 
+from src.data.symbol_utils import exchange_position_side as _exchange_position_side
+
 logger = get_logger(__name__)
-
-def _exchange_position_side(pos_data: Dict[str, Any]) -> str:
-    """
-    Determine position side from exchange position dict.
-
-    IMPORTANT: Our Kraken Futures client normalizes `size` to ALWAYS be positive and
-    provides an explicit `side` field ("long" / "short"). Therefore we must prefer
-    `side` over inferring from the sign of `size`.
-
-    Falls back to signed-size inference for compatibility with any older/alternate
-    exchange adapters that might still return signed sizes.
-    """
-    side_raw = (pos_data.get("side") or pos_data.get("positionSide") or pos_data.get("direction") or "")
-    side = str(side_raw).lower().strip()
-    if side in ("long", "short"):
-        return side
-
-    # Fallback: infer from signed size if side field is missing.
-    try:
-        size_val = Decimal(str(pos_data.get("size", 0)))
-    except Exception:
-        return "long"
-    return "long" if size_val > 0 else "short"
 
 
 class LiveTrading:

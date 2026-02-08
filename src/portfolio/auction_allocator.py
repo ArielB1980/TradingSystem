@@ -11,25 +11,8 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 
 from src.domain.models import Position, Signal, Side
+from src.data.symbol_utils import normalize_symbol_for_position_match as _normalize_symbol_for_matching
 from src.monitoring.logger import get_logger
-
-
-def _normalize_symbol_for_matching(symbol: str) -> str:
-    """
-    Normalize symbol for matching between spot and futures formats.
-    
-    Handles: PROMPT/USD, PF_PROMPTUSD, PROMPT/USD:USD -> PROMPTUSD
-    """
-    if not symbol:
-        return ""
-    s = str(symbol).upper()
-    # Remove Kraken prefixes
-    s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
-    # Remove CCXT suffixes
-    s = s.split(':')[0]
-    # Remove separators
-    s = s.replace('/', '').replace('-', '').replace('_', '')
-    return s
 
 logger = get_logger(__name__)
 

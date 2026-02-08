@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from src.data.symbol_utils import exchange_position_side as _exchange_position_side
 from src.domain.models import Position, Side
 from src.monitoring.logger import get_logger
 
@@ -18,15 +19,6 @@ if TYPE_CHECKING:
     from src.live.live_trading import LiveTrading
 
 logger = get_logger(__name__)
-
-
-def _exchange_position_side(pos_data: dict) -> str:
-    """Determine position side from exchange position dict (copied from live_trading)."""
-    side_field = pos_data.get("side", "").lower()
-    if side_field in ("long", "short"):
-        return side_field
-    size = float(pos_data.get("size", 0))
-    return "long" if size >= 0 else "short"
 
 
 # ---------------------------------------------------------------------------

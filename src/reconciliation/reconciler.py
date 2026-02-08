@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
+from src.data.symbol_utils import normalize_to_base
 from src.domain.models import Position, Side
 from src.storage.repository import get_active_positions, delete_position, save_position
 
@@ -85,15 +86,8 @@ class Reconciler:
         )
 
     def _normalize_symbol_for_comparison(self, symbol: str) -> str:
-        if not symbol:
-            return ""
-        s = str(symbol).upper()
-        s = s.replace("PF_", "").replace("PI_", "").replace("FI_", "")
-        s = s.split(":")[0]
-        s = s.replace("/", "").replace("-", "").replace("_", "")
-        if s.endswith("USD"):
-            s = s[:-3]
-        return s
+        """Normalize symbol to base asset name for reconciliation comparison."""
+        return normalize_to_base(symbol)
 
     async def _fetch_exchange_positions(self) -> Dict[str, Dict]:
         try:

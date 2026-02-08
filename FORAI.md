@@ -1,6 +1,6 @@
 # Session Knowledge: Lessons Learned & System Memory
 
-**Last Updated:** 2026-02-08 (session 2)
+**Last Updated:** 2026-02-08 (session 3)
 **Covers Sessions:** 2026-02-06 through 2026-02-08
 
 This file captures everything learned about this trading system across debugging, deployment, and operational sessions. It serves as institutional memory for any future AI agent or developer working on this codebase.
@@ -69,8 +69,17 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 | File | Purpose |
 |------|---------|
 | `src/data/market_registry.py` | Market discovery, liquidity filtering, tier classification |
+| `src/data/market_discovery.py` | Market discovery service (spot/futures pairing) |
+| `src/data/symbol_utils.py` | **Single source of truth** for symbol normalization (6 functions) |
 | `src/strategy/smc_engine.py` | SMC (Smart Money Concepts) signal generation |
-| `src/live/live_trading.py` | Main trading loop, TP backfill, cycle orchestration |
+| `src/live/live_trading.py` | Main loop + tick orchestration (1,640 lines, down from 4,367) |
+| `src/live/protection_ops.py` | SL reconciliation, TP backfill, orphan cleanup |
+| `src/live/signal_handler.py` | Signal processing (v1/v2 paths) |
+| `src/live/auction_runner.py` | Auction-based allocation execution |
+| `src/live/exchange_sync.py` | Position sync, account state, trade history |
+| `src/live/health_monitor.py` | Order polling, protection checks, daily summary, auto-recovery |
+| `src/live/coin_processor.py` | Market symbol filtering, universe discovery |
+| `src/domain/protocols.py` | EventRecorder protocol for dependency inversion |
 | `src/portfolio/auction_allocator.py` | Trade candidate selection and capital allocation |
 | `src/risk/risk_manager.py` | Position sizing, risk validation, equity caps |
 | `src/execution/execution_gateway.py` | Order submission, tracking, event handling |
@@ -80,6 +89,21 @@ MarketRegistry (discovery) -> SMC Engine (signals) -> Auction Allocator (selecti
 | `src/config/config.yaml` | Main system configuration |
 | `src/monitoring/alerting.py` | Telegram/Discord webhook alerting module |
 | `src/utils/kill_switch.py` | Kill switch with SL-preserving order cancellation |
+
+### live_trading.py Decomposition (Session 3)
+The monolithic `live_trading.py` was decomposed into 7 focused modules:
+```
+src/live/
+  live_trading.py      -- Core loop + tick orchestration (1,640 lines)
+  protection_ops.py    -- SL/TP reconciliation, orphan cleanup (841 lines)
+  health_monitor.py    -- Monitoring: order polling, protection checks,
+                          daily summary, auto-recovery (480 lines)
+  auction_runner.py    -- Auction allocation execution (414 lines)
+  exchange_sync.py     -- Position sync, account state, trade history (331 lines)
+  signal_handler.py    -- Signal processing v1/v2 (249 lines)
+  coin_processor.py    -- Symbol filtering, universe discovery (191 lines)
+```
+All extracted modules use a **delegate pattern**: functions receive the `LiveTrading` instance as their first argument (`lt`) to access shared state. The methods on `LiveTrading` remain as 2-3 line thin delegates for backward compatibility.
 
 ### MarketRegistry: Single Source of Truth
 - `MarketRegistry` is THE authority for what can be traded and at what tier.
@@ -413,7 +437,8 @@ When recovering from a kill switch:
 ## 9. Development Environment
 
 - **Python entrypoint:** `run.py`
-- **Makefile targets:** `make venv`, `make install`, `make run`, `make smoke`, `make logs`, `make smoke-logs`
+- **Makefile targets:** `make venv`, `make install`, `make run`, `make smoke`, `make logs`, `make smoke-logs`, `make lint`, `make format`
+- **Linter/Formatter:** `ruff` (installed in venv)
 - **Config loading:** `python-dotenv` loads `.env.local` when `ENV=local` or `.env.local` exists
 - **Template:** `.env.local.example` has all required env vars with placeholders
 - **Local DB default:** `sqlite:///./.local/app.db` when `DATABASE_URL` is missing in local mode
@@ -569,19 +594,88 @@ The tier classification is still done dynamically by `MarketRegistry` based on l
 
 ---
 
-## 18. Current System Status & What Comes Next
+## 18. Session 3: Production Refactor (Feb 8, 2026)
 
-**As of Feb 8, 2026 (end of session 2):**
+### Overview
+Session 3 was a comprehensive code cleanup and architecture improvement spanning 3 PRs:
+- **PR #2** (`refactor/cleanup-v1`): Dead code removal, architecture improvements, DB optimizations
+- **PR #3** (`refactor/lt-extractions`): Further `live_trading.py` decomposition
+- **PR #4** (`refactor/symbol-normalizers`): Symbol normalizer consolidation
 
-The system is **stable and fully operational**. All safety, monitoring, and alerting systems are deployed and verified. The 4 closed trades (all LTC/USD SHORT, Feb 2) are pre-fix data — the system has changed so much since then that they aren't a meaningful performance sample.
+### Impact Summary
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| `live_trading.py` lines | 4,367 | 1,640 | -62% |
+| Total codebase lines removed | - | ~6,220 | Net deletion |
+| Files deleted | - | ~40 | Dead code, debug scripts |
+| Test regressions | - | 0 | All 330 tests passing |
 
-**The 2 open positions (PAXG LONG, BNB SHORT) are the first real test of the post-fix system.** No code changes are needed right now. The system needs runtime to generate meaningful performance data.
+### What Was Removed (Phase 2)
+- **V1 Position Manager** (`position_manager.py`, 233 lines) + all legacy V1 branches in `live_trading.py`
+- **Paper trading module** (`src/paper/`, 451 lines) -- never used in production
+- **IPC module** (`src/ipc/`, 26 lines), service abstractions (`src/services/`, 1,116 lines)
+- **Legacy main files** (`src/main.py`, `src/main_with_health.py`, 452 lines)
+- **Debug scripts** (`scripts/debug/`, 15 files + 4 standalone, ~835 lines)
+- **App Platform scripts** (16 files, ~2,232 lines) -- system runs on Droplet only
+- **Streamlit references** from `Procfile`, `health.py`, `cli.py`
+
+### Architecture Improvements (Phase 3)
+
+**EventRecorder Protocol** (`src/domain/protocols.py`):
+- `SMCEngine` and `RiskManager` accept `event_recorder` via constructor injection
+- Eliminates direct `from src.storage.repository import record_event` coupling
+- Unit tests use the default no-op recorder instead of module-level mocking
+
+**Database Optimizations** (`src/storage/repository.py`, `smc_engine.py`, `symbol_cooldown.py`):
+- Fixed N+1 query in `sync_active_positions` (batch fetch + dict lookup)
+- SQL `GROUP BY` in `get_last_signal_per_symbol` (was Python-side aggregation)
+- `SELECT ... FOR UPDATE` on `save_position` to prevent race conditions
+- Composite index `idx_trade_symbol_exited` on `TradeModel`
+- Raw `psycopg2` migrated to SQLAlchemy pool with 5-minute TTL caching
+
+**KrakenClient Performance** (`src/data/kraken_client.py`):
+- Persistent `aiohttp.ClientSession` with connection pooling (limit=30, DNS cache 300s)
+- Replaced 5 per-request session creations in futures API methods
+
+**Symbol Normalizer Consolidation** (`src/data/symbol_utils.py`):
+- `symbol_utils.py` is now the single source of truth for ALL symbol normalization
+- Added `normalize_to_base()` (strips to base asset: "BTC/USD" -> "BTC")
+- Added `exchange_position_side()` (position side from exchange dict)
+- Replaced 6 duplicate normalizers across `executor.py`, `auction_allocator.py`, `reconciler.py`, `symbol_cooldown.py`, `live_trading.py`, `protection_ops.py`
+
+### Bugs Fixed During Refactor
+- **`db_positions` NameError**: `_validate_position_protection` referenced undefined variable in else branch (leftover from V1 removal). Would crash at runtime when all positions were protected. Fixed during health_monitor extraction.
+- **Simplified `_exchange_position_side` in `protection_ops.py`**: Used `float()` instead of `Decimal()`, losing precision. Replaced with canonical version from `symbol_utils`.
+
+### Key Decisions
+1. **Delegate pattern over pass-through args**: Extracted functions receive `lt: "LiveTrading"` to access shared state. This was preferred over passing 10+ individual dependencies, balancing architecture clarity with practical regression risk.
+2. **No trading logic changes**: Zero modifications to signal generation, risk limits, sizing, order routing, or config defaults. All changes are structural.
+3. **Droplet-only target**: Archived App Platform config, deleted 16 related scripts. The system is deployed exclusively via `systemd` on a DigitalOcean Droplet.
+
+### Makefile Additions
+```
+make lint      -- Run ruff linter with auto-fix
+make format    -- Format code with ruff
+```
+
+---
+
+## 19. Current System Status & What Comes Next
+
+**As of Feb 8, 2026 (end of session 3):**
+
+The system is **stable, fully operational, and significantly cleaner**. The codebase has been reduced by ~6,200 lines with zero behavior changes. All 330 tests pass.
+
+**Remaining deferred items (lower priority, separate PRs):**
+- Move ~80 archival markdown files to `docs/archive/`
+- Create `ARCHITECTURE.md` with Droplet deployment guide and database layout
+- DB observability: connection pool logging, candle pruning, reconciliation monitor
 
 **When to intervene:**
-- If both positions get stopped out → investigate whether 4H ATR stop multipliers (0.15-0.30x) are too tight
-- If daily loss limit fires → check if the limit (5%) is appropriate for the account size
-- If universe shrink protection fires → check Kraken API health
-- If kill switch fires → check logs for the specific invariant that triggered it
+- If both positions get stopped out -> investigate whether 4H ATR stop multipliers (0.15-0.30x) are too tight
+- If daily loss limit fires -> check if the limit (5%) is appropriate for the account size
+- If universe shrink protection fires -> check Kraken API health
+- If kill switch fires -> check logs for the specific invariant that triggered it
 
 **What NOT to change without data:**
 - Strategy parameters (score thresholds, ATR multipliers, Fibonacci gates)

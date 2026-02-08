@@ -9,19 +9,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Tuple
 from decimal import Decimal
 
+from src.data.symbol_utils import normalize_to_base as normalize_symbol
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
 
 # In-memory cache for cooldowns (symbol -> cooldown_until timestamp)
 _symbol_cooldowns: Dict[str, datetime] = {}
-
-
-def normalize_symbol(symbol: str) -> str:
-    """Normalize symbol to base format for matching."""
-    # Handle both WIF/USD and PF_WIFUSD formats
-    base = symbol.replace("PF_", "").replace("USD", "").replace("/", "")
-    return base.upper()
 
 
 _loss_stats_cache: Dict[str, tuple] = {}  # key: (symbol, lookback_hours) -> ((count, pct), expires_at)
