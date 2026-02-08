@@ -32,7 +32,6 @@ from src.execution.position_manager_v2 import (
     ManagementAction as ManagementActionV2,
     ActionType as ActionTypeV2
 )
-from src.execution.equity import calculate_effective_equity
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.position_persistence import PositionPersistence
 from src.execution.production_safety import (
@@ -43,7 +42,7 @@ from src.execution.production_safety import (
 
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import save_candle, save_candles_bulk, get_active_position, save_account_state, sync_active_positions, record_event, record_metrics_snapshot, load_candles_map, get_candles, get_latest_candle_timestamp
+from src.storage.repository import record_event, record_metrics_snapshot
 from src.storage.maintenance import DatabasePruner
 from src.live.startup_validator import ensure_all_coins_have_traces
 from src.live.maintenance import periodic_data_maintenance
@@ -315,144 +314,19 @@ class LiveTrading:
                    hardening_enabled=self.hardening is not None)
 
     def _market_symbols(self) -> List[str]:
-        """Return list of spot symbols. Handles both list (initial) and dict (after discovery). Excludes blocklist."""
-        blocklist = set(
-            s.strip().upper() for s in getattr(self.config.exchange, "spot_ohlcv_blocklist", []) or []
-        )
-        # Also honor assets.blacklist (exists in config model but was not enforced here previously).
-        blocklist |= set(s.strip().upper() for s in getattr(self.config.assets, "blacklist", []) or [])
-        # Also honor execution entry blocklist for universe filtering (analysis + new entries).
-        blocklist |= set(
-            s.strip().upper().split(":")[0] for s in getattr(self.config.execution, "entry_blocklist_spot_symbols", []) or []
-        )
-        blocked_bases = set(
-            b.strip().upper() for b in getattr(self.config.execution, "entry_blocklist_bases", []) or []
-        )
-        if isinstance(self.markets, dict):
-            raw = list(self.markets.keys())
-        else:
-            raw = list(self.markets)
-        if not blocklist:
-            if not blocked_bases:
-                return raw
-        out: List[str] = []
-        for s in raw:
-            key = (s.strip().upper().split(":")[0] if s else "")
-            if not key:
-                continue
-            if key in blocklist:
-                continue
-            # Global exclusion: never include fiat/stablecoin-base instruments in the trading universe.
-            if has_disallowed_base(key):
-                continue
-            if blocked_bases:
-                base = key.split("/")[0].strip() if "/" in key else key
-                if base in blocked_bases:
-                    continue
-            out.append(s)
-        return out
+        """Return filtered spot symbols -- delegates to coin_processor module."""
+        from src.live.coin_processor import market_symbols
+        return market_symbols(self)
 
     def _get_static_tier(self, symbol: str) -> Optional[str]:
-        """
-        DEPRECATED: Debug-only legacy tier lookup.
-        
-        This method looks up the symbol in config coin_universe.liquidity_tiers,
-        which are now CANDIDATE GROUPS, not tier assignments.
-        
-        For authoritative tier classification, use:
-            self.market_discovery.get_symbol_tier(symbol)
-        
-        This is kept only for transitional logging and debugging.
-        Returns "A", "B", "C", or None if not in any config group.
-        """
-        if not getattr(self.config, "coin_universe", None) or not getattr(self.config.coin_universe, "enabled", False):
-            return None
-        tiers = getattr(self.config.coin_universe, "liquidity_tiers", None) or {}
-        for tier in ("A", "B", "C"):
-            if symbol in tiers.get(tier, []):
-                return tier
-        return None
-    
+        """DEPRECATED tier lookup -- delegates to coin_processor module."""
+        from src.live.coin_processor import get_static_tier
+        return get_static_tier(self, symbol)
+
     async def _update_market_universe(self):
-        """Discover and update trading universe."""
-        if not self.config.exchange.use_market_discovery:
-            return
-            
-        try:
-            logger.info("Executing periodic market discovery...")
-            mapping = await self.market_discovery.discover_markets()
-
-            if not mapping:
-                cooldown_min = getattr(
-                    self.config.exchange, "market_discovery_failure_log_cooldown_minutes", 60
-                )
-                now = datetime.now(timezone.utc)
-                should_log = (
-                    self._last_discovery_error_log_time is None
-                    or (now - self._last_discovery_error_log_time).total_seconds()
-                    >= cooldown_min * 60
-                )
-                if should_log:
-                    logger.critical(
-                        "Market discovery empty; using existing universe; "
-                        "check spot/futures market fetch (get_spot_markets/get_futures_markets)."
-                    )
-                    self._last_discovery_error_log_time = now
-                return
-            
-            # Shrink protection: if new universe is <50% of LAST DISCOVERED universe,
-            # something is wrong (API issue, temporary outage). Keep old universe.
-            # Only applies after first successful discovery (initial config list is much larger).
-            last_discovered_count = getattr(self, "_last_discovered_count", 0)
-            new_count = len(mapping)
-            if last_discovered_count > 10 and new_count < last_discovered_count * 0.5:
-                logger.critical(
-                    "UNIVERSE_SHRINK_REJECTED: new universe is <50% of last discovery — likely API issue, keeping old universe",
-                    last_discovered=last_discovered_count,
-                    new_count=new_count,
-                    dropped_pct=f"{(1 - new_count / last_discovered_count) * 100:.0f}%",
-                )
-                try:
-                    from src.monitoring.alerting import send_alert
-                    await send_alert(
-                        "UNIVERSE_SHRINK",
-                        f"Discovery returned {new_count} coins vs {last_discovered_count} last discovery — rejected",
-                        urgent=True,
-                    )
-                except Exception:
-                    pass
-                return
-
-            # Track last successful discovery count for future shrink checks
-            self._last_discovered_count = new_count
-
-            # Log added/removed symbols vs current universe
-            prev_symbols = set(self._market_symbols())
-            supported = set(mapping.keys())
-            dropped = prev_symbols - supported
-            added = supported - prev_symbols
-            for sym in sorted(dropped):
-                logger.warning("SYMBOL_REMOVED", symbol=sym)
-            for sym in sorted(added):
-                logger.info("SYMBOL_ADDED", symbol=sym)
-            
-            # Update internal state (Maintain Spot -> Futures mapping)
-            self.markets = mapping
-            self.futures_adapter.set_spot_to_futures_override(mapping)
-
-            # Update Data Acquisition
-            new_spot_symbols = list(mapping.keys())
-            new_futures_symbols = list(mapping.values())
-            self.data_acq.update_symbols(new_spot_symbols, new_futures_symbols)
-            
-            # Initialize logic is handled lazily by CandleManager/PositionManager as needed
-            # We just ensure DataAcquisition is updated (done above)
-            pass
-            
-            logger.info("Market universe updated", count=len(self.markets))
-            
-        except Exception as e:
-            logger.error("Failed to update market universe", error=str(e))
+        """Discover and update trading universe -- delegates to coin_processor module."""
+        from src.live.coin_processor import update_market_universe
+        await update_market_universe(self)
 
     async def run(self):
         """
@@ -837,387 +711,44 @@ class LiveTrading:
             logger.info("Live trading shutdown complete")
 
     async def _run_order_polling(self, interval_seconds: int = 12) -> None:
-        """Poll pending entry order status, process fills, trigger PLACE_STOP (SL/TP)."""
-        while self.active:
-            await asyncio.sleep(interval_seconds)
-            if not self.active:
-                break
-            if not self.execution_gateway:
-                continue
-            try:
-                n = await self.execution_gateway.poll_and_process_order_updates()
-                if n > 0:
-                    logger.info("Order poll processed updates", count=n)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Order poll failed", error=str(e))
+        """Poll pending entry order status -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_order_polling
+        await run_order_polling(self, interval_seconds)
 
     async def _run_protection_checks(self, interval_seconds: int = 30) -> None:
-        """
-        V2 protection monitor loop with escalation policy.
-
-        If a naked position is detected in prod live, fail closed by activating the kill switch
-        (emergency flatten).
-        
-        Startup grace: The first check is delayed by 3x the normal interval (90s by default)
-        to give the main tick loop time to place missing stops after a restart or kill switch
-        recovery. Without this, the monitor fires before stops can be placed, causing an
-        immediate emergency kill switch on startup.
-        """
-        # Startup grace period: wait longer on first check so the tick loop can
-        # place missing stops before we start enforcing Invariant K.
-        startup_grace_seconds = interval_seconds * 3
-        logger.info(
-            "Protection monitor: startup grace period",
-            grace_seconds=startup_grace_seconds,
-            enforce_after="first check",
-        )
-        await asyncio.sleep(startup_grace_seconds)
-        
-        consecutive_naked_count: Dict[str, int] = {}  # symbol -> consecutive naked detections
-        ESCALATION_THRESHOLD = 2  # Require 2 consecutive naked detections before emergency kill
-        
-        while self.active:
-            if not self.active:
-                break
-            if not getattr(self, "_protection_monitor", None):
-                await asyncio.sleep(interval_seconds)
-                continue
-            try:
-                results = await self._protection_monitor.check_all_positions()
-                naked = [s for s, ok in results.items() if not ok]
-                if naked:
-                    # Update consecutive counts
-                    for s in naked:
-                        consecutive_naked_count[s] = consecutive_naked_count.get(s, 0) + 1
-                    
-                    # Check if any symbol has been naked for enough consecutive checks
-                    persistent_naked = [s for s in naked if consecutive_naked_count.get(s, 0) >= ESCALATION_THRESHOLD]
-                    
-                    if persistent_naked:
-                        logger.critical(
-                            "NAKED_POSITIONS_DETECTED (persistent)",
-                            naked_symbols=persistent_naked,
-                            details=results,
-                            consecutive_counts={s: consecutive_naked_count[s] for s in persistent_naked},
-                        )
-                        is_prod_live = (os.getenv("ENVIRONMENT", "").strip().lower() == "prod") and (not self.config.system.dry_run)
-                        if is_prod_live:
-                            await self.kill_switch.activate(KillSwitchReason.RECONCILIATION_FAILURE, emergency=True)
-                            return
-                    else:
-                        logger.warning(
-                            "NAKED_POSITIONS_DETECTED (first occurrence, giving time to self-heal)",
-                            naked_symbols=naked,
-                            details=results,
-                            consecutive_counts={s: consecutive_naked_count.get(s, 0) for s in naked},
-                        )
-                else:
-                    # All positions protected — reset all counters
-                    consecutive_naked_count.clear()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Protection check loop failed", error=str(e), error_type=type(e).__name__)
-            
-            await asyncio.sleep(interval_seconds)
+        """V2 protection monitor loop -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_protection_checks
+        await run_protection_checks(self, interval_seconds)
 
     async def _get_system_status(self) -> dict:
-        """
-        Data provider for Telegram command handler.
-        Returns current system state for /status and /positions commands.
-        """
-        from src.execution.equity import calculate_effective_equity
-        
-        result: dict = {
-            "equity": Decimal("0"),
-            "margin_used": Decimal("0"),
-            "margin_pct": 0.0,
-            "positions": [],
-            "system_state": "UNKNOWN",
-            "kill_switch_active": False,
-            "cycle_count": getattr(self, "_last_cycle_count", 0),
-            "cooldowns_active": len(self._signal_cooldown),
-            "universe_size": len(self._market_symbols()),
-        }
-        
-        try:
-            balance = await self.client.get_futures_balance()
-            base = getattr(self.config.exchange, "base_currency", "USD")
-            equity, available_margin, margin_used = await calculate_effective_equity(
-                balance, base_currency=base, kraken_client=self.client
-            )
-            result["equity"] = equity
-            result["margin_used"] = margin_used
-            result["margin_pct"] = float((margin_used / equity) * 100) if equity > 0 else 0
-        except Exception as e:
-            logger.warning("Status: failed to get equity", error=str(e))
-        
-        try:
-            positions = await self.client.get_all_futures_positions()
-            result["positions"] = [p for p in positions if p.get("size", 0) != 0]
-        except Exception as e:
-            logger.warning("Status: failed to get positions", error=str(e))
-        
-        # System state
-        kill_active = self.kill_switch.is_active() if self.kill_switch else False
-        result["kill_switch_active"] = kill_active
-        if kill_active:
-            result["system_state"] = "KILL_SWITCH"
-        elif self.hardening and hasattr(self.hardening, 'invariant_monitor'):
-            inv_state = self.hardening.invariant_monitor.state.value
-            result["system_state"] = inv_state.upper() if inv_state != "active" else "NORMAL"
-        else:
-            result["system_state"] = "NORMAL"
-        
-        return result
+        """System status for Telegram -- delegates to health_monitor module."""
+        from src.live.health_monitor import get_system_status
+        return await get_system_status(self)
 
     async def _run_daily_summary(self) -> None:
-        """
-        Send a daily P&L summary via Telegram at midnight UTC.
-        
-        Calculates: equity, daily P&L, open positions, trades today, win rate.
-        Runs in a background loop, sleeping until the next midnight.
-        """
-        from src.monitoring.alerting import send_alert
-        
-        while self.active:
-            try:
-                # Calculate seconds until next midnight UTC
-                now = datetime.now(timezone.utc)
-                tomorrow = (now + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=5, microsecond=0
-                )
-                sleep_seconds = (tomorrow - now).total_seconds()
-                await asyncio.sleep(sleep_seconds)
-                
-                if not self.active:
-                    break
-                
-                # Gather data
-                try:
-                    account_info = await self.client.get_futures_account_info()
-                    equity = Decimal(str(account_info.get("equity", 0)))
-                    margin_used = Decimal(str(account_info.get("marginUsed", 0)))
-                    margin_pct = float((margin_used / equity) * 100) if equity > 0 else 0
-                    
-                    # Get open positions
-                    positions = await self.client.get_all_futures_positions()
-                    open_positions = [p for p in positions if p.get("size", 0) != 0]
-                    
-                    # Get today's trades from DB
-                    today_trades = []
-                    try:
-                        from src.storage.repository import get_trades_since
-                        since = now - timedelta(hours=24)
-                        all_trades = await asyncio.to_thread(get_trades_since, since)
-                        today_trades = all_trades if all_trades else []
-                    except Exception:
-                        pass
-                    
-                    wins = sum(1 for t in today_trades if getattr(t, 'net_pnl', 0) > 0)
-                    losses = sum(1 for t in today_trades if getattr(t, 'net_pnl', 0) <= 0)
-                    total_pnl = sum(getattr(t, 'net_pnl', Decimal("0")) for t in today_trades)
-                    win_rate = f"{(wins / (wins + losses) * 100):.0f}%" if (wins + losses) > 0 else "N/A"
-                    
-                    pnl_sign = "+" if total_pnl >= 0 else ""
-                    pnl_emoji = "📈" if total_pnl >= 0 else "📉"
-                    
-                    # Build position list
-                    pos_lines = []
-                    for p in open_positions[:10]:  # Max 10
-                        sym = p.get('symbol', '?')
-                        side = p.get('side', '?')
-                        upnl = Decimal(str(p.get('unrealizedPnl', p.get('unrealized_pnl', 0))))
-                        upnl_sign = "+" if upnl >= 0 else ""
-                        pos_lines.append(f"  • {sym} ({side}) {upnl_sign}${upnl:.2f}")
-                    
-                    positions_str = "\n".join(pos_lines) if pos_lines else "  None"
-                    
-                    summary = (
-                        f"{pnl_emoji} Daily Summary ({now.strftime('%Y-%m-%d')})\n"
-                        f"\n"
-                        f"Equity: ${equity:.2f}\n"
-                        f"Margin used: {margin_pct:.1f}%\n"
-                        f"\n"
-                        f"Trades today: {len(today_trades)}\n"
-                        f"Win/Loss: {wins}W / {losses}L ({win_rate})\n"
-                        f"Day P&L: {pnl_sign}${total_pnl:.2f}\n"
-                        f"\n"
-                        f"Open positions ({len(open_positions)}):\n"
-                        f"{positions_str}"
-                    )
-                    
-                    await send_alert("DAILY_SUMMARY", summary, urgent=True)
-                    logger.info("Daily summary sent", equity=str(equity), trades=len(today_trades))
-                    
-                    # Reset daily loss tracking for new day
-                    self.risk_manager.reset_daily_metrics(equity)
-                    
-                except Exception as e:
-                    logger.warning("Failed to gather daily summary data", error=str(e))
-                    
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Daily summary loop error", error=str(e))
-                await asyncio.sleep(3600)  # Retry in 1 hour
+        """Daily P&L summary at midnight UTC -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_daily_summary
+        await run_daily_summary(self)
 
     def _convert_to_position(self, data: Dict) -> Position:
-        """Convert raw exchange position dict to Position domain object."""
-        # Handle key variations (CCXT vs Raw vs Internal)
-        symbol = data.get('symbol')
-        
-        # Parse Side
-        side_raw = data.get('side', 'long').lower()
-        side = Side.LONG if side_raw in ['long', 'buy'] else Side.SHORT
-        
-        # Parse Numerics
-        size = Decimal(str(data.get('size', 0)))
-        entry_price = Decimal(str(data.get('entryPrice', data.get('entry_price', 0))))
-        mark_price = Decimal(str(data.get('markPrice', data.get('mark_price', 0))))
-        liq_price = Decimal(str(data.get('liquidationPrice', data.get('liquidation_price', 0))))
-        unrealized_pnl = Decimal(str(data.get('unrealizedPnl', data.get('unrealized_pnl', 0))))
-        leverage = Decimal(str(data.get('leverage', 1)))
-        margin_used = Decimal(str(data.get('initialMargin', data.get('margin_used', 0))))
-        
-        if mark_price == 0:
-            # Fallback for mark price if missing
-             mark_price = entry_price
-             
-        # Calculate Notional
-        size_notional = size * mark_price
-        
-        return Position(
-            symbol=symbol,
-            side=side,
-            size=size,
-            size_notional=size_notional,
-            entry_price=entry_price,
-            current_mark_price=mark_price,
-            liquidation_price=liq_price,
-            unrealized_pnl=unrealized_pnl,
-            leverage=leverage,
-            margin_used=margin_used,
-            opened_at=datetime.now(timezone.utc) # Approximate if missing
-        )
+        """Convert raw exchange position dict to Position domain object -- delegates to exchange_sync module."""
+        from src.live.exchange_sync import convert_to_position
+        return convert_to_position(self, data)
 
     async def _sync_positions(self, raw_positions: Optional[List[Dict]] = None) -> List[Dict]:
-        """
-        Sync active positions from exchange and update RiskManager.
-        
-        Args:
-            raw_positions: Optional pre-fetched positions list (to avoid duplicate API calls)
-        
-        Returns:
-            List of active positions (dicts)
-        """
-        if raw_positions is None:
-            try:
-                # Add timeout to prevent hanging the main loop
-                raw_positions = await asyncio.wait_for(self.client.get_all_futures_positions(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.error("Timeout fetching futures positions during sync")
-                raw_positions = []
-            except Exception as e:
-                logger.error("Failed to fetch futures positions", error=str(e))
-                raw_positions = []
-        
-        # Convert to Domain Objects
-        active_positions = []
-        for p in raw_positions:
-            try:
-                pos_obj = self._convert_to_position(p)
-                active_positions.append(pos_obj)
-            except Exception as e:
-                logger.error("Failed to convert position object", data=str(p), error=str(e))
-        
-        # Update Risk Manager
-        self.risk_manager.update_position_list(active_positions)
-        
-        # Persist to DB for Dashboard (Phase 2: Use async wrapper)
-        try:
-             await asyncio.to_thread(sync_active_positions, self.risk_manager.current_positions)
-        except Exception as e:
-             logger.error("Failed to sync positions to DB", error=str(e))
-        
-        # ALWAYS log position count for debugging
-        logger.info(
-            f"Active Portfolio: {len(active_positions)} positions", 
-            symbols=[p.symbol for p in active_positions]
-        )
-        
-        return raw_positions
+        """Sync active positions from exchange -- delegates to exchange_sync module."""
+        from src.live.exchange_sync import sync_positions
+        return await sync_positions(self, raw_positions)
 
     def _build_reconciler(self) -> "Reconciler":
-        """Build Reconciler with config, place_futures_order, and optional place_protection callback."""
-        place_futures = lambda symbol, side, order_type, size, reduce_only: self.client.place_futures_order(
-            symbol=symbol, side=side, order_type=order_type, size=size, reduce_only=reduce_only
-        )
-        place_protection = None  # Adopted positions get protection on next tick via _reconcile_protective_orders
-        return Reconciler(
-            self.client,
-            self.config,
-            place_futures_order_fn=place_futures,
-            place_protection_callback=place_protection,
-        )
+        """Build Reconciler -- delegates to exchange_sync module."""
+        from src.live.exchange_sync import build_reconciler
+        return build_reconciler(self)
 
     async def _validate_position_protection(self):
-        """
-        Validate all positions have protection (startup safety gate).
-        
-        Checks V2 position registry for unprotected positions.
-        Emits alerts and optionally pauses trading.
-        """
-        from src.storage.repository import async_record_event
-        
-        unprotected = []
-
-        tracked_symbols: set[str] = set()
-
-        # V2: Check registry state (authoritative)
-        for p in self.position_registry.get_all_active():
-            tracked_symbols.add(p.symbol)
-            
-            # Skip positions with zero remaining quantity - nothing to protect
-            if p.remaining_qty <= 0:
-                continue
-            
-            # Minimal protection invariants (full takeover invariants are handled elsewhere)
-            has_stop_price = p.current_stop_price is not None
-            has_stop_order = p.stop_order_id is not None
-            is_protected = bool(has_stop_price and has_stop_order)
-            if not is_protected:
-                unprotected.append({
-                    "symbol": p.symbol,
-                    "source": "registry_v2",
-                    "reason": "MISSING_STOP",
-                    "has_sl_price": has_stop_price,
-                    "has_sl_order": has_stop_order,
-                    "is_protected": is_protected,
-                    "remaining_qty": str(p.remaining_qty),
-                })
-        
-        if unprotected:
-            # This is actionable (positions lack protection) but is not a crash.
-            logger.error(
-                "UNPROTECTED positions detected",
-                count=len(unprotected),
-                positions=unprotected
-            )
-            # Emit alert events
-            for up in unprotected:
-                await async_record_event(
-                    "UNPROTECTED_POSITION",
-                    up['symbol'],
-                    up
-                )
-            # Optional: Pause new opens (uncomment if desired)
-            # self.trading_paused = True
-        else:
-            total_tracked = len(tracked_symbols) + (len(db_positions) if db_positions else 0)
-            logger.info("All positions are protected", total_positions=total_tracked)
+        """Startup position protection validation -- delegates to health_monitor module."""
+        from src.live.health_monitor import validate_position_protection
+        await validate_position_protection(self)
 
     async def _tick(self):
         """
@@ -2036,136 +1567,14 @@ class LiveTrading:
     _AUTO_RECOVERY_MARGIN_SAFE_PCT = 85  # Must be below this to recover
 
     async def _try_auto_recovery(self) -> bool:
-        """
-        Attempt automatic recovery from kill switch (margin_critical only).
-        
-        Rules (ALL must be true):
-        1. Kill switch reason is MARGIN_CRITICAL
-        2. At least 5 minutes since the halt was activated
-        3. Current margin utilization is below 85% (well below 92% trigger)
-        4. Fewer than 2 auto-recoveries in the last 24 hours
-        
-        Returns:
-            True if recovery was successful, False otherwise
-        """
-        if not self.kill_switch or not self.kill_switch.is_active():
-            return False
-        
-        if self.kill_switch.reason != KillSwitchReason.MARGIN_CRITICAL:
-            return False
-        
-        now = datetime.now(timezone.utc)
-        
-        # Rule 2: Cooldown since halt activation
-        if self.kill_switch.activated_at:
-            elapsed = (now - self.kill_switch.activated_at).total_seconds()
-            if elapsed < self._AUTO_RECOVERY_COOLDOWN_SECONDS:
-                logger.debug(
-                    "Auto-recovery: waiting for cooldown",
-                    elapsed_seconds=int(elapsed),
-                    required_seconds=self._AUTO_RECOVERY_COOLDOWN_SECONDS,
-                )
-                return False
-        
-        # Rule 4: Max recoveries per day
-        cutoff = now - timedelta(hours=24)
-        recent_attempts = [t for t in self._auto_recovery_attempts if t > cutoff]
-        self._auto_recovery_attempts = recent_attempts  # Prune old entries
-        if len(recent_attempts) >= self._AUTO_RECOVERY_MAX_PER_DAY:
-            logger.warning(
-                "Auto-recovery: daily limit reached (system needs manual intervention)",
-                attempts_today=len(recent_attempts),
-                max_per_day=self._AUTO_RECOVERY_MAX_PER_DAY,
-            )
-            return False
-        
-        # Rule 3: Check current margin utilization
-        try:
-            account_info = await self.client.get_futures_account_info()
-            equity = Decimal(str(account_info.get("equity", 0)))
-            margin_used = Decimal(str(account_info.get("marginUsed", 0)))
-            
-            if equity <= 0:
-                return False
-            
-            margin_util_pct = float((margin_used / equity) * 100)
-            
-            if margin_util_pct >= self._AUTO_RECOVERY_MARGIN_SAFE_PCT:
-                logger.info(
-                    "Auto-recovery: margin still too high",
-                    margin_util_pct=f"{margin_util_pct:.1f}",
-                    required_below=self._AUTO_RECOVERY_MARGIN_SAFE_PCT,
-                )
-                return False
-            
-            # All conditions met — recover!
-            self._auto_recovery_attempts.append(now)
-            
-            logger.critical(
-                "AUTO_RECOVERY: Clearing kill switch (margin recovered)",
-                margin_util_pct=f"{margin_util_pct:.1f}",
-                recovery_attempt=len(self._auto_recovery_attempts),
-                max_per_day=self._AUTO_RECOVERY_MAX_PER_DAY,
-                halt_duration_seconds=int((now - self.kill_switch.activated_at).total_seconds())
-                    if self.kill_switch.activated_at else 0,
-            )
-            
-            # Clear kill switch
-            self.kill_switch.acknowledge()
-            
-            # Also clear hardening halt state if it exists
-            if self.hardening and self.hardening.is_halted():
-                self.hardening.clear_halt(operator="auto_recovery")
-            
-            # Send alert
-            try:
-                from src.monitoring.alerting import send_alert_sync
-                send_alert_sync(
-                    "AUTO_RECOVERY",
-                    f"System auto-recovered from MARGIN_CRITICAL\n"
-                    f"Margin utilization: {margin_util_pct:.1f}%\n"
-                    f"Recovery #{len(self._auto_recovery_attempts)} of {self._AUTO_RECOVERY_MAX_PER_DAY}/day",
-                    urgent=True,
-                )
-            except Exception:
-                pass
-            
-            return True
-            
-        except Exception as e:
-            logger.warning("Auto-recovery: failed to check margin", error=str(e))
-            return False
+        """Auto-recovery from kill switch -- delegates to health_monitor module."""
+        from src.live.health_monitor import try_auto_recovery
+        return await try_auto_recovery(self)
 
     async def _sync_account_state(self):
-        """Fetch and persist real-time account state."""
-        try:
-            # 1. Get Balances
-            balance = await self.client.get_futures_balance()
-            if not balance:
-                return
-
-            # 2. Calculate Effective Equity (Shared Logic)
-            base = getattr(self.config.exchange, "base_currency", "USD")
-            equity, avail_margin, margin_used_val = await calculate_effective_equity(
-                balance, base_currency=base, kraken_client=self.client
-            )
-
-            # 3. Persist
-            save_account_state(
-                equity=equity,
-                balance=equity, # For futures margin, equity IS the balance relevant for trading
-                margin_used=margin_used_val,
-                available_margin=avail_margin,
-                unrealized_pnl=Decimal("0.0") # Included in portfolioValue usually
-            )
-            
-            # 4. Initialize daily loss tracking if not set
-            if self.risk_manager.daily_start_equity <= 0:
-                self.risk_manager.reset_daily_metrics(equity)
-                logger.info("Daily loss tracking initialized", starting_equity=str(equity))
-            
-        except Exception as e:
-            logger.error("Failed to sync account state", error=str(e))
+        """Fetch and persist real-time account state -- delegates to exchange_sync module."""
+        from src.live.exchange_sync import sync_account_state
+        await sync_account_state(self)
     
     # -----------------------------------------------------------------------
     # Signal handling (delegated to src.live.signal_handler)
@@ -2195,122 +1604,9 @@ class LiveTrading:
         await run_auction_allocation(self, raw_positions)
     
     async def _save_trade_history(self, position: Position, exit_price: Decimal, exit_reason: str):
-        """
-        Save closed position to trade history.
-        
-        Args:
-            position: The position being closed
-            exit_price: Exit price
-            exit_reason: Reason for exit (stop_loss, take_profit, manual, etc.)
-        """
-        try:
-            from src.domain.models import Trade
-            from src.storage.repository import save_trade
-            from datetime import datetime, timezone
-            import uuid
-            
-            # Calculate holding period
-            now = datetime.now(timezone.utc)
-            holding_hours = (now - position.opened_at).total_seconds() / 3600
-            
-            # Calculate PnL
-            if position.side == Side.LONG:
-                gross_pnl = (exit_price - position.entry_price) * position.size
-            else:  # SHORT
-                gross_pnl = (position.entry_price - exit_price) * position.size
-            
-            # Estimate fees (simplified - should use actual fees if available)
-            # Maker: 0.02%, Taker: 0.05% (Kraken Futures)
-            entry_fee = position.size_notional * Decimal("0.0002")  # Assume maker
-            exit_fee = position.size_notional * Decimal("0.0002")
-            fees = entry_fee + exit_fee
-            
-            # Estimate funding (simplified - should use actual funding if available)
-            # Average funding rate ~0.01% per 8 hours
-            funding_periods = holding_hours / 8
-            funding = position.size_notional * Decimal("0.0001") * Decimal(str(funding_periods))
-            
-            net_pnl = gross_pnl - fees - funding
-            
-            # Create Trade object
-            trade = Trade(
-                trade_id=str(uuid.uuid4()),
-                symbol=position.symbol,
-                side=position.side,
-                entry_price=position.entry_price,
-                exit_price=exit_price,
-                size_notional=position.size_notional,
-                leverage=position.leverage,
-                gross_pnl=gross_pnl,
-                fees=fees,
-                funding=funding,
-                net_pnl=net_pnl,
-                entered_at=position.opened_at,
-                exited_at=now,
-                holding_period_hours=Decimal(str(holding_hours)),
-                exit_reason=exit_reason
-            )
-            
-            # Save to database
-            await asyncio.to_thread(save_trade, trade)
-            
-            # Update daily P&L tracking in risk manager
-            try:
-                setup_type = getattr(position, 'setup_type', None)
-                balance = await self.client.get_futures_balance()
-                base = getattr(self.config.exchange, "base_currency", "USD")
-                equity_now, _, _ = await calculate_effective_equity(
-                    balance, base_currency=base, kraken_client=self.client
-                )
-                self.risk_manager.record_trade_result(net_pnl, equity_now, setup_type)
-                
-                # Alert if daily loss limit approached or exceeded
-                daily_loss_pct = abs(self.risk_manager.daily_pnl) / self.risk_manager.daily_start_equity \
-                    if self.risk_manager.daily_start_equity > 0 and self.risk_manager.daily_pnl < 0 \
-                    else Decimal("0")
-                if daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct * 0.7)):
-                    from src.monitoring.alerting import send_alert
-                    limit_pct = self.config.risk.daily_loss_limit_pct * 100
-                    await send_alert(
-                        "DAILY_LOSS_WARNING",
-                        f"Daily loss at {daily_loss_pct:.1%} of equity\n"
-                        f"Limit: {limit_pct:.0f}%\n"
-                        f"Daily P&L: ${self.risk_manager.daily_pnl:.2f}",
-                        urgent=daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct)),
-                    )
-            except Exception as e:
-                logger.warning("Failed to update daily P&L tracking", error=str(e))
-            
-            logger.info(
-                "Trade saved to history",
-                symbol=position.symbol,
-                side=position.side.value,
-                entry_price=str(position.entry_price),
-                exit_price=str(exit_price),
-                net_pnl=str(net_pnl),
-                exit_reason=exit_reason,
-                holding_hours=f"{holding_hours:.2f}"
-            )
-            
-            # Send close alert via Telegram
-            try:
-                from src.monitoring.alerting import send_alert
-                pnl_sign = "+" if net_pnl >= 0 else ""
-                pnl_emoji = "✅" if net_pnl >= 0 else "❌"
-                await send_alert(
-                    "POSITION_CLOSED",
-                    f"{pnl_emoji} Position closed: {position.symbol}\n"
-                    f"Side: {position.side.value.upper()}\n"
-                    f"Entry: ${position.entry_price} → Exit: ${exit_price}\n"
-                    f"P&L: {pnl_sign}${net_pnl:.2f}\n"
-                    f"Reason: {exit_reason}\n"
-                    f"Duration: {holding_hours:.1f}h",
-                )
-            except Exception:
-                pass  # Alert failure must never block trade history
-            
-        except Exception as e:
-            logger.error("Failed to save trade history", symbol=position.symbol, error=str(e))
+        """Save closed position to trade history -- delegates to exchange_sync module."""
+        from src.live.exchange_sync import save_trade_history
+        await save_trade_history(self, position, exit_price, exit_reason)
 
 
     # -----------------------------------------------------------------------

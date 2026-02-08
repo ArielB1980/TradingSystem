@@ -231,7 +231,7 @@ async def test_live_trading_keeps_existing_universe_and_logs_critical():
     lt._last_discovery_error_log_time = None
 
     with patch.object(lt.market_discovery, "discover_markets", new_callable=AsyncMock, return_value={}):
-        with patch("src.live.live_trading.logger") as mock_log:
+        with patch("src.live.coin_processor.logger") as mock_log:
             await lt._update_market_universe()
 
     assert lt.markets == {"BTC/USD": "PF_XBTUSD", "ETH/USD": "PF_ETHUSD"}
