@@ -500,11 +500,11 @@ def kill_switch_cmd(
 
 @app.command()
 def dashboard(
-    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
     port: int = typer.Option(8000, "--port", help="Port to bind to"),
 ):
     """
-    Launch the Web Dashboard.
+    Launch the static HTML Web Dashboard.
     
     Example:
         python src/cli.py dashboard
@@ -513,20 +513,16 @@ def dashboard(
     import sys
     import webbrowser
     
-    app_path = Path("src/dashboard/streamlit_app.py").resolve()
-    
     url = f"http://{host}:{port}"
-    typer.secho(f"🚀 Dashboard running at: {url}", fg=typer.colors.GREEN, bold=True)
+    typer.secho(f"Dashboard running at: {url}", fg=typer.colors.GREEN, bold=True)
     
-    # Auto-open browser
-    webbrowser.open(url)
+    # Auto-open browser (use localhost for browser even if binding to 0.0.0.0)
+    browser_url = url.replace("0.0.0.0", "127.0.0.1")
+    webbrowser.open(browser_url)
     
-    # Run Streamlit
+    # Run static dashboard
     subprocess.run([
-        sys.executable, "-m", "streamlit", "run", str(app_path),
-        "--server.port", str(port),
-        "--server.address", host,
-        "--theme.base", "dark"
+        sys.executable, "-m", "src.dashboard.static_dashboard",
     ])
 
 
