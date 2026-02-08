@@ -468,6 +468,27 @@ class ExecutionConfig(BaseSettings):
     )
 
 
+class DataSanityConfig(BaseSettings):
+    """Per-symbol data sanity gate configuration.
+
+    Stage A (pre-I/O): futures spread + volume.
+    Stage B (post-I/O): candle count + freshness.
+    Also controls the DataQualityTracker state machine thresholds.
+    """
+
+    max_spread_pct: float = Field(default=0.10, description="Max futures spread (10%)")
+    min_volume_24h_usd: float = Field(default=10_000, description="Min 24h futures volume USD")
+    min_decision_tf_candles: int = Field(default=250, description="Min candles on decision TF")
+    decision_tf: str = Field(default="4h", description="Decision timeframe for candle checks")
+    allow_spot_fallback: bool = Field(default=False, description="Fall back to spot ticker when futures missing")
+    degraded_after_failures: int = Field(default=3, ge=1, le=20)
+    suspend_after_hours: int = Field(default=6, ge=1, le=168)
+    release_after_successes: int = Field(default=3, ge=1, le=20)
+    probe_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    log_cooldown_seconds: int = Field(default=1800, ge=60, le=86400)
+    degraded_skip_ratio: int = Field(default=4, ge=2, le=20)
+
+
 class DataConfig(BaseSettings):
     """Data acquisition configuration."""
     # WebSocket settings
@@ -486,6 +507,9 @@ class DataConfig(BaseSettings):
     allow_futures_ohlcv_fallback: bool = Field(default=True, description="Use futures OHLCV when spot fails")
     min_healthy_coins: int = Field(default=30, ge=1, le=500, description="Min coins with sufficient candles to allow new entries")
     min_health_ratio: float = Field(default=0.25, ge=0.05, le=1.0, description="Min ratio sufficient/total to allow new entries")
+    
+    # Data sanity gate
+    data_sanity: DataSanityConfig = Field(default_factory=DataSanityConfig)
     
     # Storage
     # database_url can be None in DigitalOcean if RUN_TIME secrets aren't immediately available

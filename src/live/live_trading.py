@@ -56,6 +56,8 @@ from src.safety.integration import (
 )
 
 from src.data.symbol_utils import exchange_position_side as _exchange_position_side
+from src.data.data_sanity import SanityThresholds, check_ticker_sanity, check_candle_sanity
+from src.data.data_quality_tracker import DataQualityTracker
 
 logger = get_logger(__name__)
 
@@ -286,6 +288,41 @@ class LiveTrading:
         except Exception as e:
             logger.warning("Failed to initialize ProductionHardeningLayer", error=str(e))
             self.hardening = None
+        
+        # ===== DATA SANITY GATE + QUALITY TRACKER =====
+        try:
+            from src.config.config import DataSanityConfig
+            ds = getattr(config.data, "data_sanity", None)
+            if isinstance(ds, DataSanityConfig):
+                self.sanity_thresholds = SanityThresholds(
+                    max_spread_pct=Decimal(str(ds.max_spread_pct)),
+                    min_volume_24h_usd=Decimal(str(ds.min_volume_24h_usd)),
+                    min_decision_tf_candles=ds.min_decision_tf_candles,
+                    decision_tf=ds.decision_tf,
+                    allow_spot_fallback=ds.allow_spot_fallback,
+                )
+                self.data_quality_tracker = DataQualityTracker(
+                    degraded_after_failures=ds.degraded_after_failures,
+                    suspend_after_seconds=ds.suspend_after_hours * 3600,
+                    release_after_successes=ds.release_after_successes,
+                    probe_interval_seconds=ds.probe_interval_minutes * 60,
+                    log_cooldown_seconds=ds.log_cooldown_seconds,
+                    degraded_skip_ratio=ds.degraded_skip_ratio,
+                )
+                self.data_quality_tracker.restore()
+                logger.info(
+                    "DataSanityGate initialized",
+                    max_spread_pct=float(self.sanity_thresholds.max_spread_pct),
+                    min_volume=float(self.sanity_thresholds.min_volume_24h_usd),
+                    min_candles=self.sanity_thresholds.min_decision_tf_candles,
+                    decision_tf=self.sanity_thresholds.decision_tf,
+                )
+            else:
+                raise TypeError("data_sanity config not found or wrong type")
+        except Exception:
+            self.sanity_thresholds = SanityThresholds()
+            self.data_quality_tracker = DataQualityTracker()
+            logger.info("DataSanityGate initialized with defaults")
         
         logger.info("Live Trading initialized", 
                    markets=config.exchange.futures_markets,
@@ -687,6 +724,8 @@ class LiveTrading:
                     pass
             await self.data_acq.stop()
             await self.client.close()
+            # Persist data quality state so SUSPENDED/DEGRADED symbols survive restart
+            self.data_quality_tracker.force_persist()
             logger.info("Live trading shutdown complete")
 
     async def _run_order_polling(self, interval_seconds: int = 12) -> None:
@@ -881,6 +920,13 @@ class LiveTrading:
                 self.trade_paused = False
             map_spot_tickers = await self.client.get_spot_tickers_bulk(market_symbols)
             map_futures_tickers = await self.client.get_futures_tickers_bulk()
+            # Full FuturesTicker objects for data sanity gate (bid/ask/volume).
+            # None => bulk fetch failed => Stage A skipped (fail-open).
+            try:
+                map_futures_tickers_full = await self.client.get_futures_tickers_bulk_full()
+            except Exception as _e:
+                logger.warning("get_futures_tickers_bulk_full failed; sanity gate will skip Stage A", error=str(_e))
+                map_futures_tickers_full = None
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
@@ -1231,6 +1277,24 @@ class LiveTrading:
                     
                     is_tradable = skip_reason is None
 
+                    # --- STAGE A: Futures ticker sanity (pre-I/O) ---
+                    # Check spread + volume from already-fetched futures ticker.
+                    # If data is garbage, skip candle fetch + signal gen entirely.
+                    # Fail-open: if the bulk full ticker fetch failed (None), skip Stage A.
+                    if map_futures_tickers_full is not None:
+                        futures_ticker_full = map_futures_tickers_full.get(futures_symbol)
+                        stage_a = check_ticker_sanity(
+                            symbol=spot_symbol,
+                            futures_ticker=futures_ticker_full,
+                            spot_ticker=map_spot_tickers.get(spot_symbol),
+                            thresholds=self.sanity_thresholds,
+                        )
+                        if not stage_a.passed:
+                            self.data_quality_tracker.record_result(
+                                spot_symbol, passed=False, reason=stage_a.reason,
+                            )
+                            return
+
                     # Update Candles (spot first; futures fallback when spot unavailable)
                     await self._update_candles(spot_symbol)
                     
@@ -1285,40 +1349,23 @@ class LiveTrading:
                     if prev_count > 50 and candle_count == 0:
                         logger.critical("Data Depth Drop Detected!", symbol=spot_symbol, prev=prev_count, now=0)
 
-                    if candle_count < 50:
-                        # Still log trace even if insufficient candles (monitoring status)
-                        now = datetime.now(timezone.utc)
-                        last_trace = self.last_trace_log.get(spot_symbol, datetime.min.replace(tzinfo=timezone.utc))
-                        
-                        if (now - last_trace).total_seconds() > 300: # 5 minutes
-                            try:
-                                from src.storage.repository import async_record_event
-                                
-                                trace_details = {
-                                    "signal": "NO_SIGNAL",
-                                    "regime": "unknown",
-                                    "bias": "neutral",
-                                    "adx": 0.0,
-                                    "atr": 0.0,
-                                    "ema200_slope": "flat",
-                                    "spot_price": float(spot_price),
-                                    "setup_quality": 0.0,
-                                    "score_breakdown": {},
-                                    "status": "monitoring",
-                                    "candle_count": candle_count,
-                                    "reason": "insufficient_candles"
-                                }
-                                
-                                await async_record_event(
-                                    event_type="DECISION_TRACE",
-                                    symbol=spot_symbol,
-                                    details=trace_details,
-                                    timestamp=now
-                                )
-                                self.last_trace_log[spot_symbol] = now
-                            except Exception as e:
-                                logger.error("Failed to record monitoring trace", symbol=spot_symbol, error=str(e))
+                    # --- STAGE B: Candle integrity (post-I/O) ---
+                    # Check 4H decision-timeframe candle count + freshness.
+                    # Replaces the old `candle_count < 50` guard with a more
+                    # principled check that validates the decision TF specifically.
+                    stage_b = check_candle_sanity(
+                        symbol=spot_symbol,
+                        candle_manager=self.candle_manager,
+                        thresholds=self.sanity_thresholds,
+                    )
+                    if not stage_b.passed:
+                        self.data_quality_tracker.record_result(
+                            spot_symbol, passed=False, reason=stage_b.reason,
+                        )
                         return
+
+                    # Both stages passed -- record success
+                    self.data_quality_tracker.record_result(spot_symbol, passed=True)
 
                     # 4H DECISION AUTHORITY HIERARCHY:
                     # 1D: Regime filter (EMA200 bias)
@@ -1456,7 +1503,9 @@ class LiveTrading:
         # CRITICAL: Only process the filtered universe.
         # `self.markets` may include symbols that must be hard-blocked (e.g. fiat pairs),
         # and `process_coin()` can still trade them via futures tickers even without spot tickers.
-        await asyncio.gather(*[process_coin(s) for s in market_symbols], return_exceptions=True)
+        # Data quality filter: exclude SUSPENDED/DEGRADED-skipped symbols at scheduling level.
+        analyzable = [s for s in market_symbols if self.data_quality_tracker.should_analyze(s)]
+        await asyncio.gather(*[process_coin(s) for s in analyzable], return_exceptions=True)
         
         # Run auction mode allocation (if enabled) - after all signals processed
         if self.auction_allocator:
@@ -1475,6 +1524,9 @@ class LiveTrading:
         # Phase 2: Batch save all collected candles (grouped by symbol/timeframe)
         # Phase 2: Batch save all collected candles (delegated to Manager)
         await self.candle_manager.flush_pending()
+        
+        # Persist data quality state (rate-limited internally to every 5 min)
+        self.data_quality_tracker.persist()
         
         # Log periodic status summary (every 5 minutes)
         now = datetime.now(timezone.utc)
@@ -1503,6 +1555,11 @@ class LiveTrading:
                 fc = self.candle_manager.pop_futures_fallback_count()
                 if fc > 0:
                     summary["coins_futures_fallback_used"] = fc
+                # Include data quality summary
+                dq = self.data_quality_tracker.get_status_summary()
+                summary["data_quality_healthy"] = dq["healthy"]
+                summary["data_quality_degraded"] = dq["degraded"]
+                summary["data_quality_suspended"] = dq["suspended"]
                 logger.info("Coin processing status summary", **summary)
                 self.last_status_summary = now
             except Exception as e:

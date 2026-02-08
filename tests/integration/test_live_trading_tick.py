@@ -7,6 +7,7 @@ the tick path runs without crashing.
 import asyncio
 import os
 import pytest
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,8 +15,30 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.data.kraken_client import FuturesTicker
+
 from src.config.config import load_config
 from src.live.live_trading import LiveTrading
+
+
+def _make_futures_ticker(symbol: str, price: Decimal) -> FuturesTicker:
+    """Create a FuturesTicker with healthy spread + volume for tests."""
+    return FuturesTicker(
+        symbol=symbol,
+        mark_price=price,
+        bid=price * Decimal("0.999"),
+        ask=price * Decimal("1.001"),
+        volume_24h=Decimal("500000"),
+        open_interest=Decimal("10000"),
+        funding_rate=Decimal("0.0001"),
+    )
+
+
+def _make_candle(hours_ago: float = 0):
+    """Return a mock candle with a recent timestamp."""
+    c = MagicMock()
+    c.timestamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return c
 
 
 @pytest.fixture
@@ -145,6 +168,13 @@ def test_tick_processes_futures_only_symbol(minimal_config, mock_env):
                     "PF_ZILUSD": Decimal("0.02"),
                 }
             )
+            kc.return_value.get_futures_tickers_bulk_full = AsyncMock(
+                return_value={
+                    "PF_XBTUSD": _make_futures_ticker("PF_XBTUSD", Decimal("50000")),
+                    "PF_ETHUSD": _make_futures_ticker("PF_ETHUSD", Decimal("3000")),
+                    "PF_ZILUSD": _make_futures_ticker("PF_ZILUSD", Decimal("0.02")),
+                }
+            )
             kc.return_value.get_futures_balance = AsyncMock(
                 return_value={"total": {"USD": 10000}, "free": {"USD": 8000}, "used": {"USD": 2000}}
             )
@@ -153,7 +183,18 @@ def test_tick_processes_futures_only_symbol(minimal_config, mock_env):
             ex.return_value.check_order_timeouts = AsyncMock(return_value=0)
             cm.return_value.initialize = AsyncMock()
             cm.return_value.update_candles = AsyncMock()
-            cm.return_value.get_candles = lambda s, tf: [MagicMock()] * 60 if tf == "15m" else []
+            # Return enough candles for Stage B (4h >= 250, with fresh timestamps)
+            def _get_candles(s, tf):
+                if tf == "4h":
+                    return [_make_candle(hours_ago=i * 4) for i in range(260)]
+                if tf == "15m":
+                    return [_make_candle(hours_ago=i * 0.25) for i in range(60)]
+                if tf == "1h":
+                    return [_make_candle(hours_ago=i) for i in range(60)]
+                if tf == "1d":
+                    return [_make_candle(hours_ago=i * 24) for i in range(30)]
+                return []
+            cm.return_value.get_candles = _get_candles
             cm.return_value.flush_pending = AsyncMock()
             cm.return_value.pop_futures_fallback_count = lambda: 0
 

@@ -248,6 +248,22 @@ data:
   # Storage
   database_url: "${DATABASE_URL}"  # From environment variable
 
+  # Data sanity gate -- per-symbol quality checks inside process_coin().
+  # Stage A (pre-I/O): futures spread + volume → catch garbage data early.
+  # Stage B (post-I/O): candle count + freshness → ensure signal inputs exist.
+  data_sanity:
+    max_spread_pct: 0.10           # 10% -- reject clearly broken futures data
+    min_volume_24h_usd: 10000      # $10k -- dead market threshold (not liquidity tier)
+    min_decision_tf_candles: 250   # 4H candles for EMA200 + buffer
+    decision_tf: "4h"             # decision timeframe (freshness derived from this)
+    allow_spot_fallback: false    # only use spot if futures ticker entirely missing
+    degraded_after_failures: 3    # consecutive failures before DEGRADED state
+    suspend_after_hours: 6        # continuous failure hours before SUSPENDED
+    release_after_successes: 3    # consecutive passes to return to HEALTHY
+    probe_interval_minutes: 30    # SUSPENDED symbols re-check interval
+    log_cooldown_seconds: 1800    # 30 min per-symbol rate limit for non-transition logs
+    degraded_skip_ratio: 4        # in DEGRADED, analyze every Nth cycle (4 = 25%)
+
 ## Liquidity Filters (Market Discovery)
 # ============================================================
 # V2 FILTER REDESIGN: OI and Funding REMOVED as gates
