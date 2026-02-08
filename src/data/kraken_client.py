@@ -187,9 +187,33 @@ class KrakenClient:
 
         # Reusable SSL context
         self._ssl_context = None
+        
+        # Persistent HTTP session for connection reuse (created lazily)
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
         logger.info("Kraken client configuration loaded")
     
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """Get or create a persistent aiohttp.ClientSession for connection reuse."""
+        if self._http_session is None or self._http_session.closed:
+            connector = aiohttp.TCPConnector(
+                ssl=self._get_ssl_context(),
+                limit=20,  # max concurrent connections
+                ttl_dns_cache=300,  # DNS cache TTL
+            )
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._http_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
+        return self._http_session
+
+    async def close_http_session(self) -> None:
+        """Close the persistent HTTP session. Call on shutdown."""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            self._http_session = None
+
     def has_valid_spot_credentials(self) -> bool:
         """Check if spot API keys are present."""
         return bool(self.api_key and self.api_secret and not self.api_key.startswith("${"))
@@ -573,29 +597,27 @@ class KrakenClient:
             url = "https://futures.kraken.com/derivatives/api/v3/openpositions"
             headers = await self._get_futures_auth_headers(url, "GET")
             
-            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise Exception(f"Futures API error: {error_text}")
-                    
-                    data = await response.json()
-                    logger.debug("Raw Positions Response", keys=list(data.keys()), count=len(data.get('openPositions', [])))
-                    
-                    positions = []
-                    for pos in data.get('openPositions', []):
-                        positions.append({
-                            'symbol': pos.get('symbol'),
-                            'size': abs(Decimal(str(pos.get('size', 0)))),  # Always positive
-                            'entry_price': Decimal(str(pos.get('price', 0))),
-                            'liquidation_price': Decimal(str(pos.get('liquidationPrice', 0))),
-                            'unrealized_pnl': Decimal(str(pos.get('unrealizedPnl', 0))),
-                            'side': pos.get('side', 'long'),  # Use API's side field directly
-                        })
-                    
-                    return positions
+            session = await self._get_http_session()
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"Futures API error: {error_text}")
+                
+                data = await response.json()
+                logger.debug("Raw Positions Response", keys=list(data.keys()), count=len(data.get('openPositions', [])))
+                
+                positions = []
+                for pos in data.get('openPositions', []):
+                    positions.append({
+                        'symbol': pos.get('symbol'),
+                        'size': abs(Decimal(str(pos.get('size', 0)))),  # Always positive
+                        'entry_price': Decimal(str(pos.get('price', 0))),
+                        'liquidation_price': Decimal(str(pos.get('liquidationPrice', 0))),
+                        'unrealized_pnl': Decimal(str(pos.get('unrealizedPnl', 0))),
+                        'side': pos.get('side', 'long'),  # Use API's side field directly
+                    })
+                
+                return positions
             
         except Exception as e:
             logger.error("Failed to fetch all futures positions", error=str(e))
@@ -609,14 +631,12 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise Exception(f"Futures API error: {await response.text()}")
-                    data = await response.json()
-                    return data.get('instruments', [])
+            session = await self._get_http_session()
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Futures API error: {await response.text()}")
+                data = await response.json()
+                return data.get('instruments', [])
         except Exception as e:
             logger.error("Failed to fetch futures instruments", error=str(e))
             raise
@@ -639,44 +659,42 @@ class KrakenClient:
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             
-            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error("Futures API error", status=response.status, error=error_text)
-                        raise Exception(f"Futures API error: {error_text}")
-                    
-                    data = await response.json()
-                    
-                    # Kraken Futures uses PF_ prefix for perpetuals
-                    # and XBT instead of BTC
-                    search_symbols = [symbol]
-                    if symbol.endswith('-PERP'):
-                        base = symbol.replace('-PERP', '').replace('/', '')
-                        # Kraken uses XBT for Bitcoin
-                        base = base.replace('BTC', 'XBT')
-                        search_symbols.append(f"PF_{base}")
-                        search_symbols.append(f"PI_{base}")  # Legacy format
-                    
-                    # Find ticker for this symbol
-                    for ticker in data.get('tickers', []):
-                        ticker_symbol = ticker.get('symbol')
-                        if ticker_symbol in search_symbols:
-                            mark_price = ticker.get('markPrice')
-                            if mark_price is None:
-                                raise ValueError(f"Mark price not available for {symbol}")
-                            
-                            logger.debug(
-                                "Fetched futures mark price",
-                                symbol=symbol,
-                                ticker_symbol=ticker_symbol,
-                                mark_price=mark_price,
-                            )
-                            return Decimal(str(mark_price))
-                    
-                    raise ValueError(f"Symbol {symbol} not found in tickers. Searched: {search_symbols}")
+            session = await self._get_http_session()
+            async with session.get(url) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error("Futures API error", status=response.status, error=error_text)
+                    raise Exception(f"Futures API error: {error_text}")
+                
+                data = await response.json()
+                
+                # Kraken Futures uses PF_ prefix for perpetuals
+                # and XBT instead of BTC
+                search_symbols = [symbol]
+                if symbol.endswith('-PERP'):
+                    base = symbol.replace('-PERP', '').replace('/', '')
+                    # Kraken uses XBT for Bitcoin
+                    base = base.replace('BTC', 'XBT')
+                    search_symbols.append(f"PF_{base}")
+                    search_symbols.append(f"PI_{base}")  # Legacy format
+                
+                # Find ticker for this symbol
+                for ticker in data.get('tickers', []):
+                    ticker_symbol = ticker.get('symbol')
+                    if ticker_symbol in search_symbols:
+                        mark_price = ticker.get('markPrice')
+                        if mark_price is None:
+                            raise ValueError(f"Mark price not available for {symbol}")
+                        
+                        logger.debug(
+                            "Fetched futures mark price",
+                            symbol=symbol,
+                            ticker_symbol=ticker_symbol,
+                            mark_price=mark_price,
+                        )
+                        return Decimal(str(mark_price))
+                
+                raise ValueError(f"Symbol {symbol} not found in tickers. Searched: {search_symbols}")
             
         except Exception as e:
             logger.error("Failed to fetch futures mark price", symbol=symbol, error=str(e))
@@ -696,13 +714,11 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
-            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise Exception(f"Futures API error: {await response.text()}")
-                    data = await response.json()
+            session = await self._get_http_session()
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Futures API error: {await response.text()}")
+                data = await response.json()
 
             results: Dict[str, Decimal] = {}
             
@@ -790,13 +806,11 @@ class KrakenClient:
         await self.public_limiter.wait_for_token()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
-            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise Exception(f"Futures API error: {await response.text()}")
-                    data = await response.json()
+            session = await self._get_http_session()
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Futures API error: {await response.text()}")
+                data = await response.json()
 
             results: Dict[str, FuturesTicker] = {}
             
@@ -1418,6 +1432,7 @@ class KrakenClient:
 
     async def close(self):
         """Cleanup resources."""
+        await self.close_http_session()
         if self.futures_exchange:
             await self.futures_exchange.close()
         if self.exchange:

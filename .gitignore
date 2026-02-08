@@ -36,6 +36,10 @@ env/
 .env
 DATABASE_URL.txt
 
+# Credential files (NEVER commit API keys)
+ADD_API_KEYS.md
+QUICK_ADD_KEYS.md
+
 # Database
 *.db
 *.db-*

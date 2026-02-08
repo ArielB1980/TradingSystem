@@ -71,22 +71,6 @@ class Executor:
         
         logger.info("Executor initialized", config=config.model_dump())
         
-    def _normalize_symbol(self, symbol: str) -> str:
-        """
-        Normalize symbol for robust comparison.
-        Handles: PF_MONUSD, MON/USD:USD, MONUSD-PERP, etc.
-        Returns: MONUSD (clean uppercase)
-        """
-        if not symbol: return ""
-        s = symbol.upper()
-        # Remove Kraken prefixes
-        s = s.replace('PF_', '').replace('PI_', '').replace('FI_', '')
-        # Remove CCXT suffixes
-        s = s.split(':')[0]
-        # Remove separators
-        s = s.replace('/', '').replace('-', '').replace('_', '')
-        return s
-
 
         
     async def sync_open_orders(self) -> None:
@@ -312,7 +296,7 @@ class Executor:
                     
                     # Now check if exchange has pending orders for this symbol
                     exchange_pending = any(
-                        self._normalize_symbol(o.get('symbol', '')) == self._normalize_symbol(futures_symbol)
+                        normalize_symbol_for_position_match(o.get('symbol', '')) == normalize_symbol_for_position_match(futures_symbol)
                         and o.get('side', '').lower() == ('buy' if order_intent.side == Side.LONG else 'sell')
                         and o.get('status', '').lower() in ('open', 'pending', 'submitted')
                         for o in exchange_orders
@@ -339,7 +323,7 @@ class Executor:
                 # Block duplicate entry orders - only one entry order per symbol at a time
                 # NOTE: After cleaning stale orders above, this should be more accurate
                 has_pending = any(
-                    self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol)
+                    normalize_symbol_for_position_match(o.symbol) == normalize_symbol_for_position_match(futures_symbol)
                     and o.status in (OrderStatus.SUBMITTED, OrderStatus.PENDING)
                     and o.side == order_intent.side  # Same side to allow reversal orders
                     for o in self.submitted_orders.values()
@@ -352,7 +336,7 @@ class Executor:
                         side=order_intent.side.value,
                         reason="Pending entry order already exists in local state",
                         local_orders=len([o for o in self.submitted_orders.values()
-                                         if self._normalize_symbol(o.symbol) == self._normalize_symbol(futures_symbol)])
+                                         if normalize_symbol_for_position_match(o.symbol) == normalize_symbol_for_position_match(futures_symbol)])
                     )
                     return None
             

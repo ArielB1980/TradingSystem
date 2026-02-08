@@ -4,10 +4,17 @@ Shared symbol helpers for Kraken Futures.
 - PF_* (Kraken raw) <-> X/USD:USD (CCXT unified)
 - Position symbol vs order symbol matching (positions use PF_*, orders use unified)
 - futures_candidate_symbols: single source of truth for Kraken BTC/XBT and variants
+- normalize_to_base: extract base asset name from any symbol format
+- exchange_position_side: determine position side from exchange data dict
+
+This module is the **single source of truth** for symbol normalization. If you
+need to compare symbols across formats anywhere in the codebase, import from
+here rather than writing ad-hoc normalization logic.
 """
 from __future__ import annotations
 
-from typing import List
+from decimal import Decimal
+from typing import Any, Dict, List
 
 
 def normalize_symbol_for_position_match(symbol: str) -> str:
@@ -25,6 +32,55 @@ def normalize_symbol_for_position_match(symbol: str) -> str:
     s = s.split(":")[0]
     s = s.replace("/", "").replace("-", "").replace("_", "")
     return s
+
+
+def normalize_to_base(symbol: str) -> str:
+    """
+    Extract the base asset name from any symbol format.
+
+    BTC/USD, BTC/USD:USD, PF_BTCUSD, PI_BTCUSD, PF_XBTUSD -> BTC.
+    ROSE/USD -> ROSE.  WIF/USD:USD -> WIF.  PF_WIFUSD -> WIF.
+
+    Like ``normalize_symbol_for_position_match`` but also strips the trailing
+    "USD" quote currency, and applies the XBT->BTC alias.  Used for cooldown
+    matching, reconciliation base-asset comparison, and similar cases where
+    you need just the asset name.
+    """
+    s = normalize_symbol_for_position_match(symbol)
+    if s.endswith("USD"):
+        s = s[:-3]
+    # Kraken legacy alias
+    if s == "XBT":
+        s = "BTC"
+    return s
+
+
+def exchange_position_side(pos_data: Dict[str, Any]) -> str:
+    """
+    Determine position side from an exchange position dict.
+
+    IMPORTANT: Our Kraken Futures client normalizes ``size`` to ALWAYS be
+    positive and provides an explicit ``side`` field ("long" / "short").
+    Therefore we prefer ``side`` over inferring from the sign of ``size``.
+
+    Falls back to signed-size inference for compatibility with any older or
+    alternate exchange adapters that might still return signed sizes.
+    """
+    side_raw = (
+        pos_data.get("side")
+        or pos_data.get("positionSide")
+        or pos_data.get("direction")
+        or ""
+    )
+    side = str(side_raw).lower().strip()
+    if side in ("long", "short"):
+        return side
+    # Fallback: infer from signed size
+    try:
+        size_val = Decimal(str(pos_data.get("size", 0)))
+    except Exception:
+        return "long"
+    return "long" if size_val > 0 else "short"
 
 
 def pf_to_unified(s: str) -> str:

@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Tuple
 from decimal import Decimal
 
+from src.data.symbol_utils import normalize_to_base as normalize_symbol
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -17,16 +18,14 @@ logger = get_logger(__name__)
 _symbol_cooldowns: Dict[str, datetime] = {}
 
 
-def normalize_symbol(symbol: str) -> str:
-    """Normalize symbol to base format for matching."""
-    # Handle both WIF/USD and PF_WIFUSD formats
-    base = symbol.replace("PF_", "").replace("USD", "").replace("/", "")
-    return base.upper()
+_loss_stats_cache: Dict[str, tuple] = {}  # key: (symbol, lookback_hours) -> ((count, pct), expires_at)
+_LOSS_STATS_CACHE_TTL = 300  # 5 minutes
 
 
 def get_symbol_loss_stats(symbol: str, lookback_hours: int = 24) -> Tuple[int, float]:
     """
     Query database for recent losses on a symbol.
+    Uses SQLAlchemy connection pool (not raw psycopg2) and a 5-minute TTL cache.
     
     Args:
         symbol: Trading symbol (e.g., 'WIF/USD' or 'PF_WIFUSD')
@@ -35,42 +34,50 @@ def get_symbol_loss_stats(symbol: str, lookback_hours: int = 24) -> Tuple[int, f
     Returns:
         Tuple of (loss_count, total_pnl_pct)
     """
+    import time as _time
+
+    cache_key = f"{symbol}:{lookback_hours}"
+    cached = _loss_stats_cache.get(cache_key)
+    if cached and _time.monotonic() < cached[1]:
+        return cached[0]
+
     try:
-        import psycopg2
+        from sqlalchemy import text
+        from src.storage.db import get_db
+
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             return 0, 0.0
-            
-        conn = psycopg2.connect(database_url)
-        cur = conn.cursor()
         
-        # Normalize symbol for matching
+        db = get_db()
         base_symbol = normalize_symbol(symbol)
         
-        # Query trades table for losses
-        cur.execute("""
-            SELECT COUNT(*), COALESCE(SUM(net_pnl), 0), COALESCE(SUM(size_notional), 0)
-            FROM trades 
-            WHERE (
-                UPPER(REPLACE(REPLACE(symbol, 'PF_', ''), '/', '')) LIKE %s
-                OR UPPER(REPLACE(REPLACE(symbol, 'USD', ''), '/', '')) LIKE %s
+        with db.get_session() as session:
+            result = session.execute(
+                text("""
+                    SELECT COUNT(*), COALESCE(SUM(net_pnl), 0), COALESCE(SUM(size_notional), 0)
+                    FROM trades 
+                    WHERE (
+                        UPPER(REPLACE(REPLACE(symbol, 'PF_', ''), '/', '')) LIKE :base1
+                        OR UPPER(REPLACE(REPLACE(symbol, 'USD', ''), '/', '')) LIKE :base2
+                    )
+                    AND net_pnl < 0
+                    AND exited_at >= NOW() - INTERVAL :hours
+                """),
+                {"base1": f"%{base_symbol}%", "base2": f"%{base_symbol}%", "hours": f"{lookback_hours} hours"},
             )
-            AND net_pnl < 0
-            AND exited_at >= NOW() - INTERVAL '%s hours'
-        """, (f"%{base_symbol}%", f"%{base_symbol}%", lookback_hours))
+            row = result.fetchone()
         
-        result = cur.fetchone()
-        loss_count = result[0] if result and result[0] else 0
-        total_pnl = float(result[1]) if result and result[1] else 0.0
-        total_notional = float(result[2]) if result and result[2] else 1.0
+        loss_count = row[0] if row and row[0] else 0
+        total_pnl = float(row[1]) if row and row[1] else 0.0
+        total_notional = float(row[2]) if row and row[2] else 1.0
         
-        # Calculate PnL as percentage of notional
         pnl_pct = (total_pnl / total_notional * 100) if total_notional > 0 else 0.0
         
-        cur.close()
-        conn.close()
+        stats = (loss_count, pnl_pct)
+        _loss_stats_cache[cache_key] = (stats, _time.monotonic() + _LOSS_STATS_CACHE_TTL)
         
-        return loss_count, pnl_pct
+        return stats
         
     except Exception as e:
         logger.warning("Failed to query symbol losses", symbol=symbol, error=str(e))

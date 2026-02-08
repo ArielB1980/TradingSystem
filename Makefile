@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -31,6 +31,8 @@ help:
 	@echo "  make cancel-all-place-stops-live  Cancel ALL orders, then place SL per position (STOP_PCT=2)"
 	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
 	@echo "  make test          Run unit tests"
+	@echo "  make lint          Lint code with ruff"
+	@echo "  make format        Format code with ruff"
 	@echo "  make logs          Tail run logs"
 	@echo "  make smoke-logs    Tail smoke logs"
 	@echo "  make status        Check if bot is running"
@@ -118,11 +120,10 @@ smoke:
 
 integration:
 	@mkdir -p logs
-	@echo "Starting integration test (5 minutes)..."
-	@echo "This will test signal generation for 20+ symbols to catch bugs early."
+	@echo "Starting integration test (5 minutes, full live pipeline in dry-run)..."
 	@if [ -f .env.local ]; then \
 		set -a; source .env.local; set +a; \
-		ENV=local ENVIRONMENT=dev DRY_RUN=1 LOG_LEVEL=INFO PYTHONPATH=. $(PYTHON) src/test_integration.py 300 2>&1 | tee logs/integration.log; \
+		ENV=local ENVIRONMENT=dev DRY_RUN=1 RUN_SECONDS=300 LOG_LEVEL=INFO $(PYTHON) run.py live --force 2>&1 | tee logs/integration.log; \
 		EXIT_CODE=$$?; \
 		if [ $$EXIT_CODE -eq 0 ]; then \
 			echo ""; \
@@ -272,6 +273,14 @@ check-signals:
 test:
 	@echo "Running unit tests..."
 	$(PYTHON) -m pytest tests/ -v
+
+lint:
+	@echo "Running ruff linter..."
+	$(PYTHON) -m ruff check src/ tests/ --fix
+
+format:
+	@echo "Formatting code with ruff..."
+	$(PYTHON) -m ruff format src/ tests/
 
 logs:
 	@if [ -f logs/run.log ]; then \

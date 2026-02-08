@@ -1,37 +1,33 @@
 """
-Health check endpoint for App Platform.
+Health check endpoint for Droplet deployment.
 
 Two FastAPI apps are provided:
 1. `app` - Standalone health server (for `python -m src.health`)
-   - Used by old "web" service (now removed, but kept for backwards compatibility)
    - Comprehensive health checks with kill switch and worker liveness
    
 2. `worker_health_app` - Worker-integrated health server (for `python -m src.entrypoints.prod_live` with `WITH_HEALTH=1`)
    - Used by prod-live worker when `WITH_HEALTH=1`
-   - Includes Streamlit dashboard proxy at /dashboard
    - Simpler health checks optimized for worker context
 
 Production uses: worker_health_app (via `python -m src.entrypoints.prod_live` with `WITH_HEALTH=1`)
-Legacy/standalone: app (via python -m src.health)
+Standalone: app (via python -m src.health)
 """
 import html as html_module
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import os
 import time
 import subprocess
 import sys
 from typing import Optional, Tuple
-import httpx
 
 # Standalone health app (for python -m src.health - legacy, kept for backwards compatibility)
 app = FastAPI(title="Trading System Health Check")
 
 _worker_start = time.time()
-_streamlit_process = None
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -73,64 +69,13 @@ def _metrics_prometheus() -> Tuple[str, int]:
         return (f"# error: {e}\n", 200)
 
 
-def _start_streamlit():
-    """Start Streamlit subprocess for dashboard."""
-    global _streamlit_process
-    if _streamlit_process is not None:
-        # Check if process is still running
-        if _streamlit_process.poll() is None:
-            return  # Already started and running
-        # Process died, reset
-        _streamlit_process = None
-    
-    try:
-        _streamlit_process = subprocess.Popen([
-            sys.executable, "-m", "streamlit", "run",
-            "src/dashboard/streamlit_app.py",
-            "--server.port", "8501",
-            "--server.address", "127.0.0.1",
-            "--server.headless", "true",
-            "--browser.serverAddress", "0.0.0.0",
-            "--server.enableCORS", "false",
-            "--server.enableXsrfProtection", "false",
-            "--server.baseUrlPath", "/dashboard"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # Give Streamlit a moment to start (non-blocking check)
-        time.sleep(2)
-        # Check if process is still alive
-        if _streamlit_process.poll() is not None:
-            # Process died immediately
-            stdout, stderr = _streamlit_process.communicate()
-            error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
-            print(f"Warning: Streamlit failed to start: {error_msg[:200]}", file=sys.stderr)
-            _streamlit_process = None
-    except Exception as e:
-        print(f"Warning: Failed to start Streamlit: {e}", file=sys.stderr)
-        _streamlit_process = None
-
-
-def get_worker_health_app(with_dashboard: bool = True, enable_debug: bool = False) -> FastAPI:
+def get_worker_health_app(enable_debug: bool = False) -> FastAPI:
     """
     Health app for worker (prod-live entrypoint with `WITH_HEALTH=1`).
     Serves /, /health. Also /api, /api/health, /api/debug/signals, /debug/signals
     so the default app URL (which routes to worker) can serve debug endpoints.
-    Optionally serves Streamlit dashboard at /dashboard.
     """
-    global _streamlit_process
-
     w = FastAPI(title="Worker Health")
-
-    # Note: Streamlit will be started lazily on first dashboard request
-    # This avoids blocking startup if Streamlit has issues
-
-    @w.on_event("shutdown")
-    async def shutdown():
-        """Clean up Streamlit process on shutdown."""
-        global _streamlit_process
-        if _streamlit_process:
-            _streamlit_process.terminate()
-            _streamlit_process.wait()
-            _streamlit_process = None
 
     @w.get("/")
     async def root():
@@ -221,77 +166,22 @@ def get_worker_health_app(with_dashboard: bool = True, enable_debug: bool = Fals
         body, status = _metrics_prometheus()
         return PlainTextResponse(body, status_code=status)
 
-    # Proxy dashboard requests to Streamlit
-    @w.api_route("/dashboard", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-    @w.api_route("/dashboard/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-    async def proxy_dashboard(request: Request, path: str = ""):
-        """Proxy requests to Streamlit dashboard."""
-        if not with_dashboard:
-            return JSONResponse(
-                content={"error": "Dashboard not enabled"},
-                status_code=503
-            )
-        
-        # Lazy start Streamlit on first request
-        if _streamlit_process is None or (_streamlit_process.poll() is not None):
-            _start_streamlit()
-        
-        # Check if Streamlit is running
-        if _streamlit_process is None or _streamlit_process.poll() is not None:
-            return JSONResponse(
-                content={"error": "Dashboard service unavailable - Streamlit failed to start"},
-                status_code=503
-            )
-        
-        # Build Streamlit URL - handle both /dashboard and /dashboard/...
-        if path:
-            streamlit_url = f"http://127.0.0.1:8501/dashboard/{path}"
-        else:
-            streamlit_url = "http://127.0.0.1:8501/dashboard"
-        
-        query_params = str(request.url.query)
-        if query_params:
-            streamlit_url += f"?{query_params}"
-
-        async with httpx.AsyncClient() as client:
-            headers = dict(request.headers)
-            headers.pop("host", None)
-            
-            try:
-                if request.method == "GET":
-                    response = await client.get(streamlit_url, headers=headers, follow_redirects=True, timeout=30.0)
-                elif request.method == "POST":
-                    body = await request.body()
-                    response = await client.post(streamlit_url, content=body, headers=headers, follow_redirects=True, timeout=30.0)
-                else:
-                    body = await request.body()
-                    response = await client.request(
-                        request.method,
-                        streamlit_url,
-                        content=body,
-                        headers=headers,
-                        follow_redirects=True,
-                        timeout=30.0
-                    )
-                
-                return StreamingResponse(
-                    response.aiter_bytes(),
-                    status_code=response.status_code,
-                    headers=dict(response.headers)
-                )
-            except Exception as e:
-                return JSONResponse(
-                    content={"error": f"Failed to proxy to Streamlit: {str(e)}"},
-                    status_code=502
-                )
+    @w.get("/dashboard")
+    async def dashboard_info():
+        """Dashboard is served separately by static_dashboard.py."""
+        return JSONResponse(
+            content={
+                "message": "Dashboard is served by static_dashboard.py on its own port.",
+                "detail": "Run: python -m src.dashboard.static_dashboard",
+            },
+            status_code=200,
+        )
 
     return w
 
 
-# Secure defaults: disable dashboard + debug unless explicitly enabled.
-# This prevents accidental public exposure if the worker health server is bound to 0.0.0.0.
+# Secure defaults: disable debug unless explicitly enabled.
 worker_health_app = get_worker_health_app(
-    with_dashboard=_env_bool("WORKER_HEALTH_ENABLE_DASHBOARD", default=False),
     enable_debug=_env_bool("WORKER_HEALTH_ENABLE_DEBUG", default=False),
 )
 
@@ -393,14 +283,12 @@ async def metrics_prometheus():
 
 @app.get("/api/dashboard")
 async def dashboard_routing_debug():
-    """Debug endpoint - dashboard is now served by worker_health_app."""
+    """Dashboard is served by static_dashboard.py on its own port."""
     return JSONResponse(
-        status_code=404,
+        status_code=200,
         content={
-            "error": "Dashboard not available",
-            "message": "Dashboard is served by worker service via worker_health_app.",
-            "detail": "Use worker service with --with-health flag to access dashboard at /dashboard",
-            "service": "standalone-health"
+            "message": "Dashboard is served by static_dashboard.py on its own port.",
+            "detail": "Run: python -m src.dashboard.static_dashboard",
         }
     )
 

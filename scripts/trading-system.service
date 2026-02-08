@@ -1,17 +1,26 @@
 [Unit]
 Description=Trading System Live Trading
-After=network.target
+After=network.target postgresql.service
+Wants=postgresql.service
 
 [Service]
 Type=simple
 User=trading
 WorkingDirectory=/home/trading/TradingSystem
-Environment="PATH=/home/trading/TradingSystem/venv/bin"
+EnvironmentFile=/home/trading/TradingSystem/.env.production
+Environment="PATH=/home/trading/TradingSystem/venv/bin:/usr/local/bin:/usr/bin"
+Environment="WITH_HEALTH=1"
+ExecStartPre=/home/trading/TradingSystem/venv/bin/python migrate_schema.py
 ExecStart=/home/trading/TradingSystem/venv/bin/python -m src.entrypoints.prod_live
 Restart=always
 RestartSec=10
 StandardOutput=append:/home/trading/TradingSystem/logs/trading.log
 StandardError=append:/home/trading/TradingSystem/logs/trading-error.log
+
+# Safety: prevent runaway resource usage
+LimitNOFILE=65536
+MemoryMax=2G
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

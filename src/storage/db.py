@@ -2,12 +2,19 @@
 Database engine and session management.
 
 PostgreSQL only - SQLite is no longer supported.
+Includes connection-pool observability via SQLAlchemy pool events.
 """
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.pool import Pool
 from contextlib import contextmanager
-from typing import Generator
+from typing import Generator, Dict, Any
 import os
+import time
+
+from src.monitoring.logger import get_logger
+
+_pool_logger = get_logger("db.pool")
 
 # Base class for ORM models
 Base = declarative_base()
@@ -43,6 +50,9 @@ class Database:
         )
 
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+
+        # Register pool event listeners for observability
+        _register_pool_events(self.engine.pool)
 
     def create_all(self):
         """Create all tables."""
@@ -178,3 +188,70 @@ def init_db(database_url: str) -> Database:
     _db_instance = Database(database_url)
     _db_instance.create_all()
     return _db_instance
+
+
+# ---------------------------------------------------------------------------
+# Connection-pool observability
+# ---------------------------------------------------------------------------
+
+def _register_pool_events(pool: Pool) -> None:
+    """
+    Attach SQLAlchemy pool event listeners for observability.
+
+    Logs:
+      - ``POOL_CHECKOUT``:   A connection was checked out.
+      - ``POOL_CHECKIN``:    A connection was returned.
+      - ``POOL_OVERFLOW``:   A new overflow connection was created.
+      - ``POOL_TIMEOUT``:    A checkout waited longer than the pool timeout.
+      - ``POOL_INVALIDATE``: A connection was invalidated (e.g. stale).
+    """
+
+    @event.listens_for(pool, "checkout")
+    def _on_checkout(dbapi_connection, connection_record, connection_proxy):
+        connection_record.info["checkout_time"] = time.monotonic()
+        _pool_logger.debug(
+            "POOL_CHECKOUT",
+            pool_size=pool.size(),
+            checked_out=pool.checkedout(),
+            overflow=pool.overflow(),
+        )
+
+    @event.listens_for(pool, "checkin")
+    def _on_checkin(dbapi_connection, connection_record):
+        checkout_time = connection_record.info.pop("checkout_time", None)
+        held_ms = (
+            round((time.monotonic() - checkout_time) * 1000, 1)
+            if checkout_time is not None
+            else None
+        )
+        _pool_logger.debug(
+            "POOL_CHECKIN",
+            held_ms=held_ms,
+            pool_size=pool.size(),
+            checked_out=pool.checkedout(),
+        )
+
+    @event.listens_for(pool, "invalidate")
+    def _on_invalidate(dbapi_connection, connection_record, exception):
+        _pool_logger.warning(
+            "POOL_INVALIDATE",
+            error=str(exception) if exception else None,
+        )
+
+
+def get_pool_status() -> Dict[str, Any]:
+    """
+    Return a snapshot of connection-pool health metrics.
+
+    Useful for health-check endpoints and periodic monitoring.
+    Returns an empty dict if the database has not been initialised yet.
+    """
+    if _db_instance is None:
+        return {}
+    pool = _db_instance.engine.pool
+    return {
+        "pool_size": pool.size(),
+        "checked_out": pool.checkedout(),
+        "overflow": pool.overflow(),
+        "checked_in": pool.checkedin(),
+    }
