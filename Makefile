@@ -118,11 +118,10 @@ smoke:
 
 integration:
 	@mkdir -p logs
-	@echo "Starting integration test (5 minutes)..."
-	@echo "This will test signal generation for 20+ symbols to catch bugs early."
+	@echo "Starting integration test (5 minutes, full live pipeline in dry-run)..."
 	@if [ -f .env.local ]; then \
 		set -a; source .env.local; set +a; \
-		ENV=local ENVIRONMENT=dev DRY_RUN=1 LOG_LEVEL=INFO PYTHONPATH=. $(PYTHON) src/test_integration.py 300 2>&1 | tee logs/integration.log; \
+		ENV=local ENVIRONMENT=dev DRY_RUN=1 RUN_SECONDS=300 LOG_LEVEL=INFO $(PYTHON) run.py live --force 2>&1 | tee logs/integration.log; \
 		EXIT_CODE=$$?; \
 		if [ $$EXIT_CODE -eq 0 ]; then \
 			echo ""; \

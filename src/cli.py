@@ -119,44 +119,6 @@ def backtest(
 
 
 @app.command()
-def paper(
-    config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
-):
-    """
-    Run paper trading with real-time data and simulated execution.
-    
-    Example:
-        python src/cli.py paper
-    """
-    # Load configuration
-    config = _load_config(config_path)
-    _setup_logging_from_config(config)
-    
-    # Validate environment
-    if config.environment != "paper":
-        logger.warning("Environment is not set to 'paper' in config", env=config.environment)
-        if not typer.confirm("Continue anyway?"):
-            raise typer.Abort()
-    
-    logger.info("Starting paper trading")
-    
-    import asyncio
-    from src.paper.paper_trading import PaperTrading
-    
-    async def run_paper():
-        engine = PaperTrading(config)
-        await engine.run()
-        
-    try:
-        asyncio.run(run_paper())
-    except KeyboardInterrupt:
-        logger.info("Paper trading stopped by user")
-    except Exception as e:
-        logger.error("Paper trading failed", error=str(e))
-        raise typer.Exit(1)
-
-
-@app.command()
 def live(
     config_path: Path = typer.Option("src/config/config.yaml", "--config", help="Path to config file"),
     force: bool = typer.Option(False, "--force", help="Force live trading (bypass safety gates)"),
