@@ -133,11 +133,19 @@ def check_candle_sanity(
     symbol: str,
     candle_manager: "CandleManager",
     thresholds: SanityThresholds,
+    now: Optional[datetime] = None,
 ) -> SanityResult:
     """Check candle count and freshness for the decision timeframe.
 
     Must be called **after** ``_update_candles()`` so the cache is populated.
+
+    Args:
+        now: Override wall-clock time (for deterministic replay).
+             Defaults to ``datetime.now(timezone.utc)``.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
     tf = thresholds.decision_tf
     candles = candle_manager.get_candles(symbol, tf)
     count = len(candles)
@@ -153,7 +161,7 @@ def check_candle_sanity(
     newest = candles[-1].timestamp
     if newest.tzinfo is None:
         newest = newest.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - newest).total_seconds() / 3600
+    age_hours = (now - newest).total_seconds() / 3600
     max_age = _max_candle_age_hours(tf)
     if age_hours > max_age:
         return SanityResult(

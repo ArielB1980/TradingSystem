@@ -78,6 +78,10 @@ data/instrument_specs_cache.json
 logs/
 .venv/
 
+# Recording & replay data
+data/recordings/
+data/replay_reports/
+
 # Ad-hoc logs and output (run-specific)
 raw_logs.txt
 full_logs.txt

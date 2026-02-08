@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from src.monitoring.logger import get_logger
 
@@ -80,6 +80,7 @@ class DataQualityTracker:
         degraded_skip_ratio: int = DEFAULT_DEGRADED_SKIP_RATIO,
         persist_interval_seconds: float = DEFAULT_PERSIST_INTERVAL_SECONDS,
         state_file: str = DEFAULT_STATE_FILE,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.degraded_after_failures = degraded_after_failures
         self.suspend_after_seconds = suspend_after_seconds
@@ -89,6 +90,7 @@ class DataQualityTracker:
         self.degraded_skip_ratio = degraded_skip_ratio
         self.persist_interval_seconds = persist_interval_seconds
         self.state_file = Path(state_file)
+        self._clock: Callable[[], float] = clock or time.time
 
         self._symbols: Dict[str, _SymbolRecord] = {}
         self._log_cooldowns: Dict[str, float] = {}   # symbol -> last log ts
@@ -124,7 +126,7 @@ class DataQualityTracker:
             return False
 
         if rec.state == SymbolHealthState.SUSPENDED:
-            now = time.time()
+            now = self._clock()
             if now - rec.last_probe_ts >= self.probe_interval_seconds:
                 rec.last_probe_ts = now
                 self.log_event(symbol, "probe", "probing SUSPENDED symbol")
@@ -140,7 +142,7 @@ class DataQualityTracker:
         Handles all state transitions.
         """
         rec = self._get(symbol)
-        now = time.time()
+        now = self._clock()
 
         if passed:
             self._handle_pass(rec, symbol, now)
@@ -179,7 +181,7 @@ class DataQualityTracker:
         force: bool = False,
     ) -> None:
         """Rate-limited logger.  State transitions always force-log."""
-        now = time.time()
+        now = self._clock()
         last = self._log_cooldowns.get(symbol, 0.0)
 
         if not force and (now - last) < self.log_cooldown_seconds:
@@ -200,7 +202,7 @@ class DataQualityTracker:
 
     def persist(self) -> None:
         """Write non-HEALTHY symbols to disk if enough time has elapsed."""
-        now = time.time()
+        now = self._clock()
         if now - self._last_persist_ts < self.persist_interval_seconds:
             return
         self._last_persist_ts = now
@@ -208,7 +210,7 @@ class DataQualityTracker:
 
     def force_persist(self) -> None:
         """Persist immediately (e.g. on shutdown)."""
-        self._last_persist_ts = time.time()
+        self._last_persist_ts = self._clock()
         self._do_persist()
 
     def _do_persist(self) -> None:
