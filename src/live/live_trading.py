@@ -2167,227 +2167,23 @@ class LiveTrading:
         except Exception as e:
             logger.error("Failed to sync account state", error=str(e))
     
+    # -----------------------------------------------------------------------
+    # Signal handling (delegated to src.live.signal_handler)
+    # -----------------------------------------------------------------------
+
     async def _handle_signal(
-        self, 
-        signal: Signal, 
-        spot_price: Decimal, 
-        mark_price: Decimal,
+        self, signal: Signal, spot_price: Decimal, mark_price: Decimal,
     ) -> dict:
-        """
-        Process signal through Position State Machine V2.
-        
-        Args:
-            signal: Trading signal
-            spot_price: Current spot price
-            mark_price: Current futures mark price
-        
-        Returns:
-            dict with keys:
-                - order_placed: bool (True if order was placed, False if rejected/failed)
-                - reason: str (human-readable reason for success/failure)
-                - rejection_reasons: list[str] (if rejected, list of rejection reasons from RiskManager)
-        """
-        self.signals_since_emit += 1
-        logger.info("New signal detected", type=signal.signal_type.value, symbol=signal.symbol)
-        
-        # Health gate: no new entries when candle health is insufficient
-        if getattr(self, "trade_paused", False):
-            return {
-                "order_placed": False,
-                "reason": "TRADING PAUSED: candle health insufficient",
-                "rejection_reasons": ["trade_paused"],
-            }
-        
-        return await self._handle_signal_v2(signal, spot_price, mark_price)
+        """Signal processing -- delegates to signal_handler module."""
+        from src.live.signal_handler import handle_signal
+        return await handle_signal(self, signal, spot_price, mark_price)
 
     async def _handle_signal_v2(
-        self, signal: Signal, spot_price: Decimal, mark_price: Decimal
+        self, signal: Signal, spot_price: Decimal, mark_price: Decimal,
     ) -> dict:
-        """
-        Process signal through Position State Machine V2.
-        
-        CRITICAL: All orders flow through ExecutionGateway.
-        No direct exchange calls allowed.
-
-        Returns:
-            {"order_placed": bool, "reason": str | None}
-            reason is set when order_placed is False (e.g. risk_rejected, state_machine_rejected, entry_failed).
-        """
-        import uuid
-
-        def _fail(reason: str) -> dict:
-            return {"order_placed": False, "reason": reason}
-
-        def _ok() -> dict:
-            return {"order_placed": True, "reason": None}
-        
-        logger.info("Processing signal via State Machine V2", 
-                   symbol=signal.symbol, 
-                   type=signal.signal_type.value)
-        
-        # 1. Fetch Account Equity and Available Margin
-        balance = await self.client.get_futures_balance()
-        base = getattr(self.config.exchange, "base_currency", "USD")
-        equity, available_margin, _ = await calculate_effective_equity(
-            balance, base_currency=base, kraken_client=self.client
-        )
-        if equity <= 0:
-            logger.error("Insufficient equity for trading", equity=str(equity))
-            return _fail("Insufficient equity for trading")
-        # 2. Risk Validation (Safety Gate)
-        # Get symbol tier for tier-specific sizing
-        symbol_tier = self.market_discovery.get_symbol_tier(signal.symbol) if self.market_discovery else "C"
-        if symbol_tier != "A":
-            static_tier = self._get_static_tier(signal.symbol)
-            if static_tier == "A":
-                logger.warning(
-                    "Tier downgrade detected",
-                    symbol=signal.symbol,
-                    static_tier=static_tier,
-                    dynamic_tier=symbol_tier,
-                    reason="Dynamic classification is authoritative",
-                )
-        
-        decision = self.risk_manager.validate_trade(
-            signal, equity, spot_price, mark_price,
-            available_margin=available_margin,
-            symbol_tier=symbol_tier,
-        )
-        
-        if not decision.approved:
-            reasons = getattr(decision, "rejection_reasons", []) or []
-            detail = reasons[0] if reasons else "Trade rejected by Risk Manager"
-            logger.warning("Trade rejected by Risk Manager", symbol=signal.symbol, reasons=reasons)
-            return _fail(f"Risk Manager rejected: {detail}")
-        logger.info("Risk approved", symbol=signal.symbol, notional=str(decision.position_notional))
-
-        # 3. Map to futures symbol (use latest futures tickers for optimal mapping)
-        futures_symbol = self.futures_adapter.map_spot_to_futures(
-            signal.symbol,
-            futures_tickers=self.latest_futures_tickers
-        )
-        
-        # 4. Generate entry plan to get TP levels
-        order_intent = self.execution_engine.generate_entry_plan(
-            signal,
-            decision.position_notional,
-            spot_price,
-            mark_price,
-            decision.leverage
-        )
-        
-        tps = order_intent.get('take_profits', [])
-        tp1_price = tps[0]['price'] if len(tps) > 0 else None
-        tp2_price = tps[1]['price'] if len(tps) > 1 else None
-        final_target = tps[-1]['price'] if len(tps) > 2 else None
-        
-        # 5. Calculate position size in contracts
-        # Using the order_intent which has the calculated size
-        position_size = Decimal(str(order_intent.get('size', 0)))
-        if position_size <= 0:
-            position_size = decision.position_notional / mark_price
-        
-        # 6. Evaluate entry via Position Manager V2
-        # This enforces Invariant A (single position) and Invariant E (no reversal without close)
-        action, position = self.position_manager_v2.evaluate_entry(
-            signal=signal,
-            entry_price=mark_price,
-            stop_price=order_intent['metadata']['fut_sl'],
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
-            final_target=final_target,
-            position_size=position_size,
-            trade_type=signal.regime if hasattr(signal, 'regime') else "tight_smc",
-            leverage=decision.leverage,
-        )
-        
-        if action.type == ActionTypeV2.REJECT_ENTRY:
-            logger.warning("Entry REJECTED by State Machine", symbol=signal.symbol, reason=action.reason)
-            return _fail(f"State Machine rejected: {action.reason or 'REJECT_ENTRY'}")
-        logger.info("State machine accepted entry", symbol=signal.symbol, client_order_id=action.client_order_id)
-
-        # 7. Handle opportunity cost replacement via V2
-        if decision.should_close_existing and decision.close_symbol:
-            logger.warning("Opportunity cost replacement via V2",
-                          closing=decision.close_symbol,
-                          opening=signal.symbol)
-            
-            # Request reversal close
-            close_actions = self.position_manager_v2.request_reversal(
-                decision.close_symbol,
-                Side.LONG if signal.signal_type == SignalType.LONG else Side.SHORT,
-                mark_price
-            )
-            
-            # Execute close actions via gateway
-            for close_action in close_actions:
-                result = await self.execution_gateway.execute_action(close_action)
-                if not result.success:
-                    logger.error("Failed to close for replacement", error=result.error)
-                    return _fail(f"Failed to close for replacement: {result.error}")
-            
-            # Confirm reversal is closed
-            self.position_registry.confirm_reversal_closed(decision.close_symbol)
-        
-        # 8. Register position in state machine
-        # This is done BEFORE order placement to ensure we track the position
-        position.entry_order_id = action.client_order_id
-        position.entry_client_order_id = action.client_order_id
-        position.futures_symbol = futures_symbol  # For PLACE_STOP / UPDATE_STOP exchange calls
-        
-        try:
-            self.position_registry.register_position(position)
-        except Exception as e:
-            logger.error("Failed to register position", error=str(e))
-            return _fail(f"Failed to register position: {e}")
-        
-        # 9. Execute entry via Execution Gateway
-        # This is the ONLY way to place orders. Use futures symbol for exchange (Kraken expects X/USD:USD).
-        logger.info("Submitting entry to gateway", symbol=futures_symbol, client_order_id=action.client_order_id)
-        result = await self.execution_gateway.execute_action(action, order_symbol=futures_symbol)
-        
-        if not result.success:
-            logger.error("Entry failed", error=result.error)
-            # Mark position as error
-            position.mark_error(f"Entry failed: {result.error}")
-            return _fail(f"Entry failed: {result.error}")
-        
-        logger.info("Entry order placed via V2",
-                   symbol=futures_symbol,
-                   client_order_id=action.client_order_id,
-                   exchange_order_id=result.exchange_order_id)
-        
-        # 10. Persist position state
-        if self.position_persistence:
-            self.position_persistence.save_position(position)
-            self.position_persistence.log_action(
-                position.position_id,
-                "entry_submitted",
-                {
-                    "signal_type": signal.signal_type.value,
-                    "entry_price": str(mark_price),
-                    "stop_price": str(position.initial_stop_price),
-                    "size": str(position_size)
-                }
-            )
-        
-        # Note: Stop placement happens in the gateway's order event handler
-        # when the entry fill is confirmed
-        
-        # Send alert for new position
-        try:
-            from src.monitoring.alerting import send_alert_sync
-            send_alert_sync(
-                "NEW_POSITION",
-                f"New {signal.signal_type.value} position\n"
-                f"Symbol: {signal.symbol}\n"
-                f"Size: {position_size} @ ${mark_price}\n"
-                f"Stop: ${position.initial_stop_price}",
-            )
-        except Exception:
-            pass  # Alert failure must never block trading
-        
-        return _ok()
+        """V2 signal processing -- delegates to signal_handler module."""
+        from src.live.signal_handler import handle_signal_v2
+        return await handle_signal_v2(self, signal, spot_price, mark_price)
 
     async def _update_candles(self, symbol: str):
         """Update local candle caches from acquisition with throttling."""
