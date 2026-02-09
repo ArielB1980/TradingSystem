@@ -6,6 +6,7 @@ Extracted from live_trading.py to reduce god-object size.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List
 
@@ -259,6 +260,11 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             reasons=plan.reasons,
         )
 
+        # Record auction wins for churn tracking
+        now_utc = datetime.now(timezone.utc)
+        for sig in plan.opens:
+            lt._auction_win_log.setdefault(sig.symbol, []).append(now_utc)
+
         # Execute closes first
         for symbol in plan.closes:
             try:
@@ -340,6 +346,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     result = await lt._handle_signal(signal, spot_price_val, mark_price_val)
                     if result.get("order_placed", False):
                         opens_executed += 1
+                        lt._auction_entry_log[signal.symbol] = datetime.now(timezone.utc)
                         logger.info(
                             "Auction: Opened position",
                             symbol=signal.symbol,

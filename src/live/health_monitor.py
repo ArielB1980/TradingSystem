@@ -142,6 +142,231 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
 
 
 # ---------------------------------------------------------------------------
+# Trade starvation monitor
+# ---------------------------------------------------------------------------
+
+async def run_trade_starvation_monitor(
+    lt: "LiveTrading",
+    check_interval_seconds: int = 300,
+    *,
+    starvation_window_hours: float = 6.0,
+    min_signals_threshold: int = 10,
+) -> None:
+    """
+    Alert if the system generates signals but never executes trades.
+
+    This catches silent regressions where the signal pipeline works
+    but the execution pipeline is blocked (sizing bug, auction deadlock,
+    exchange rejection loop, missing futures mapping, etc.).
+
+    Logic:
+        Every ``check_interval_seconds`` (default 5 min), look at the
+        rolling window of ``starvation_window_hours``.  If
+        ``signals_generated >= min_signals_threshold`` AND
+        ``orders_placed == 0`` over that window, fire an alert.
+
+    The monitor tracks per-cycle stats from the CycleGuard (via the
+    safety integration layer) and from the auction runner logs.
+    """
+    from src.monitoring.alerting import send_alert
+
+    # Rolling window accumulators: (cycle_end_ts, signals, orders_placed)
+    _history: list[tuple[datetime, int, int]] = []
+    _alerted = False  # De-duplicate: only alert once per starvation episode
+
+    # Let the system warm up before checking
+    await asyncio.sleep(max(check_interval_seconds, 120))
+
+    while lt.active:
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=starvation_window_hours)
+
+            # Collect current cycle stats from the CycleGuard
+            hardening = getattr(lt, "hardening_layer", None)
+            if hardening and hasattr(hardening, "cycle_guard") and hardening.cycle_guard:
+                recent = hardening.cycle_guard.get_recent_cycles(limit=200)
+                # Rebuild history from CycleGuard data
+                _history.clear()
+                for cycle in recent:
+                    ts = cycle.get("started_at") or cycle.get("ended_at")
+                    if ts and isinstance(ts, str):
+                        try:
+                            ts = datetime.fromisoformat(ts)
+                        except (ValueError, TypeError):
+                            continue
+                    if ts is None:
+                        continue
+                    sig = cycle.get("signals_generated", 0)
+                    orders = cycle.get("orders_placed", 0)
+                    _history.append((ts, sig, orders))
+
+            # Prune old entries
+            _history[:] = [(ts, s, o) for ts, s, o in _history if ts >= cutoff]
+
+            window_signals = sum(s for _, s, _ in _history)
+            window_orders = sum(o for _, _, o in _history)
+
+            if window_signals >= min_signals_threshold and window_orders == 0:
+                if not _alerted:
+                    msg = (
+                        f"TRADE STARVATION: {window_signals} signals generated "
+                        f"but 0 orders placed in the last {starvation_window_hours:.0f}h.\n"
+                        f"Possible causes: sizing rejection, auction deadlock, "
+                        f"exchange mapping failure, or risk pipeline bug."
+                    )
+                    logger.critical(
+                        "TRADE_STARVATION_DETECTED",
+                        signals=window_signals,
+                        orders=window_orders,
+                        window_hours=starvation_window_hours,
+                    )
+                    await send_alert("TRADE_STARVATION", msg, urgent=True)
+                    _alerted = True
+            else:
+                if _alerted and window_orders > 0:
+                    logger.info(
+                        "Trade starvation resolved",
+                        signals=window_signals,
+                        orders=window_orders,
+                    )
+                    _alerted = False
+
+            # Periodic health log (debug level)
+            logger.debug(
+                "Trade starvation check",
+                window_signals=window_signals,
+                window_orders=window_orders,
+                window_hours=starvation_window_hours,
+                alerted=_alerted,
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Trade starvation monitor failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+        await asyncio.sleep(check_interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Winner churn monitor
+# ---------------------------------------------------------------------------
+
+async def run_winner_churn_monitor(
+    lt: "LiveTrading",
+    check_interval_seconds: int = 300,
+    *,
+    max_wins_without_entry: int = 5,
+    decay_hours: float = 12.0,
+) -> None:
+    """
+    Alert if the same symbol wins the auction repeatedly without ever
+    getting an entry executed.
+
+    This catches the AXS-style deadlock regression: a symbol scores
+    highest every cycle, wins the auction, but is always rejected at
+    execution (basis guard, min-notional, exchange error, etc.).  The
+    auction keeps picking it, starving other contenders.
+
+    Logic:
+        Track ``(symbol -> [win_timestamps])`` from auction plan logs.
+        Track ``(symbol -> last_entry_ts)`` from successful opens.
+        If a symbol has >= ``max_wins_without_entry`` wins in
+        ``decay_hours`` without a single successful entry, fire an alert.
+    """
+    from src.monitoring.alerting import send_alert
+
+    # symbols already alerted (to de-duplicate)
+    _alerted_symbols: set[str] = set()
+
+    # Warm-up
+    await asyncio.sleep(max(check_interval_seconds, 120))
+
+    while lt.active:
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=decay_hours)
+
+            # ---- Read auction tracking data from LiveTrading ----
+            # lt._auction_win_log: Dict[symbol, list[datetime]] populated by auction_runner
+            # lt._auction_entry_log: Dict[symbol, datetime] populated by auction_runner
+            win_log = getattr(lt, "_auction_win_log", {})
+            entry_log = getattr(lt, "_auction_entry_log", {})
+
+            # ---- Prune old win entries ----
+            for sym in list(win_log):
+                win_log[sym] = [t for t in win_log[sym] if t >= cutoff]
+                if not win_log[sym]:
+                    del win_log[sym]
+
+            # ---- Check for churn ----
+            churn_symbols = []
+            for sym, wins in win_log.items():
+                if len(wins) < max_wins_without_entry:
+                    continue
+                # Has this symbol had a successful entry in the window?
+                last_entry = entry_log.get(sym)
+                if last_entry and last_entry >= cutoff:
+                    continue  # Entry happened, not churning
+                churn_symbols.append((sym, len(wins)))
+
+            if churn_symbols:
+                new_churn = [
+                    (sym, count)
+                    for sym, count in churn_symbols
+                    if sym not in _alerted_symbols
+                ]
+                if new_churn:
+                    symbols_str = ", ".join(
+                        f"{sym} ({count} wins)" for sym, count in new_churn
+                    )
+                    msg = (
+                        f"WINNER CHURN: {symbols_str} won the auction "
+                        f">={max_wins_without_entry} times in {decay_hours:.0f}h "
+                        f"without a single entry.\n"
+                        f"Possible causes: persistent risk rejection, basis guard, "
+                        f"exchange min-notional, missing futures mapping."
+                    )
+                    logger.warning(
+                        "WINNER_CHURN_DETECTED",
+                        churn_symbols=[(s, c) for s, c in new_churn],
+                        window_hours=decay_hours,
+                    )
+                    await send_alert("WINNER_CHURN", msg, urgent=False)
+                    for sym, _ in new_churn:
+                        _alerted_symbols.add(sym)
+
+            # Clear alerts for symbols that resolved (got an entry)
+            resolved = _alerted_symbols - {sym for sym, _ in churn_symbols}
+            if resolved:
+                logger.info("Winner churn resolved", symbols=list(resolved))
+            _alerted_symbols -= resolved
+
+            logger.debug(
+                "Winner churn check",
+                tracked_symbols=len(_win_history),
+                churn_count=len(churn_symbols),
+                alerted=len(_alerted_symbols),
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Winner churn monitor failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+        await asyncio.sleep(check_interval_seconds)
+
+
+# ---------------------------------------------------------------------------
 # System status (Telegram data provider)
 # ---------------------------------------------------------------------------
 

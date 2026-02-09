@@ -166,7 +166,13 @@ class LiveTrading:
         # Auction mode allocator (if enabled)
         self.auction_allocator = None
         self.auction_signals_this_tick = []  # Collect signals for auction mode
-        
+
+        # Churn tracking: populated by auction_runner, consumed by winner churn monitor
+        # Dict[symbol, list[datetime]] — timestamps when symbol won the auction
+        self._auction_win_log: Dict[str, list] = {}
+        # Dict[symbol, datetime] — timestamp of last successful entry per symbol
+        self._auction_entry_log: Dict[str, datetime] = {}
+
         # Signal cooldown: prevent the same signal from firing repeatedly for the same symbol.
         # Key: symbol, Value: (signal_type, structure_timestamp, cooldown_until)
         # A signal is considered "same" if it has the same symbol + signal_type + structure_timestamp.
@@ -517,7 +523,24 @@ class LiveTrading:
             except Exception as e:
                 logger.error("Failed to start daily summary task", error=str(e))
 
-            # 2.6d Telegram command handler (/status, /positions, /help)
+            # 2.6d Runtime regression monitors (trade starvation + winner churn)
+            try:
+                self._starvation_monitor_task = asyncio.create_task(
+                    self._run_trade_starvation_monitor(interval_seconds=300)
+                )
+                logger.info("Trade starvation monitor started (interval=300s)")
+            except Exception as e:
+                logger.error("Failed to start trade starvation monitor", error=str(e))
+
+            try:
+                self._churn_monitor_task = asyncio.create_task(
+                    self._run_winner_churn_monitor(interval_seconds=300)
+                )
+                logger.info("Winner churn monitor started (interval=300s)")
+            except Exception as e:
+                logger.error("Failed to start winner churn monitor", error=str(e))
+
+            # 2.6e Telegram command handler (/status, /positions, /help)
             try:
                 from src.monitoring.telegram_bot import TelegramCommandHandler
                 self._telegram_handler = TelegramCommandHandler(
@@ -723,6 +746,18 @@ class LiveTrading:
                     await self._telegram_cmd_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_starvation_monitor_task", None) and not self._starvation_monitor_task.done():
+                self._starvation_monitor_task.cancel()
+                try:
+                    await self._starvation_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            if getattr(self, "_churn_monitor_task", None) and not self._churn_monitor_task.done():
+                self._churn_monitor_task.cancel()
+                try:
+                    await self._churn_monitor_task
+                except asyncio.CancelledError:
+                    pass
             await self.data_acq.stop()
             await self.client.close()
             # Persist data quality state so SUSPENDED/DEGRADED symbols survive restart
@@ -748,6 +783,16 @@ class LiveTrading:
         """Daily P&L summary at midnight UTC -- delegates to health_monitor module."""
         from src.live.health_monitor import run_daily_summary
         await run_daily_summary(self)
+
+    async def _run_trade_starvation_monitor(self, interval_seconds: int = 300) -> None:
+        """Trade starvation sentinel -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_trade_starvation_monitor
+        await run_trade_starvation_monitor(self, interval_seconds)
+
+    async def _run_winner_churn_monitor(self, interval_seconds: int = 300) -> None:
+        """Winner churn sentinel -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_winner_churn_monitor
+        await run_winner_churn_monitor(self, interval_seconds)
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object -- delegates to exchange_sync module."""
