@@ -77,7 +77,10 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
     await asyncio.sleep(startup_grace_seconds)
 
     consecutive_naked_count: Dict[str, int] = {}
-    ESCALATION_THRESHOLD = 2  # Require 2 consecutive detections before emergency kill
+    # Require 3 consecutive detections (90s at 30s interval) before emergency kill.
+    # This gives the stop-order poller (12s interval) multiple chances to detect
+    # and process a legitimate stop fill before we escalate to kill switch.
+    ESCALATION_THRESHOLD = 3
 
     while lt.active:
         if not lt.active:

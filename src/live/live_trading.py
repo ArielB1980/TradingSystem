@@ -488,7 +488,8 @@ class LiveTrading:
                     cfg = SafetyConfig()
                     enforcer = ProtectionEnforcer(self.client, cfg)
                     self._protection_monitor = PositionProtectionMonitor(
-                        self.client, self.position_registry, enforcer
+                        self.client, self.position_registry, enforcer,
+                        persistence=self.position_persistence,
                     )
                     self._protection_task = asyncio.create_task(
                         self._run_protection_checks(interval_seconds=30)

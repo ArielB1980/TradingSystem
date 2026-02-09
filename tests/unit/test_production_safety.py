@@ -599,5 +599,295 @@ class TestIntegrationScenarios:
         timeout_manager.exit_completed("BTC/USD:USD")
 
 
+class TestStopFillNotNaked:
+    """
+    Test: Stop loss fill should NOT trigger NAKED POSITION kill switch.
+
+    Root cause of the 2026-02-09 XRP/USD kill switch incident:
+    Stop loss was filled by exchange (expected behavior), but the system
+    treated the missing stop order as a safety violation.
+
+    These tests verify the multi-layer defense:
+    1. Stop order polling detects fills (poll_and_process_order_updates)
+    2. Protection monitor verifies stop status before declaring naked
+    3. Graceful position closure when stop fill is confirmed
+    """
+
+    @pytest.fixture
+    def mock_client(self):
+        client = AsyncMock()
+        return client
+
+    @pytest.fixture
+    def position(self):
+        pos = ManagedPosition(
+            symbol="XRP/USD",
+            side=Side.LONG,
+            position_id="test-stop-fill",
+            initial_size=Decimal("100"),
+            initial_entry_price=Decimal("2.50"),
+            initial_stop_price=Decimal("2.40"),
+            initial_tp1_price=Decimal("2.70"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.entry_order_id = "entry-xrp-1"
+        pos.stop_order_id = "stop-xrp-1"
+        pos.state = PositionState.OPEN
+        # Add entry fill so remaining_qty > 0
+        from src.execution.position_state_machine import FillRecord
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-entry-xrp",
+            order_id="entry-xrp-1",
+            side=Side.LONG,
+            qty=Decimal("100"),
+            price=Decimal("2.50"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        return pos
+
+    @pytest.mark.asyncio
+    async def test_stop_filled_not_treated_as_naked(self, mock_client, position):
+        """
+        When stop loss fills and exchange still shows a brief position,
+        the system should verify the stop was filled and NOT flag as naked.
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        # Exchange state: position still briefly exists, but stop order is gone
+        mock_client.get_futures_open_orders.return_value = []  # No open orders
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_XRPUSD", "contracts": 100}  # Still shows position
+        ]
+        # Stop order was FILLED (this is the key verification)
+        mock_client.fetch_order.return_value = {
+            "id": "stop-xrp-1",
+            "status": "closed",
+            "filled": 100,
+            "average": 2.40,
+            "price": 2.40,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        mock_persistence = MagicMock()
+        monitor = PositionProtectionMonitor(
+            mock_client, registry, enforcer, persistence=mock_persistence,
+        )
+
+        results = await monitor.check_all_positions()
+
+        # Should be treated as PROTECTED (stop filled = expected behavior)
+        assert results.get("XRP/USD") is True, (
+            f"Expected XRP/USD to be treated as protected, got: {results}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_cancelled_still_treated_as_naked(self, mock_client, position):
+        """
+        If the stop was cancelled (not filled), it IS a genuinely naked position.
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        # Exchange: position exists, no stop orders
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_XRPUSD", "contracts": 100}
+        ]
+        # Stop was CANCELLED (not filled -- this is a real problem)
+        mock_client.fetch_order.return_value = {
+            "id": "stop-xrp-1",
+            "status": "canceled",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+
+        # Should be flagged as NAKED (genuinely dangerous)
+        assert results.get("XRP/USD") is False, (
+            f"Expected XRP/USD to be flagged as naked, got: {results}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_fill_closes_position_gracefully(self, mock_client, position):
+        """
+        When a stop fill is confirmed, the position should be transitioned
+        to CLOSED with exit_reason=STOP_LOSS.
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_XRPUSD", "contracts": 100}
+        ]
+        mock_client.fetch_order.return_value = {
+            "id": "stop-xrp-1",
+            "status": "closed",
+            "filled": 100,
+            "average": 2.40,
+            "price": 2.40,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        mock_persistence = MagicMock()
+        monitor = PositionProtectionMonitor(
+            mock_client, registry, enforcer, persistence=mock_persistence,
+        )
+
+        await monitor.check_all_positions()
+
+        # Position should now be CLOSED
+        from src.execution.position_state_machine import ExitReason
+        assert position.state == PositionState.CLOSED
+        assert position.exit_reason == ExitReason.STOP_LOSS
+        assert len(position.exit_fills) == 1
+        assert position.exit_fills[0].qty == Decimal("100")
+
+        # Persistence should have been called
+        mock_persistence.save_position.assert_called_once_with(position)
+
+    @pytest.mark.asyncio
+    async def test_position_closed_on_exchange_treated_as_protected(self, mock_client, position):
+        """
+        If exchange position size = 0 (stop filled and position fully closed),
+        should be treated as protected (Layer 1 defense).
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_XRPUSD", "contracts": 0}  # Position gone
+        ]
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+
+        # Layer 1: position closed on exchange = protected
+        assert results.get("XRP/USD") is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_order_failure_treats_as_naked(self, mock_client, position):
+        """
+        If we can't verify the stop order status (API failure),
+        treat as naked (fail closed / safe).
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_XRPUSD", "contracts": 100}
+        ]
+        # fetch_order fails
+        mock_client.fetch_order.side_effect = Exception("API timeout")
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+
+        # Should fail closed: treat as naked when we can't verify
+        assert results.get("XRP/USD") is False
+
+
+class TestStopOrderPolling:
+    """
+    Test: poll_and_process_order_updates now polls stop orders too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stop_orders_are_polled(self):
+        """
+        Stop orders (STOP_INITIAL, STOP_UPDATE) should be included in polling,
+        not just ENTRY orders.
+        """
+        from src.execution.execution_gateway import (
+            ExecutionGateway,
+            PendingOrder,
+            OrderPurpose,
+        )
+        from src.domain.models import OrderType
+
+        mock_client = AsyncMock()
+        mock_registry = MagicMock()
+        mock_persistence = MagicMock()
+
+        gateway = ExecutionGateway.__new__(ExecutionGateway)
+        gateway.client = mock_client
+        gateway.registry = mock_registry
+        gateway.persistence = mock_persistence
+        gateway.metrics = {
+            "orders_submitted": 0, "orders_filled": 0,
+            "orders_cancelled": 0, "orders_rejected": 0,
+            "events_processed": 0,
+        }
+        gateway._pending_orders = {}
+        gateway._order_id_map = {}
+        gateway._event_enforcer = None
+        gateway._wal = None
+
+        # Add a stop order to pending
+        stop_pending = PendingOrder(
+            client_order_id="stop-client-1",
+            position_id="pos-btc",
+            symbol="BTC/USD",
+            purpose=OrderPurpose.STOP_INITIAL,
+            side=Side.SHORT,
+            size=Decimal("0.1"),
+            price=Decimal("49000"),
+            order_type=OrderType.STOP_LOSS,
+            submitted_at=datetime.now(timezone.utc),
+            exchange_order_id="stop-exch-1",
+            status="submitted",
+            exchange_symbol="BTC/USD:USD",
+        )
+        gateway._pending_orders["stop-client-1"] = stop_pending
+
+        # Mock fetch_order to return stop as filled
+        mock_client.fetch_order.return_value = {
+            "id": "stop-exch-1",
+            "clientOrderId": "stop-client-1",
+            "status": "closed",
+            "filled": 0.1,
+            "remaining": 0,
+            "average": 49000,
+            "trades": [{"id": "trade-1"}],
+        }
+
+        # Mock position for process_order_update
+        mock_pos = MagicMock()
+        mock_pos.stop_order_id = "stop-exch-1"
+        mock_pos.stop_client_order_id = "stop-client-1"
+        mock_pos.entry_order_id = None
+        mock_pos.pending_exit_order_id = None
+        mock_pos.pending_exit_client_order_id = None
+        mock_pos.side = Side.LONG
+        mock_pos.remaining_qty = Decimal("0.1")
+        mock_pos.is_terminal = False
+        mock_pos.processed_event_hashes = set()
+        mock_registry.get_position.return_value = mock_pos
+
+        # The stop order should be polled (not skipped)
+        mock_client.fetch_order.assert_not_called()
+        processed = await gateway.poll_and_process_order_updates()
+
+        # fetch_order should have been called for the stop order
+        mock_client.fetch_order.assert_called_once_with("stop-exch-1", "BTC/USD:USD")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

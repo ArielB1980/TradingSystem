@@ -1057,15 +1057,32 @@ class ExecutionGateway:
 
     async def poll_and_process_order_updates(self) -> int:
         """
-        Poll order status for pending entry orders, process fills, and trigger PLACE_STOP.
+        Poll order status for pending entry AND stop orders, process fills.
+
+        Entry orders: detect fills → trigger PLACE_STOP (SL/TP).
+        Stop orders:  detect fills → transition position to CLOSED.
+
+        Without stop polling, the system cannot distinguish "stop filled
+        (expected)" from "stop disappeared (danger)", which leads to false
+        NAKED POSITION kill-switch triggers.
+
         Returns number of orders processed (fill/cancel/reject).
         """
         fetch_order = getattr(self.client, "fetch_order", None)
         if not fetch_order:
             return 0
+
+        # Purposes we actively poll for status changes
+        _POLLABLE_PURPOSES = {
+            OrderPurpose.ENTRY,
+            OrderPurpose.STOP_INITIAL,
+            OrderPurpose.STOP_UPDATE,
+            OrderPurpose.EXIT_STOP,
+        }
+
         processed = 0
         for pending in list(self._pending_orders.values()):
-            if pending.purpose != OrderPurpose.ENTRY:
+            if pending.purpose not in _POLLABLE_PURPOSES:
                 continue
             if pending.status not in ("pending", "submitted"):
                 continue

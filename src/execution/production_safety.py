@@ -731,29 +731,35 @@ class PositionProtectionMonitor:
     Continuous monitoring for Invariant K.
     
     Runs periodically to verify all exposed positions have protection.
+    When a stop loss fill is detected (expected behavior), the position
+    is closed gracefully instead of triggering a false kill-switch.
     """
     
     def __init__(
         self,
         exchange_client,
         registry,
-        protection_enforcer: ProtectionEnforcer
+        protection_enforcer: ProtectionEnforcer,
+        persistence=None,
     ):
         self.client = exchange_client
         self.registry = registry
         self.enforcer = protection_enforcer
+        self.persistence = persistence
         self._running = False
     
     async def check_all_positions(self) -> Dict[str, bool]:
         """
         Check all positions for protection.
         
-        CRITICAL FIX: Verify position actually exists on exchange before
-        flagging as naked. When a stop loss is filled:
-        1. Stop order disappears (filled)
-        2. Position closes on exchange (size = 0)
-        3. Registry may still show position as active (not yet synced)
-        4. Without this check: false "NAKED POSITION" alert
+        Multi-layer defense against false NAKED POSITION alerts:
+        
+        Layer 1: Verify position actually exists on exchange.
+                 If exchange size = 0, position was closed (stop filled).
+        Layer 2: If no stop order found but position exists, check whether
+                 the known stop_order_id was recently filled (not just missing).
+                 A filled stop is expected behavior, not a safety violation.
+        Layer 3: Only flag as NAKED if the stop truly vanished without filling.
         
         Returns {symbol: is_protected}
         """
@@ -806,6 +812,13 @@ class PositionProtectionMonitor:
                     position,
                     exchange_orders
                 )
+                
+                # ---- LAYER 2: Stop-fill verification before declaring naked ----
+                if not is_protected and position.stop_order_id:
+                    is_protected = await self._check_stop_was_filled(
+                        position, exchange_size
+                    )
+                
                 results[position.symbol] = is_protected
                 
                 if not is_protected:
@@ -814,11 +827,147 @@ class PositionProtectionMonitor:
                         "NAKED POSITION DETECTED",
                         symbol=position.symbol,
                         qty=str(position.remaining_qty),
-                        exchange_qty=exchange_size
+                        exchange_qty=exchange_size,
+                        stop_order_id=position.stop_order_id or "none",
                     )
         
         return results
+
+    async def _check_stop_was_filled(
+        self,
+        position: ManagedPosition,
+        exchange_size: float,
+    ) -> bool:
+        """
+        Before declaring a position naked, verify whether its stop order was
+        filled (expected behavior) vs. vanished without filling (real danger).
+        
+        If the stop was filled, the position is being closed by the stop --
+        which is the *intended* safety mechanism, not a violation.
+        
+        Returns True (protected / expected) or False (genuinely naked).
+        """
+        fetch_order = getattr(self.client, "fetch_order", None)
+        if not fetch_order:
+            return False  # Can't verify, treat as naked
+
+        stop_oid = position.stop_order_id
+        # Use futures symbol for fetch_order if available
+        sym = getattr(position, "futures_symbol", None) or position.symbol
+
+        try:
+            order_data = await fetch_order(stop_oid, sym)
+        except Exception as e:
+            logger.warning(
+                "Stop-fill verification: fetch_order failed",
+                symbol=position.symbol,
+                stop_order_id=stop_oid,
+                error=str(e),
+            )
+            return False  # Can't verify, treat as naked
+
+        if not order_data:
+            return False
+
+        status = str(order_data.get("status") or "").lower()
+        filled_raw = order_data.get("filled")
+        filled = float(filled_raw if filled_raw is not None else 0)
+
+        if status == "closed" and filled > 0:
+            # The stop loss was FILLED -- this is expected behavior!
+            logger.info(
+                "Stop-fill verification: stop was FILLED (expected, not naked)",
+                symbol=position.symbol,
+                stop_order_id=stop_oid,
+                filled_qty=filled,
+                exchange_remaining=exchange_size,
+            )
+            # Gracefully close the position so it doesn't keep flagging
+            self._close_position_from_stop_fill(position, filled, order_data)
+            return True
+
+        if status in ("canceled", "cancelled", "expired"):
+            # Stop was cancelled/expired without filling -- genuinely naked
+            logger.warning(
+                "Stop-fill verification: stop was CANCELLED/EXPIRED (genuinely naked)",
+                symbol=position.symbol,
+                stop_order_id=stop_oid,
+                status=status,
+            )
+            return False
+
+        # Status is still open/unknown -- shouldn't reach here if verify_protection
+        # already scanned open orders, but be defensive
+        logger.warning(
+            "Stop-fill verification: unexpected status",
+            symbol=position.symbol,
+            stop_order_id=stop_oid,
+            status=status,
+            filled=filled,
+        )
+        return False
     
+    def _close_position_from_stop_fill(
+        self,
+        position: ManagedPosition,
+        filled_qty: float,
+        order_data: dict,
+    ) -> None:
+        """
+        Gracefully close a position whose stop loss was confirmed filled.
+
+        Records a synthetic exit fill (so P&L / state machine are accurate),
+        sets exit_reason = STOP_LOSS, and persists the change.
+        """
+        from src.execution.position_state_machine import (
+            FillRecord, Side, ExitReason, PositionState,
+        )
+
+        if position.is_terminal:
+            return  # Already closed
+
+        avg_price = Decimal(str(order_data.get("average") or order_data.get("price") or 0))
+        qty = Decimal(str(filled_qty))
+        now = datetime.now(timezone.utc)
+
+        fill = FillRecord(
+            fill_id=f"stop-fill-detect-{int(now.timestamp() * 1000)}",
+            order_id=position.stop_order_id or "unknown",
+            side=Side.SHORT if position.side == Side.LONG else Side.LONG,
+            qty=min(qty, position.remaining_qty),
+            price=avg_price if avg_price > 0 else (position.initial_entry_price or Decimal("0")),
+            timestamp=now,
+            is_entry=False,
+        )
+        position.exit_fills.append(fill)
+
+        if position.remaining_qty <= 0:
+            position.state = PositionState.CLOSED
+            position.exit_reason = ExitReason.STOP_LOSS
+            position.exit_time = now
+
+        position.updated_at = now
+
+        logger.info(
+            "Position closed via stop-fill detection",
+            symbol=position.symbol,
+            filled_qty=str(qty),
+            avg_price=str(avg_price),
+            remaining=str(position.remaining_qty),
+            state=position.state.value,
+        )
+
+        # Persist if we have a persistence reference
+        if self.persistence:
+            try:
+                self.persistence.save_position(position)
+            except Exception as e:
+                logger.warning(
+                    "Failed to persist stop-fill closure",
+                    symbol=position.symbol,
+                    error=str(e),
+                )
+
     async def run_periodic_check(self, interval_seconds: int = 30) -> None:
         """Run periodic protection checks."""
         self._running = True
