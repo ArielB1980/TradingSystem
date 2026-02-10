@@ -235,6 +235,32 @@ multi_tp:
   final_target_behavior: tighten_trail  # tighten_trail | close_partial | close_full
   tighten_trail_at_final_target_atr_mult: 1.2  # ATR mult after final target touch
 
+  # Progressive trailing: tighten trail as position gains R-multiples
+  progressive_trail_enabled: true
+  progressive_trail_levels:
+    - r_threshold: 3.0      # At 3R profit: moderate tighten
+      atr_mult: 1.8
+    - r_threshold: 5.0      # At 5R profit: tighter
+      atr_mult: 1.4
+    - r_threshold: 8.0      # At 8R profit: very tight (lock in)
+      atr_mult: 1.0
+
+  # Regime-aware runner sizing: auto-adjust runner % based on market structure
+  regime_runner_sizing_enabled: true
+  regime_runner_overrides:
+    tight_smc:             # OB/FVG setups: smaller runner, bigger TP1/TP2
+      runner_pct: 0.10
+      tp1_close_pct: 0.50
+      tp2_close_pct: 0.40
+    wide_structure:        # BOS/TREND setups: bigger runner for trend capture
+      runner_pct: 0.30
+      tp1_close_pct: 0.35
+      tp2_close_pct: 0.35
+    consolidation:         # Ranging market: small runner, take profits quickly
+      runner_pct: 0.10
+      tp1_close_pct: 0.50
+      tp2_close_pct: 0.40
+
 ## Data Acquisition
 data:
   # WebSocket settings

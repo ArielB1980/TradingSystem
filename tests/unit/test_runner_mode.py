@@ -97,6 +97,7 @@ def _make_config(
         runner_tp_r_multiple=runner_tp_r_multiple,
         final_target_behavior=final_target_behavior,
         tighten_trail_at_final_target_atr_mult=tighten_trail_at_final_target_atr_mult,
+        regime_runner_sizing_enabled=False,  # Disable in base tests; tested separately
     )
 
     config = MagicMock()
@@ -755,3 +756,373 @@ class TestConfigBackwardCompatibility:
         )
         assert mtp.runner_has_fixed_tp is True
         assert mtp.runner_tp_r_multiple == 5.0
+
+
+# ============================================================
+# Test 7: Regime-aware runner sizing
+# ============================================================
+
+
+class TestRegimeAwareSizing:
+    """Test that TP splits are adjusted based on signal regime."""
+
+    def test_tight_smc_regime_uses_smaller_runner(self):
+        """tight_smc signals should get smaller runner (10%) and bigger TP1 (50%)."""
+        mtp = MultiTPConfig(
+            enabled=True,
+            tp1_close_pct=0.40,
+            tp2_close_pct=0.40,
+            runner_pct=0.20,
+            regime_runner_sizing_enabled=True,
+            regime_runner_overrides={
+                "tight_smc": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
+                "wide_structure": {"runner_pct": 0.30, "tp1_close_pct": 0.35, "tp2_close_pct": 0.35},
+            },
+        )
+        config = MagicMock()
+        config.multi_tp = mtp
+        config.execution = MagicMock()
+        config.execution.default_order_type = "market"
+        config.execution.tp_splits = [0.35, 0.35, 0.30]
+        config.execution.rr_fallback_multiples = [1.0, 2.0, 3.0]
+        config.strategy = MagicMock()
+
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)  # regime="tight_smc"
+        plan = engine.generate_entry_plan(
+            signal,
+            Decimal("1000"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("5"),
+        )
+
+        # TP1 should be 50% of position (10 units), TP2 should be 40%
+        total_qty = Decimal("1000") / Decimal("100")  # 10
+        tp1_qty = plan["take_profits"][0]["qty"]
+        tp2_qty = plan["take_profits"][1]["qty"]
+        assert tp1_qty == round(total_qty * Decimal("0.50"), 4), f"TP1 should be 50%, got {tp1_qty}"
+        assert tp2_qty == round(total_qty * Decimal("0.40"), 4), f"TP2 should be 40%, got {tp2_qty}"
+        assert plan["metadata"]["runner_pct"] == 0.10
+        assert plan["metadata"]["regime"] == "tight_smc"
+
+    def test_wide_structure_regime_uses_bigger_runner(self):
+        """wide_structure signals should get bigger runner (30%)."""
+        mtp = MultiTPConfig(
+            enabled=True,
+            tp1_close_pct=0.40,
+            tp2_close_pct=0.40,
+            runner_pct=0.20,
+            regime_runner_sizing_enabled=True,
+            regime_runner_overrides={
+                "tight_smc": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
+                "wide_structure": {"runner_pct": 0.30, "tp1_close_pct": 0.35, "tp2_close_pct": 0.35},
+            },
+        )
+        config = MagicMock()
+        config.multi_tp = mtp
+        config.execution = MagicMock()
+        config.execution.default_order_type = "market"
+        config.execution.tp_splits = [0.35, 0.35, 0.30]
+        config.execution.rr_fallback_multiples = [1.0, 2.0, 3.0]
+        config.strategy = MagicMock()
+
+        engine = ExecutionEngine(config)
+        # Create a wide_structure signal
+        signal = _make_signal(SignalType.LONG)
+        signal.regime = "wide_structure"
+        signal.setup_type = SetupType.BOS
+
+        plan = engine.generate_entry_plan(
+            signal,
+            Decimal("1000"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("5"),
+        )
+
+        total_qty = Decimal("1000") / Decimal("100")  # 10
+        tp1_qty = plan["take_profits"][0]["qty"]
+        tp2_qty = plan["take_profits"][1]["qty"]
+        assert tp1_qty == round(total_qty * Decimal("0.35"), 4), f"TP1 should be 35%, got {tp1_qty}"
+        assert tp2_qty == round(total_qty * Decimal("0.35"), 4), f"TP2 should be 35%, got {tp2_qty}"
+        assert plan["metadata"]["runner_pct"] == 0.30
+
+    def test_regime_sizing_disabled_uses_base_splits(self):
+        """When regime_runner_sizing_enabled=False, uses base config splits."""
+        config = _make_config()  # regime_runner_sizing_enabled=False by default in tests
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)
+
+        plan = engine.generate_entry_plan(
+            signal,
+            Decimal("1000"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("5"),
+        )
+
+        total_qty = Decimal("1000") / Decimal("100")
+        tp1_qty = plan["take_profits"][0]["qty"]
+        assert tp1_qty == round(total_qty * Decimal("0.40"), 4), f"TP1 should be 40%, got {tp1_qty}"
+
+    def test_unknown_regime_uses_base_splits(self):
+        """Unknown regime should fall back to base config splits."""
+        mtp = MultiTPConfig(
+            enabled=True,
+            regime_runner_sizing_enabled=True,
+            regime_runner_overrides={
+                "tight_smc": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
+            },
+        )
+        config = MagicMock()
+        config.multi_tp = mtp
+        config.execution = MagicMock()
+        config.execution.default_order_type = "market"
+        config.execution.tp_splits = [0.35, 0.35, 0.30]
+        config.execution.rr_fallback_multiples = [1.0, 2.0, 3.0]
+        config.strategy = MagicMock()
+
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)
+        signal.regime = "unknown_regime"
+
+        plan = engine.generate_entry_plan(
+            signal,
+            Decimal("1000"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("5"),
+        )
+
+        total_qty = Decimal("1000") / Decimal("100")
+        tp1_qty = plan["take_profits"][0]["qty"]
+        # Should use base 40% since "unknown_regime" is not in overrides
+        assert tp1_qty == round(total_qty * Decimal("0.40"), 4)
+
+
+# ============================================================
+# Test 8: Progressive trailing tightening
+# ============================================================
+
+
+class TestProgressiveTrailing:
+    """Test that trailing ATR mult tightens at R-level milestones."""
+
+    def setup_method(self):
+        reset_position_registry()
+
+    def _make_prog_mtp(self) -> MultiTPConfig:
+        return MultiTPConfig(
+            enabled=True,
+            tp1_close_pct=0.40,
+            tp2_close_pct=0.40,
+            runner_pct=0.20,
+            runner_has_fixed_tp=False,
+            regime_runner_sizing_enabled=False,
+            progressive_trail_enabled=True,
+            progressive_trail_levels=[
+                {"r_threshold": 3.0, "atr_mult": 1.8},
+                {"r_threshold": 5.0, "atr_mult": 1.4},
+                {"r_threshold": 8.0, "atr_mult": 1.0},
+            ],
+        )
+
+    def _make_filled_position(self, final_target: Decimal = Decimal("150")) -> ManagedPosition:
+        """Create a filled ManagedPosition (with entry fill so remaining_qty > 0)."""
+        position = ManagedPosition(
+            symbol="BTC/USD",
+            side=Side.LONG,
+            position_id="test-prog-trail",
+            initial_size=Decimal("1.0"),
+            initial_entry_price=Decimal("100"),
+            initial_stop_price=Decimal("95"),
+            initial_tp1_price=Decimal("105"),
+            initial_tp2_price=Decimal("112.5"),
+            initial_final_target=final_target,  # Set high so final target doesn't interfere
+            runner_mode=True,
+            tp1_close_pct=Decimal("0.40"),
+            tp2_close_pct=Decimal("0.40"),
+            runner_pct=Decimal("0.20"),
+        )
+        position.state = PositionState.OPEN
+        position.entry_acknowledged = True
+        position.trailing_active = True
+        position.break_even_triggered = True
+        position.peak_price = Decimal("114")
+        position.current_stop_price = Decimal("100")  # at BE
+        # Add entry fill so remaining_qty > 0
+        position.entry_fills.append(FillRecord(
+            fill_id="fill-prog-1",
+            order_id="entry-prog-1",
+            side=Side.LONG,
+            qty=Decimal("1.0"),
+            price=Decimal("100"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        return position
+
+    def test_no_tightening_below_3r(self):
+        """Below 3R, no progressive trailing action should be generated."""
+        registry = PositionRegistry()
+        mtp = self._make_prog_mtp()
+        manager = PositionManagerV2(registry=registry, multi_tp_config=mtp)
+
+        position = self._make_filled_position()
+        registry.register_position(position)
+
+        # Price at 2.5R (entry=100, stop=95, risk=5, so 2.5R = 112.5)
+        actions = manager.evaluate_position(
+            "BTC/USD",
+            current_price=Decimal("112.5"),
+            current_atr=Decimal("2"),
+        )
+        prog_actions = [a for a in actions if "Progressive" in a.reason]
+        assert len(prog_actions) == 0, f"Should not tighten below 3R, got: {[a.reason for a in prog_actions]}"
+
+    def test_tightening_at_3r(self):
+        """At 3R, progressive trailing should tighten to 1.8x ATR."""
+        registry = PositionRegistry()
+        mtp = self._make_prog_mtp()
+        manager = PositionManagerV2(registry=registry, multi_tp_config=mtp)
+
+        position = self._make_filled_position()
+        registry.register_position(position)
+
+        # Price at 3R (entry=100, stop=95, risk=5, so 3R = 115)
+        actions = manager.evaluate_position(
+            "BTC/USD",
+            current_price=Decimal("115"),
+            current_atr=Decimal("2"),
+        )
+        prog_actions = [a for a in actions if "Progressive" in a.reason]
+        assert len(prog_actions) == 1, f"Expected 1 progressive trail action, got: {len(prog_actions)}"
+        assert "3.0R" in prog_actions[0].reason
+        assert "1.8" in prog_actions[0].reason
+        assert position.highest_r_tighten_level == 0
+
+    def test_tightening_at_5r(self):
+        """At 5R, should tighten to 1.4x ATR."""
+        registry = PositionRegistry()
+        mtp = self._make_prog_mtp()
+        manager = PositionManagerV2(registry=registry, multi_tp_config=mtp)
+
+        position = self._make_filled_position()
+        registry.register_position(position)
+
+        # Price at 5R (entry=100, risk=5, so 5R = 125)
+        actions = manager.evaluate_position(
+            "BTC/USD",
+            current_price=Decimal("125"),
+            current_atr=Decimal("2"),
+        )
+        prog_actions = [a for a in actions if "Progressive" in a.reason]
+        # Should get TWO actions: one for 3R and one for 5R (both newly crossed)
+        assert len(prog_actions) == 2, f"Expected 2 progressive trail actions at 5R, got: {len(prog_actions)}"
+        assert position.highest_r_tighten_level == 1
+
+    def test_progressive_trail_only_triggers_once_per_level(self):
+        """Re-evaluating at same price should not re-trigger."""
+        registry = PositionRegistry()
+        mtp = self._make_prog_mtp()
+        manager = PositionManagerV2(registry=registry, multi_tp_config=mtp)
+
+        position = self._make_filled_position()
+        registry.register_position(position)
+
+        # First evaluation at 3R
+        manager.evaluate_position("BTC/USD", current_price=Decimal("115"), current_atr=Decimal("2"))
+        assert position.highest_r_tighten_level == 0
+
+        # Second evaluation at same price
+        actions = manager.evaluate_position("BTC/USD", current_price=Decimal("115"), current_atr=Decimal("2"))
+        prog_actions = [a for a in actions if "Progressive" in a.reason]
+        assert len(prog_actions) == 0, "Should not re-trigger at same R-level"
+
+    def test_progressive_trail_stores_atr_mult_on_position(self):
+        """After tightening, position.current_trail_atr_mult should be set."""
+        registry = PositionRegistry()
+        mtp = self._make_prog_mtp()
+        manager = PositionManagerV2(registry=registry, multi_tp_config=mtp)
+
+        position = self._make_filled_position()
+        registry.register_position(position)
+
+        manager.evaluate_position("BTC/USD", current_price=Decimal("115"), current_atr=Decimal("2"))
+        assert position.current_trail_atr_mult == Decimal("1.8")
+
+        manager.evaluate_position("BTC/USD", current_price=Decimal("125"), current_atr=Decimal("2"))
+        assert position.current_trail_atr_mult == Decimal("1.4")
+
+
+# ============================================================
+# Test 9: Backtest runner metrics
+# ============================================================
+
+
+class TestBacktestRunnerMetrics:
+    """Test that BacktestMetrics tracks runner-specific stats."""
+
+    def test_metrics_has_runner_fields(self):
+        """BacktestMetrics should have runner-specific fields."""
+        from src.backtest.backtest_engine import BacktestMetrics
+        m = BacktestMetrics()
+        assert hasattr(m, 'tp1_fills')
+        assert hasattr(m, 'tp2_fills')
+        assert hasattr(m, 'tp1_pnl')
+        assert hasattr(m, 'tp2_pnl')
+        assert hasattr(m, 'runner_exits')
+        assert hasattr(m, 'runner_pnl')
+        assert hasattr(m, 'runner_r_multiples')
+        assert hasattr(m, 'runner_avg_r')
+        assert hasattr(m, 'runner_exits_beyond_3r')
+        assert hasattr(m, 'runner_max_r')
+        assert hasattr(m, 'exit_reasons')
+
+    def test_runner_metrics_update(self):
+        """Runner avg_r and beyond_3r should be computed in update()."""
+        from src.backtest.backtest_engine import BacktestMetrics
+        m = BacktestMetrics()
+        m.runner_r_multiples = [2.5, 4.0, 6.0, 1.0]
+        m.update()
+        assert m.runner_avg_r == pytest.approx(3.375)
+        assert m.runner_exits_beyond_3r == 2  # 4.0 and 6.0
+        assert m.runner_max_r == pytest.approx(6.0)
+
+    def test_exit_reasons_tracked(self):
+        """BacktestMetrics exit_reasons list should be appendable."""
+        from src.backtest.backtest_engine import BacktestMetrics
+        m = BacktestMetrics()
+        m.exit_reasons.append("trailing_stop")
+        m.exit_reasons.append("stop_loss")
+        assert len(m.exit_reasons) == 2
+        assert m.exit_reasons[0] == "trailing_stop"
+
+
+# ============================================================
+# Test 10: Config new fields
+# ============================================================
+
+
+class TestConfigNewFields:
+    """Test that new config fields have correct defaults and validate."""
+
+    def test_progressive_trail_defaults(self):
+        mtp = MultiTPConfig(enabled=True)
+        assert mtp.progressive_trail_enabled is True
+        assert len(mtp.progressive_trail_levels) == 3
+        assert mtp.progressive_trail_levels[0]["r_threshold"] == 3.0
+        assert mtp.progressive_trail_levels[2]["atr_mult"] == 1.0
+
+    def test_regime_sizing_defaults(self):
+        mtp = MultiTPConfig(enabled=True)
+        assert mtp.regime_runner_sizing_enabled is True
+        assert "tight_smc" in mtp.regime_runner_overrides
+        assert "wide_structure" in mtp.regime_runner_overrides
+        assert mtp.regime_runner_overrides["tight_smc"]["runner_pct"] == 0.10
+        assert mtp.regime_runner_overrides["wide_structure"]["runner_pct"] == 0.30
+
+    def test_regime_sizing_can_be_disabled(self):
+        mtp = MultiTPConfig(enabled=True, regime_runner_sizing_enabled=False)
+        assert mtp.regime_runner_sizing_enabled is False
