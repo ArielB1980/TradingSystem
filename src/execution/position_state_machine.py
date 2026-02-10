@@ -246,8 +246,17 @@ class ManagedPosition:
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     
     # ========== CONFIGURATION ==========
-    partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1
+    partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1 (legacy)
     min_partial_for_be: Decimal = Decimal("0.3")  # Min fill % before BE allowed
+    
+    # Runner mode configuration (populated from MultiTPConfig when enabled)
+    tp1_close_pct: Decimal = Decimal("0.40")   # % of filled entry to close at TP1
+    tp2_close_pct: Decimal = Decimal("0.40")   # % of filled entry to close at TP2
+    runner_pct: Decimal = Decimal("0.20")       # Implicit remainder; no TP order in runner mode
+    runner_mode: bool = False                    # True when runner_pct > 0 and runner_has_fixed_tp == False
+    final_target_behavior: str = "tighten_trail"  # tighten_trail | close_partial | close_full
+    tighten_trail_atr_mult: Decimal = Decimal("1.2")  # ATR mult after final target touch
+    final_target_touched: bool = False           # Set True on first final target hit (one-time tighten)
     
     def __post_init__(self):
         """Validate position parameters."""
@@ -270,6 +279,14 @@ class ManagedPosition:
             check_invariant(
                 self.initial_stop_price > self.initial_entry_price,
                 f"SHORT stop ({self.initial_stop_price}) must be above entry ({self.initial_entry_price})"
+            )
+        
+        # Validate runner mode pct invariant
+        if self.runner_mode:
+            total = self.tp1_close_pct + self.tp2_close_pct + self.runner_pct
+            check_invariant(
+                total <= Decimal("1.001"),
+                f"TP pcts exceed 100%: tp1={self.tp1_close_pct} + tp2={self.tp2_close_pct} + runner={self.runner_pct} = {total}"
             )
         
         # Initialize current stop

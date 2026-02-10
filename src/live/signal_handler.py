@@ -136,7 +136,12 @@ async def handle_signal_v2(
     tps = order_intent.get("take_profits", [])
     tp1_price = tps[0]["price"] if len(tps) > 0 else None
     tp2_price = tps[1]["price"] if len(tps) > 1 else None
-    final_target = tps[-1]["price"] if len(tps) > 2 else None
+    # In runner mode (2 TPs), final_target comes from metadata (3.0R aspiration level).
+    # In legacy mode (3+ TPs), final_target is the last TP price.
+    metadata = order_intent.get("metadata", {})
+    final_target = metadata.get("final_target_price")
+    if final_target is None:
+        final_target = tps[-1]["price"] if len(tps) > 2 else None
 
     # 5. Calculate position size in contracts
     position_size = Decimal(str(order_intent.get("size", 0)))

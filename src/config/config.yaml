@@ -230,6 +230,10 @@ multi_tp:
   move_sl_to_be_after_tp1: true  # Auto move to breakeven after TP1
   trailing_stop_enabled: true    # Enable trailing for runner
   trailing_stop_atr_multiplier: 1.5
+  runner_has_fixed_tp: false       # false = runner has NO TP order (trend-following)
+  # runner_tp_r_multiple: 5.0     # Only used if runner_has_fixed_tp: true
+  final_target_behavior: tighten_trail  # tighten_trail | close_partial | close_full
+  tighten_trail_at_final_target_atr_mult: 1.2  # ATR mult after final target touch
 
 ## Data Acquisition
 data:

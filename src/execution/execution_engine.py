@@ -26,12 +26,30 @@ class ExecutionEngine:
         mtp = getattr(config, "multi_tp", None)
 
         if mtp and getattr(mtp, "enabled", False):
-            self._tp_splits = [mtp.tp1_close_pct, mtp.tp2_close_pct, mtp.runner_pct]
-            self._rr_fallback_multiples = [mtp.tp1_r_multiple, mtp.tp2_r_multiple, 3.0]
-            logger.info("ExecutionEngine using multi_tp config", tp_splits=self._tp_splits, rr_multiples=self._rr_fallback_multiples)
+            runner_has_fixed_tp = getattr(mtp, "runner_has_fixed_tp", False)
+            if runner_has_fixed_tp:
+                # Legacy 3-TP mode: runner gets a fixed TP order
+                runner_r = getattr(mtp, "runner_tp_r_multiple", 3.0) or 3.0
+                self._tp_splits = [mtp.tp1_close_pct, mtp.tp2_close_pct, mtp.runner_pct]
+                self._rr_fallback_multiples = [mtp.tp1_r_multiple, mtp.tp2_r_multiple, runner_r]
+            else:
+                # Runner mode: only 2 TPs, runner has no TP order (trend-following)
+                self._tp_splits = [mtp.tp1_close_pct, mtp.tp2_close_pct]
+                self._rr_fallback_multiples = [mtp.tp1_r_multiple, mtp.tp2_r_multiple]
+            self._runner_pct = mtp.runner_pct
+            self._runner_has_fixed_tp = runner_has_fixed_tp
+            logger.info(
+                "ExecutionEngine using multi_tp config",
+                tp_splits=self._tp_splits,
+                rr_multiples=self._rr_fallback_multiples,
+                runner_pct=self._runner_pct,
+                runner_has_fixed_tp=self._runner_has_fixed_tp,
+            )
         else:
             self._tp_splits = list(self.config.tp_splits)
             self._rr_fallback_multiples = list(self.config.rr_fallback_multiples)
+            self._runner_pct = 0.0
+            self._runner_has_fixed_tp = True  # legacy: all TPs have orders
 
         self.price_precision = Decimal("0.1")
         self.qty_precision = Decimal("0.001")
@@ -106,6 +124,21 @@ class ExecutionEngine:
                 "reduce_only": True,
                 "trigger_price": tp_price
             })
+        
+        # Compute final target price for runner mode trail-tightening.
+        # In runner mode (no TP3 order), this is the RR level at 3.0R (or last TP if 3 TPs).
+        # This price is used as a management signal, not an order.
+        risk = abs(fut_entry - fut_sl)
+        if not self._runner_has_fixed_tp and len(tps) == 2:
+            # Runner mode: compute final target at 3.0R as aspiration level
+            final_target_r = Decimal("3.0")
+            if signal.signal_type == SignalType.LONG:
+                final_target_price = fut_entry + (risk * final_target_r)
+            else:
+                final_target_price = fut_entry - (risk * final_target_r)
+        else:
+            # Legacy mode: final target is the last TP price
+            final_target_price = tps[-1] if tps else None
             
         return {
             "entry": entry_order,
@@ -114,7 +147,10 @@ class ExecutionEngine:
             "metadata": {
                 "fut_entry": fut_entry,
                 "fut_sl": fut_sl,
-                "sl_pct": sl_pct
+                "sl_pct": sl_pct,
+                "runner_pct": self._runner_pct,
+                "runner_has_fixed_tp": self._runner_has_fixed_tp,
+                "final_target_price": final_target_price,
             }
         }
         
@@ -210,7 +246,7 @@ class ExecutionEngine:
         side: SignalType
     ) -> List[Decimal]:
         """
-        Generate 3 TP levels.
+        Generate TP levels (2 in runner mode, 3 in legacy/fixed-TP mode).
         Priority: Structure (Signal.tp_candidates) > RR Fallback.
         """
         tps = []
@@ -230,13 +266,13 @@ class ExecutionEngine:
                 fallbacks.append(fut_entry - (risk * m))
                 
         # Merge: Use candidates where available, else fill with fallback
-        # Logic: If we have 2 candidates, use them as TP1, TP2, use fallback for TP3.
+        # Logic: If we have 2 candidates, use them as TP1, TP2, use fallback for remainder.
         # But we need to ensure they are "progressive" (further away).
         
         final_tps = []
         
-        # Simple merge strategy: Fill slots 1, 2, 3
-        num_slots = 3
+        # Dynamic slot count: 2 in runner mode (no fixed TP for runner), 3 in legacy
+        num_slots = len(self._rr_fallback_multiples)
         
         structure_idx = 0
         fallback_idx = 0
@@ -250,10 +286,7 @@ class ExecutionEngine:
         for i in range(num_slots):
             # Prefer structural candidate
             if structure_idx < len(candidates):
-                # We have a candidate, but we need to convert it to futures price?
-                # The candidates in Signal are SPOT prices.
-                # We need to convert them same way as SL.
-                
+                # Candidates in Signal are SPOT prices - convert to futures
                 spot_tp = candidates[structure_idx]
                 # Calculate % dist from spot entry
                 if side == SignalType.LONG:
@@ -266,9 +299,7 @@ class ExecutionEngine:
                 final_tps.append(fut_tp_candidate)
                 structure_idx += 1
             else:
-                # Use fallback
-                # Ensure specific index fallback corresponds to specific TP (e.g. TP3 uses 3R)
-                # Current loop index i maps to fallback index i
+                # Use fallback - index i maps to fallback index i
                 final_tps.append(fallbacks[i])
         
         # Final sort to ensure logical order (e.g. if fallback TP3 < structure TP2 somehow)
@@ -280,23 +311,47 @@ class ExecutionEngine:
         return final_tps
 
     def _split_quantities(self, total_qty: Decimal, num_tps: int) -> List[Decimal]:
-        """Split quantities according to config splits."""
+        """Split quantities according to config splits.
+        
+        In runner mode (2 TPs), each TP gets exactly its configured pct of total_qty.
+        The implicit runner remainder is NOT included in the returned list.
+        In legacy mode (3 TPs), the last TP still gets remainder to ensure exact sum.
+        """
         splits = self._tp_splits
         # Ensure splits match num_tps
         if len(splits) != num_tps:
-            # Fallback
+            # Fallback to equal splits
             splits = [Decimal("1") / Decimal(str(num_tps))] * num_tps
         
-        qtys = []
-        remaining = total_qty
+        # Check if splits sum to < 1.0 (runner mode: runner is implicit remainder)
+        splits_sum = sum(Decimal(str(s)) for s in splits)
+        runner_mode = splits_sum < Decimal("0.999")  # runner pct is not in splits
         
-        for i in range(num_tps - 1):
-            split_pct = Decimal(str(splits[i]))
-            qty = total_qty * split_pct
-            # Rounding (simplified)
-            qty = round(qty, 4) 
-            qtys.append(qty)
-            remaining -= qty
-            
-        qtys.append(remaining) # Last one gets remainder to ensure exact sum
+        qtys = []
+        
+        if runner_mode:
+            # Runner mode: each TP gets exactly its configured pct
+            for i in range(num_tps):
+                split_pct = Decimal(str(splits[i]))
+                qty = total_qty * split_pct
+                qty = round(qty, 4)
+                if qty <= 0:
+                    logger.warning(
+                        "TP qty rounded to zero, skipping",
+                        tp_index=i + 1,
+                        split_pct=str(split_pct),
+                    )
+                    continue
+                qtys.append(qty)
+        else:
+            # Legacy mode: last TP gets remainder to ensure exact sum
+            remaining = total_qty
+            for i in range(num_tps - 1):
+                split_pct = Decimal(str(splits[i]))
+                qty = total_qty * split_pct
+                qty = round(qty, 4)
+                qtys.append(qty)
+                remaining -= qty
+            qtys.append(remaining)
+        
         return qtys

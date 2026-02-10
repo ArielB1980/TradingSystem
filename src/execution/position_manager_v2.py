@@ -145,14 +145,16 @@ class PositionManagerV2:
     6. State transitions are driven by acknowledged fills, not intent
     """
     
-    def __init__(self, registry: Optional[PositionRegistry] = None):
+    def __init__(self, registry: Optional[PositionRegistry] = None, multi_tp_config=None):
         """
-        Initialize with optional custom registry.
+        Initialize with optional custom registry and multi-TP config.
         
         Args:
             registry: Position registry (uses singleton if not provided)
+            multi_tp_config: Optional MultiTPConfig for runner mode settings
         """
         self.registry = registry or get_position_registry()
+        self._multi_tp_config = multi_tp_config
         
         # Decision history for metrics / debugging
         self.decision_history: List[DecisionTick] = []
@@ -267,6 +269,26 @@ class PositionManagerV2:
         position_id = f"pos-{uuid.uuid4().hex[:12]}"
         client_order_id = f"entry-{position_id}"
         
+        # Determine runner mode settings from multi_tp config
+        mtp = self._multi_tp_config
+        runner_mode = False
+        tp1_close_pct = Decimal("0.40")
+        tp2_close_pct = Decimal("0.40")
+        runner_pct = Decimal("0.20")
+        final_target_behavior = "tighten_trail"
+        tighten_trail_atr_mult = Decimal("1.2")
+        
+        if mtp and getattr(mtp, "enabled", False):
+            runner_has_fixed_tp = getattr(mtp, "runner_has_fixed_tp", False)
+            runner_mode = not runner_has_fixed_tp and mtp.runner_pct > 0
+            tp1_close_pct = Decimal(str(mtp.tp1_close_pct))
+            tp2_close_pct = Decimal(str(mtp.tp2_close_pct))
+            runner_pct = Decimal(str(mtp.runner_pct))
+            final_target_behavior = getattr(mtp, "final_target_behavior", "tighten_trail")
+            tighten_trail_atr_mult = Decimal(str(
+                getattr(mtp, "tighten_trail_at_final_target_atr_mult", 1.2)
+            ))
+        
         position = ManagedPosition(
             symbol=symbol,
             side=side,
@@ -279,7 +301,13 @@ class PositionManagerV2:
             initial_final_target=final_target,
             setup_type=signal.setup_type.value if hasattr(signal, 'setup_type') else None,
             regime=signal.regime if hasattr(signal, 'regime') else None,
-            trade_type=trade_type
+            trade_type=trade_type,
+            runner_mode=runner_mode,
+            tp1_close_pct=tp1_close_pct,
+            tp2_close_pct=tp2_close_pct,
+            runner_pct=runner_pct,
+            final_target_behavior=final_target_behavior,
+            tighten_trail_atr_mult=tighten_trail_atr_mult,
         )
         position.entry_order_id = client_order_id
         position.entry_client_order_id = client_order_id
@@ -325,7 +353,10 @@ class PositionManagerV2:
         RULE PRIORITY (highest to lowest):
         1. STOP HIT → Immediate close (ABSOLUTE)
         2. PREMISE INVALIDATION → Immediate close
-        3. FINAL TARGET HIT → Full close
+        3. FINAL TARGET HIT → Behavior depends on config:
+           - close_full (legacy): Full close
+           - tighten_trail (default runner): Tighten trailing stop
+           - close_partial: Close ~50% of runner
         4. TP2 HIT → Partial close
         5. TP1 HIT → Partial close + conditional BE
         6. TRAILING STOP UPDATE → Move stop toward profit
@@ -424,23 +455,86 @@ class PositionManagerV2:
         # ========== RULE 11: FINAL TARGET HIT ==========
         if position.check_final_target_hit(current_price):
             reason_codes.append("FINAL_TARGET_HIT")
-            client_order_id = f"exit-final-{position.position_id}"
             
-            actions.append(ManagementAction(
-                type=ActionType.CLOSE_FULL,
-                symbol=symbol,
-                reason=f"Final Target Hit ({position.initial_final_target})",
-                side=position.side,
-                size=position.remaining_qty,
-                order_type=OrderType.MARKET,
-                client_order_id=client_order_id,
-                position_id=position.position_id,
-                exit_reason=ExitReason.TAKE_PROFIT_FINAL,
-                priority=80
-            ))
+            # Determine behavior: runner mode uses configurable behavior, legacy always closes full
+            behavior = position.final_target_behavior if position.runner_mode else "close_full"
             
-            self._record_decision(symbol, current_price, position, actions, reason_codes)
-            return actions
+            if behavior == "close_full":
+                # Legacy: close full position
+                client_order_id = f"exit-final-{position.position_id}"
+                actions.append(ManagementAction(
+                    type=ActionType.CLOSE_FULL,
+                    symbol=symbol,
+                    reason=f"Final Target Hit ({position.initial_final_target})",
+                    side=position.side,
+                    size=position.remaining_qty,
+                    order_type=OrderType.MARKET,
+                    client_order_id=client_order_id,
+                    position_id=position.position_id,
+                    exit_reason=ExitReason.TAKE_PROFIT_FINAL,
+                    priority=80
+                ))
+                self._record_decision(symbol, current_price, position, actions, reason_codes)
+                return actions
+            
+            elif behavior == "tighten_trail":
+                # Tighten trailing stop at final target, do NOT close
+                if not position.final_target_touched:
+                    position.final_target_touched = True
+                    reason_codes.append("TIGHTEN_TRAIL_AT_FINAL")
+                    logger.info(
+                        "Final target touched - tightening trail (not closing)",
+                        symbol=symbol,
+                        final_target=str(position.initial_final_target),
+                        current_price=str(current_price),
+                    )
+                    if position.trailing_active and current_atr:
+                        tighter_mult = position.tighten_trail_atr_mult
+                        new_trail = self._calculate_trailing_stop(
+                            position, current_price, current_atr,
+                            atr_mult_override=tighter_mult,
+                        )
+                        if new_trail and position._validate_stop_move(new_trail):
+                            client_order_id = f"stop-tighten-final-{position.position_id}"
+                            actions.append(ManagementAction(
+                                type=ActionType.UPDATE_STOP,
+                                symbol=symbol,
+                                reason=f"Tighten trail at final target ({position.initial_final_target})",
+                                side=position.side,
+                                price=new_trail,
+                                client_order_id=client_order_id,
+                                position_id=position.position_id,
+                                priority=75
+                            ))
+                            self.metrics["stop_moves"] += 1
+                # Do NOT return early -- allow subsequent rules (trailing, etc.) to run
+            
+            elif behavior == "close_partial":
+                # Close ~50% of remaining runner at final target
+                if not position.final_target_touched:
+                    position.final_target_touched = True
+                    partial_size = position.remaining_qty * Decimal("0.5")
+                    if partial_size > 0:
+                        client_order_id = f"exit-final-partial-{position.position_id}"
+                        reason_codes.append("FINAL_TARGET_CLOSE_PARTIAL")
+                        actions.append(ManagementAction(
+                            type=ActionType.CLOSE_PARTIAL,
+                            symbol=symbol,
+                            reason=f"Final Target Partial Close ({position.initial_final_target})",
+                            side=position.side,
+                            size=partial_size,
+                            order_type=OrderType.MARKET,
+                            client_order_id=client_order_id,
+                            position_id=position.position_id,
+                            exit_reason=ExitReason.TAKE_PROFIT_FINAL,
+                            priority=75
+                        ))
+                        logger.info(
+                            "Final target touched - closing partial runner",
+                            symbol=symbol,
+                            partial_size=str(partial_size),
+                        )
+                # Do NOT return early -- allow subsequent rules to run
         
         # ========== RULE 10: TP2 HIT ==========
         if position.check_tp2_hit(current_price):
@@ -526,10 +620,17 @@ class PositionManagerV2:
         self,
         position: ManagedPosition,
         current_price: Decimal,
-        current_atr: Decimal
+        current_atr: Decimal,
+        atr_mult_override: Optional[Decimal] = None
     ) -> Optional[Decimal]:
-        """Calculate trailing stop using ATR."""
-        trail_distance = current_atr * self.trailing_atr_multiple
+        """Calculate trailing stop using ATR.
+        
+        Args:
+            atr_mult_override: If provided, overrides self.trailing_atr_multiple.
+                Used for tightening trail at final target.
+        """
+        mult = atr_mult_override if atr_mult_override is not None else self.trailing_atr_multiple
+        trail_distance = current_atr * mult
         
         if position.side == Side.LONG:
             new_stop = current_price - trail_distance
@@ -591,10 +692,18 @@ class PositionManagerV2:
                         priority=100
                     ))
                 
-                # V3 FIX: Place TP orders after entry fill
-                # TP1: Use partial_close_pct of position size
+                # Place TP orders after entry fill
+                # In runner mode: TP1 and TP2 sized from filled_entry_qty * configured pcts
+                # In legacy mode: TP1 = partial_close_pct, TP2 = remainder
+                filled_entry = position._filled_entry_qty
+                
                 if position.initial_tp1_price and not position.tp1_order_id:
-                    tp1_size = position.remaining_qty * position.partial_close_pct
+                    if position.runner_mode:
+                        tp1_size = filled_entry * position.tp1_close_pct
+                    else:
+                        tp1_size = position.remaining_qty * position.partial_close_pct
+                    # Safety: never exceed remaining
+                    tp1_size = min(tp1_size, position.remaining_qty)
                     if tp1_size > 0:
                         tp1_client_id = f"tp1-{position.position_id}"
                         follow_up_actions.append(ManagementAction(
@@ -612,13 +721,18 @@ class PositionManagerV2:
                             "Queuing TP1 placement",
                             symbol=symbol,
                             price=str(position.initial_tp1_price),
-                            size=str(tp1_size)
+                            size=str(tp1_size),
+                            runner_mode=position.runner_mode,
                         )
                 
-                # TP2: Use remaining after TP1 (or configurable portion)
                 if position.initial_tp2_price and not position.tp2_order_id:
-                    # TP2 gets the remaining portion after TP1
-                    tp2_size = position.remaining_qty * (Decimal("1") - position.partial_close_pct)
+                    if position.runner_mode:
+                        tp2_size = filled_entry * position.tp2_close_pct
+                    else:
+                        # Legacy: TP2 gets the remaining portion after TP1
+                        tp2_size = position.remaining_qty * (Decimal("1") - position.partial_close_pct)
+                    # Safety: never exceed remaining (account for TP1 that was just queued)
+                    tp2_size = min(tp2_size, position.remaining_qty)
                     if tp2_size > 0:
                         tp2_client_id = f"tp2-{position.position_id}"
                         follow_up_actions.append(ManagementAction(
@@ -636,7 +750,8 @@ class PositionManagerV2:
                             "Queuing TP2 placement",
                             symbol=symbol,
                             price=str(position.initial_tp2_price),
-                            size=str(tp2_size)
+                            size=str(tp2_size),
+                            runner_mode=position.runner_mode,
                         )
         
         # Handle exit fill → check for BE trigger
