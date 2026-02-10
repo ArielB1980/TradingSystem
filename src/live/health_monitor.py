@@ -349,7 +349,7 @@ async def run_winner_churn_monitor(
 
             logger.debug(
                 "Winner churn check",
-                tracked_symbols=len(_win_history),
+                tracked_symbols=len(win_log),
                 churn_count=len(churn_symbols),
                 alerted=len(_alerted_symbols),
             )
