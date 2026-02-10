@@ -213,8 +213,11 @@ class LiveTrading:
             # Initialize Persistence (SQLite)
             self.position_persistence = PositionPersistence("data/positions.db")
             
-            # Initialize Position Manager V2
-            self.position_manager_v2 = PositionManagerV2(registry=self.position_registry)
+            # Initialize Position Manager V2 (pass multi_tp config for runner mode)
+            self.position_manager_v2 = PositionManagerV2(
+                registry=self.position_registry,
+                multi_tp_config=getattr(self.config, "multi_tp", None),
+            )
             
             # Initialize Execution Gateway - ALL orders flow through here
             self.execution_gateway = ExecutionGateway(

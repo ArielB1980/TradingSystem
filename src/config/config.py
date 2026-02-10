@@ -411,6 +411,18 @@ class MultiTPConfig(BaseSettings):
     trailing_stop_enabled: bool = True
     trailing_stop_atr_multiplier: float = Field(default=1.5, ge=1.0, le=3.0)
 
+    # Runner behavior: when False, runner has NO fixed TP order (trend-following mode)
+    runner_has_fixed_tp: bool = False
+    # R-multiple for runner TP; only used when runner_has_fixed_tp is True
+    runner_tp_r_multiple: Optional[float] = Field(default=None, ge=1.0, le=20.0)
+    # What happens when price hits final target level:
+    #   tighten_trail = tighten trailing stop (default, best for trend-following)
+    #   close_partial  = close ~50% of remaining runner
+    #   close_full     = legacy full exit
+    final_target_behavior: Literal["tighten_trail", "close_partial", "close_full"] = "tighten_trail"
+    # ATR multiplier to use when tightening trail at final target
+    tighten_trail_at_final_target_atr_mult: float = Field(default=1.2, ge=0.5, le=3.0)
+
 
 class ExecutionConfig(BaseSettings):
     """Execution settings configuration."""
