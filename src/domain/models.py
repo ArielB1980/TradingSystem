@@ -226,6 +226,10 @@ class Position:
     initial_stop_distance_pct: Optional[Decimal] = None  # Risk in % at entry
     margin_used_at_entry: Optional[Decimal] = None  # Margin at entry (for tracking)
     
+    # Runner tracking (backtest use)
+    _tp_fills_count: int = 0  # Number of TPs filled (for runner exit detection)
+    _initial_risk_per_unit: Optional[Decimal] = None  # |entry - initial_stop| per unit, for R-multiple calc
+    
     def liquidation_distance_pct(self) -> Decimal:
         """
         Calculate liquidation distance as percentage.

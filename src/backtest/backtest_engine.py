@@ -50,6 +50,19 @@ class BacktestMetrics:
     trade_symbols: List[str] = field(default_factory=list)  # Symbols for each trade
     loss_correlation: float = 0.0  # Correlation coefficient of consecutive losses
     
+    # Runner-specific metrics
+    tp1_fills: int = 0              # Number of TP1 partial fills
+    tp2_fills: int = 0              # Number of TP2 partial fills
+    tp1_pnl: Decimal = Decimal("0")  # Cumulative PnL from TP1 exits
+    tp2_pnl: Decimal = Decimal("0")  # Cumulative PnL from TP2 exits
+    runner_exits: int = 0           # Number of runner exits (trailing stop / SL after TPs)
+    runner_pnl: Decimal = Decimal("0")  # Cumulative PnL from runner portion
+    runner_r_multiples: List[float] = field(default_factory=list)  # R-multiple at runner exit
+    runner_avg_r: float = 0.0       # Average R-multiple of runner exits
+    runner_exits_beyond_3r: int = 0  # Count of runners that exceeded 3R
+    runner_max_r: float = 0.0       # Best single runner R-multiple
+    exit_reasons: List[str] = field(default_factory=list)  # Exit reason for each trade
+    
     def update(self):
         """Update calculated metrics."""
         if self.total_trades > 0:
@@ -74,6 +87,12 @@ class BacktestMetrics:
                 self.avg_loss = sum(losses) / len(losses)
             if self.avg_loss != 0:
                 self.profit_factor = float(abs(self.avg_win * self.winning_trades) / abs(self.avg_loss * self.losing_trades))
+        
+        # Runner metrics
+        if self.runner_r_multiples:
+            self.runner_avg_r = sum(self.runner_r_multiples) / len(self.runner_r_multiples)
+            self.runner_exits_beyond_3r = sum(1 for r in self.runner_r_multiples if r > 3.0)
+            self.runner_max_r = max(self.runner_r_multiples)
     
     def _calculate_loss_correlation(self):
         """
@@ -281,6 +300,38 @@ class BacktestEngine:
                          atr_val = self.smc_engine.indicators.calculate_atr(hist_1h, 14).iloc[-1]
                          current_sl = Decimal(self.position.stop_loss_order_id.split("-")[1])
                          
+                         # Progressive trailing: compute R-multiple and apply tighter ATR mult if applicable
+                         effective_atr_mult = None  # None = use default from config
+                         risk_per_unit = getattr(self.position, '_initial_risk_per_unit', None)
+                         mtp = getattr(self.config, 'multi_tp', None)
+                         prog_enabled = mtp and getattr(mtp, 'progressive_trail_enabled', False)
+                         
+                         if prog_enabled and risk_per_unit and risk_per_unit > 0:
+                             if self.position.side == Side.LONG:
+                                 current_r = (spot_price - self.position.entry_price) / risk_per_unit
+                             else:
+                                 current_r = (self.position.entry_price - spot_price) / risk_per_unit
+                             
+                             prog_levels = getattr(mtp, 'progressive_trail_levels', [])
+                             sorted_levels = sorted(prog_levels, key=lambda x: x.get("r_threshold", 0))
+                             highest_level = getattr(self.position, '_prog_trail_level', -1)
+                             
+                             for idx, level in enumerate(sorted_levels):
+                                 r_thresh = Decimal(str(level.get("r_threshold", 999)))
+                                 if current_r >= r_thresh and idx > highest_level:
+                                     self.position._prog_trail_level = idx
+                                     effective_atr_mult = Decimal(str(level.get("atr_mult", 2.0)))
+                             
+                             # Use the highest applicable ATR mult
+                             if hasattr(self.position, '_prog_trail_level') and self.position._prog_trail_level >= 0:
+                                 best_level = sorted_levels[self.position._prog_trail_level]
+                                 effective_atr_mult = Decimal(str(best_level.get("atr_mult", 2.0)))
+                         
+                         # Temporarily override execution engine's trailing ATR mult if progressive
+                         original_mult = self.execution.config.trailing_atr_mult
+                         if effective_atr_mult is not None:
+                             self.execution.config.trailing_atr_mult = float(effective_atr_mult)
+                         
                          new_sl = self.execution.check_trailing_stop(
                              self.position,
                              spot_price,
@@ -288,9 +339,12 @@ class BacktestEngine:
                              spot_price,
                              current_sl
                          )
+                         
+                         # Restore original mult
+                         self.execution.config.trailing_atr_mult = original_mult
+                         
                          if new_sl:
                              self.position.stop_loss_order_id = f"SL-{new_sl}"
-                             # logger.debug(f"Trailing SL Updated: {new_sl}")
 
             # Generate signal (only if no position) - 4H Decision Authority
             if not self.position:
@@ -355,6 +409,22 @@ class BacktestEngine:
             total_pnl=str(self.metrics.total_pnl),
             max_dd=f"{self.metrics.max_drawdown:.1%}",
         )
+        
+        # Runner-specific summary
+        if self.metrics.runner_exits > 0:
+            logger.info(
+                "Runner stats",
+                runner_exits=self.metrics.runner_exits,
+                runner_pnl=str(self.metrics.runner_pnl),
+                runner_avg_r=f"{self.metrics.runner_avg_r:.2f}R",
+                runner_max_r=f"{self.metrics.runner_max_r:.2f}R",
+                runners_beyond_3r=self.metrics.runner_exits_beyond_3r,
+                tp1_fills=self.metrics.tp1_fills,
+                tp2_fills=self.metrics.tp2_fills,
+                tp1_pnl=str(self.metrics.tp1_pnl),
+                tp2_pnl=str(self.metrics.tp2_pnl),
+                runner_pnl_pct=f"{float(self.metrics.runner_pnl) / max(float(self.metrics.total_pnl), 0.01) * 100:.1f}%",
+            )
         
         return self.metrics
     
@@ -503,6 +573,10 @@ class BacktestEngine:
             margin_used_at_entry=decision.margin_required
         )
         
+        # Set runner tracking metadata
+        self.position._tp_fills_count = 0
+        self.position._initial_risk_per_unit = abs(fill_price - sl_price) if sl_price else None
+        
         # logger.info("Position opened", side=self.position.side.value, size=str(decision.position_notional))
     
     def _check_exit(self, position: Position, candle: Candle) -> bool:
@@ -519,7 +593,8 @@ class BacktestEngine:
                 hit_sl = True
         
         if hit_sl:
-            self._close_position(stop_loss, "stop_loss", candle.timestamp, position.size)
+            exit_reason = "trailing_stop" if position.trailing_active else "stop_loss"
+            self._close_position(stop_loss, exit_reason, candle.timestamp, position.size)
             return True
             
         # Check TPs (Partial)
@@ -551,6 +626,7 @@ class BacktestEngine:
                 close_qty = min(qty, position.size)
                 self._close_partial(position, price, close_qty, f"tp_{parts[1]}", candle.timestamp)
                 hits += 1
+                position._tp_fills_count = getattr(position, '_tp_fills_count', 0) + 1
                 
                  # Activate Trailing if TP1
                 if parts[1] == "0":
@@ -609,6 +685,14 @@ class BacktestEngine:
         self.current_equity += net_pnl
         self.position_realized_pnl += net_pnl
         
+        # Track TP-specific metrics
+        if reason == "tp_0":
+            self.metrics.tp1_fills += 1
+            self.metrics.tp1_pnl += net_pnl
+        elif reason == "tp_1":
+            self.metrics.tp2_fills += 1
+            self.metrics.tp2_pnl += net_pnl
+        
         position.size -= qty
         position.size_notional -= (qty * position.entry_price)
         
@@ -643,6 +727,26 @@ class BacktestEngine:
         self.metrics.trade_results.append(self.position_realized_pnl)
         self.metrics.trade_timestamps.append(timestamp)
         self.metrics.trade_symbols.append(self.position.symbol)
+        self.metrics.exit_reasons.append(reason)
+        
+        # Runner-specific metrics: if this is a runner exit (trailing stop / SL after TPs filled)
+        # A runner exit = position closed after TP orders were already filled but position still had size
+        is_runner_exit = (
+            reason in ("trailing_stop", "stop_loss", "backtest_end")
+            and hasattr(self.position, '_tp_fills_count')
+            and self.position._tp_fills_count >= 2
+        )
+        if is_runner_exit:
+            self.metrics.runner_exits += 1
+            self.metrics.runner_pnl += net_pnl
+            # Compute R-multiple for the runner portion
+            stop_dist = getattr(self.position, '_initial_risk_per_unit', None)
+            if stop_dist and stop_dist > 0:
+                if self.position.side == Side.LONG:
+                    r_mult = float((exit_price - self.position.entry_price) / stop_dist)
+                else:
+                    r_mult = float((self.position.entry_price - exit_price) / stop_dist)
+                self.metrics.runner_r_multiples.append(r_mult)
             
         self.risk_manager.record_trade_result(
             self.position_realized_pnl, 

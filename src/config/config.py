@@ -422,6 +422,30 @@ class MultiTPConfig(BaseSettings):
     final_target_behavior: Literal["tighten_trail", "close_partial", "close_full"] = "tighten_trail"
     # ATR multiplier to use when tightening trail at final target
     tighten_trail_at_final_target_atr_mult: float = Field(default=1.2, ge=0.5, le=3.0)
+    
+    # Progressive trailing tightening at R-multiple milestones
+    # Each level: (r_multiple_threshold, atr_multiplier_to_use)
+    # When price reaches N*R profit, trail tightens to the specified ATR mult
+    progressive_trail_enabled: bool = True
+    progressive_trail_levels: list[dict] = Field(
+        default=[
+            {"r_threshold": 3.0, "atr_mult": 1.8},   # At 3R: moderate tighten
+            {"r_threshold": 5.0, "atr_mult": 1.4},   # At 5R: tighter
+            {"r_threshold": 8.0, "atr_mult": 1.0},   # At 8R: very tight (1x ATR)
+        ]
+    )
+    
+    # Regime-aware runner sizing overrides
+    # When regime is "tight_smc" (consolidation/range), use smaller runner
+    # When regime is "wide_structure" (trending), use larger runner
+    regime_runner_sizing_enabled: bool = True
+    regime_runner_overrides: dict = Field(
+        default={
+            "tight_smc": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
+            "wide_structure": {"runner_pct": 0.30, "tp1_close_pct": 0.35, "tp2_close_pct": 0.35},
+            "consolidation": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
+        }
+    )
 
 
 class ExecutionConfig(BaseSettings):

@@ -25,6 +25,7 @@ class ExecutionEngine:
         self.strategy_config = config.strategy
         mtp = getattr(config, "multi_tp", None)
 
+        self._multi_tp_config = mtp
         if mtp and getattr(mtp, "enabled", False):
             runner_has_fixed_tp = getattr(mtp, "runner_has_fixed_tp", False)
             if runner_has_fixed_tp:
@@ -38,18 +39,23 @@ class ExecutionEngine:
                 self._rr_fallback_multiples = [mtp.tp1_r_multiple, mtp.tp2_r_multiple]
             self._runner_pct = mtp.runner_pct
             self._runner_has_fixed_tp = runner_has_fixed_tp
+            self._regime_sizing_enabled = getattr(mtp, "regime_runner_sizing_enabled", False)
+            self._regime_overrides = getattr(mtp, "regime_runner_overrides", {})
             logger.info(
                 "ExecutionEngine using multi_tp config",
                 tp_splits=self._tp_splits,
                 rr_multiples=self._rr_fallback_multiples,
                 runner_pct=self._runner_pct,
                 runner_has_fixed_tp=self._runner_has_fixed_tp,
+                regime_sizing=self._regime_sizing_enabled,
             )
         else:
             self._tp_splits = list(self.config.tp_splits)
             self._rr_fallback_multiples = list(self.config.rr_fallback_multiples)
             self._runner_pct = 0.0
             self._runner_has_fixed_tp = True  # legacy: all TPs have orders
+            self._regime_sizing_enabled = False
+            self._regime_overrides = {}
 
         self.price_precision = Decimal("0.1")
         self.qty_precision = Decimal("0.001")
@@ -82,12 +88,36 @@ class ExecutionEngine:
         else:
             fut_sl = fut_entry * (Decimal("1") + sl_pct)
             
-        # 2. Generate TP Ladder (Futures prices)
+        # 2. Regime-aware sizing: override tp_splits and runner_pct based on signal's regime
+        effective_tp_splits = list(self._tp_splits)
+        effective_runner_pct = self._runner_pct
+        regime_used = getattr(signal, 'regime', None)
+        
+        if (
+            self._regime_sizing_enabled
+            and not self._runner_has_fixed_tp
+            and regime_used
+            and regime_used in self._regime_overrides
+        ):
+            override = self._regime_overrides[regime_used]
+            effective_runner_pct = override.get("runner_pct", self._runner_pct)
+            regime_tp1 = override.get("tp1_close_pct", effective_tp_splits[0] if effective_tp_splits else 0.4)
+            regime_tp2 = override.get("tp2_close_pct", effective_tp_splits[1] if len(effective_tp_splits) > 1 else 0.4)
+            effective_tp_splits = [regime_tp1, regime_tp2]
+            logger.info(
+                "Regime-aware sizing applied",
+                regime=regime_used,
+                tp1_pct=regime_tp1,
+                tp2_pct=regime_tp2,
+                runner_pct=effective_runner_pct,
+            )
+        
+        # 2b. Generate TP Ladder (Futures prices)
         tps = self._generate_tp_ladder(signal, fut_entry, fut_sl, signal.signal_type)
         
-        # 3. Calculate Quantities
+        # 3. Calculate Quantities (using effective regime-adjusted splits)
         size_qty = size_notional / fut_entry
-        tp_quantities = self._split_quantities(size_qty, len(tps))
+        tp_quantities = self._split_quantities(size_qty, len(tps), effective_tp_splits)
         
         # 4. Construct Orders (Intents only, ID generation happens at placement)
         # Entry
@@ -148,9 +178,11 @@ class ExecutionEngine:
                 "fut_entry": fut_entry,
                 "fut_sl": fut_sl,
                 "sl_pct": sl_pct,
-                "runner_pct": self._runner_pct,
+                "runner_pct": effective_runner_pct,
                 "runner_has_fixed_tp": self._runner_has_fixed_tp,
                 "final_target_price": final_target_price,
+                "regime": regime_used,
+                "effective_tp_splits": effective_tp_splits,
             }
         }
         
@@ -310,14 +342,18 @@ class ExecutionEngine:
             
         return final_tps
 
-    def _split_quantities(self, total_qty: Decimal, num_tps: int) -> List[Decimal]:
+    def _split_quantities(self, total_qty: Decimal, num_tps: int, splits_override: Optional[list] = None) -> List[Decimal]:
         """Split quantities according to config splits.
         
         In runner mode (2 TPs), each TP gets exactly its configured pct of total_qty.
         The implicit runner remainder is NOT included in the returned list.
         In legacy mode (3 TPs), the last TP still gets remainder to ensure exact sum.
+        
+        Args:
+            splits_override: If provided, use these splits instead of self._tp_splits.
+                Used for regime-aware sizing.
         """
-        splits = self._tp_splits
+        splits = splits_override if splits_override is not None else self._tp_splits
         # Ensure splits match num_tps
         if len(splits) != num_tps:
             # Fallback to equal splits

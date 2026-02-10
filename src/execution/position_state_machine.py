@@ -258,6 +258,10 @@ class ManagedPosition:
     tighten_trail_atr_mult: Decimal = Decimal("1.2")  # ATR mult after final target touch
     final_target_touched: bool = False           # Set True on first final target hit (one-time tighten)
     
+    # Progressive trailing state: tracks the highest R-level tightening applied
+    highest_r_tighten_level: int = -1  # Index into progressive_trail_levels; -1 = none applied yet
+    current_trail_atr_mult: Optional[Decimal] = None  # Current effective ATR mult (set by progressive trail)
+    
     def __post_init__(self):
         """Validate position parameters."""
         check_invariant(

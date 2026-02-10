@@ -288,6 +288,25 @@ class PositionManagerV2:
             tighten_trail_atr_mult = Decimal(str(
                 getattr(mtp, "tighten_trail_at_final_target_atr_mult", 1.2)
             ))
+            
+            # Regime-aware sizing: override pcts based on signal regime
+            regime_sizing = getattr(mtp, "regime_runner_sizing_enabled", False)
+            regime_overrides = getattr(mtp, "regime_runner_overrides", {})
+            signal_regime = signal.regime if hasattr(signal, 'regime') else None
+            
+            if regime_sizing and runner_mode and signal_regime and signal_regime in regime_overrides:
+                ov = regime_overrides[signal_regime]
+                tp1_close_pct = Decimal(str(ov.get("tp1_close_pct", float(tp1_close_pct))))
+                tp2_close_pct = Decimal(str(ov.get("tp2_close_pct", float(tp2_close_pct))))
+                runner_pct = Decimal(str(ov.get("runner_pct", float(runner_pct))))
+                logger.info(
+                    "Regime-aware sizing for position",
+                    symbol=symbol,
+                    regime=signal_regime,
+                    tp1_pct=str(tp1_close_pct),
+                    tp2_pct=str(tp2_close_pct),
+                    runner_pct=str(runner_pct),
+                )
         
         position = ManagedPosition(
             symbol=symbol,
@@ -536,6 +555,63 @@ class PositionManagerV2:
                         )
                 # Do NOT return early -- allow subsequent rules to run
         
+        # ========== RULE 10.5: PROGRESSIVE TRAILING (R-based tightening) ==========
+        if (
+            position.runner_mode
+            and position.trailing_active
+            and current_atr
+            and self._multi_tp_config
+            and getattr(self._multi_tp_config, 'progressive_trail_enabled', False)
+        ):
+            prog_levels = getattr(self._multi_tp_config, 'progressive_trail_levels', [])
+            # Compute current R-multiple
+            entry_ref = position.avg_entry_price or position.initial_entry_price
+            if position.initial_stop_price and entry_ref:
+                risk_per_unit = abs(entry_ref - position.initial_stop_price)
+                if risk_per_unit > 0:
+                    if position.side == Side.LONG:
+                        current_r = (current_price - entry_ref) / risk_per_unit
+                    else:
+                        current_r = (entry_ref - current_price) / risk_per_unit
+                    
+                    # Check each level (sorted by r_threshold ascending)
+                    sorted_levels = sorted(prog_levels, key=lambda x: x.get("r_threshold", 0))
+                    for idx, level in enumerate(sorted_levels):
+                        r_thresh = Decimal(str(level.get("r_threshold", 999)))
+                        atr_m = Decimal(str(level.get("atr_mult", 2.0)))
+                        
+                        if current_r >= r_thresh and idx > position.highest_r_tighten_level:
+                            # New R-level reached: tighten trail
+                            position.highest_r_tighten_level = idx
+                            position.current_trail_atr_mult = atr_m
+                            reason_codes.append(f"PROGRESSIVE_TRAIL_{float(r_thresh):.0f}R")
+                            
+                            new_trail = self._calculate_trailing_stop(
+                                position, current_price, current_atr,
+                                atr_mult_override=atr_m,
+                            )
+                            if new_trail and position._validate_stop_move(new_trail):
+                                client_order_id = f"stop-prog-trail-{float(r_thresh):.0f}r-{position.position_id}"
+                                actions.append(ManagementAction(
+                                    type=ActionType.UPDATE_STOP,
+                                    symbol=symbol,
+                                    reason=f"Progressive trail tighten at {float(r_thresh):.1f}R (ATR×{float(atr_m):.1f})",
+                                    side=position.side,
+                                    price=new_trail,
+                                    client_order_id=client_order_id,
+                                    position_id=position.position_id,
+                                    priority=76  # Between final target (75) and TP2 (70)
+                                ))
+                                self.metrics["stop_moves"] += 1
+                                logger.info(
+                                    "Progressive trail tightened",
+                                    symbol=symbol,
+                                    r_level=f"{float(r_thresh):.1f}R",
+                                    atr_mult=f"{float(atr_m):.1f}",
+                                    new_stop=str(new_trail),
+                                    current_price=str(current_price),
+                                )
+        
         # ========== RULE 10: TP2 HIT ==========
         if position.check_tp2_hit(current_price):
             if os.environ.get("TRADING_PARTIALS_ENABLED", "true").lower() != "true":
@@ -586,7 +662,9 @@ class PositionManagerV2:
         # ========== RULE 9: TRAILING STOP ==========
         if position.break_even_triggered and current_atr:
             if os.environ.get("TRADING_TRAILING_ENABLED", "true").lower() == "true":
-                new_trail = self._calculate_trailing_stop(position, current_price, current_atr)
+                # Use progressive trail ATR mult if set, otherwise default
+                trail_override = position.current_trail_atr_mult if position.current_trail_atr_mult is not None else None
+                new_trail = self._calculate_trailing_stop(position, current_price, current_atr, atr_mult_override=trail_override)
                 
                 if new_trail and position._validate_stop_move(new_trail):
                     pct_move = abs(new_trail - position.current_stop_price) / position.current_stop_price
