@@ -74,6 +74,20 @@ class RiskConfig(BaseSettings):
     max_position_size_usd: float = Field(default=100000.0, ge=1000.0, le=1000000.0)  # Max notional position
     max_risk_per_trade_entry_pct: float = Field(default=0.02, ge=0.001, le=0.10)  # Max risk per trade for Kelly
     
+    # Margin-based caps (replace notional caps; vs 7x leverage)
+    max_single_position_margin_pct_equity: float = Field(
+        default=0.25, ge=0.05, le=0.50,
+        description="Max margin per position as % of equity (25% = 1.75x notional at 7x leverage)"
+    )
+    max_aggregate_margin_pct_equity: float = Field(
+        default=2.0, ge=0.5, le=5.0,
+        description="Max total margin across all positions as % of equity (200% = 14x notional at 7x leverage)"
+    )
+    use_margin_caps: bool = Field(
+        default=True,
+        description="If True, use margin-based caps; if False, use legacy notional caps"
+    )
+
     # Liquidation safety
     min_liquidation_buffer_pct: float = Field(default=0.35, ge=0.30, le=0.50)
     
@@ -96,6 +110,9 @@ class RiskConfig(BaseSettings):
     auction_max_trades_per_cycle: int = Field(default=5, ge=1, le=20)
     auction_max_new_opens_per_cycle: int = Field(default=5, ge=1, le=20)
     auction_max_closes_per_cycle: int = Field(default=5, ge=1, le=20)
+    # Capital reallocation after TP1/TP2 partial: auction sees freed margin on next tick.
+    # Rate limit: 0 = no extra limit; when > 0, skip new opens for N seconds after partial close.
+    auction_partial_close_cooldown_seconds: int = Field(default=0, ge=0, le=300)
     auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     
@@ -410,6 +427,8 @@ class MultiTPConfig(BaseSettings):
     move_sl_to_be_after_tp1: bool = True
     trailing_stop_enabled: bool = True
     trailing_stop_atr_multiplier: float = Field(default=1.5, ge=1.0, le=3.0)
+    # Guard for activating trailing at TP1: require ATR >= this (0 = no minimum)
+    trailing_activation_atr_min: float = Field(default=0.0, ge=0.0, le=10.0)
 
     # Runner behavior: when False, runner has NO fixed TP order (trend-following mode)
     runner_has_fixed_tp: bool = False

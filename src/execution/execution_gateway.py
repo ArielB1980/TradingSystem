@@ -12,7 +12,7 @@ This ensures:
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Optional, Dict, List, Callable, Awaitable
+from typing import Callable, Optional, Dict, List, Callable, Awaitable
 from datetime import datetime, timezone
 import asyncio
 
@@ -109,6 +109,7 @@ class ExecutionGateway:
         persistence: Optional[PositionPersistence] = None,
         safety_config: Optional[SafetyConfig] = None,
         use_safety: bool = True,
+        on_partial_close: Optional[Callable[[str], None]] = None,
     ):
         """
         Initialize the execution gateway.
@@ -128,6 +129,7 @@ class ExecutionGateway:
         self._safety_config = safety_config or SafetyConfig()
         self._use_safety = use_safety
 
+        self._on_partial_close = on_partial_close
         self._stop_replacer: Optional[AtomicStopReplacer] = None
         self._wal: Optional[WriteAheadIntentLog] = None
         self._event_enforcer: Optional[EventOrderingEnforcer] = None
@@ -1027,6 +1029,9 @@ class ExecutionGateway:
         )
         
         follow_up = self.position_manager.handle_order_event(pending.symbol, event)
+        if self._on_partial_close and event_type in (OrderEventType.FILLED, OrderEventType.PARTIAL_FILL):
+            if client_order_id and (client_order_id.startswith("tp1-") or client_order_id.startswith("tp2-")):
+                self._on_partial_close(pending.symbol)
         
         if self._event_enforcer:
             self._event_enforcer.mark_processed(exchange_order_id, next_seq, fill_id)
@@ -1352,6 +1357,7 @@ class ExecutionGateway:
                 is_entry=True,
             )
             managed_pos.entry_fills.append(fill)
+            managed_pos.ensure_snapshot_targets()
             
             try:
                 self.registry.register_position(managed_pos)

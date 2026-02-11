@@ -129,8 +129,14 @@ async def handle_signal_v2(
     )
 
     # 4. Generate entry plan to get TP levels
+    step_size = None
+    if hasattr(lt, "instrument_spec_registry") and lt.instrument_spec_registry:
+        spec = lt.instrument_spec_registry.get_spec(futures_symbol)
+        if spec and spec.size_step > 0:
+            step_size = spec.size_step
     order_intent = lt.execution_engine.generate_entry_plan(
-        signal, decision.position_notional, spot_price, mark_price, decision.leverage
+        signal, decision.position_notional, spot_price, mark_price, decision.leverage,
+        step_size=step_size,
     )
 
     tps = order_intent.get("take_profits", [])

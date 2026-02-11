@@ -447,6 +447,7 @@ class TestFinalTargetBehavior:
             runner_mode=True,
             final_target_behavior="close_partial",
         )
+        position.initial_size = Decimal("2.0")  # 2.0 so 50% = 1.0 (meets venue min)
         position.state = PositionState.OPEN
         position.entry_acknowledged = True
         position.current_stop_price = Decimal("100")
@@ -458,7 +459,7 @@ class TestFinalTargetBehavior:
             fill_id="fill-1",
             order_id="entry-1",
             side=Side.LONG,
-            qty=Decimal("1.0"),
+            qty=Decimal("2.0"),
             price=Decimal("100"),
             timestamp=datetime.now(timezone.utc),
             is_entry=True,
@@ -479,8 +480,8 @@ class TestFinalTargetBehavior:
         assert len(final_partial_actions) == 1, (
             "close_partial should produce a CLOSE_PARTIAL action at final target"
         )
-        # Should close ~50% of remaining
-        assert final_partial_actions[0].size == Decimal("0.5")
+        # Should close ~50% of remaining (2.0 * 0.5 = 1.0; venue min is 1)
+        assert final_partial_actions[0].size == Decimal("1.0")
 
     def test_final_target_only_triggers_once(self):
         """Tighten/close_partial should only fire once (final_target_touched flag)."""
@@ -567,20 +568,11 @@ class TestTPSizingRunnerMode:
         position.current_stop_price = Decimal("95")
         position.entry_order_id = "entry-1"
 
-        # Simulate entry fill
-        fill = FillRecord(
-            fill_id="fill-1",
-            order_id="entry-1",
-            side=Side.LONG,
-            qty=Decimal("1.0"),
-            price=Decimal("100"),
-            timestamp=datetime.now(timezone.utc),
-            is_entry=True,
-        )
-        position.entry_fills.append(fill)
+        # Do NOT add fill manually - the event will add it via _record_fill.
+        # (Adding both would double filled_entry_qty and snapshot targets.)
         registry.register_position(position)
 
-        # Simulate entry fill event to trigger TP placement
+        # Simulate entry fill event to trigger TP placement (adds fill + snapshot)
         event = OrderEvent(
             order_id="entry-1",
             client_order_id="entry-test-pos-runner",

@@ -529,11 +529,15 @@ class PositionManagerV2:
                 # Do NOT return early -- allow subsequent rules (trailing, etc.) to run
             
             elif behavior == "close_partial":
-                # Close ~50% of remaining runner at final target
+                # Close ~50% of remaining runner at final target.
+                # Root cause fix: Kraken (and many venues) require min order size of 1 contract;
+                # sending 0.5 causes "amount must be greater than minimum amount precision of 1".
                 if not position.final_target_touched:
                     position.final_target_touched = True
                     partial_size = position.remaining_qty * Decimal("0.5")
-                    if partial_size > 0:
+                    # Only emit partial close if size meets venue minimum (1 contract typical).
+                    # Skip dust partials to avoid ORDER_REJECTED_BY_VENUE / Partial close failed.
+                    if partial_size > 0 and partial_size >= Decimal("1"):
                         client_order_id = f"exit-final-partial-{position.position_id}"
                         reason_codes.append("FINAL_TARGET_CLOSE_PARTIAL")
                         actions.append(ManagementAction(
@@ -618,7 +622,10 @@ class PositionManagerV2:
                 reason_codes.append("TP2_HIT_IGNORED")
             else:
                 reason_codes.append("TP2_HIT")
-                partial_size = position.remaining_qty * self.tp2_partial_pct
+                if position.tp2_qty_target is not None:
+                    partial_size = min(position.tp2_qty_target, position.remaining_qty)
+                else:
+                    partial_size = position.remaining_qty * self.tp2_partial_pct
                 client_order_id = f"exit-tp2-{position.position_id}"
                 
                 actions.append(ManagementAction(
@@ -640,7 +647,10 @@ class PositionManagerV2:
                 reason_codes.append("TP1_HIT_IGNORED")
             else:
                 reason_codes.append("TP1_HIT")
-                partial_size = position.remaining_qty * self.tp1_partial_pct
+                if position.tp1_qty_target is not None:
+                    partial_size = min(position.tp1_qty_target, position.remaining_qty)
+                else:
+                    partial_size = position.remaining_qty * self.tp1_partial_pct
                 client_order_id = f"exit-tp1-{position.position_id}"
                 
                 actions.append(ManagementAction(
@@ -659,8 +669,15 @@ class PositionManagerV2:
                 # CONDITIONAL BE (after TP1 fill confirmed by event, not here)
                 reason_codes.append("TP1_PARTIAL_QUEUED")
         
+        # ========== TRAILING ACTIVATION (guard at TP1) ==========
+        if position.tp1_filled and not position.trailing_active and current_atr:
+            atr_min = Decimal("0")
+            if self._multi_tp_config:
+                atr_min = Decimal(str(getattr(self._multi_tp_config, "trailing_activation_atr_min", 0)))
+            position.activate_trailing_if_guard_passes(current_atr, atr_min)
+
         # ========== RULE 9: TRAILING STOP ==========
-        if position.break_even_triggered and current_atr:
+        if (position.break_even_triggered or position.trailing_active) and current_atr:
             if os.environ.get("TRADING_TRAILING_ENABLED", "true").lower() == "true":
                 # Use progressive trail ATR mult if set, otherwise default
                 trail_override = position.current_trail_atr_mult if position.current_trail_atr_mult is not None else None
@@ -771,12 +788,14 @@ class PositionManagerV2:
                     ))
                 
                 # Place TP orders after entry fill
-                # In runner mode: TP1 and TP2 sized from filled_entry_qty * configured pcts
-                # In legacy mode: TP1 = partial_close_pct, TP2 = remainder
-                filled_entry = position._filled_entry_qty
+                # Use snapshot targets when available (avoids partial sizing drift)
+                position.ensure_snapshot_targets()
+                filled_entry = position.filled_entry_qty
                 
                 if position.initial_tp1_price and not position.tp1_order_id:
-                    if position.runner_mode:
+                    if position.tp1_qty_target is not None:
+                        tp1_size = min(position.tp1_qty_target, position.remaining_qty)
+                    elif position.runner_mode:
                         tp1_size = filled_entry * position.tp1_close_pct
                     else:
                         tp1_size = position.remaining_qty * position.partial_close_pct
@@ -804,7 +823,9 @@ class PositionManagerV2:
                         )
                 
                 if position.initial_tp2_price and not position.tp2_order_id:
-                    if position.runner_mode:
+                    if position.tp2_qty_target is not None:
+                        tp2_size = min(position.tp2_qty_target, position.remaining_qty)
+                    elif position.runner_mode:
                         tp2_size = filled_entry * position.tp2_close_pct
                     else:
                         # Legacy: TP2 gets the remaining portion after TP1

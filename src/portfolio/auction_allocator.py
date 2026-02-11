@@ -303,8 +303,25 @@ class AuctionAllocator:
             )
             contenders.append(contender)
         
+        # Capital reallocation rate limit: skip new opens when within partial-close cooldown
+        last_partial = portfolio_state.get("last_partial_close_at")
+        cooldown_sec = portfolio_state.get("partial_close_cooldown_seconds", 0) or 0
+        in_cooldown = (
+            cooldown_sec > 0
+            and last_partial is not None
+            and (now - last_partial).total_seconds() < cooldown_sec
+        )
+        if in_cooldown:
+            logger.info(
+                "Auction: Skipping new opens (partial-close cooldown)",
+                cooldown_sec=cooldown_sec,
+                seconds_since_partial=(now - last_partial).total_seconds() if last_partial else 0,
+            )
+
         # Add candidate signals (after hard filters)
         for candidate in candidate_signals:
+            if in_cooldown:
+                continue
             # Hard constraint checks
             if not self._passes_hard_filters(candidate, portfolio_state):
                 continue

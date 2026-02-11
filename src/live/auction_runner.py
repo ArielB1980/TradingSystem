@@ -243,6 +243,10 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         portfolio_state = {
             "available_margin": auction_budget_margin,
             "account_equity": equity,
+            "last_partial_close_at": getattr(lt, "_last_partial_close_at", None),
+            "partial_close_cooldown_seconds": getattr(
+                lt.config.risk, "auction_partial_close_cooldown_seconds", 0
+            ),
         }
 
         plan = lt.auction_allocator.allocate(

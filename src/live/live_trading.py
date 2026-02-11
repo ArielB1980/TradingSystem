@@ -204,6 +204,7 @@ class LiveTrading:
             )
             logger.info("Auction mode enabled", max_positions=limits.max_positions)
         
+        self._last_partial_close_at: Optional[datetime] = None
         if self.use_state_machine_v2:
             logger.critical("🚀 POSITION STATE MACHINE V2 ENABLED")
             
@@ -225,6 +226,7 @@ class LiveTrading:
                 registry=self.position_registry,
                 position_manager=self.position_manager_v2,
                 persistence=self.position_persistence,
+                on_partial_close=lambda _: setattr(self, "_last_partial_close_at", datetime.now(timezone.utc)),
             )
             
             logger.critical("State Machine V2 running - all orders via gateway")

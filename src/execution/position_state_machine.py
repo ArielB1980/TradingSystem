@@ -14,7 +14,7 @@ This module enforces world-class position management with:
 NO TRADE CAN EXIST OUTSIDE THIS STATE MACHINE.
 """
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from enum import Enum
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple, Set
@@ -249,6 +249,11 @@ class ManagedPosition:
     partial_close_pct: Decimal = Decimal("0.5")  # % to close at TP1 (legacy)
     min_partial_for_be: Decimal = Decimal("0.3")  # Min fill % before BE allowed
     
+    # Snapshot-based targets (set once on first entry fill, never mutated)
+    entry_size_initial: Optional[Decimal] = None   # Filled qty when position opened
+    tp1_qty_target: Optional[Decimal] = None      # Fixed TP1 close size
+    tp2_qty_target: Optional[Decimal] = None      # Fixed TP2 close size
+
     # Runner mode configuration (populated from MultiTPConfig when enabled)
     tp1_close_pct: Decimal = Decimal("0.40")   # % of filled entry to close at TP1
     tp2_close_pct: Decimal = Decimal("0.40")   # % of filled entry to close at TP2
@@ -393,7 +398,27 @@ class ManagedPosition:
         if self.stop_order_id and event.client_order_id == self.stop_order_id:
             return True
         return False
-    
+
+    def _matches_tp1_event(self, event: OrderEvent) -> bool:
+        """Match TP1 order fills by exchange/client id."""
+        if self.tp1_order_id and event.order_id == self.tp1_order_id:
+            return True
+        if self.tp1_order_id and event.client_order_id == self.tp1_order_id:
+            return True
+        if event.client_order_id and event.client_order_id.startswith("tp1-"):
+            return True
+        return False
+
+    def _matches_tp2_event(self, event: OrderEvent) -> bool:
+        """Match TP2 order fills by exchange/client id."""
+        if self.tp2_order_id and event.order_id == self.tp2_order_id:
+            return True
+        if self.tp2_order_id and event.client_order_id == self.tp2_order_id:
+            return True
+        if event.client_order_id and event.client_order_id.startswith("tp2-"):
+            return True
+        return False
+
     # ========== STATE TRANSITION METHODS ==========
     
     def apply_order_event(self, event: OrderEvent) -> bool:
@@ -459,7 +484,14 @@ class ManagedPosition:
     def _record_fill(self, event: OrderEvent) -> bool:
         """Record a fill and update state."""
         is_entry = self._matches_entry_event(event)
-        is_exit = self._matches_pending_exit_event(event) or self._matches_stop_event(event)
+        is_tp1 = self._matches_tp1_event(event)
+        is_tp2 = self._matches_tp2_event(event)
+        is_exit = (
+            self._matches_pending_exit_event(event)
+            or self._matches_stop_event(event)
+            or is_tp1
+            or is_tp2
+        )
         
         fill = FillRecord(
             fill_id=event.fill_id or f"{event.order_id}-{event.event_seq}",
@@ -473,9 +505,14 @@ class ManagedPosition:
         
         if is_entry:
             self.entry_fills.append(fill)
+            self._snapshot_targets_on_entry_fill(event)
             self._update_state_after_entry_fill()
         elif is_exit:
             self.exit_fills.append(fill)
+            if is_tp1:
+                self.tp1_filled = True
+            if is_tp2:
+                self.tp2_filled = True
             self._update_state_after_exit_fill(event)
         else:
             logger.warning(f"Unknown fill order_id: {event.order_id}")
@@ -486,6 +523,29 @@ class ManagedPosition:
         
         return True
     
+    def ensure_snapshot_targets(self) -> None:
+        """Set entry_size_initial, tp1_qty_target, tp2_qty_target once from filled_entry_qty if not set."""
+        if self.entry_size_initial is not None:
+            return
+        filled = self.filled_entry_qty
+        if filled <= 0:
+            return
+        step = Decimal("0.0001")
+        self.entry_size_initial = filled.quantize(step, rounding=ROUND_DOWN)
+        self.tp1_qty_target = (self.entry_size_initial * self.tp1_close_pct).quantize(step, rounding=ROUND_DOWN)
+        self.tp2_qty_target = (self.entry_size_initial * self.tp2_close_pct).quantize(step, rounding=ROUND_DOWN)
+        logger.info(
+            "Snapshot targets set",
+            symbol=self.symbol,
+            entry_size_initial=str(self.entry_size_initial),
+            tp1_target=str(self.tp1_qty_target),
+            tp2_target=str(self.tp2_qty_target),
+        )
+
+    def _snapshot_targets_on_entry_fill(self, _event: OrderEvent) -> None:
+        """Called from _record_fill when entry fill is recorded."""
+        self.ensure_snapshot_targets()
+
     def _update_state_after_entry_fill(self) -> None:
         """Update state after entry fill."""
         if self.state == PositionState.PENDING:
@@ -650,7 +710,39 @@ class ManagedPosition:
         
         # For tight trades, require intent_confirmed (set when price crosses BOS/confirmation level or structure confirms)
         return bool(self.intent_confirmed)
-    
+
+    def activate_trailing_if_guard_passes(
+        self,
+        current_atr: Decimal,
+        atr_min: Decimal = Decimal("0"),
+    ) -> bool:
+        """
+        Activate trailing at TP1 when guard passes (e.g. ATR > threshold).
+        Guard evaluated once at TP1; once trailing_active it stays on.
+        Returns True iff trailing_active was set.
+        """
+        if self.trailing_active:
+            return False
+        if not self.tp1_filled:
+            return False
+        if current_atr <= 0:
+            return False
+        if atr_min > 0 and current_atr < atr_min:
+            logger.debug(
+                "Trailing guard not passed: ATR < min",
+                symbol=self.symbol,
+                atr=str(current_atr),
+                atr_min=str(atr_min),
+            )
+            return False
+        self.trailing_active = True
+        logger.info(
+            "Trailing activated at TP1 (guard passed)",
+            symbol=self.symbol,
+            atr=str(current_atr),
+        )
+        return True
+
     def trigger_break_even(self, be_price: Optional[Decimal] = None) -> bool:
         """Trigger break-even stop move."""
         if not self.should_trigger_break_even():

@@ -172,6 +172,14 @@ class PositionPersistence:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+            for col in ("entry_size_initial", "tp1_qty_target", "tp2_qty_target"):
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE positions ADD COLUMN {col} TEXT"
+                    )
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
     
     # ========== POSITION CRUD ==========
     
@@ -185,12 +193,13 @@ class PositionPersistence:
                     initial_tp1_price, initial_tp2_price, initial_final_target,
                     current_stop_price, entry_acknowledged,
                     tp1_filled, tp2_filled, break_even_triggered, trailing_active,
+                    entry_size_initial, tp1_qty_target, tp2_qty_target,
                     exit_reason, exit_time,
                     entry_order_id, stop_order_id, pending_exit_order_id,
                     setup_type, regime, trade_type, intent_confirmed,
                     created_at, updated_at,
                     processed_event_hashes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position.position_id,
                 position.symbol,
@@ -208,6 +217,9 @@ class PositionPersistence:
                 1 if position.tp2_filled else 0,
                 1 if position.break_even_triggered else 0,
                 1 if position.trailing_active else 0,
+                str(position.entry_size_initial) if position.entry_size_initial else None,
+                str(position.tp1_qty_target) if position.tp1_qty_target else None,
+                str(position.tp2_qty_target) if position.tp2_qty_target else None,
                 position.exit_reason.value if position.exit_reason else None,
                 position.exit_time.isoformat() if position.exit_time else None,
                 position.entry_order_id,
@@ -313,6 +325,12 @@ class PositionPersistence:
             pos.tp2_filled = bool(row.get("tp2_filled", 0))
             pos.break_even_triggered = bool(row.get("break_even_triggered", 0))
             pos.trailing_active = bool(row.get("trailing_active", 0))
+            if row.get("entry_size_initial"):
+                pos.entry_size_initial = Decimal(row["entry_size_initial"])
+            if row.get("tp1_qty_target"):
+                pos.tp1_qty_target = Decimal(row["tp1_qty_target"])
+            if row.get("tp2_qty_target"):
+                pos.tp2_qty_target = Decimal(row["tp2_qty_target"])
             pos.exit_reason = ExitReason(row["exit_reason"]) if row.get("exit_reason") else None
             pos.exit_time = datetime.fromisoformat(row["exit_time"]) if row.get("exit_time") else None
             pos.entry_order_id = row.get("entry_order_id")
@@ -331,6 +349,7 @@ class PositionPersistence:
             
             # Load fills
             self._load_fills(pos)
+            pos.ensure_snapshot_targets()
             
             return pos
             

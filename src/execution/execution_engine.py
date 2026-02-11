@@ -66,7 +66,9 @@ class ExecutionEngine:
         size_notional: Decimal,
         spot_price: Decimal,
         mark_price: Decimal,
-        leverage: Decimal
+        leverage: Decimal,
+        *,
+        step_size: Optional[Decimal] = None,
     ) -> Dict[str, any]:
         """
         Generate complete order package: Entry + SL + TPs.
@@ -114,10 +116,14 @@ class ExecutionEngine:
         
         # 2b. Generate TP Ladder (Futures prices)
         tps = self._generate_tp_ladder(signal, fut_entry, fut_sl, signal.signal_type)
+        if not self._runner_has_fixed_tp and len(tps) > 2:
+            tps = tps[:2]
+            logger.warning("Runner mode: capped TP ladder to 2 levels (no fixed TP3)")
         
         # 3. Calculate Quantities (using effective regime-adjusted splits)
         size_qty = size_notional / fut_entry
-        tp_quantities = self._split_quantities(size_qty, len(tps), effective_tp_splits)
+        qty_step = step_size if step_size is not None and step_size > 0 else self.qty_precision
+        tp_quantities = self._split_quantities(size_qty, len(tps), effective_tp_splits, step_size=qty_step)
         
         # 4. Construct Orders (Intents only, ID generation happens at placement)
         # Entry
@@ -342,35 +348,42 @@ class ExecutionEngine:
             
         return final_tps
 
-    def _split_quantities(self, total_qty: Decimal, num_tps: int, splits_override: Optional[list] = None) -> List[Decimal]:
+    def _split_quantities(
+        self,
+        total_qty: Decimal,
+        num_tps: int,
+        splits_override: Optional[list] = None,
+        *,
+        step_size: Optional[Decimal] = None,
+    ) -> List[Decimal]:
         """Split quantities according to config splits.
         
         In runner mode (2 TPs), each TP gets exactly its configured pct of total_qty.
         The implicit runner remainder is NOT included in the returned list.
         In legacy mode (3 TPs), the last TP still gets remainder to ensure exact sum.
         
+        Uses Decimal.quantize with venue step_size to avoid float/ConversionSyntax issues.
+        round(qty, 4) was removed - it caused decimal.ConversionSyntax in TP backfill.
+        
         Args:
             splits_override: If provided, use these splits instead of self._tp_splits.
-                Used for regime-aware sizing.
+            step_size: Venue size step for quantize (from InstrumentSpec). Default: qty_precision.
         """
         splits = splits_override if splits_override is not None else self._tp_splits
+        step = step_size if step_size is not None and step_size > 0 else self.qty_precision
+
         # Ensure splits match num_tps
         if len(splits) != num_tps:
-            # Fallback to equal splits
             splits = [Decimal("1") / Decimal(str(num_tps))] * num_tps
-        
-        # Check if splits sum to < 1.0 (runner mode: runner is implicit remainder)
+
         splits_sum = sum(Decimal(str(s)) for s in splits)
-        runner_mode = splits_sum < Decimal("0.999")  # runner pct is not in splits
-        
+        runner_mode = splits_sum < Decimal("0.999")
+
         qtys = []
-        
         if runner_mode:
-            # Runner mode: each TP gets exactly its configured pct
             for i in range(num_tps):
                 split_pct = Decimal(str(splits[i]))
-                qty = total_qty * split_pct
-                qty = round(qty, 4)
+                qty = (total_qty * split_pct).quantize(step, rounding=ROUND_DOWN)
                 if qty <= 0:
                     logger.warning(
                         "TP qty rounded to zero, skipping",
@@ -380,14 +393,12 @@ class ExecutionEngine:
                     continue
                 qtys.append(qty)
         else:
-            # Legacy mode: last TP gets remainder to ensure exact sum
             remaining = total_qty
             for i in range(num_tps - 1):
                 split_pct = Decimal(str(splits[i]))
-                qty = total_qty * split_pct
-                qty = round(qty, 4)
+                qty = (total_qty * split_pct).quantize(step, rounding=ROUND_DOWN)
                 qtys.append(qty)
                 remaining -= qty
-            qtys.append(remaining)
-        
+            qtys.append(remaining.quantize(step, rounding=ROUND_DOWN) if step > 0 else remaining)
+
         return qtys

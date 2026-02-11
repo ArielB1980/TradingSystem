@@ -307,63 +307,102 @@ class RiskManager:
             if position_notional > buying_power:
                  position_notional = buying_power
 
-        # Hard Cap: Max single position as % of equity (pre-trade enforcement)
-        # This prevents opening positions larger than 25% of equity (notional basis).
-        # The invariant monitor checks this post-trade (pos_notional / equity),
-        # so we enforce the same formula here pre-trade.
-        # IMPORTANT: This applies to ALL paths including auction overrides.
-        max_position_pct_equity = Decimal("0.25")  # 25% of equity max per position (notional)
-        max_notional_from_equity = account_equity * max_position_pct_equity
-        if position_notional > max_notional_from_equity:
-            logger.info(
-                "Capping position notional by max_single_position_pct_equity",
-                symbol=signal.symbol,
-                before=str(position_notional),
-                after=str(max_notional_from_equity),
-                equity=str(account_equity),
-                max_pct=str(max_position_pct_equity),
-            )
-            position_notional = max_notional_from_equity
-        
-        # Reject if capped notional is below minimum viable size
         min_notional_viable = Decimal("10")
+        use_margin_caps = getattr(self.config, "use_margin_caps", True)
+
+        if use_margin_caps:
+            # Margin-based caps: limit margin (not notional) vs equity
+            max_single_margin_pct = Decimal(str(getattr(self.config, "max_single_position_margin_pct_equity", 0.25)))
+            max_aggregate_margin_pct = Decimal(str(getattr(self.config, "max_aggregate_margin_pct_equity", 2.0)))
+            max_single_margin = account_equity * max_single_margin_pct
+            max_single_notional = max_single_margin * requested_leverage
+            if position_notional > max_single_notional:
+                logger.info(
+                    "Capping position by single-position margin limit",
+                    symbol=signal.symbol,
+                    before=str(position_notional),
+                    after=str(max_single_notional),
+                    equity=str(account_equity),
+                    max_margin_pct=str(max_single_margin_pct),
+                    leverage=str(requested_leverage),
+                )
+                position_notional = max_single_notional
+            existing_notional = sum(
+                abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
+                for p in self.current_positions
+                if p.size and p.size != 0
+            )
+            existing_margin = existing_notional / requested_leverage if requested_leverage > 0 else Decimal("0")
+            new_margin = position_notional / requested_leverage
+            max_aggregate_margin = account_equity * max_aggregate_margin_pct
+            projected_margin = existing_margin + new_margin
+            if projected_margin > max_aggregate_margin:
+                margin_headroom = max(max_aggregate_margin - existing_margin, Decimal("0"))
+                allowed_notional = margin_headroom * requested_leverage
+                if allowed_notional < min_notional_viable:
+                    rejection_reasons.append(
+                        f"Aggregate margin ${projected_margin:.2f} would exceed {max_aggregate_margin_pct:.0%} of equity "
+                        f"(${max_aggregate_margin:.2f}). Existing margin=${existing_margin:.2f}, "
+                        f"new margin=${new_margin:.2f}. Headroom=${allowed_notional:.2f} below min ${min_notional_viable}."
+                    )
+                else:
+                    logger.info(
+                        "Capping position notional by aggregate margin limit",
+                        symbol=signal.symbol,
+                        existing_margin=str(existing_margin),
+                        before=str(position_notional),
+                        after=str(allowed_notional),
+                        equity=str(account_equity),
+                        max_margin_pct=str(max_aggregate_margin_pct),
+                    )
+                    position_notional = allowed_notional
+        else:
+            # Legacy notional caps
+            max_position_pct_equity = Decimal("0.25")
+            max_notional_from_equity = account_equity * max_position_pct_equity
+            if position_notional > max_notional_from_equity:
+                logger.info(
+                    "Capping position notional by max_single_position_pct_equity",
+                    symbol=signal.symbol,
+                    before=str(position_notional),
+                    after=str(max_notional_from_equity),
+                    equity=str(account_equity),
+                    max_pct=str(max_position_pct_equity),
+                )
+                position_notional = max_notional_from_equity
+            max_aggregate_pct_equity = Decimal("2.0")
+            existing_notional = sum(
+                abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
+                for p in self.current_positions
+                if p.size and p.size != 0
+            )
+            projected_total = existing_notional + position_notional
+            max_aggregate_notional = account_equity * max_aggregate_pct_equity
+            if projected_total > max_aggregate_notional:
+                allowed = max(max_aggregate_notional - existing_notional, Decimal("0"))
+                if allowed < min_notional_viable:
+                    rejection_reasons.append(
+                        f"Aggregate notional ${projected_total:.2f} would exceed {max_aggregate_pct_equity:.0%} of equity "
+                        f"(${max_aggregate_notional:.2f}). Existing=${existing_notional:.2f}, "
+                        f"new=${position_notional:.2f}. Headroom=${allowed:.2f} below min ${min_notional_viable}."
+                    )
+                else:
+                    logger.info(
+                        "Capping position notional by aggregate exposure limit",
+                        symbol=signal.symbol,
+                        existing_notional=str(existing_notional),
+                        before=str(position_notional),
+                        after=str(allowed),
+                        equity=str(account_equity),
+                        max_pct=str(max_aggregate_pct_equity),
+                    )
+                    position_notional = allowed
+
         if position_notional < min_notional_viable:
             rejection_reasons.append(
                 f"Position notional ${position_notional:.2f} below minimum ${min_notional_viable} "
-                f"after equity cap (equity=${account_equity:.2f}, max_pct={max_position_pct_equity:.0%})"
+                f"after equity cap (equity=${account_equity:.2f})"
             )
-
-        # Hard Cap: Aggregate notional exposure vs equity (all positions combined)
-        # Prevents runaway total exposure from compounding bugs or too many positions.
-        # This is a belt-and-suspenders guard: even if individual positions are sized
-        # correctly, the total must not exceed 200% of equity.
-        max_aggregate_pct_equity = Decimal("2.0")  # 200% of equity max total notional
-        existing_notional = sum(
-            abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
-            for p in self.current_positions
-            if p.size and p.size != 0
-        )
-        projected_total = existing_notional + position_notional
-        max_aggregate_notional = account_equity * max_aggregate_pct_equity
-        if projected_total > max_aggregate_notional:
-            allowed = max(max_aggregate_notional - existing_notional, Decimal("0"))
-            if allowed < min_notional_viable:
-                rejection_reasons.append(
-                    f"Aggregate notional ${projected_total:.2f} would exceed {max_aggregate_pct_equity:.0%} of equity "
-                    f"(${max_aggregate_notional:.2f}). Existing=${existing_notional:.2f}, "
-                    f"new=${position_notional:.2f}. Headroom=${allowed:.2f} below min ${min_notional_viable}."
-                )
-            else:
-                logger.info(
-                    "Capping position notional by aggregate exposure limit",
-                    symbol=signal.symbol,
-                    existing_notional=str(existing_notional),
-                    before=str(position_notional),
-                    after=str(allowed),
-                    equity=str(account_equity),
-                    max_pct=str(max_aggregate_pct_equity),
-                )
-                position_notional = allowed
 
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")
         # Skip margin check if skip_margin_check=True (auction already validated)
