@@ -2,6 +2,8 @@
 
 For **DigitalOcean App Platform** (and similar), the **worker** component must run the production live path.
 
+> **Note:** This droplet uses **systemd** (`trading-bot.service`), not DO App Platform. The service runs `python -m src.entrypoints.prod_live`. For DO App Platform workers, use the commands below.
+
 ## Correct Run Command
 
 ```bash
