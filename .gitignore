@@ -63,13 +63,11 @@ Thumbs.db
 # Project specific
 trading.db
 
-# Market discovery data
-data/discovered_markets.json
+# Market discovery data and runtime data
+data/
 
 # State files (legacy and current)
 .kill_switch_state
-data/kill_switch_state.json
-data/instrument_specs_cache.json
 
 # Process management
 .watchdog_live_trading.pid
@@ -77,10 +75,6 @@ data/instrument_specs_cache.json
 .local/
 logs/
 .venv/
-
-# Recording & replay data
-data/recordings/
-data/replay_reports/
 
 # Ad-hoc logs and output (run-specific)
 raw_logs.txt
