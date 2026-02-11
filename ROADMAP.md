@@ -3,24 +3,12 @@
 ## ✅ Phase 1: Foundation (COMPLETE)
 All core infrastructure implemented and tested.
 
-## 🔄 Phase 2: Kraken Futures API Integration (NEXT)
+## 🔄 Phase 2: Kraken Futures API Integration (IN PROGRESS)
 
-### Priority 1: Mark Price & Positions
-1. **Implement mark price fetching** (`src/data/kraken_client.py`)
-   - Research Kraken Futures mark price API endpoint
-   - Add authenticated REST call for mark/index price
-   - Update `OrderBook` to consume real mark price feed
-
-2. **Implement position fetching** (`src/data/kraken_client.py`)
-   - Add GET positions endpoint
-   - Parse exchange liquidation price
-   - Map futures positions to domain models
-
-3. **Implement order placement** (`src/execution/futures_adapter.py`)
-   - Research Kraken Futures order API
-   - Implement POST order endpoint with authentication
-   - Add order status polling
-   - Implement order cancellation
+### Priority 1: Mark Price & Positions ✅
+1. **Mark price fetching** — `KrakenClient.get_futures_mark_price()` implemented
+2. **Position fetching** — `KrakenClient.get_all_futures_positions()` implemented
+3. **Order placement** — FuturesAdapter + ExecutionGateway place orders via Kraken Futures API
 
 ### Priority 2: WebSocket Real-Time Feeds
 4. **Spot candle streams** (`src/data/data_acquisition.py`)

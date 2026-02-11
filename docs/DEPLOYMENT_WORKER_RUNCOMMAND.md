@@ -18,7 +18,7 @@ python migrate_schema.py && WITH_HEALTH=1 python -m src.entrypoints.prod_live
 
 ## Do NOT Use
 
-- `python -m src.main_with_health` — deprecated; exits with code 1 when `ENVIRONMENT=prod`
+- `python -m src.main_with_health` — removed; stub exits with code 1
 - `python -m src.main` — legacy TradingService, not LiveTrading
 
 ## Verification

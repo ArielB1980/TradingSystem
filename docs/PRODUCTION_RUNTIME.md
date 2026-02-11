@@ -42,18 +42,14 @@ In production live trading, the runtime enforces these hard gates:
 
 ## Deprecated / non-production
 
-### `main.py` and `main_with_health.py`
+### `main_with_health.py` (removed 2026-02-11)
 
-- **Entrypoint:** `python -m src.main` or `python -m src.main_with_health`
-- **Architecture:** Single-process async, `DataService` → queue → `TradingService`
-
-These paths use the same strategy, risk, and execution logic but a different data loop (polling + hydration). They are **not** used in production and are **deprecated** for live deployment. Use only for local experimentation.  
-`main_with_health` exits with code 1 if `ENVIRONMENT=prod` to prevent accidental production use.
+Replaced with a deprecation stub that exits with code 1 and prints the correct entrypoints. Use `python -m src.entrypoints.prod_live` or `run.py live --force` for production.
 
 ### Summary
 
 | Component     | Production                          | Deprecated (do not deploy)        |
 |--------------|-------------------------------------|-----------------------------------|
 | Web / health | `python -m src.health`              | -                                 |
-| Worker       | `python -m src.entrypoints.prod_live` → `LiveTrading` | `run.py live`, `main.py`, `main_with_health` |
+| Worker       | `python -m src.entrypoints.prod_live` → `LiveTrading` | `run.py live`, `main.py` (main_with_health removed) |
 | Dashboard    | Streamlit app                       | -                                 |

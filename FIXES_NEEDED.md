@@ -10,16 +10,7 @@ Prioritized list from the audit, live DO logs, and codebase scan.
 
 ### 1.1 Worker running wrong runtime (deployment)
 
-**Issue:** DigitalOcean **tradingbot** worker logs show:
-- `"main_with_health is NOT the production runtime"`
-- `"Initializing Trading Bot with Health Endpoints"`
-- `"Data Service Task Starting"` / `"Trading Service Task Starting"`
-
-So the worker is running **`main_with_health`** (DataService + TradingService + embedded health), not **`run.py live`** → `LiveTrading`. Production should use `LiveTrading` per [docs/PRODUCTION_RUNTIME.md](docs/PRODUCTION_RUNTIME.md).
-
-**Fix:** Update the DO app **worker** `run_command` to  
-`python migrate_schema.py && python run.py live --force`  
-(and remove any `python -m src.main_with_health` or similar). Ensure the **deployed** spec (DO console or `app.yaml` / `.do/app.yaml`) matches. `app.yaml` and `.do/app.yaml` in repo already use `run.py live --force`; the live **tradingbot** app may be using a different spec.
+**Status (2026-02-11):** `main_with_health` has been **removed** (replaced with deprecation stub). Production uses `python -m src.entrypoints.prod_live` or `run.py live --force` via systemd (`trading-bot.service`). For DO App Platform workers, use `python migrate_schema.py && python run.py live --force`. See [docs/DEPLOYMENT_WORKER_RUNCOMMAND.md](docs/DEPLOYMENT_WORKER_RUNCOMMAND.md).
 
 ---
 
@@ -147,5 +138,8 @@ Addressing **1.1** and **1.2** first will align production with the intended arc
 | **Deploy docs** | Merged `DEPLOY_WORKER_RUNCOMMAND.md` into `DEPLOYMENT_WORKER_RUNCOMMAND.md`; deleted duplicate |
 | **Dead code** | Removed unused `src/services/market_discovery.py` (duplicate of `src/data/market_discovery.py`) |
 | **discovered_markets_loader** | Fixed docstring: `src.services.market_discovery` → `src.data.market_discovery` |
+| **main_with_health** | Replaced with deprecation stub (exits with code 1, prints correct entrypoints) |
+| **src/services/** | Removed empty directory |
+| **test_integration** | Removed unused `TradingService` import |
 
 See [CLEANUP_PROPOSAL](docs/CLEANUP_PROPOSAL.md) for full cleanup history.

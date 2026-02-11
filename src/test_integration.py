@@ -24,7 +24,6 @@ sys.path.insert(0, str(project_root))
 
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
-from src.services.trading_service import TradingService
 from src.data.kraken_client import KrakenClient
 
 logger = get_logger("IntegrationTest")
