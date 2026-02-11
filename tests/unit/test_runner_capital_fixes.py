@@ -349,3 +349,93 @@ class TestTrailingActivationGuard:
         )
         assert result is False
         assert pos.trailing_active is False
+
+
+class TestVenueMinimumPartialClose:
+    """TP1/TP2 partial closes respect venue min_size from InstrumentSpecRegistry."""
+
+    def setup_method(self):
+        reset_position_registry()
+
+    def test_tp1_skip_when_partial_below_min_size(self):
+        """When partial_size < min_size, no CLOSE_PARTIAL action (avoids ORDER_REJECTED_BY_VENUE)."""
+        mock_registry = MagicMock()
+        mock_spec = MagicMock()
+        mock_spec.min_size = Decimal("1")
+        mock_registry.get_spec.return_value = mock_spec
+
+        pm = PositionManagerV2(instrument_spec_registry=mock_registry)
+        pos = ManagedPosition(
+            symbol="GALA/USD",
+            side=Side.LONG,
+            position_id="test-gala",
+            initial_size=Decimal("2.0"),
+            initial_entry_price=Decimal("0.05"),
+            initial_stop_price=Decimal("0.04"),
+            initial_tp1_price=Decimal("0.06"),
+            initial_tp2_price=Decimal("0.07"),
+            initial_final_target=Decimal("0.08"),
+            tp1_close_pct=Decimal("0.5"),
+            tp2_close_pct=Decimal("0.25"),
+            runner_pct=Decimal("0.25"),
+        )
+        pos.futures_symbol = "PF_GALAUSD"
+        pos.state = PositionState.OPEN
+        pos.entry_fills = [
+            FillRecord("e1", "o1", Side.LONG, Decimal("2"), Decimal("0.05"), datetime.now(timezone.utc), True)
+        ]
+        pos.exit_fills = [
+            FillRecord("x1", "o2", Side.SHORT, Decimal("1"), Decimal("0.06"), datetime.now(timezone.utc), False)
+        ]
+        # remaining_qty = 2 - 1 = 1; tp1 partial = min(0.5, 1) = 0.5, below min 1
+        pos.tp1_qty_target = Decimal("0.5")
+        pos.tp2_qty_target = Decimal("0.5")
+        pos.entry_size_initial = Decimal("2.0")
+        pm.registry.register_position(pos)
+
+        actions = pm.evaluate_position("GALA/USD", Decimal("0.065"))
+        partial_actions = [a for a in actions if a.type == ActionType.CLOSE_PARTIAL]
+        assert len(partial_actions) == 0
+
+    def test_tp1_emit_when_partial_above_min_size(self):
+        """When partial_size >= min_size, CLOSE_PARTIAL is emitted."""
+        mock_registry = MagicMock()
+        mock_spec = MagicMock()
+        mock_spec.min_size = Decimal("1")
+        mock_registry.get_spec.return_value = mock_spec
+
+        pm = PositionManagerV2(instrument_spec_registry=mock_registry)
+        pos = ManagedPosition(
+            symbol="GALA/USD",
+            side=Side.LONG,
+            position_id="test-gala2",
+            initial_size=Decimal("5.0"),
+            initial_entry_price=Decimal("0.05"),
+            initial_stop_price=Decimal("0.04"),
+            initial_tp1_price=Decimal("0.06"),
+            initial_tp2_price=Decimal("0.07"),
+            initial_final_target=Decimal("0.08"),
+            tp1_close_pct=Decimal("0.5"),
+            tp2_close_pct=Decimal("0.25"),
+            runner_pct=Decimal("0.25"),
+        )
+        pos.futures_symbol = "PF_GALAUSD"
+        pos.state = PositionState.OPEN
+        pos.entry_fills = [
+            FillRecord("e2", "o3", Side.LONG, Decimal("5"), Decimal("0.05"), datetime.now(timezone.utc), True)
+        ]
+        # remaining_qty = 5; tp1 partial = min(2, 5) = 2 >= min 1
+        pos.tp1_qty_target = Decimal("2")
+        pos.tp2_qty_target = Decimal("1.25")
+        pos.entry_size_initial = Decimal("5.0")
+        pm.registry.register_position(pos)
+
+        actions = pm.evaluate_position("GALA/USD", Decimal("0.065"))
+        partial_actions = [a for a in actions if a.type == ActionType.CLOSE_PARTIAL]
+        assert len(partial_actions) == 1
+        assert partial_actions[0].size == Decimal("2")
+
+    def test_get_min_size_fallback_when_no_registry(self):
+        """When no instrument_spec_registry, _get_min_size_for_partial returns 1."""
+        pm = PositionManagerV2(instrument_spec_registry=None)
+        assert pm._get_min_size_for_partial("PF_XBTUSD") == Decimal("1")

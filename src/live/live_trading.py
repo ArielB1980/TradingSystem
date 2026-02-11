@@ -218,6 +218,7 @@ class LiveTrading:
             self.position_manager_v2 = PositionManagerV2(
                 registry=self.position_registry,
                 multi_tp_config=getattr(self.config, "multi_tp", None),
+                instrument_spec_registry=getattr(self, "instrument_spec_registry", None),
             )
             
             # Initialize Execution Gateway - ALL orders flow through here

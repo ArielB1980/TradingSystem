@@ -26,6 +26,7 @@ from src.execution.position_state_machine import (
     get_position_registry,
     check_invariant
 )
+from src.execution.instrument_specs import InstrumentSpecRegistry
 from src.domain.models import Side, OrderType, Signal, SignalType
 from src.monitoring.logger import get_logger
 
@@ -145,16 +146,23 @@ class PositionManagerV2:
     6. State transitions are driven by acknowledged fills, not intent
     """
     
-    def __init__(self, registry: Optional[PositionRegistry] = None, multi_tp_config=None):
+    def __init__(
+        self,
+        registry: Optional[PositionRegistry] = None,
+        multi_tp_config=None,
+        instrument_spec_registry: Optional[InstrumentSpecRegistry] = None,
+    ):
         """
         Initialize with optional custom registry and multi-TP config.
         
         Args:
             registry: Position registry (uses singleton if not provided)
             multi_tp_config: Optional MultiTPConfig for runner mode settings
+            instrument_spec_registry: Optional registry for venue min_size; used to guard partial closes
         """
         self.registry = registry or get_position_registry()
         self._multi_tp_config = multi_tp_config
+        self._instrument_spec_registry = instrument_spec_registry
         
         # Decision history for metrics / debugging
         self.decision_history: List[DecisionTick] = []
@@ -188,6 +196,18 @@ class PositionManagerV2:
             "blocked_duplicates": 0,
             "errors": 0
         }
+    
+    def _get_min_size_for_partial(self, symbol: str) -> Decimal:
+        """
+        Get venue minimum size for partial closes. Used to avoid ORDER_REJECTED_BY_VENUE.
+        Returns spec.min_size if available, else Decimal("1") (typical Kraken futures minimum).
+        """
+        if not self._instrument_spec_registry:
+            return Decimal("1")
+        spec = self._instrument_spec_registry.get_spec(symbol)
+        if not spec or spec.min_size <= 0:
+            return Decimal("1")
+        return spec.min_size
     
     # ========== ENTRY EVALUATION ==========
     
@@ -530,14 +550,16 @@ class PositionManagerV2:
             
             elif behavior == "close_partial":
                 # Close ~50% of remaining runner at final target.
-                # Root cause fix: Kraken (and many venues) require min order size of 1 contract;
+                # Root cause fix: Kraken (and many venues) require min order size (often 1 contract);
                 # sending 0.5 causes "amount must be greater than minimum amount precision of 1".
                 if not position.final_target_touched:
                     position.final_target_touched = True
                     partial_size = position.remaining_qty * Decimal("0.5")
-                    # Only emit partial close if size meets venue minimum (1 contract typical).
+                    spec_symbol = position.futures_symbol or symbol
+                    min_size = self._get_min_size_for_partial(spec_symbol)
+                    # Only emit partial close if size meets venue minimum (per InstrumentSpec or 1).
                     # Skip dust partials to avoid ORDER_REJECTED_BY_VENUE / Partial close failed.
-                    if partial_size > 0 and partial_size >= Decimal("1"):
+                    if partial_size > 0 and partial_size >= min_size:
                         client_order_id = f"exit-final-partial-{position.position_id}"
                         reason_codes.append("FINAL_TARGET_CLOSE_PARTIAL")
                         actions.append(ManagementAction(
@@ -626,20 +648,30 @@ class PositionManagerV2:
                     partial_size = min(position.tp2_qty_target, position.remaining_qty)
                 else:
                     partial_size = position.remaining_qty * self.tp2_partial_pct
-                client_order_id = f"exit-tp2-{position.position_id}"
-                
-                actions.append(ManagementAction(
-                    type=ActionType.CLOSE_PARTIAL,
-                    symbol=symbol,
-                    reason=f"TP2 Hit ({position.initial_tp2_price})",
-                    side=position.side,
-                    size=partial_size,
-                    order_type=OrderType.MARKET,
-                    client_order_id=client_order_id,
-                    position_id=position.position_id,
-                    exit_reason=ExitReason.TAKE_PROFIT_2,
-                    priority=70
-                ))
+                spec_symbol = position.futures_symbol or symbol
+                min_size = self._get_min_size_for_partial(spec_symbol)
+                if partial_size >= min_size:
+                    client_order_id = f"exit-tp2-{position.position_id}"
+                    actions.append(ManagementAction(
+                        type=ActionType.CLOSE_PARTIAL,
+                        symbol=symbol,
+                        reason=f"TP2 Hit ({position.initial_tp2_price})",
+                        side=position.side,
+                        size=partial_size,
+                        order_type=OrderType.MARKET,
+                        client_order_id=client_order_id,
+                        position_id=position.position_id,
+                        exit_reason=ExitReason.TAKE_PROFIT_2,
+                        priority=70
+                    ))
+                else:
+                    reason_codes.append("TP2_HIT_SKIP_BELOW_MIN")
+                    logger.debug(
+                        "TP2 partial skip: size below venue min",
+                        symbol=symbol,
+                        partial_size=str(partial_size),
+                        min_size=str(min_size),
+                    )
         
         # ========== RULE 5: TP1 HIT ==========
         if position.check_tp1_hit(current_price):
@@ -651,23 +683,31 @@ class PositionManagerV2:
                     partial_size = min(position.tp1_qty_target, position.remaining_qty)
                 else:
                     partial_size = position.remaining_qty * self.tp1_partial_pct
-                client_order_id = f"exit-tp1-{position.position_id}"
-                
-                actions.append(ManagementAction(
-                    type=ActionType.CLOSE_PARTIAL,
-                    symbol=symbol,
-                    reason=f"TP1 Hit ({position.initial_tp1_price})",
-                    side=position.side,
-                    size=partial_size,
-                    order_type=OrderType.MARKET,
-                    client_order_id=client_order_id,
-                    position_id=position.position_id,
-                    exit_reason=ExitReason.TAKE_PROFIT_1,
-                    priority=60
-                ))
-            
-                # CONDITIONAL BE (after TP1 fill confirmed by event, not here)
-                reason_codes.append("TP1_PARTIAL_QUEUED")
+                spec_symbol = position.futures_symbol or symbol
+                min_size = self._get_min_size_for_partial(spec_symbol)
+                if partial_size >= min_size:
+                    client_order_id = f"exit-tp1-{position.position_id}"
+                    actions.append(ManagementAction(
+                        type=ActionType.CLOSE_PARTIAL,
+                        symbol=symbol,
+                        reason=f"TP1 Hit ({position.initial_tp1_price})",
+                        side=position.side,
+                        size=partial_size,
+                        order_type=OrderType.MARKET,
+                        client_order_id=client_order_id,
+                        position_id=position.position_id,
+                        exit_reason=ExitReason.TAKE_PROFIT_1,
+                        priority=60
+                    ))
+                    reason_codes.append("TP1_PARTIAL_QUEUED")
+                else:
+                    reason_codes.append("TP1_HIT_SKIP_BELOW_MIN")
+                    logger.debug(
+                        "TP1 partial skip: size below venue min",
+                        symbol=symbol,
+                        partial_size=str(partial_size),
+                        min_size=str(min_size),
+                    )
         
         # ========== TRAILING ACTIVATION (guard at TP1) ==========
         if position.tp1_filled and not position.trailing_active and current_atr:
