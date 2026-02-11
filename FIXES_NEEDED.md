@@ -136,3 +136,16 @@ Addressing **1.1** and **1.2** first will align production with the intended arc
 | **position_manager** | `current_stop` TODO replaced with brief note. |
 
 **Local verification:** `make smoke` (✅), `run_quick_backtest` (✅), 57 unit tests passed. One async test fails without `pytest-asyncio` (existing).
+
+---
+
+## 7. Cleanup (2026-02-11)
+
+| Item | Change |
+|------|--------|
+| **Duplicate import** | Removed duplicate `datetime` import in `position_manager_v2.py` |
+| **Deploy docs** | Merged `DEPLOY_WORKER_RUNCOMMAND.md` into `DEPLOYMENT_WORKER_RUNCOMMAND.md`; deleted duplicate |
+| **Dead code** | Removed unused `src/services/market_discovery.py` (duplicate of `src/data/market_discovery.py`) |
+| **discovered_markets_loader** | Fixed docstring: `src.services.market_discovery` → `src.data.market_discovery` |
+
+See [CLEANUP_PROPOSAL](docs/CLEANUP_PROPOSAL.md) for full cleanup history.

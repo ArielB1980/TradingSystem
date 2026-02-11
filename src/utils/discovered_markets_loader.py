@@ -1,7 +1,7 @@
 """
 Load discovered markets from JSON (file-based). Used by dashboard.
 
-Live trading uses MarketDiscoveryService (API-based) in src.services.market_discovery.
+Live trading uses MarketDiscoveryService (API-based) in src.data.market_discovery.
 """
 import json
 from pathlib import Path
