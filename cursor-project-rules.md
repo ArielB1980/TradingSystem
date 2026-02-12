@@ -18,20 +18,16 @@
 - Be transparent about limitations and confidence levels in every response
 
 ### Project Context
-- You are working on a full-stack agent management app in this repository.
-
-**Goal:**
-- Implement end-to-end support for creating, editing, listing, and running agents.
-- Backend: APIs for agents, projects, and agent runs.
-- Frontend: Pages for listing agents, viewing details, creating/editing, and triggering runs.
-- Agent layer: A simple agent runtime abstraction with pluggable tools (even if some tools are just placeholders for now).
+- This repository is a **live trading system** (Python, Kraken futures, real capital at risk). Production entrypoint: `python -m src.entrypoints.prod_live` → LiveTrading; deployed via systemd on a Droplet.
+- **Architecture and lessons:** See `FORAI.md` (lessons, deploy, components) and `ARCHITECTURE.md` (data flow, key files). Use them when working on execution, risk, live, or deployment.
+- **Goal:** Reliable, invariant-preserving trading: signal generation → auction allocation → risk validation → execution → position/TP management. Backend + live loop + risk/execution; no separate frontend app in this repo.
 
 **Important:**
 - Follow the Project Rules.
 - Do not ask me to confirm file creation or config choices.
 - Create any missing files, config, or folders you need.
-- If stack/framework is unclear, infer it from the existing code; if not possible, choose sensible defaults and proceed.
-- Continue until the full flow is implemented: backend + frontend + basic docs and example configs.
+- If stack or behaviour is unclear, infer from existing code and FORAI/ARCHITECTURE; prefer safe defaults for risk/execution.
+- For risk/execution changes: run relevant tests and consider invariants (see `.cursor/rules/risk-execution-safety.mdc`).
 
 ## Code Quality Rules
 
