@@ -128,6 +128,20 @@ async def handle_signal_v2(
         signal.symbol, futures_tickers=lt.latest_futures_tickers
     )
 
+    # 3b. Enforce minimum position notional (venue min_size * price)
+    if hasattr(lt, "instrument_spec_registry") and lt.instrument_spec_registry and mark_price > 0:
+        min_size = lt.instrument_spec_registry.get_effective_min_size(futures_symbol)
+        min_notional = min_size * mark_price
+        if decision.position_notional < min_notional:
+            logger.warning(
+                "Position notional below venue minimum - rejecting",
+                symbol=signal.symbol,
+                notional=str(decision.position_notional),
+                min_notional=str(min_notional),
+                min_size=str(min_size),
+            )
+            return _fail(f"Position notional {decision.position_notional} below venue min {min_notional}")
+
     # 4. Generate entry plan to get TP levels
     step_size = None
     if hasattr(lt, "instrument_spec_registry") and lt.instrument_spec_registry:

@@ -228,6 +228,7 @@ class LiveTrading:
                 position_manager=self.position_manager_v2,
                 persistence=self.position_persistence,
                 on_partial_close=lambda _: setattr(self, "_last_partial_close_at", datetime.now(timezone.utc)),
+                instrument_spec_registry=getattr(self, "instrument_spec_registry", None),
             )
             
             logger.critical("State Machine V2 running - all orders via gateway")

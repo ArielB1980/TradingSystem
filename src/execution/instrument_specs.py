@@ -38,6 +38,23 @@ def _instrument_specs_cache_path() -> Path:
 CACHE_PATH = _instrument_specs_cache_path()  # For backward compatibility
 CACHE_TTL_SECONDS = 12 * 3600  # 12 hours
 
+# Kraken min_size now parsed from contractValueTradePrecision at refresh. Overrides only for
+# edge cases where API is wrong or we discover post-deploy. Keys: normalized base+USD (e.g. UNIUSD)
+VENUE_MIN_OVERRIDES: Dict[str, Decimal] = {}
+
+
+def _normalize_symbol_for_override(symbol: str) -> str:
+    """Normalize symbol for VENUE_MIN_OVERRIDES lookup. PF_UNIUSD, UNI/USD:USD -> UNIUSD."""
+    s = (symbol or "").strip().upper().replace(" ", "")
+    s = s.replace("PF_", "").replace("PI_", "").replace("FI_", "")
+    # Remove / and : before stripping quote (avoid UNI/USD:USD -> UNIUSDUSD)
+    if "/" in s:
+        s = s.split("/")[0] + s.split("/")[-1].replace(":", "").replace("USD", "")
+    else:
+        s = s.replace("/", "").replace(":", "").replace("-", "").replace("_", "")
+    s = s.replace("USD", "")  # PF_UNIUSD -> UNI, UNIUSD -> UNI
+    return (s + "USD") if s else "USD"
+
 
 @dataclass
 class InstrumentSpec:
@@ -168,8 +185,19 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
             except (ValueError, TypeError):
                 size_step = Decimal("0")
         else:
-            size_step = Decimal("0")
-            size_step_source = "missing"
+            # Kraken: contractValueTradePrecision implies size step for PF_ symbols
+            cv_prec = raw.get("contractValueTradePrecision")
+            if cv_prec is not None:
+                try:
+                    p = int(cv_prec)
+                    size_step = Decimal("10") ** (-p) if p >= 0 else Decimal("0.0001")
+                    size_step_source = "contractValueTradePrecision"
+                except (TypeError, ValueError):
+                    size_step = Decimal("0")
+                    size_step_source = "missing"
+            else:
+                size_step = Decimal("0")
+                size_step_source = "missing"
         if size_step <= 0:
             logger.warning(
                 "SPEC_SIZE_STEP_MISSING",
@@ -196,15 +224,26 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
                 break
             except (TypeError, ValueError):
                 pass
-    # Min size: prefer per-symbol source, then conservative default. Log when using fallback.
-    lim = raw.get("limits") or {}
-    amount_lim = lim.get("amount") if isinstance(lim, dict) else {}
-    # Order: ccxt market limits.amount.min -> Kraken instrument minSize/minimumSize -> default
-    min_from_limits = amount_lim.get("min") if isinstance(amount_lim, dict) else None
-    min_from_instrument = raw.get("minSize") or raw.get("minimumSize")
-    min_sz = min_from_limits if min_from_limits is not None else min_from_instrument
-    min_source = "limits.amount.min" if min_from_limits is not None else ("minSize" if min_from_instrument is not None else None)
-    min_sz = float(min_sz) if min_sz is not None else 0
+    # Min size: Kraken contractValueTradePrecision = decimal places -> min = 10^(-n)
+    # e.g. precision=1 -> min 0.1, precision=2 -> min 0.01. Applies to all PF_ symbols.
+    min_sz = None
+    min_source = None
+    cv_prec = raw.get("contractValueTradePrecision")
+    if cv_prec is not None:
+        try:
+            p = int(cv_prec)
+            min_sz = float(10 ** (-p)) if p >= 0 else 0.001
+            min_source = "contractValueTradePrecision"
+        except (TypeError, ValueError):
+            pass
+    if min_sz is None or min_sz <= 0:
+        lim = raw.get("limits") or {}
+        amount_lim = lim.get("amount") if isinstance(lim, dict) else {}
+        min_from_limits = amount_lim.get("min") if isinstance(amount_lim, dict) else None
+        min_from_instrument = raw.get("minSize") or raw.get("minimumSize")
+        min_sz = min_from_limits if min_from_limits is not None else min_from_instrument
+        min_source = "limits.amount.min" if min_from_limits is not None else ("minSize" if min_from_instrument is not None else None)
+        min_sz = float(min_sz) if min_sz is not None else 0
     if min_sz <= 0:
         min_sz = 0.001
         logger.warning(
@@ -214,8 +253,6 @@ def _parse_instrument(raw: Dict[str, Any]) -> Optional[InstrumentSpec]:
             source="default",
             hint="Fix upstream: set limits.amount.min or minSize per instrument",
         )
-    elif min_source:
-        min_source = min_source or "minSize"
     tick_val = raw.get("tickSize") or raw.get("tick_size")
     return InstrumentSpec(
         symbol_raw=symbol,
@@ -266,6 +303,8 @@ def compute_size_contracts(
     spec: InstrumentSpec,
     size_notional: Decimal,
     price: Decimal,
+    *,
+    effective_min_size: Optional[Decimal] = None,
 ) -> Tuple[Decimal, Optional[str]]:
     """
     Convert notional to contract size using spec. All sizes in contracts (same unit as min_size/size_step).
@@ -279,12 +318,13 @@ def compute_size_contracts(
 
     Returns (contracts, rejection_reason). rejection_reason non-None means reject.
     If spec.min_size is 0, uses 0.001 as fallback (see _parse_instrument SPEC_MIN_SIZE_MISSING when upstream missing).
+    effective_min_size: Use when venue enforces stricter min than spec (e.g. UNI: 0.1).
     """
     if price <= 0:
         return (Decimal("0"), "PRICE_INVALID")
     if spec.contract_size <= 0:
         return (Decimal("0"), "CONTRACT_SIZE_INVALID")
-    effective_min = spec.min_size
+    effective_min = effective_min_size if effective_min_size is not None else spec.min_size
     if effective_min <= 0:
         effective_min = Decimal("0.001")
     # 1. Raw contracts (notional and min_size both in same unit: contracts for futures)
@@ -609,6 +649,20 @@ class InstrumentSpecRegistry:
         else:
             out = self._by_raw.get(s + "USD") or self._by_raw.get("PF_" + s + "USD")
         return out
+
+    def get_effective_min_size(self, futures_symbol_any_format: str) -> Decimal:
+        """
+        Get venue minimum size for order placement. Uses VENUE_MIN_OVERRIDES when
+        Kraken enforces stricter mins than API/cache reports (e.g. UNI: 0.1).
+        """
+        norm = _normalize_symbol_for_override(futures_symbol_any_format)
+        override = VENUE_MIN_OVERRIDES.get(norm)
+        if override is not None:
+            return override
+        spec = self.get_spec(futures_symbol_any_format)
+        if not spec or spec.min_size <= 0:
+            return Decimal("1")
+        return spec.min_size
 
     def resolve_symbol_to_spec(
         self,

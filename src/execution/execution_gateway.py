@@ -110,6 +110,7 @@ class ExecutionGateway:
         safety_config: Optional[SafetyConfig] = None,
         use_safety: bool = True,
         on_partial_close: Optional[Callable[[str], None]] = None,
+        instrument_spec_registry=None,
     ):
         """
         Initialize the execution gateway.
@@ -121,10 +122,12 @@ class ExecutionGateway:
             persistence: Persistence layer (optional, creates default if not provided)
             safety_config: Config for AtomicStopReplacer, etc. (default SafetyConfig())
             use_safety: If True, wire AtomicStopReplacer, WAL, EventOrderingEnforcer
+            instrument_spec_registry: Optional registry for venue min_size; used to guard partial closes
         """
         self.client = exchange_client
         self.registry = registry or get_position_registry()
         self.position_manager = position_manager or PositionManagerV2(self.registry)
+        self._instrument_spec_registry = instrument_spec_registry
         self.persistence = persistence or PositionPersistence()
         self._safety_config = safety_config or SafetyConfig()
         self._use_safety = use_safety
@@ -562,10 +565,27 @@ class ExecutionGateway:
     
     async def _execute_partial_close(self, action: ManagementAction) -> ExecutionResult:
         """Execute partial position close. Use position.futures_symbol for exchange when set."""
-        self.metrics["orders_submitted"] += 1
         position = self.registry.get_position(action.symbol)
         exchange_symbol = (getattr(position, "futures_symbol", None) if position else None) or action.symbol
-        
+
+        # Venue min guard: reject before sending to avoid ORDER_REJECTED_BY_VENUE
+        if self._instrument_spec_registry:
+            min_size = self._instrument_spec_registry.get_effective_min_size(exchange_symbol)
+            if action.size < min_size:
+                self.metrics["orders_rejected"] = self.metrics.get("orders_rejected", 0) + 1
+                logger.warning(
+                    "Partial close below venue min - skipping",
+                    symbol=exchange_symbol,
+                    size=str(action.size),
+                    min_size=str(min_size),
+                )
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error=f"Partial close size {action.size} below venue min {min_size} for {exchange_symbol}",
+                )
+
+        self.metrics["orders_submitted"] += 1
         pending = PendingOrder(
             client_order_id=action.client_order_id,
             position_id=action.position_id,
@@ -811,12 +831,27 @@ class ExecutionGateway:
                 client_order_id=action.client_order_id,
                 error="TP requires positive size"
             )
+
+        # Venue min guard: reject before sending to avoid ORDER_REJECTED_BY_VENUE
+        exchange_symbol = position.futures_symbol or action.symbol
+        if self._instrument_spec_registry:
+            min_size = self._instrument_spec_registry.get_effective_min_size(exchange_symbol)
+            if action.size < min_size:
+                self.metrics["orders_rejected"] = self.metrics.get("orders_rejected", 0) + 1
+                logger.warning(
+                    "TP size below venue min - skipping",
+                    symbol=exchange_symbol,
+                    size=str(action.size),
+                    min_size=str(min_size),
+                )
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error=f"TP size {action.size} below venue min {min_size} for {exchange_symbol}",
+                )
         
         # Determine TP side (opposite of position side)
         tp_side = "sell" if position.side == Side.LONG else "buy"
-        
-        # Get futures symbol for exchange
-        exchange_symbol = position.futures_symbol or action.symbol
         
         self._wal_record_intent(action, "place_tp", price=action.price, size=action.size)
         

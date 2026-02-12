@@ -319,7 +319,10 @@ class FuturesAdapter:
                     spec_summary=None,
                 )
                 raise ValueError(f"Instrument specs for {symbol} not found")
-            size_contracts, size_reason = compute_size_contracts(spec, size_notional, price_use)
+            effective_min = self.instrument_spec_registry.get_effective_min_size(symbol)
+            size_contracts, size_reason = compute_size_contracts(
+                spec, size_notional, price_use, effective_min_size=effective_min
+            )
             if size_reason:
                 logger.warning(
                     "AUCTION_OPEN_REJECTED",

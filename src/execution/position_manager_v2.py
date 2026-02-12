@@ -199,14 +199,11 @@ class PositionManagerV2:
     def _get_min_size_for_partial(self, symbol: str) -> Decimal:
         """
         Get venue minimum size for partial closes. Used to avoid ORDER_REJECTED_BY_VENUE.
-        Returns spec.min_size if available, else Decimal("1") (typical Kraken futures minimum).
+        Uses get_effective_min_size (includes VENUE_MIN_OVERRIDES for known Kraken symbols).
         """
         if not self._instrument_spec_registry:
             return Decimal("1")
-        spec = self._instrument_spec_registry.get_spec(symbol)
-        if not spec or spec.min_size <= 0:
-            return Decimal("1")
-        return spec.min_size
+        return self._instrument_spec_registry.get_effective_min_size(symbol)
     
     # ========== ENTRY EVALUATION ==========
     
