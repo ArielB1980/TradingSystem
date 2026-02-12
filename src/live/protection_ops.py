@@ -799,6 +799,14 @@ async def place_tp_backfill(
             instrument_spec_registry=instrument_spec_registry,
         )
 
+        # Persist new SL order ID so protection monitor sees the live stop (avoids false NAKED → kill switch).
+        if new_sl_id:
+            db_pos.stop_loss_order_id = new_sl_id
+            if lt.position_registry:
+                reg_pos = lt.position_registry.get_position(symbol)
+                if reg_pos:
+                    reg_pos.stop_order_id = new_sl_id
+
         db_pos.tp_order_ids = new_tp_ids
         db_pos.tp1_price = tp_plan[0] if len(tp_plan) > 0 else None
         db_pos.tp2_price = tp_plan[1] if len(tp_plan) > 1 else None
