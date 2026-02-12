@@ -5,7 +5,7 @@ Covers:
 1. ExecutionEngine _split_quantities uses Decimal.quantize (no round)
 2. ManagedPosition snapshot targets (entry_size_initial, tp1_qty_target, tp2_qty_target)
 3. PositionManagerV2 uses snapshot targets for TP1/TP2 hit and TP placement
-4. RiskManager margin-based caps (use_margin_caps, max_single/aggregate margin)
+4. RiskManager margin-based caps (max_single/aggregate margin)
 5. Trailing activation guard at TP1
 """
 import pytest
@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from src.config.config import Config, MultiTPConfig, RiskConfig
+from src.domain.models import Position, Signal, SignalType, SetupType, Side
 from src.execution.execution_engine import ExecutionEngine
 from src.execution.position_state_machine import (
     ManagedPosition,
@@ -28,7 +29,6 @@ from src.execution.position_manager_v2 import (
     PositionManagerV2,
     ActionType,
 )
-from src.domain.models import Signal, SignalType, SetupType, Side
 
 
 def _make_signal() -> Signal:
@@ -228,13 +228,11 @@ class TestRiskManagerMarginCaps:
     def test_margin_caps_allow_larger_notional_than_legacy(self):
         """With 7x leverage, 25% margin = 1.75x equity notional."""
         config = RiskConfig(
-            use_margin_caps=True,
             max_single_position_margin_pct_equity=0.25,
             max_aggregate_margin_pct_equity=2.0,
             target_leverage=7.0,
         )
         from src.risk.risk_manager import RiskManager
-        from src.domain.models import Position
         rm = RiskManager(config)
         rm.current_positions = []
 
@@ -261,16 +259,30 @@ class TestRiskManagerMarginCaps:
         assert decision.approved
         assert decision.position_notional <= Decimal("17500")
 
-    def test_use_margin_caps_false_uses_legacy_notional(self):
-        """When use_margin_caps=False, legacy 25% notional cap applies."""
+    def test_aggregate_margin_cap_limits_total(self):
+        """Aggregate margin cap limits total margin across positions."""
         config = RiskConfig(
-            use_margin_caps=False,
+            max_single_position_margin_pct_equity=0.25,
+            max_aggregate_margin_pct_equity=0.5,  # 50% total
             target_leverage=7.0,
         )
         from src.risk.risk_manager import RiskManager
         rm = RiskManager(config)
-        rm.current_positions = []
-
+        # Existing: 7.875 * 4000 = 31500 notional → 31500/7 ≈ 4500 margin (45% of 10k)
+        rm.current_positions = [
+            Position(
+                symbol="ETH/USD",
+                side=Side.LONG,
+                size=Decimal("7.875"),
+                size_notional=Decimal("31500"),
+                entry_price=Decimal("4000"),
+                current_mark_price=Decimal("4000"),
+                liquidation_price=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                leverage=Decimal("7"),
+                margin_used=Decimal("4500"),
+            ),
+        ]
         signal = Signal(
             timestamp=datetime.now(timezone.utc),
             symbol="BTC/USD",
@@ -290,8 +302,8 @@ class TestRiskManagerMarginCaps:
         decision = rm.validate_trade(
             signal, equity, Decimal("50000"), Decimal("50000"),
         )
-        # Legacy: max notional = 25% of equity = 2500
-        assert decision.position_notional <= Decimal("2500")
+        # 50% of 10k = 5k margin; existing ~4.5k; headroom ~500; allowed notional = 500*7 = 3500
+        assert decision.position_notional <= Decimal("4000")
 
 
 class TestTrailingActivationGuard:
@@ -360,16 +372,14 @@ class TestVenueMinimumPartialClose:
     def test_tp1_skip_when_partial_below_min_size(self):
         """When partial_size < min_size, no CLOSE_PARTIAL action (avoids ORDER_REJECTED_BY_VENUE)."""
         mock_registry = MagicMock()
-        mock_spec = MagicMock()
-        mock_spec.min_size = Decimal("1")
-        mock_registry.get_spec.return_value = mock_spec
+        mock_registry.get_effective_min_size = MagicMock(return_value=Decimal("0.1"))
 
         pm = PositionManagerV2(instrument_spec_registry=mock_registry)
         pos = ManagedPosition(
             symbol="GALA/USD",
             side=Side.LONG,
             position_id="test-gala",
-            initial_size=Decimal("2.0"),
+            initial_size=Decimal("0.2"),
             initial_entry_price=Decimal("0.05"),
             initial_stop_price=Decimal("0.04"),
             initial_tp1_price=Decimal("0.06"),
@@ -382,15 +392,15 @@ class TestVenueMinimumPartialClose:
         pos.futures_symbol = "PF_GALAUSD"
         pos.state = PositionState.OPEN
         pos.entry_fills = [
-            FillRecord("e1", "o1", Side.LONG, Decimal("2"), Decimal("0.05"), datetime.now(timezone.utc), True)
+            FillRecord("e1", "o1", Side.LONG, Decimal("0.2"), Decimal("0.05"), datetime.now(timezone.utc), True)
         ]
         pos.exit_fills = [
-            FillRecord("x1", "o2", Side.SHORT, Decimal("1"), Decimal("0.06"), datetime.now(timezone.utc), False)
+            FillRecord("x1", "o2", Side.SHORT, Decimal("0.1"), Decimal("0.06"), datetime.now(timezone.utc), False)
         ]
-        # remaining_qty = 2 - 1 = 1; tp1 partial = min(0.5, 1) = 0.5, below min 1
-        pos.tp1_qty_target = Decimal("0.5")
-        pos.tp2_qty_target = Decimal("0.5")
-        pos.entry_size_initial = Decimal("2.0")
+        # remaining_qty = 0.2 - 0.1 = 0.1; tp1 partial = min(0.05, 0.1) = 0.05, below min 0.1
+        pos.tp1_qty_target = Decimal("0.05")
+        pos.tp2_qty_target = Decimal("0.05")
+        pos.entry_size_initial = Decimal("0.2")
         pm.registry.register_position(pos)
 
         actions = pm.evaluate_position("GALA/USD", Decimal("0.065"))
@@ -400,9 +410,7 @@ class TestVenueMinimumPartialClose:
     def test_tp1_emit_when_partial_above_min_size(self):
         """When partial_size >= min_size, CLOSE_PARTIAL is emitted."""
         mock_registry = MagicMock()
-        mock_spec = MagicMock()
-        mock_spec.min_size = Decimal("1")
-        mock_registry.get_spec.return_value = mock_spec
+        mock_registry.get_effective_min_size = MagicMock(return_value=Decimal("0.1"))
 
         pm = PositionManagerV2(instrument_spec_registry=mock_registry)
         pos = ManagedPosition(
@@ -424,7 +432,7 @@ class TestVenueMinimumPartialClose:
         pos.entry_fills = [
             FillRecord("e2", "o3", Side.LONG, Decimal("5"), Decimal("0.05"), datetime.now(timezone.utc), True)
         ]
-        # remaining_qty = 5; tp1 partial = min(2, 5) = 2 >= min 1
+        # remaining_qty = 5; tp1 partial = min(2, 5) = 2 >= min 0.1
         pos.tp1_qty_target = Decimal("2")
         pos.tp2_qty_target = Decimal("1.25")
         pos.entry_size_initial = Decimal("5.0")

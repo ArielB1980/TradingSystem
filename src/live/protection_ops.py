@@ -780,7 +780,11 @@ async def place_tp_backfill(
         position_size_notional = await lt.futures_adapter.position_size_notional(
             symbol=symbol, pos_data=pos_data, current_price=current_price
         )
+        position_size_contracts = Decimal(str(pos_data.get("size", 0) or 0))
+        multi_tp = getattr(lt.config, "multi_tp", None)
+        instrument_spec_registry = getattr(lt, "instrument_spec_registry", None)
 
+        # Single TP placement path for live/backfill: executor.update_protective_orders. With multi_tp + position_size_contracts + instrument_spec_registry we get contract sizing, step quantize, and venue min filter (no dust).
         new_sl_id, new_tp_ids = await lt.executor.update_protective_orders(
             symbol=symbol,
             side=db_pos.side,
@@ -789,6 +793,10 @@ async def place_tp_backfill(
             current_tp_ids=existing_tp_ids,
             new_tp_prices=tp_plan,
             position_size_notional=position_size_notional,
+            position_size_contracts=position_size_contracts if position_size_contracts > 0 else None,
+            current_price=current_price,
+            multi_tp_config=multi_tp if multi_tp and getattr(multi_tp, "enabled", False) else None,
+            instrument_spec_registry=instrument_spec_registry,
         )
 
         db_pos.tp_order_ids = new_tp_ids

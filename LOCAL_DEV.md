@@ -128,7 +128,6 @@ TradingSystem-1/
 
 Recent additions (2026-02-11):
 - **multi_tp.trailing_activation_atr_min**: Guard at TP1; require ATR >= this to activate trailing (0 = no min).
-- **risk.use_margin_caps**: Use margin-based caps instead of notional (default true).
 - **risk.max_single_position_margin_pct_equity**: 25% margin per position (1.75x notional at 7x).
 - **risk.max_aggregate_margin_pct_equity**: 200% total margin (14x notional at 7x).
 - **risk.auction_partial_close_cooldown_seconds**: Skip new opens for N sec after TP1/TP2 partial (0 = disabled).

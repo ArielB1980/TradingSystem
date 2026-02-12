@@ -8,7 +8,7 @@ Handles:
 - Order state machine
 - Pyramiding guard
 """
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Optional, Set, List, Tuple, Any
 from datetime import datetime, timezone
 import uuid
@@ -411,6 +411,10 @@ class Executor:
         """
         Place SL/TP orders immediately after entry fill.
         
+        DEPRECATED for live: Live/backfill TP placement must use update_protective_orders
+        (via protection_ops.place_tp_backfill) so contract sizing, step quantize, and
+        venue min filter apply. This method uses notional and has no min-size filter.
+        
         Args:
             entry_order: Filled entry order
             stop_loss_price: Stop-loss price (futures)
@@ -419,6 +423,12 @@ class Executor:
         Returns:
             (stop_loss_order, take_profit_order)
         """
+        import warnings
+        warnings.warn(
+            "place_protective_orders is deprecated for live; use update_protective_orders via place_tp_backfill for contract sizing and venue min filter.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         sl_order = None
         tp_order = None
         
@@ -481,43 +491,38 @@ class Executor:
         current_tp_ids: List[str],
         new_tp_prices: List[Decimal],
         position_size_notional: Optional[Decimal] = None,
+        *,
+        position_size_contracts: Optional[Decimal] = None,
+        current_price: Optional[Decimal] = None,
+        multi_tp_config: Optional[Any] = None,
+        instrument_spec_registry: Optional[Any] = None,
     ) -> Tuple[Optional[str], List[str]]:
         """
         Update SL/TP orders (Cancel + Replace).
-        
-        Args:
-            symbol: Symbol
-            side: Entry side (LONG/SHORT)
-            current_sl_id: Current SL order ID
-            new_sl_price: New target SL price
-            current_tp_ids: Current TP order IDs
-            new_tp_prices: New target TP prices (full ladder)
-        
-        Returns:
-            (new_sl_id, new_tp_ids)
+        When position_size_contracts + multi_tp_config: sizes by contracts, multi_tp semantics,
+        sum(tp_qtys) <= position_qty (last clamped). Else: legacy notional.
         """
         protective_side = Side.SHORT if side == Side.LONG else Side.LONG
-        
-        # 1. Update SL
+        sl_notional = position_size_notional
+        if position_size_contracts is not None and current_price and current_price > 0:
+            sl_notional = position_size_contracts * current_price
+        elif sl_notional is None:
+            sl_notional = Decimal("0")
+
         updated_sl_id = current_sl_id
-        if new_sl_price:
-            # Cancel old SL first (separate try so notFound doesn't block new SL placement)
+        if new_sl_price and sl_notional > 0:
             if current_sl_id:
                 try:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
                 except Exception as e:
-                    # notFound means old SL was already cancelled (e.g. by kill switch).
-                    # This is safe to ignore — we'll place a new one below.
                     logger.warning(
                         "Old SL cancel failed (proceeding to place new SL)",
                         symbol=symbol,
                         old_sl_id=current_sl_id,
                         error=str(e),
                     )
-            
-            # Place new SL (MUST run even if old cancel failed)
             try:
-                sl_size = position_size_notional if position_size_notional else Decimal("0")
+                sl_size = sl_notional
                 sl_order = await self.futures_adapter.place_order(
                     symbol=symbol,
                     side=protective_side,
@@ -536,34 +541,105 @@ class Executor:
         updated_tp_ids = current_tp_ids
         if new_tp_prices:
             try:
-                # Cancel existing TP orders
                 for tp_id in current_tp_ids:
                     try:
                         await self.futures_adapter.cancel_order(tp_id, symbol)
-                        logger.debug("Cancelled TP order", order_id=tp_id)
                     except Exception as e:
                         logger.warning("Failed to cancel TP", order_id=tp_id, error=str(e))
-                
-                # Place new TP ladder
+
                 new_tp_ids = []
-                # Use actual position size if provided (for proper TP sizing)
-                # CRITICAL: Apply TP splits so total reduce-only size doesn't exceed position
-                # Kraken rejects orders with "wouldNotReducePosition" if we exceed position size
-                tp_splits = getattr(self.config, 'tp_splits', [Decimal("0.35"), Decimal("0.35"), Decimal("0.30")])
-                base_size = position_size_notional if position_size_notional else Decimal("0")
-                
-                for i, tp_price in enumerate(new_tp_prices):
-                    try:
-                        # Apply TP split percentage for this level
-                        # Ensures total reduce-only size doesn't exceed position size
+                step = Decimal("0.0001")
+                venue_min_size = Decimal("0")  # Only enforced in contract path; 0 = no filter
+                if instrument_spec_registry:
+                    instrument_spec_registry.ensure_loaded()
+                    spec = instrument_spec_registry.get_spec(symbol)
+                    if spec and spec.size_step > 0:
+                        step = spec.size_step
+
+                if position_size_contracts is not None and multi_tp_config and position_size_contracts > 0:
+                    runner_has_fixed_tp = getattr(multi_tp_config, "runner_has_fixed_tp", False)
+                    tp1_pct = Decimal(str(getattr(multi_tp_config, "tp1_close_pct", 0.4)))
+                    tp2_pct = Decimal(str(getattr(multi_tp_config, "tp2_close_pct", 0.4)))
+                    runner_pct = Decimal(str(getattr(multi_tp_config, "runner_pct", 0.2)))
+                    if runner_has_fixed_tp:
+                        splits = [tp1_pct, tp2_pct, runner_pct]
+                        num_tps = 3
+                    else:
+                        splits = [tp1_pct, tp2_pct]
+                        num_tps = 2
+                    num_tps = min(num_tps, len(new_tp_prices))
+                    if num_tps <= 0:
+                        num_tps = 1
+                        splits = [Decimal("1")]
+
+                    qtys: List[Decimal] = []
+                    remaining = position_size_contracts
+                    for i in range(num_tps - 1):
+                        split_pct = splits[i] if i < len(splits) else Decimal("1") / Decimal(str(num_tps))
+                        qty = (position_size_contracts * split_pct).quantize(step, rounding=ROUND_DOWN)
+                        qty = min(qty, remaining)
+                        if qty <= 0:
+                            continue
+                        qtys.append(qty)
+                        remaining -= qty
+                    last_qty = remaining.quantize(step, rounding=ROUND_DOWN) if step > 0 else remaining
+                    if last_qty > 0:
+                        qtys.append(last_qty)
+                    tp_prices_to_use = new_tp_prices[:num_tps]
+                    if len(qtys) > len(tp_prices_to_use):
+                        qtys = qtys[: len(tp_prices_to_use)]
+                    elif len(qtys) < len(tp_prices_to_use):
+                        tp_prices_to_use = tp_prices_to_use[: len(qtys)]
+                    total = sum(qtys)
+                    if total > position_size_contracts:
+                        qty_excess = total - position_size_contracts
+                        qtys[-1] = max(Decimal("0"), qtys[-1] - qty_excess)
+                        if qtys[-1] <= 0:
+                            qtys.pop()
+                            tp_prices_to_use = tp_prices_to_use[: len(qtys)]
+                    # Invariant: only place TP if tp_qty >= venue_min_size (avoid dust/reject loops)
+                    if instrument_spec_registry:
+                        try:
+                            venue_min_size = instrument_spec_registry.get_effective_min_size(symbol)
+                        except Exception:
+                            venue_min_size = Decimal("0.001")
+                else:
+                    # Legacy path: notional-based, no venue min filter. Backfill should use contract path (position_size_contracts + multi_tp_config) to get min-size and step semantics.
+                    tp_splits = getattr(self.config, "tp_splits", [Decimal("0.35"), Decimal("0.35"), Decimal("0.30")])
+                    base_size = position_size_notional or Decimal("0")
+                    qtys = []
+                    for i in range(len(new_tp_prices)):
                         split_pct = Decimal(str(tp_splits[i])) if i < len(tp_splits) else Decimal("0.33")
-                        tp_size = base_size * split_pct
-                        
-                        # Place TP order with split size
+                        qtys.append(base_size * split_pct)
+                    tp_prices_to_use = new_tp_prices
+
+                for i, tp_price in enumerate(tp_prices_to_use):
+                    if i >= len(qtys):
+                        break
+                    qty_or_notional = qtys[i]
+                    if position_size_contracts is not None and multi_tp_config:
+                        # Quantize to venue step before min check (avoid passing min but failing step at venue)
+                        qty_or_notional = (qty_or_notional.quantize(step, rounding=ROUND_DOWN) if step > 0 else qty_or_notional)
+                        if qty_or_notional < venue_min_size:
+                            # Skip this TP; we do not roll this qty into the next TP (explicit: bias toward larger runner).
+                            logger.debug(
+                                "Skipping TP below venue min",
+                                symbol=symbol,
+                                tp_index=i,
+                                tp_qty=str(qty_or_notional),
+                                venue_min_size=str(venue_min_size),
+                            )
+                            continue
+                        tp_notional = qty_or_notional * tp_price
+                    else:
+                        tp_notional = qty_or_notional
+                    if tp_notional <= 0:
+                        continue
+                    try:
                         tp_order = await self.futures_adapter.place_order(
                             symbol=symbol,
                             side=protective_side,
-                            size_notional=tp_size,
+                            size_notional=tp_notional,
                             leverage=Decimal("1"),
                             order_type=OrderType.TAKE_PROFIT,
                             price=tp_price,
@@ -578,10 +654,10 @@ class Executor:
                         )
                     except Exception as e:
                         logger.error(f"Failed to place TP{i+1}", symbol=symbol, error=str(e))
-                
+
                 updated_tp_ids = new_tp_ids
                 logger.info("TP ladder updated", symbol=symbol, tp_count=len(new_tp_ids))
-                
+
             except Exception as e:
                 logger.error("Failed to update TP ladder", symbol=symbol, error=str(e))
         

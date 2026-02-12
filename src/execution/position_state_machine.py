@@ -227,7 +227,7 @@ class ManagedPosition:
     # ========== STATE FLAGS ==========
     entry_acknowledged: bool = False  # Invariant C kicks in after this
     tp1_filled: bool = False
-    tp2_filled: bool = False
+    tp2_filled: bool = False  # When TP1 order is skipped (e.g. below venue min), first fill may set tp2_filled; do not assume tp1_filled before tp2_filled in fill handling. check_tp2_hit (price-based) still requires tp1_filled for semantic order.
     break_even_triggered: bool = False
     trailing_active: bool = False
     peak_price: Optional[Decimal] = None  # For trailing stop calculation
@@ -512,6 +512,15 @@ class ManagedPosition:
             if is_tp1:
                 self.tp1_filled = True
             if is_tp2:
+                # Invariant: if TP1 was skipped (no order), tp2_filled first is allowed. Else log if TP2 fill before TP1.
+                if self.tp1_order_id is not None and not self.tp1_filled:
+                    logger.warning(
+                        "TP2 fill received while TP1 order exists and not filled; check event mapping",
+                        symbol=self.symbol,
+                        tp1_order_id=self.tp1_order_id,
+                        tp2_order_id=event.order_id,
+                        fill_id=event.fill_id,
+                    )
                 self.tp2_filled = True
             self._update_state_after_exit_fill(event)
         else:
@@ -903,7 +912,7 @@ class ManagedPosition:
             return current_price <= self.initial_tp1_price
     
     def check_tp2_hit(self, current_price: Decimal) -> bool:
-        """Check if TP2 has been hit."""
+        """Check if TP2 level has been hit (price-based). Requires tp1_filled for semantic order; fill events may set tp2_filled first when TP1 order was skipped (dust)."""
         if self.tp2_filled or self.initial_tp2_price is None:
             return False
         if not self.tp1_filled:

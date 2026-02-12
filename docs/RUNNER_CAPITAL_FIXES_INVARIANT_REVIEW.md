@@ -8,7 +8,7 @@
 ## 1) Executive Verdict: GO-WITH-CONDITIONS
 
 - **Verdict**: GO-WITH-CONDITIONS
-- **Reason**: The changes restore and strengthen invariants (quantize vs round, snapshot targets, margin caps). Minor conditions: verify `use_margin_caps` default in prod config, and ensure `auction_partial_close_cooldown_seconds` stays 0 unless explicitly enabled to avoid blocking new opens.
+- **Reason**: The changes restore and strengthen invariants (quantize vs round, snapshot targets, margin caps). Minor conditions: ensure `auction_partial_close_cooldown_seconds` stays 0 unless explicitly enabled to avoid blocking new opens.
 
 ---
 
@@ -32,7 +32,7 @@
 | TP qty ≤ remaining | `position_manager_v2.py` RULE 5/10: `min(tp1_qty_target, remaining_qty)` | None identified | Yes |
 | Snapshot immutable | `position_state_machine.py` `ensure_snapshot_targets()` returns early if set | None | N/A (state) |
 | Quantize not round | `execution_engine.py` `_split_quantities` uses `quantize(step, ROUND_DOWN)` | `step_size=None` falls back to `qty_precision` (0.001) | Yes |
-| Margin caps | `risk_manager.py` `validate_trade` when `use_margin_caps=True` | `use_margin_caps=False` in config | Yes |
+| Margin caps | `risk_manager.py` `validate_trade` (always on) | None | Yes |
 | Trailing guard | `position_state_machine.py` `activate_trailing_if_guard_passes` | `atr_min=0` passes always | Yes |
 | No duplicate orders | `execution_gateway` + WAL + event enforcer | Concurrency (multiple workers) | Yes |
 
@@ -66,7 +66,7 @@
   - `test_ensure_snapshot_targets_idempotent`: asserts no overwrite on second call
   - `test_tp1_hit_uses_tp1_qty_target_when_set`: asserts RULE 5 uses snapshot
   - `test_margin_caps_allow_larger_notional_than_legacy`: asserts margin caps
-  - `test_use_margin_caps_false_uses_legacy_notional`: asserts legacy path
+  - `test_aggregate_margin_cap_limits_total`: asserts aggregate margin cap limits total
   - `test_activate_trailing_if_guard_passes`: asserts trailing activation
   - `test_activate_trailing_guard_atr_min_blocks`: asserts guard blocks when ATR < min
 

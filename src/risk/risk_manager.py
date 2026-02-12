@@ -1,6 +1,7 @@
 """
 Risk management for position sizing, leverage control, and safety limits.
 """
+from enum import Enum
 from typing import List, Optional, TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -16,6 +17,18 @@ if TYPE_CHECKING:
     from src.config.config import Config
 
 logger = get_logger(__name__)
+
+
+class BindingConstraint(str, Enum):
+    """Single winner: the final constraint that limited position size."""
+    RISK_SIZING = "risk_sizing"
+    NOTIONAL_OVERRIDE = "notional_override"
+    MAX_USD = "max_usd"
+    BUYING_POWER = "buying_power"
+    SINGLE_MARGIN = "single_margin"
+    AGGREGATE_MARGIN = "aggregate_margin"
+    AVAILABLE_MARGIN = "available_margin"
+    MIN_NOTIONAL_REJECT = "min_notional_reject"
 
 
 class RiskManager:
@@ -206,15 +219,27 @@ class RiskManager:
         # Calculate buying_power (needed for later checks even if using override)
         buying_power = account_equity * requested_leverage
         
+        # Binding constraint and computed-from-risk for explainability log (one winner: final_binding_constraint)
+        binding_constraint = BindingConstraint.NOTIONAL_OVERRIDE
+        binding_constraints: List[BindingConstraint] = []
+        computed_notional_from_risk: Optional[Decimal] = None
+        per_position_ceiling: Optional[Decimal] = None
+        aggregate_margin_remaining: Optional[Decimal] = None
+        utilisation_boost_applied = False
+
         # If notional_override provided (auction execution), use it directly and skip sizing
         if notional_override is not None:
             position_notional = notional_override
+            computed_notional_from_risk = position_notional
+            binding_constraints = [BindingConstraint.NOTIONAL_OVERRIDE]
             logger.debug(
                 "Using notional override from auction",
                 symbol=signal.symbol,
                 notional=str(position_notional),
             )
         else:
+            binding_constraint = BindingConstraint.RISK_SIZING
+            binding_constraints = [BindingConstraint.RISK_SIZING]
             # --- NEW SIZING LOGIC (V4: Adaptive) ---
             # Leverage-Based Sizing (Simple)
             # Position size = Equity × Leverage × Risk%
@@ -283,6 +308,8 @@ class RiskManager:
                     position_notional *= Decimal(str(scaler))
                 else:
                     logger.debug("Volatility Sizing skipped: atr_ratio missing in Signal")
+
+            computed_notional_from_risk = position_notional
             
             # Hard Cap: Max Notional USD (use tier-specific cap if available)
             max_usd = Decimal(str(self.config.max_position_size_usd))
@@ -300,105 +327,73 @@ class RiskManager:
             
             if position_notional > effective_max_usd:
                 position_notional = effective_max_usd
+                binding_constraint = BindingConstraint.MAX_USD
+                binding_constraints.append(BindingConstraint.MAX_USD)
 
         # Hard Cap: Max Leverage Buying Power (only if not using override)
         if notional_override is None:
             buying_power = account_equity * requested_leverage
             if position_notional > buying_power:
-                 position_notional = buying_power
+                position_notional = buying_power
+                binding_constraint = BindingConstraint.BUYING_POWER
+                binding_constraints.append(BindingConstraint.BUYING_POWER)
 
         min_notional_viable = Decimal("10")
-        use_margin_caps = getattr(self.config, "use_margin_caps", True)
-
-        if use_margin_caps:
-            # Margin-based caps: limit margin (not notional) vs equity
-            max_single_margin_pct = Decimal(str(getattr(self.config, "max_single_position_margin_pct_equity", 0.25)))
-            max_aggregate_margin_pct = Decimal(str(getattr(self.config, "max_aggregate_margin_pct_equity", 2.0)))
-            max_single_margin = account_equity * max_single_margin_pct
-            max_single_notional = max_single_margin * requested_leverage
-            if position_notional > max_single_notional:
-                logger.info(
-                    "Capping position by single-position margin limit",
-                    symbol=signal.symbol,
-                    before=str(position_notional),
-                    after=str(max_single_notional),
-                    equity=str(account_equity),
-                    max_margin_pct=str(max_single_margin_pct),
-                    leverage=str(requested_leverage),
-                )
-                position_notional = max_single_notional
-            existing_notional = sum(
-                abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
-                for p in self.current_positions
-                if p.size and p.size != 0
+        # Margin caps (capital utilisation): limit margin vs equity, not notional
+        max_single_margin_pct = Decimal(str(getattr(self.config, "max_single_position_margin_pct_equity", 0.25)))
+        max_aggregate_margin_pct = Decimal(str(getattr(self.config, "max_aggregate_margin_pct_equity", 2.0)))
+        max_single_margin = account_equity * max_single_margin_pct
+        max_single_notional = max_single_margin * requested_leverage
+        per_position_ceiling = max_single_notional
+        if position_notional > max_single_notional:
+            logger.info(
+                "Capping position by single-position margin limit",
+                symbol=signal.symbol,
+                before=str(position_notional),
+                after=str(max_single_notional),
+                equity=str(account_equity),
+                max_margin_pct=str(max_single_margin_pct),
+                leverage=str(requested_leverage),
             )
-            existing_margin = existing_notional / requested_leverage if requested_leverage > 0 else Decimal("0")
-            new_margin = position_notional / requested_leverage
-            max_aggregate_margin = account_equity * max_aggregate_margin_pct
-            projected_margin = existing_margin + new_margin
-            if projected_margin > max_aggregate_margin:
-                margin_headroom = max(max_aggregate_margin - existing_margin, Decimal("0"))
-                allowed_notional = margin_headroom * requested_leverage
-                if allowed_notional < min_notional_viable:
-                    rejection_reasons.append(
-                        f"Aggregate margin ${projected_margin:.2f} would exceed {max_aggregate_margin_pct:.0%} of equity "
-                        f"(${max_aggregate_margin:.2f}). Existing margin=${existing_margin:.2f}, "
-                        f"new margin=${new_margin:.2f}. Headroom=${allowed_notional:.2f} below min ${min_notional_viable}."
-                    )
-                else:
-                    logger.info(
-                        "Capping position notional by aggregate margin limit",
-                        symbol=signal.symbol,
-                        existing_margin=str(existing_margin),
-                        before=str(position_notional),
-                        after=str(allowed_notional),
-                        equity=str(account_equity),
-                        max_margin_pct=str(max_aggregate_margin_pct),
-                    )
-                    position_notional = allowed_notional
-        else:
-            # Legacy notional caps
-            max_position_pct_equity = Decimal("0.25")
-            max_notional_from_equity = account_equity * max_position_pct_equity
-            if position_notional > max_notional_from_equity:
-                logger.info(
-                    "Capping position notional by max_single_position_pct_equity",
-                    symbol=signal.symbol,
-                    before=str(position_notional),
-                    after=str(max_notional_from_equity),
-                    equity=str(account_equity),
-                    max_pct=str(max_position_pct_equity),
+            position_notional = max_single_notional
+            binding_constraint = BindingConstraint.SINGLE_MARGIN
+            binding_constraints.append(BindingConstraint.SINGLE_MARGIN)
+        existing_notional = sum(
+            abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
+            for p in self.current_positions
+            if p.size and p.size != 0
+        )
+        existing_margin = existing_notional / requested_leverage if requested_leverage > 0 else Decimal("0")
+        new_margin = position_notional / requested_leverage
+        max_aggregate_margin = account_equity * max_aggregate_margin_pct
+        aggregate_margin_remaining = max_aggregate_margin - existing_margin
+        projected_margin = existing_margin + new_margin
+        if projected_margin > max_aggregate_margin:
+            margin_headroom = max(max_aggregate_margin - existing_margin, Decimal("0"))
+            allowed_notional = margin_headroom * requested_leverage
+            if allowed_notional < min_notional_viable:
+                rejection_reasons.append(
+                    f"Aggregate margin ${projected_margin:.2f} would exceed {max_aggregate_margin_pct:.0%} of equity "
+                    f"(${max_aggregate_margin:.2f}). Existing margin=${existing_margin:.2f}, "
+                    f"new margin=${new_margin:.2f}. Headroom=${allowed_notional:.2f} below min ${min_notional_viable}."
                 )
-                position_notional = max_notional_from_equity
-            max_aggregate_pct_equity = Decimal("2.0")
-            existing_notional = sum(
-                abs(Decimal(str(p.size)) * Decimal(str(p.current_mark_price or p.entry_price or 0)))
-                for p in self.current_positions
-                if p.size and p.size != 0
-            )
-            projected_total = existing_notional + position_notional
-            max_aggregate_notional = account_equity * max_aggregate_pct_equity
-            if projected_total > max_aggregate_notional:
-                allowed = max(max_aggregate_notional - existing_notional, Decimal("0"))
-                if allowed < min_notional_viable:
-                    rejection_reasons.append(
-                        f"Aggregate notional ${projected_total:.2f} would exceed {max_aggregate_pct_equity:.0%} of equity "
-                        f"(${max_aggregate_notional:.2f}). Existing=${existing_notional:.2f}, "
-                        f"new=${position_notional:.2f}. Headroom=${allowed:.2f} below min ${min_notional_viable}."
-                    )
-                else:
-                    logger.info(
-                        "Capping position notional by aggregate exposure limit",
-                        symbol=signal.symbol,
-                        existing_notional=str(existing_notional),
-                        before=str(position_notional),
-                        after=str(allowed),
-                        equity=str(account_equity),
-                        max_pct=str(max_aggregate_pct_equity),
-                    )
-                    position_notional = allowed
+            else:
+                logger.info(
+                    "Capping position notional by aggregate margin limit",
+                    symbol=signal.symbol,
+                    existing_margin=str(existing_margin),
+                    before=str(position_notional),
+                    after=str(allowed_notional),
+                    equity=str(account_equity),
+                    max_margin_pct=str(max_aggregate_margin_pct),
+                )
+                position_notional = allowed_notional
+                binding_constraint = BindingConstraint.AGGREGATE_MARGIN
+                binding_constraints.append(BindingConstraint.AGGREGATE_MARGIN)
 
         if position_notional < min_notional_viable:
+            binding_constraint = BindingConstraint.MIN_NOTIONAL_REJECT
+            binding_constraints.append(BindingConstraint.MIN_NOTIONAL_REJECT)
             rejection_reasons.append(
                 f"Position notional ${position_notional:.2f} below minimum ${min_notional_viable} "
                 f"after equity cap (equity=${account_equity:.2f})"
@@ -435,6 +430,8 @@ class RiskManager:
                     after=str(max_notional_from_avail),
                 )
                 position_notional = max_notional_from_avail
+                binding_constraint = BindingConstraint.AVAILABLE_MARGIN
+                binding_constraints.append(BindingConstraint.AVAILABLE_MARGIN)
             if position_notional < min_notional:
                 rejection_reasons.append(
                     f"Insufficient available margin: would allow only ${position_notional:.0f} notional (min ${min_notional})"
@@ -455,6 +452,45 @@ class RiskManager:
                 symbol=signal.symbol,
                 notional=str(position_notional),
             )
+
+        # Post-sizing utilisation boost (auction mode): if margin utilisation below target, scale notional up (bounded), clamped to single/aggregate caps.
+        # skip_margin_check=True means "auction path: margin validated elsewhere"; boost is intended to run here.
+        # Risk sanity: only boost when sizing is leverage_based. With stop-distance-based sizing (fixed/kelly/volatility),
+        # notional = f(stop_distance); boosting notional would increase dollar risk for the same stop and violate risk-per-trade.
+        # With leverage_based, risk is % of buying power, so scaling notional does not change that assumption.
+        if (
+            getattr(self.config, "auction_mode_enabled", False)
+            and skip_margin_check
+            and sizing_method == "leverage_based"
+            and position_notional >= min_notional_viable
+            and aggregate_margin_remaining is not None
+            and per_position_ceiling is not None
+            and requested_leverage > 0
+        ):
+            new_margin_here = position_notional / requested_leverage
+            current_util = (existing_margin + new_margin_here) / account_equity if account_equity > 0 else Decimal("0")
+            target_min = Decimal(str(getattr(self.config, "target_margin_util_min", 0.70)))
+            if current_util < target_min:
+                target_margin = target_min * account_equity - existing_margin
+                target_notional = (target_margin * requested_leverage) if target_margin > 0 else position_notional
+                max_factor = Decimal(str(getattr(self.config, "utilisation_boost_max_factor", 2.0)))
+                capped_boost = min(
+                    target_notional,
+                    position_notional * max_factor,
+                    per_position_ceiling,
+                    aggregate_margin_remaining * requested_leverage,
+                )
+                if capped_boost > position_notional:
+                    logger.debug(
+                        "Utilisation boost applied",
+                        symbol=signal.symbol,
+                        before=str(position_notional),
+                        after=str(capped_boost),
+                        current_util=str(current_util),
+                        target_min=str(target_min),
+                    )
+                    position_notional = capped_boost
+                    utilisation_boost_applied = True
         
         logger.debug(
             f"Validating trade: {len(self.current_positions)} active positions",
@@ -667,6 +703,25 @@ class RiskManager:
         
         # Approve or reject
         approved = len(rejection_reasons) == 0
+
+        # One-line explainability: why is stake this size / what bound it (one winner: final_binding_constraint)
+        final_binding_constraint = binding_constraint
+        auction_max_margin_util = getattr(self.config, "auction_max_margin_util", None)
+        min_notional_log = min_notional_viable  # same as min_notional used in checks
+        logger.debug(
+            "Risk sizing binding constraint",
+            symbol=signal.symbol,
+            equity=str(account_equity),
+            target_leverage=str(requested_leverage),
+            auction_max_margin_util=auction_max_margin_util,
+            min_notional=str(min_notional_log),
+            computed_notional_from_risk=str(computed_notional_from_risk) if computed_notional_from_risk is not None else "n/a",
+            per_position_ceiling=str(per_position_ceiling) if per_position_ceiling is not None else "n/a",
+            aggregate_margin_remaining=str(aggregate_margin_remaining) if aggregate_margin_remaining is not None else "n/a",
+            final_notional=str(position_notional),
+            binding_constraints=[c.value for c in binding_constraints],
+            final_binding_constraint=final_binding_constraint.value,
+        )
         
         decision = RiskDecision(
             approved=approved,
@@ -678,7 +733,8 @@ class RiskManager:
             estimated_fees_funding=estimated_fees_funding,
             rejection_reasons=rejection_reasons,
             should_close_existing=should_close_existing,
-            close_symbol=close_symbol
+            close_symbol=close_symbol,
+            utilisation_boost_applied=utilisation_boost_applied,
         )
         
         if approved:

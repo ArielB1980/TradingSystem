@@ -83,10 +83,6 @@ class RiskConfig(BaseSettings):
         default=2.0, ge=0.5, le=5.0,
         description="Max total margin across all positions as % of equity (200% = 14x notional at 7x leverage)"
     )
-    use_margin_caps: bool = Field(
-        default=True,
-        description="If True, use margin-based caps; if False, use legacy notional caps"
-    )
 
     # Liquidation safety
     min_liquidation_buffer_pct: float = Field(default=0.35, ge=0.30, le=0.50)
@@ -115,6 +111,10 @@ class RiskConfig(BaseSettings):
     auction_partial_close_cooldown_seconds: int = Field(default=0, ge=0, le=300)
     auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
+    # Target margin utilisation band: when below target_min, boost notional (bounded) to deploy more capital.
+    # Only applied when sizing_method is leverage_based (risk sanity: stop-distance-based sizing would violate risk-per-trade if we boosted).
+    target_margin_util_min: float = Field(default=0.70, ge=0.50, le=0.90, description="Below this, utilisation boost may scale notional up (clamped to single/aggregate caps)")
+    utilisation_boost_max_factor: float = Field(default=2.0, ge=1.0, le=3.0, description="Max factor to scale notional when under target_margin_util_min (e.g. 2.0 = double)")
     
     # Loss streak protection (time-based, not permanent block)
     loss_streak_cooldown: int = Field(default=3, ge=2, le=10)  # Trigger threshold

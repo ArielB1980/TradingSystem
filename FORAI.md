@@ -133,7 +133,7 @@ All extracted modules use a **delegate pattern**: functions receive the `LiveTra
 - **Decimal quantize**: Replaced `round(qty, 4)` with `Decimal.quantize(step_size, ROUND_DOWN)` in `_split_quantities` to avoid ConversionSyntax and TP backfill issues.
 - **Snapshot targets**: Added `entry_size_initial`, `tp1_qty_target`, `tp2_qty_target` on ManagedPosition; set once on first entry fill; TP1/TP2 hit uses `min(target, remaining_qty)` instead of `remaining_qty * pct` to prevent partial sizing drift.
 - **Trailing guard**: `trailing_active` set only when ATR >= `trailing_activation_atr_min` at TP1; RULE 9 relaxed to allow trailing when `(break_even_triggered or trailing_active)`.
-- **Margin-based caps**: Replaced notional caps with margin caps (25% single, 200% aggregate vs 7x leverage); config `use_margin_caps`, `max_single_position_margin_pct_equity`, `max_aggregate_margin_pct_equity`.
+- **Margin caps**: Replaced notional caps with margin caps (25% single, 200% aggregate vs 7x leverage); config `max_single_position_margin_pct_equity`, `max_aggregate_margin_pct_equity`.
 - **Capital reallocation**: `on_partial_close` callback in ExecutionGateway; `auction_partial_close_cooldown_seconds` to skip new opens for N seconds after TP1/TP2 partial (default 0 = disabled).
 
 **Invariant Review:** See `docs/RUNNER_CAPITAL_FIXES_INVARIANT_REVIEW.md`.

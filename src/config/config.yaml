@@ -50,10 +50,10 @@ risk:
   # Sizing method: leverage_based = (Equity × Leverage × Risk%)
   sizing_method: "leverage_based"  # Options: fixed, kelly, volatility, kelly_volatility, leverage_based
   
-  # Margin-based caps (replace notional; 25% single, 200% aggregate vs 7x leverage)
-  use_margin_caps: true
+  # Margin caps (capital utilisation): limit margin vs equity, not notional
   max_single_position_margin_pct_equity: 0.25  # 25% margin per position = 1.75x notional at 7x
   max_aggregate_margin_pct_equity: 2.0  # 200% total margin = 14x notional at 7x
+  # Binding constraints for "tiny stakes" are usually: risk_per_trade_pct, max_single_position_margin_pct_equity, min notional, auction_max_positions — not aggregate. To increase utilisation: more slots (auction_max_positions) or bigger per-ticket margin (max_single_*) or target margin band (future).
   auction_partial_close_cooldown_seconds: 0  # 0=disabled; >0 skips new opens for N sec after TP1/TP2 partial
   
   # Liquidation safety
@@ -78,6 +78,8 @@ risk:
   auction_max_closes_per_cycle: 5  # Maximum closes per cycle
   auction_entry_cost: 2.0  # Entry cost penalty in score points
   auction_exit_cost: 2.0  # Exit cost penalty in score points
+  target_margin_util_min: 0.70  # Below this, utilisation boost may scale notional (clamped to caps)
+  utilisation_boost_max_factor: 2.0  # Max factor when under target (e.g. 2.0 = double)
   
   # Basis guards
   basis_max_pct: 0.0075  # 0.75% max spot-perp divergence for entry

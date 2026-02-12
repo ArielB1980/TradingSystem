@@ -264,6 +264,9 @@ class RiskDecision:
     # Rejection reasons
     rejection_reasons: list[str] = field(default_factory=list)
     
+    # Utilisation boost (auction mode): True if notional was increased toward target_margin_util_min
+    utilisation_boost_applied: bool = False
+    
     # Metadata
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
