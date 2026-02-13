@@ -1215,8 +1215,9 @@ class KrakenClient:
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a single order by id (open or closed).
-        Returns dict with id, status, filled, remaining, average, trades, clientOrderId
-        for process_order_update, or None if not found / error.
+        Returns dict with id, status, filled, remaining, average, trades, clientOrderId,
+        plus side/type/amount/reduceOnly/stopPrice for semantic validation.
+        Returns None if not found / error.
         """
         if not self.futures_exchange:
             return None
@@ -1233,6 +1234,12 @@ class KrakenClient:
                 "average": raw.get("average") or raw.get("price") or 0,
                 "trades": raw.get("trades") or [],
                 "clientOrderId": raw.get("clientOrderId") or info.get("cliOrdId") or info.get("clientOrderId"),
+                # Semantic validation fields (for stop-order health checks)
+                "side": (raw.get("side") or "").lower(),
+                "type": (raw.get("type") or info.get("orderType") or "").lower(),
+                "amount": raw.get("amount"),
+                "reduceOnly": bool(raw.get("reduceOnly") or info.get("reduceOnly") or False),
+                "stopPrice": raw.get("stopPrice") or info.get("triggerPrice"),
             }
         except Exception as e:
             logger.debug("fetch_order failed", order_id=order_id, symbol=symbol, error=str(e))

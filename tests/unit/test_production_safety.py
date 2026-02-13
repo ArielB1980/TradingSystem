@@ -1059,6 +1059,190 @@ class TestEnteredBookNotNaked:
             )
 
 
+class TestStopSemanticValidation:
+    """
+    Test: _warn_if_stop_semantically_wrong detects substantive mismatches
+    without changing the protection verdict.
+
+    These are warning-only checks. The stop is still treated as protected,
+    but logs make the issue observable for manual follow-up.
+    """
+
+    @pytest.fixture
+    def long_position(self):
+        pos = ManagedPosition(
+            symbol="ZRO/USD",
+            side=Side.LONG,
+            position_id="test-semantic",
+            initial_size=Decimal("10"),
+            initial_entry_price=Decimal("2.39"),
+            initial_stop_price=Decimal("2.17"),
+            initial_tp1_price=Decimal("2.60"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.OPEN
+        from src.execution.position_state_machine import FillRecord
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-1",
+            order_id="entry-1",
+            side=Side.LONG,
+            qty=Decimal("10"),
+            price=Decimal("2.39"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        pos.stop_order_id = "stop-1"
+        return pos
+
+    @pytest.mark.asyncio
+    async def test_correct_stop_no_warning(self, long_position):
+        """A correct stop (sell, reduceOnly, full size, stop type) should not warn."""
+        mock_client = AsyncMock()
+        order_data = {
+            "id": "stop-1",
+            "side": "sell",
+            "type": "stop",
+            "amount": 10,
+            "reduceOnly": True,
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            # No warning calls about "semantic mismatch"
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            mismatch_warnings = [w for w in warning_calls if "semantic mismatch" in w.lower()]
+            assert len(mismatch_warnings) == 0, f"Unexpected warnings: {mismatch_warnings}"
+
+    @pytest.mark.asyncio
+    async def test_wrong_side_warns(self, long_position):
+        """A long position with a BUY stop (wrong side) should warn."""
+        mock_client = AsyncMock()
+        order_data = {
+            "id": "stop-1",
+            "side": "buy",  # Wrong! Should be sell for a long position
+            "type": "stop",
+            "amount": 10,
+            "reduceOnly": True,
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            assert any("semantic mismatch" in w.lower() for w in warning_calls), (
+                f"Expected side mismatch warning, got: {warning_calls}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_not_reduce_only_warns(self, long_position):
+        """reduceOnly=False on a protective stop should warn."""
+        mock_client = AsyncMock()
+        order_data = {
+            "id": "stop-1",
+            "side": "sell",
+            "type": "stop",
+            "amount": 10,
+            "reduceOnly": False,  # Should be True
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+
+    @pytest.mark.asyncio
+    async def test_undersized_stop_warns(self, long_position):
+        """A stop covering < 50% of position size should warn."""
+        mock_client = AsyncMock()
+        order_data = {
+            "id": "stop-1",
+            "side": "sell",
+            "type": "stop",
+            "amount": 3,  # Only 30% of 10 — significantly undersized
+            "reduceOnly": True,
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+
+    @pytest.mark.asyncio
+    async def test_take_profit_type_warns(self, long_position):
+        """If the 'stop' is actually a take_profit, should warn."""
+        mock_client = AsyncMock()
+        order_data = {
+            "id": "stop-1",
+            "side": "sell",
+            "type": "take_profit",  # Not a stop!
+            "amount": 10,
+            "reduceOnly": True,
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+
+    @pytest.mark.asyncio
+    async def test_semantic_check_does_not_change_verdict(self, long_position):
+        """Even with all mismatches, the stop is still treated as protected."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(long_position)
+
+        mock_client = AsyncMock()
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_ZROUSD", "contracts": 10}
+        ]
+        # Stop is alive but semantically wrong (wrong side, not reduce-only)
+        mock_client.fetch_order.return_value = {
+            "id": "stop-1",
+            "status": "entered_book",
+            "filled": 0,
+            "side": "buy",          # Wrong
+            "type": "limit",        # Wrong
+            "amount": 2,            # Undersized
+            "reduceOnly": False,    # Wrong
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+
+        # Still protected — semantic issues don't trigger kill switch
+        assert results.get("ZRO/USD") is True, (
+            "Semantic mismatches should produce warnings, not change the verdict"
+        )
+
+
 class TestStopOrderPolling:
     """
     Test: poll_and_process_order_updates now polls stop orders too.

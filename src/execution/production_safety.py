@@ -22,6 +22,7 @@ from src.execution.position_state_machine import (
     InvariantViolation
 )
 from src.data.symbol_utils import position_symbol_matches_order
+from src.domain.models import Side
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -977,6 +978,8 @@ class PositionProtectionMonitor:
                 status=status,
                 filled=filled,
             )
+            # Non-blocking semantic check: is the stop *correct*, not just alive?
+            self._warn_if_stop_semantically_wrong(position, order_data)
             return True
 
         # ---- UNKNOWN STATUS: fail-safe → treat as protected ----
@@ -990,6 +993,68 @@ class PositionProtectionMonitor:
             filled=filled,
         )
         return True
+
+    def _warn_if_stop_semantically_wrong(
+        self,
+        position: ManagedPosition,
+        order_data: dict,
+    ) -> None:
+        """
+        Non-blocking validation: is this alive stop *substantively correct*?
+
+        Checks:
+          1. Side matches position direction (long→sell stop, short→buy stop)
+          2. reduceOnly is True
+          3. Amount >= position remaining_qty
+          4. Type contains 'stop' (not a take-profit mislabeled)
+
+        Logs WARNING for each mismatch but does NOT change the protection
+        verdict.  This gives observability for "alive but wrong" stops
+        without introducing new kill-switch risk.
+        """
+        issues = []
+
+        # --- Side check ---
+        order_side = str(order_data.get("side") or "").lower()
+        if order_side:
+            expected_side = "sell" if position.side == Side.LONG else "buy"
+            if order_side != expected_side:
+                issues.append(f"side={order_side}, expected={expected_side}")
+
+        # --- reduceOnly check ---
+        reduce_only = order_data.get("reduceOnly")
+        if reduce_only is not None and not reduce_only:
+            issues.append("reduceOnly=False (expected True for protective stop)")
+
+        # --- Amount check ---
+        order_amount = order_data.get("amount")
+        if order_amount is not None:
+            try:
+                amount = float(order_amount)
+                remaining = float(position.remaining_qty)
+                if remaining > 0 and amount < remaining * 0.5:
+                    # Only warn if significantly undersized (< 50% of position)
+                    # Small differences can be normal (partial fills, rounding)
+                    issues.append(f"amount={amount}, remaining_qty={remaining} (undersized)")
+            except (ValueError, TypeError):
+                pass
+
+        # --- Type check ---
+        order_type = str(order_data.get("type") or "").lower()
+        if order_type:
+            is_stop_type = any(t in order_type for t in ("stop", "stp"))
+            if not is_stop_type:
+                issues.append(f"type='{order_type}' (expected stop variant)")
+            if "take_profit" in order_type or "take-profit" in order_type:
+                issues.append(f"type='{order_type}' appears to be TP, not SL")
+
+        if issues:
+            logger.warning(
+                "Stop semantic mismatch: stop is ALIVE but may not be correct protection",
+                symbol=position.symbol,
+                stop_order_id=str(order_data.get("id") or ""),
+                issues=issues,
+            )
     
     def _close_position_from_stop_fill(
         self,
