@@ -27,7 +27,10 @@ from src.execution.production_safety import (
     ExitTimeoutManager,
     ExitEscalationLevel,
     ExitEscalationState,
-    PositionProtectionMonitor
+    PositionProtectionMonitor,
+    ALIVE_STOP_STATUSES,
+    DEAD_STOP_STATUSES,
+    FINAL_STOP_STATUSES,
 )
 from src.execution.position_state_machine import (
     ManagedPosition,
@@ -802,6 +805,258 @@ class TestStopFillNotNaked:
 
         # Should fail closed: treat as naked when we can't verify
         assert results.get("XRP/USD") is False
+
+
+class TestEnteredBookNotNaked:
+    """
+    Test: Kraken Futures 'entered_book' status must NOT trigger kill switch.
+
+    Root cause of the 2026-02-13 ZRO/USD kill switch incident:
+    Stop order was triggered (entered_book = resting on order book, waiting to fill)
+    but the system treated the transitional status as "unexpected" → naked → kill switch.
+
+    These tests verify:
+    1. _check_stop_was_filled returns True for all ALIVE statuses
+    2. _check_stop_was_filled returns False for DEAD statuses
+    3. _check_stop_was_filled returns True (fail-safe) for unknown statuses
+    4. verify_protection accepts entered_book in the order list
+    5. Full monitor integration: entered_book → protected (no kill switch)
+    """
+
+    @pytest.fixture
+    def mock_client(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def position(self):
+        pos = ManagedPosition(
+            symbol="ZRO/USD",
+            side=Side.LONG,
+            position_id="test-entered-book",
+            initial_size=Decimal("10"),
+            initial_entry_price=Decimal("2.39"),
+            initial_stop_price=Decimal("2.17"),
+            initial_tp1_price=Decimal("2.60"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.entry_order_id = "entry-zro-1"
+        pos.stop_order_id = "stop-zro-1"
+        pos.state = PositionState.OPEN
+        from src.execution.position_state_machine import FillRecord
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-entry-zro",
+            order_id="entry-zro-1",
+            side=Side.LONG,
+            qty=Decimal("10"),
+            price=Decimal("2.39"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        return pos
+
+    # ------------------------------------------------------------------
+    # Layer 2: _check_stop_was_filled status classification
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", list(ALIVE_STOP_STATUSES))
+    async def test_check_stop_alive_statuses_return_true(self, mock_client, position, status):
+        """Every ALIVE status must return True (protected)."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": status,
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        result = await monitor._check_stop_was_filled(position, exchange_size=10)
+        assert result is True, f"Expected True for alive status '{status}', got False"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", list(DEAD_STOP_STATUSES))
+    async def test_check_stop_dead_statuses_return_false(self, mock_client, position, status):
+        """Every DEAD status must return False (genuinely naked)."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": status,
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        result = await monitor._check_stop_was_filled(position, exchange_size=10)
+        assert result is False, f"Expected False for dead status '{status}', got True"
+
+    @pytest.mark.asyncio
+    async def test_check_stop_unknown_status_failsafe_returns_true(self, mock_client, position):
+        """Unknown/unfamiliar status must fail-safe to True (don't kill-switch)."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": "some_totally_unknown_status",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        result = await monitor._check_stop_was_filled(position, exchange_size=10)
+        assert result is True, "Unknown status should fail-safe to protected (True)"
+
+    @pytest.mark.asyncio
+    async def test_check_stop_closed_zero_fills_failsafe_returns_true(self, mock_client, position):
+        """Closed with 0 fills is ambiguous — fail-safe to True."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": "closed",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        result = await monitor._check_stop_was_filled(position, exchange_size=10)
+        assert result is True, "Closed with 0 fills should fail-safe to protected"
+
+    # ------------------------------------------------------------------
+    # Layer 1: verify_protection accepts ALIVE statuses
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_verify_protection_accepts_entered_book(self, mock_client, position):
+        """If a stop order appears with status 'entered_book', it should count as protected."""
+        exchange_orders = [
+            {
+                "symbol": "ZRO/USD:USD",
+                "type": "stop",
+                "status": "entered_book",
+                "reduceOnly": True,
+            }
+        ]
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        result = await enforcer.verify_protection(position, exchange_orders)
+        assert result is True, "entered_book stop should be recognized as protection"
+
+    @pytest.mark.asyncio
+    async def test_verify_protection_accepts_untouched(self, mock_client, position):
+        """Kraken 'untouched' = stop not triggered yet → definitely protected."""
+        exchange_orders = [
+            {
+                "symbol": "ZRO/USD:USD",
+                "type": "stop",
+                "status": "untouched",
+                "reduceOnly": True,
+            }
+        ]
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        result = await enforcer.verify_protection(position, exchange_orders)
+        assert result is True, "untouched stop should be recognized as protection"
+
+    @pytest.mark.asyncio
+    async def test_verify_protection_rejects_cancelled_stop(self, mock_client, position):
+        """Cancelled stop should NOT count as protection."""
+        exchange_orders = [
+            {
+                "symbol": "ZRO/USD:USD",
+                "type": "stop",
+                "status": "cancelled",
+                "reduceOnly": True,
+            }
+        ]
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        result = await enforcer.verify_protection(position, exchange_orders)
+        assert result is False, "cancelled stop should not count as protection"
+
+    # ------------------------------------------------------------------
+    # Full integration: entered_book through the complete monitor
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_full_monitor_entered_book_protected(self, mock_client, position):
+        """
+        Full integration test reproducing the 2026-02-13 ZRO/USD incident.
+        Stop has status 'entered_book' (triggered, on book).
+        Neither fetch_open_orders nor verify_protection find it.
+        Layer 2 (_check_stop_was_filled) fetches by ID → 'entered_book' → protected.
+        Kill switch must NOT fire.
+        """
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        # Exchange state: position exists, stop NOT in open orders (entered_book is transitional)
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_ZROUSD", "contracts": 10}
+        ]
+        # Layer 2: fetch_order finds the stop alive with entered_book
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+
+        assert results.get("ZRO/USD") is True, (
+            f"Expected ZRO/USD to be protected (entered_book), got: {results}. "
+            "This would have caused a false kill-switch activation."
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_monitor_layer2_rescue_logged(self, mock_client, position):
+        """Verify Layer 2 rescue produces the expected info log."""
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position)
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_ZROUSD", "contracts": 10}
+        ]
+        mock_client.fetch_order.return_value = {
+            "id": "stop-zro-1",
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            results = await monitor.check_all_positions()
+
+            # Should see the Layer 2 rescue log
+            info_calls = [
+                str(c) for c in mock_logger.info.call_args_list
+            ]
+            rescue_logged = any("Layer 2" in c and "ALIVE" in c for c in info_calls)
+            assert rescue_logged, (
+                f"Expected 'Layer 1 missed stop but Layer 2 confirmed ALIVE' log. "
+                f"Info calls: {info_calls}"
+            )
 
 
 class TestStopOrderPolling:

@@ -27,6 +27,29 @@ from src.monitoring.logger import get_logger
 logger = get_logger(__name__)
 
 
+# ============ STOP ORDER STATUS CLASSIFICATION ============
+# Kraken Futures stop orders go through:  untouched → entered_book → filled
+# CCXT may or may not normalize these.  We classify explicitly to avoid
+# false NAKED POSITION / kill-switch triggers on transitional states.
+
+ALIVE_STOP_STATUSES = frozenset({
+    "open",              # CCXT-normalized "active"
+    "entered_book",      # Kraken Futures: triggered, resting on order book
+    "untouched",         # Kraken Futures: conditional not yet triggered
+    "new",               # Some exchanges: just placed
+    "partiallyfilled",   # Partially filled, still working
+    "partial",           # CCXT alias for partially filled
+})
+
+DEAD_STOP_STATUSES = frozenset({
+    "canceled", "cancelled", "expired", "rejected",
+})
+
+FINAL_STOP_STATUSES = frozenset({
+    "closed", "filled",  # Terminal — check filled qty to decide
+})
+
+
 # ============ CONFIGURATION ============
 
 @dataclass
@@ -307,7 +330,8 @@ class ProtectionEnforcer:
             if reduce_only_present and not reduce_only:
                 continue
 
-            if str(order.get("status") or "").lower() != "open":
+            order_status = str(order.get("status") or "").lower()
+            if order_status not in ALIVE_STOP_STATUSES:
                 continue
 
             has_stop = True
@@ -317,7 +341,8 @@ class ProtectionEnforcer:
             logger.critical(
                 "INVARIANT K VIOLATION: Position has exposure but NO STOP!",
                 symbol=position.symbol,
-                remaining_qty=str(position.remaining_qty)
+                remaining_qty=str(position.remaining_qty),
+                expected_stop_id=getattr(position, "stop_order_id", None),
             )
         
         return has_stop
@@ -773,6 +798,27 @@ class PositionProtectionMonitor:
             logger.error(f"Failed to fetch orders for protection check: {e}")
             return results
         
+        # Diagnostic: log what orders are visible so future incidents are 30-second diagnoses
+        if exchange_orders:
+            order_summary = [
+                {
+                    "id": str(o.get("id") or "")[:12],
+                    "symbol": str(o.get("symbol") or ""),
+                    "type": str(o.get("type") or (o.get("info") or {}).get("orderType") or ""),
+                    "status": str(o.get("status") or ""),
+                    "filled": o.get("filled"),
+                    "amount": o.get("amount"),
+                }
+                for o in exchange_orders[:20]
+            ]
+            logger.debug(
+                "Protection check: exchange orders visible",
+                order_count=len(exchange_orders),
+                orders=order_summary,
+            )
+        else:
+            logger.debug("Protection check: no exchange orders visible")
+        
         # CRITICAL: Fetch actual positions from exchange to verify they exist
         try:
             exchange_positions = await self.client.get_all_futures_positions()
@@ -808,16 +854,25 @@ class PositionProtectionMonitor:
                     results[position.symbol] = True  # Treat as protected (closed)
                     continue
                 
-                is_protected = await self.enforcer.verify_protection(
+                layer1_protected = await self.enforcer.verify_protection(
                     position,
                     exchange_orders
                 )
                 
+                is_protected = layer1_protected
+                
                 # ---- LAYER 2: Stop-fill verification before declaring naked ----
-                if not is_protected and position.stop_order_id:
-                    is_protected = await self._check_stop_was_filled(
+                if not layer1_protected and position.stop_order_id:
+                    layer2_protected = await self._check_stop_was_filled(
                         position, exchange_size
                     )
+                    if layer2_protected:
+                        logger.info(
+                            "Protection check: Layer 1 missed stop but Layer 2 confirmed ALIVE by ID",
+                            symbol=position.symbol,
+                            stop_order_id=position.stop_order_id,
+                        )
+                    is_protected = layer2_protected
                 
                 results[position.symbol] = is_protected
                 
@@ -844,6 +899,11 @@ class PositionProtectionMonitor:
         
         If the stop was filled, the position is being closed by the stop --
         which is the *intended* safety mechanism, not a violation.
+        
+        This is the kill-switch backstop: it must default to PROTECTED (True)
+        for any ambiguous but non-dead status, because a false NAKED alarm
+        triggers emergency close + kill switch — a worse outcome than briefly
+        tolerating an uncertain but likely-alive stop.
         
         Returns True (protected / expected) or False (genuinely naked).
         """
@@ -873,21 +933,33 @@ class PositionProtectionMonitor:
         filled_raw = order_data.get("filled")
         filled = float(filled_raw if filled_raw is not None else 0)
 
-        if status == "closed" and filled > 0:
-            # The stop loss was FILLED -- this is expected behavior!
-            logger.info(
-                "Stop-fill verification: stop was FILLED (expected, not naked)",
-                symbol=position.symbol,
-                stop_order_id=stop_oid,
-                filled_qty=filled,
-                exchange_remaining=exchange_size,
-            )
-            # Gracefully close the position so it doesn't keep flagging
-            self._close_position_from_stop_fill(position, filled, order_data)
-            return True
+        # ---- FINAL (closed/filled): check filled qty ----
+        if status in FINAL_STOP_STATUSES:
+            if filled > 0:
+                # The stop loss was FILLED -- this is expected behavior!
+                logger.info(
+                    "Stop-fill verification: stop was FILLED (expected, not naked)",
+                    symbol=position.symbol,
+                    stop_order_id=stop_oid,
+                    filled_qty=filled,
+                    exchange_remaining=exchange_size,
+                )
+                # Gracefully close the position so it doesn't keep flagging
+                self._close_position_from_stop_fill(position, filled, order_data)
+                return True
+            else:
+                # Closed with 0 fills — ambiguous (e.g. self-trade prevention).
+                # Fail-safe: warn but do NOT trigger kill switch.
+                logger.warning(
+                    "Stop-fill verification: stop CLOSED with 0 fills (ambiguous, treating as protected)",
+                    symbol=position.symbol,
+                    stop_order_id=stop_oid,
+                    status=status,
+                )
+                return True
 
-        if status in ("canceled", "cancelled", "expired"):
-            # Stop was cancelled/expired without filling -- genuinely naked
+        # ---- DEAD (cancelled/expired/rejected): genuinely naked ----
+        if status in DEAD_STOP_STATUSES:
             logger.warning(
                 "Stop-fill verification: stop was CANCELLED/EXPIRED (genuinely naked)",
                 symbol=position.symbol,
@@ -896,16 +968,28 @@ class PositionProtectionMonitor:
             )
             return False
 
-        # Status is still open/unknown -- shouldn't reach here if verify_protection
-        # already scanned open orders, but be defensive
+        # ---- ALIVE (open/entered_book/untouched/etc.): stop is working ----
+        if status in ALIVE_STOP_STATUSES:
+            logger.info(
+                "Stop-fill verification: stop is ALIVE on exchange (protected)",
+                symbol=position.symbol,
+                stop_order_id=stop_oid,
+                status=status,
+                filled=filled,
+            )
+            return True
+
+        # ---- UNKNOWN STATUS: fail-safe → treat as protected ----
+        # This is the kill-switch backstop.  An unfamiliar but non-dead status
+        # should NOT trigger emergency close.  Log loud so we investigate.
         logger.warning(
-            "Stop-fill verification: unexpected status",
+            "Stop-fill verification: UNKNOWN status (treating as PROTECTED to avoid false kill-switch)",
             symbol=position.symbol,
             stop_order_id=stop_oid,
             status=status,
             filled=filled,
         )
-        return False
+        return True
     
     def _close_position_from_stop_fill(
         self,
