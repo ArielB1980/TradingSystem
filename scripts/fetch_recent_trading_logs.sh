@@ -14,6 +14,7 @@
 #   - Utilisation boost applied
 #   - Errors and critical (excluding known benign)
 #   - INVARIANT / HALT / kill_switch
+#   - KRAKEN FUTURES FILLS (last 48h) — source of truth for executed trades (avoids log-tail discrepancy)
 #
 
 set -e
@@ -75,6 +76,17 @@ echo ""
 
 echo "--- RECENT POSITIONS / ACTIVE PORTFOLIO (last 5) ---"
 echo "$RAW" | grep -E "Active Portfolio|positions=|registry_positions" | tail -5
+echo ""
+
+# Source of truth for what actually traded (avoids discrepancy when log tail scrolls past older trades)
+echo "--- KRAKEN FUTURES FILLS (last 48h, source of truth for executed trades) ---"
+FILLS=$(ssh -i "$SSH_KEY" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$SERVER" \
+  "sudo -u trading bash -c 'set -a; [ -f $TRADING_DIR/.env ] && source $TRADING_DIR/.env; set +a; cd $TRADING_DIR && ./venv/bin/python scripts/fetch_kraken_futures_trades.py --hours 48 2>/dev/null'" 2>/dev/null) || true
+if [ -n "$FILLS" ]; then
+  echo "$FILLS"
+else
+  echo "(Could not fetch Kraken fills from server; use logs above. Run fetch_kraken_futures_trades.py on server for trade history.)"
+fi
 echo ""
 
 echo "--- END OF FETCH ==="

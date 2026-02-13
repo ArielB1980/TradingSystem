@@ -154,6 +154,71 @@ class TestTradeStarvationMonitor:
             mock_alert.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_no_alert_when_db_has_closed_trades_in_window(self):
+        """When cycle history shows 0 orders but DB has closed trades in window, do not alarm."""
+        from src.live.health_monitor import run_trade_starvation_monitor
+
+        lt = FakeLiveTradingBase()
+        now = datetime.now(timezone.utc)
+
+        # Cycles with signals but 0 orders (would trigger starvation without backstop)
+        cycles = [
+            _make_cycle(now - timedelta(hours=2, minutes=i), signals=2, orders=0)
+            for i in range(20)
+        ]
+        lt.hardening_layer = FakeHardeningLayer(FakeCycleGuard(cycles))
+
+        with patch("src.monitoring.alerting.send_alert", new_callable=AsyncMock) as mock_alert:
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                mock_sleep.side_effect = _quick_sleep_then_stop(lt, max_iterations=2)
+                # DB backstop: closed trades=1, open positions=0 (repeat for each loop iteration)
+                with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                    mock_to_thread.side_effect = [1, 0] * 5  # closed=1, open_positions=0
+
+                    await run_trade_starvation_monitor(
+                        lt,
+                        check_interval_seconds=0,
+                        starvation_window_hours=6.0,
+                        min_signals_threshold=10,
+                    )
+
+            mock_alert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_alert_when_open_positions_in_window(self):
+        """When DB has 0 closed trades but an open position was entered in window, do not alarm.
+
+        This is the key gap-closer: positions that are still live don't appear
+        in the trades table, but *do* appear in the positions table.
+        """
+        from src.live.health_monitor import run_trade_starvation_monitor
+
+        lt = FakeLiveTradingBase()
+        now = datetime.now(timezone.utc)
+
+        cycles = [
+            _make_cycle(now - timedelta(hours=2, minutes=i), signals=2, orders=0)
+            for i in range(20)
+        ]
+        lt.hardening_layer = FakeHardeningLayer(FakeCycleGuard(cycles))
+
+        with patch("src.monitoring.alerting.send_alert", new_callable=AsyncMock) as mock_alert:
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                mock_sleep.side_effect = _quick_sleep_then_stop(lt, max_iterations=2)
+                # DB backstop: closed trades=0, open positions=1 (repeat for each loop iteration)
+                with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                    mock_to_thread.side_effect = [0, 1] * 5  # closed=0, open_positions=1
+
+                    await run_trade_starvation_monitor(
+                        lt,
+                        check_interval_seconds=0,
+                        starvation_window_hours=6.0,
+                        min_signals_threshold=10,
+                    )
+
+            mock_alert.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_no_alert_below_signal_threshold(self):
         """Should NOT alert when signal count is below the threshold."""
         from src.live.health_monitor import run_trade_starvation_monitor

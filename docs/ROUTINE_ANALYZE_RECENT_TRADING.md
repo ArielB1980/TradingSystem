@@ -35,6 +35,7 @@ From the fetched sections, extract and report:
 | **Critical** | Anything concerning (exclude benign PROD_INVARIANT_REPORT, PROD_LIVE_LOCK, DATABASE_CONNECTION). |
 | **INVARIANT / HALT / KILL_SWITCH** | Any violations or pauses; immediate follow-up if present. |
 | **Positions** | Latest `positions=` or registry/Active Portfolio mentions; confirm matches expectations. |
+| **KRAKEN FUTURES FILLS** | **Source of truth for executed trades.** One line per fill (datetime, symbol, side, amount, price, cost, fee, order_id). Use this to report what actually traded; reconcile with Auction/Position logs. Log tail can scroll past older trades—fills from the exchange do not. |
 
 ### 3. Produce a short report
 
@@ -42,11 +43,12 @@ Structure the reply as:
 
 1. **Health** – System state (e.g. NORMAL), any HALT/kill_switch/invariant issues.
 2. **Positions** – Current position count and symbols if visible.
-3. **Last N cycles** – Brief line per cycle (duration, positions, state) or a single summary sentence.
-4. **Auction** – Opens/closes last run; notable rejection reasons if any.
-5. **Risk / sizing** – Dominant `final_binding_constraint`; whether stakes are mostly risk_sizing, single_margin, min_notional_reject, etc.; utilisation boost usage.
-6. **Errors** – Last few; one-line each; note if transient vs needs fix.
-7. **Recommendations** – Only if something actionable: e.g. raise a cap, check a symbol, investigate an error.
+3. **Executed trades (source of truth)** – If the fetch includes **KRAKEN FUTURES FILLS**, summarize what actually traded (opens/closes per symbol, time range). Use this over log-derived counts—log tail can miss older trades.
+4. **Last N cycles** – Brief line per cycle (duration, positions, state) or a single summary sentence.
+5. **Auction** – Opens/closes last run; notable rejection reasons if any. Reconcile with fills (e.g. fills show an open at 00:00 but Auction section only shows recent “No contenders”).
+6. **Risk / sizing** – Dominant `final_binding_constraint`; whether stakes are mostly risk_sizing, single_margin, min_notional_reject, etc.; utilisation boost usage.
+7. **Errors** – Last few; one-line each; note if transient vs needs fix.
+8. **Recommendations** – Only if something actionable: e.g. raise a cap, check a symbol, investigate an error.
 
 Keep the report to one short page unless the user asks for more detail.
 

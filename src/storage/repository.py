@@ -434,7 +434,7 @@ def load_candles_map(
     Returns:
         Dict[symbol, List[Candle]]
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = _to_naive_utc(datetime.now(timezone.utc) - timedelta(days=days))
     db = get_db()
     results = {}
     
@@ -790,10 +790,11 @@ def get_trades_since(since: datetime) -> List[Trade]:
     Returns:
         List of Trade objects closed since the given time
     """
+    cutoff = _to_naive_utc(since)
     db = get_db()
     with db.get_session() as session:
         trade_models = session.query(TradeModel).filter(
-            TradeModel.exited_at >= since
+            TradeModel.exited_at >= cutoff
         ).order_by(TradeModel.exited_at.desc()).all()
         
         return [
@@ -816,6 +817,54 @@ def get_trades_since(since: datetime) -> List[Trade]:
             )
             for tm in trade_models
         ]
+
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    """
+    Convert a datetime to naive-UTC for DB comparison.
+
+    All DateTime columns in this repo store **naive UTC** (no tzinfo).
+    This helper guarantees the value we compare against is in the same
+    representation, regardless of what the caller passes:
+
+      * tz-aware (any zone) → convert to UTC first, then strip tzinfo.
+      * naive              → assumed UTC already (caller's responsibility).
+
+    Usage: pass every cutoff / boundary datetime through this before using
+    it in a SQLAlchemy filter against a DateTime column.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def count_trades_opened_since(since: datetime) -> int:
+    """
+    Count trades that were opened (entered_at) since the given time.
+    Used as source-of-truth backstop when in-memory cycle history may have
+    scrolled past (e.g. trade starvation check). Only counts closed trades
+    (opens still in progress are not in the trades table yet).
+    """
+    cutoff = _to_naive_utc(since)
+    db = get_db()
+    with db.get_session() as session:
+        return session.query(TradeModel).filter(
+            TradeModel.entered_at >= cutoff
+        ).count()
+
+
+def count_open_positions_opened_since(since: datetime) -> int:
+    """
+    Count currently-open positions whose opened_at >= since.
+    Complements count_trades_opened_since: covers positions that were opened
+    in the window but are still live (not yet in the trades table).
+    """
+    cutoff = _to_naive_utc(since)
+    db = get_db()
+    with db.get_session() as session:
+        return session.query(PositionModel).filter(
+            PositionModel.opened_at >= cutoff
+        ).count()
 
 
 def clear_cache():
@@ -1155,7 +1204,7 @@ def load_recent_intent_hashes(lookback_hours: int = 24) -> set:
     """
     from sqlalchemy import and_
 
-    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    cutoff_time = _to_naive_utc(datetime.now(timezone.utc) - timedelta(hours=lookback_hours))
     hashes = set()
     db = get_db()
     with db.get_session() as session:

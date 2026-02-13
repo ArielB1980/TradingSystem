@@ -207,8 +207,33 @@ async def run_trade_starvation_monitor(
             window_signals = sum(s for _, s, _ in _history)
             window_orders = sum(o for _, _, o in _history)
 
+            # Source-of-truth backstop: cycle history is bounded (e.g. 100 cycles).
+            # If cycle window says 0 orders but DB shows activity in the same time
+            # window, do not alarm.  Two checks cover both halves:
+            #   1. count_trades_opened_since  → closed trades entered in window
+            #   2. count_open_positions_opened_since → still-open positions entered in window
+            # Either > 0 means "not starved".
+            db_evidence = 0
+            try:
+                from src.storage.repository import (
+                    count_trades_opened_since,
+                    count_open_positions_opened_since,
+                )
+                closed_in_window = await asyncio.to_thread(count_trades_opened_since, cutoff)
+                open_in_window = await asyncio.to_thread(count_open_positions_opened_since, cutoff)
+                db_evidence = closed_in_window + open_in_window
+            except Exception:
+                pass  # If DB unavailable, rely on cycle history only
+
             if window_signals >= min_signals_threshold and window_orders == 0:
-                if not _alerted:
+                if db_evidence > 0:
+                    logger.debug(
+                        "Trade starvation check: cycle history shows 0 orders but DB has activity in window, not alarming",
+                        db_closed_trades=closed_in_window if db_evidence else 0,
+                        db_open_positions=open_in_window if db_evidence else 0,
+                        window_hours=starvation_window_hours,
+                    )
+                elif not _alerted:
                     msg = (
                         f"TRADE STARVATION: {window_signals} signals generated "
                         f"but 0 orders placed in the last {starvation_window_hours:.0f}h.\n"
@@ -237,6 +262,7 @@ async def run_trade_starvation_monitor(
                 "Trade starvation check",
                 window_signals=window_signals,
                 window_orders=window_orders,
+                db_evidence=db_evidence,
                 window_hours=starvation_window_hours,
                 alerted=_alerted,
             )
