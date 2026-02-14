@@ -131,6 +131,13 @@ class BacktestRunner:
             except DataError as e:
                 self._metrics.record_exception("DataError")
                 self._metrics.failed_ticks += 1
+            except AttributeError as e:
+                # AttributeError = programming bug → must crash (not continue).
+                # This matches production behavior where systemd restarts on crash.
+                self._metrics.record_exception("AttributeError")
+                self._metrics.failed_ticks += 1
+                logger.error("REPLAY_BUG_CRASH", tick=tick_count, error=str(e))
+                break  # Stop ticking — process would have crashed
             except Exception as e:
                 self._metrics.record_exception(type(e).__name__)
                 self._metrics.failed_ticks += 1
