@@ -607,6 +607,25 @@ class LiveTrading:
                 startup_epoch=self._startup_sm.startup_epoch.isoformat() if self._startup_sm.startup_epoch else None,
                 status=self._startup_sm.get_status(),
             )
+            
+            # Safety state banner — one-line "why are we paused?" visibility
+            try:
+                from src.safety.safety_state import get_safety_state_manager
+                ss = get_safety_state_manager().load()
+                logger.info(
+                    "SAFETY_STATE_ON_STARTUP",
+                    halt_active=ss.halt_active,
+                    halt_reason=ss.halt_reason,
+                    kill_switch_active=ss.kill_switch_active,
+                    kill_switch_reason=ss.kill_switch_reason,
+                    kill_switch_latched=ss.kill_switch_latched,
+                    peak_equity=ss.peak_equity,
+                    peak_equity_updated_at=ss.peak_equity_updated_at,
+                    last_reset_at=ss.last_reset_at,
+                    last_reset_mode=ss.last_reset_mode,
+                )
+            except Exception as e:
+                logger.debug("Could not load unified safety state on startup", error=str(e))
 
             # 4.5. Run first tick to hydrate runtime state (now safely after READY)
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
@@ -935,53 +954,91 @@ class LiveTrading:
             )
 
         # 0. Kill Switch Check (HIGHEST PRIORITY)
+        # P0.3: SAFE_HOLD semantics — kill switch active does NOT auto-flatten.
+        # Only emergency=True activation (via KillSwitch.activate(emergency=True))
+        # triggers position closure. That path runs inside activate() itself.
+        #
+        # On tick with kill switch active, we enter SAFE_HOLD:
+        #   1. Cancel non-SL orders (preserve stop losses)
+        #   2. Verify stops exist for open positions
+        #   3. Do NOT market-close positions
+        #   4. Require explicit operator action to flatten
+        #
+        # Exception: Recent (<2 min) EMERGENCY_RUNTIME reasons may auto-flatten.
         ks = self.kill_switch
         
         if ks.is_active():
-            logger.critical("Kill switch is active - halting trading")
+            # Determine if this is a recent emergency that should auto-flatten
+            should_auto_flatten = False
+            if ks.reason and ks.reason.allows_auto_flatten_on_startup and ks.activated_at:
+                age_seconds = (datetime.now(timezone.utc) - ks.activated_at).total_seconds()
+                if age_seconds < 120:  # < 2 minutes = recent emergency
+                    should_auto_flatten = True
+                    logger.critical(
+                        "Kill switch SAFE_HOLD: recent emergency — allowing auto-flatten",
+                        reason=ks.reason.value,
+                        age_seconds=f"{age_seconds:.0f}",
+                    )
 
-            # Cancel all pending orders
-            try:
-                logger.warning("Cancelling all pending orders...")
-                cancelled = await self.client.cancel_all_orders()
-                logger.info(f"Kill switch: Cancelled {len(cancelled)} orders")
-            except InvariantError:
-                raise  # Safety violation — must propagate
-            except OperationalError as e:
-                logger.error("Kill switch: cancel_all transient failure", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
-            except Exception as e:
-                logger.exception("Kill switch: unexpected error in cancel_all", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
-                raise
+            if should_auto_flatten:
+                # EMERGENCY path: cancel all + close positions (original behavior)
+                logger.critical("Kill switch EMERGENCY: cancelling orders and closing positions")
+                try:
+                    cancelled = await self.client.cancel_all_orders()
+                    logger.info(f"Kill switch: Cancelled {len(cancelled)} orders")
+                except InvariantError:
+                    raise
+                except OperationalError as e:
+                    logger.error("Kill switch: cancel_all transient failure", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
+                except Exception as e:
+                    logger.exception("Kill switch: unexpected error in cancel_all", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
+                    raise
 
-            # Close all positions
-            try:
-                logger.critical("Closing all positions due to kill switch")
-                positions = await self.client.get_all_futures_positions()
-                for pos in positions:
-                    if pos.get('size', 0) != 0:  # Only close non-zero positions
-                        symbol = pos.get('symbol')
-                        try:
-                            await self.client.close_position(symbol)
-                            logger.warning(f"Kill switch: Closed position for {symbol}")
-                        except InvariantError:
-                            raise  # Safety violation — must propagate
-                        except OperationalError as e:
-                            logger.error("Kill switch: close_position transient failure", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
-                        except Exception as e:
-                            logger.exception("Kill switch: unexpected error closing position", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
-                            raise
+                try:
+                    positions = await self.client.get_all_futures_positions()
+                    for pos in positions:
+                        if pos.get('size', 0) != 0:
+                            symbol = pos.get('symbol')
+                            try:
+                                await self.client.close_position(symbol)
+                                logger.warning(f"Kill switch: Emergency closed position for {symbol}")
+                            except InvariantError:
+                                raise
+                            except OperationalError as e:
+                                logger.error("Kill switch: close_position transient failure", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
+                            except Exception as e:
+                                logger.exception("Kill switch: unexpected error closing position", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
+                                raise
+                except InvariantError:
+                    raise
+                except OperationalError as e:
+                    logger.error("Kill switch: close_all transient failure", kill_step="close_all", error=str(e), error_type=type(e).__name__)
+                except Exception as e:
+                    logger.exception("Kill switch: unexpected error in close_all", kill_step="close_all", error=str(e), error_type=type(e).__name__)
+                    raise
+            else:
+                # SAFE_HOLD path: cancel non-SL orders, verify stops, do NOT flatten
+                logger.critical(
+                    "Kill switch SAFE_HOLD: preserving positions + stops, refusing new entries",
+                    reason=ks.reason.value if ks.reason else "unknown",
+                    activated_at=ks.activated_at.isoformat() if ks.activated_at else "unknown",
+                )
+                try:
+                    cancelled, preserved_sls = await ks._cancel_non_sl_orders()
+                    logger.info(
+                        "Kill switch SAFE_HOLD: order cleanup done",
+                        cancelled_non_sl=cancelled,
+                        preserved_stop_losses=preserved_sls,
+                    )
+                except InvariantError:
+                    raise
+                except OperationalError as e:
+                    logger.error("Kill switch SAFE_HOLD: cancel transient failure", error=str(e), error_type=type(e).__name__)
+                except Exception as e:
+                    logger.exception("Kill switch SAFE_HOLD: unexpected error in cancel", error=str(e), error_type=type(e).__name__)
+                    raise
 
-                if not positions or all(pos.get('size', 0) == 0 for pos in positions):
-                    logger.info("Kill switch: No open positions to close")
-            except InvariantError:
-                raise  # Safety violation — must propagate
-            except OperationalError as e:
-                logger.error("Kill switch: close_all transient failure", kill_step="close_all", error=str(e), error_type=type(e).__name__)
-            except Exception as e:
-                logger.exception("Kill switch: unexpected error in close_all", kill_step="close_all", error=str(e), error_type=type(e).__name__)
-                raise
-
-            # Stop processing
+            # Stop processing (no new entries while kill switch is active)
             return
         
         # 0.1 Order Timeout Monitoring (CRITICAL: Check first)
@@ -1026,12 +1083,18 @@ class LiveTrading:
                 # Convert raw positions to Position objects for check
                 position_objs = [self._convert_to_position(p) for p in all_raw_positions if p.get('size', 0) != 0]
                 
+                # Equity refetch callback for implausibility guard (P0.4)
+                async def _refetch_equity() -> Decimal:
+                    info = await self.client.get_futures_account_info()
+                    return Decimal(str(info.get("equity", 0)))
+                
                 # Run pre-tick safety checks (returns HardeningDecision)
                 decision = await self.hardening.pre_tick_check(
                     current_equity=current_equity,
                     open_positions=position_objs,
                     margin_utilization=margin_util,
                     available_margin=available_margin,
+                    refetch_equity_fn=_refetch_equity,
                 )
                 
                 if decision == HardeningDecision.HALT:
@@ -1844,23 +1907,64 @@ class LiveTrading:
         await save_trade_history(self, position, exit_price, exit_reason)
 
     def _write_heartbeat(self) -> None:
-        """Write heartbeat file with timestamp and phase info.
+        """Write heartbeat file with timestamp, phase, and health banner.
 
         External watchdog (systemd timer / sidecar) checks file staleness.
         If timestamp > 60s old → process is hung → restart.
+
+        Health banner includes breaker state, self-heal metrics, rate limiter,
+        and trade recording failures — gives immediate "are we drifting?" visibility.
         """
         try:
             import json
+            import subprocess
             heartbeat_dir = Path("runtime")
             heartbeat_dir.mkdir(parents=True, exist_ok=True)
             heartbeat_path = heartbeat_dir / "heartbeat.json"
+
+            # Core identity
             data = {
                 "timestamp": time.time(),
                 "iso": datetime.now(timezone.utc).isoformat(),
-                "phase": self._startup_sm.phase.value if self._startup_sm else "unknown",
+                "startup_phase": self._startup_sm.phase.value if self._startup_sm else "unknown",
                 "cycle": getattr(self, "_last_cycle_count", 0),
                 "kill_switch_active": self.kill_switch.is_active() if self.kill_switch else False,
             }
+
+            # Git commit hash (cached after first call)
+            if not hasattr(self, "_git_sha"):
+                try:
+                    self._git_sha = subprocess.check_output(
+                        ["git", "rev-parse", "--short", "HEAD"],
+                        stderr=subprocess.DEVNULL, timeout=2,
+                    ).decode().strip()
+                except Exception:
+                    self._git_sha = "unknown"
+            data["git_sha"] = self._git_sha
+
+            # Circuit breaker state
+            if hasattr(self.client, "api_breaker"):
+                breaker = self.client.api_breaker
+                state = getattr(breaker, "_state", None)
+                data["breaker_state"] = state.value if hasattr(state, "value") else str(state)
+                data["breaker_failure_count"] = getattr(breaker, "_failure_count", 0)
+
+            # Stop self-heal metrics
+            heal = getattr(self, "_stop_heal_metrics", {})
+            if heal:
+                data["stop_self_heal_attempts"] = heal.get("stop_self_heal_attempts_total", 0)
+                data["stop_self_heal_success"] = heal.get("stop_self_heal_success_total", 0)
+                data["stop_self_heal_failures"] = heal.get("stop_self_heal_failures_total", 0)
+                data["layer3_saves"] = heal.get("layer3_saves_total", 0)
+
+            # Execution gateway metrics
+            if hasattr(self, "execution_gateway"):
+                gw = self.execution_gateway
+                data["trade_record_failures"] = gw.metrics.get("trade_record_failures_total", 0)
+                data["orders_blocked_by_rate_limit"] = gw._order_rate_limiter.orders_blocked_total
+                data["orders_per_minute"] = gw._order_rate_limiter.orders_last_minute
+                data["gateway_errors"] = gw.metrics.get("errors", 0)
+
             # Atomic write: write to temp then rename
             tmp_path = heartbeat_path.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(data))

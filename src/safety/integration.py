@@ -41,7 +41,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.monitoring.logger import get_logger
 from src.safety.invariant_monitor import (
@@ -439,43 +439,75 @@ class ProductionHardeningLayer:
         except (OperationalError, ImportError, OSError) as e:
             logger.warning("Failed to send HALT alert (non-blocking)", error=str(e), error_type=type(e).__name__)
     
-    def clear_halt(self, operator: str = "unknown") -> bool:
+    def clear_halt(self, operator: str = "unknown", keep_kill_switch: bool = False) -> bool:
         """
-        Clear persisted halt state (MANUAL INTERVENTION REQUIRED).
+        Clear persisted halt state AND kill switch state (MANUAL INTERVENTION REQUIRED).
+        
+        P0.5: By default, also clears the kill switch persisted state. The 2026-02-14
+        incident showed that clearing halt without clearing kill switch causes the
+        system to auto-flatten positions on restart. These two states must be cleared
+        atomically unless the operator explicitly opts out.
         
         Args:
             operator: Name/ID of operator clearing the halt
+            keep_kill_switch: If True, do NOT clear the kill switch state (rare)
             
         Returns:
             True if cleared successfully
         """
+        cleared_halt = False
+        cleared_ks = False
+        
+        # 1. Clear halt state
         if not self._state_file.exists():
             logger.info("No halt state to clear")
-            return True
+            cleared_halt = True
+        else:
+            try:
+                halt_state = self._load_halt_state()
+                logger.critical(
+                    "HALT_STATE_CLEARED",
+                    operator=operator,
+                    previous_state=halt_state.state if halt_state else "unknown",
+                    previous_reason=halt_state.reason if halt_state else "unknown",
+                )
+                self._state_file.unlink()
+                cleared_halt = True
+            except InvariantError:
+                raise  # Corrupt state — must propagate
+            except OSError as e:
+                logger.error("Failed to clear halt state (filesystem)", error=str(e), error_type=type(e).__name__)
         
-        try:
-            # Log the clearance
-            halt_state = self._load_halt_state()
-            logger.critical(
-                "HALT_STATE_CLEARED",
-                operator=operator,
-                previous_state=halt_state.state if halt_state else "unknown",
-                previous_reason=halt_state.reason if halt_state else "unknown",
-            )
-            
-            # Remove the file
-            self._state_file.unlink()
-            
-            # Reset invariant monitor state
-            self.invariant_monitor.state = SystemState.ACTIVE
-            self.invariant_monitor.violations.clear()
-            
-            return True
-        except InvariantError:
-            raise  # Corrupt state — must propagate
-        except OSError as e:
-            logger.error("Failed to clear halt state (filesystem)", error=str(e), error_type=type(e).__name__)
-            return False
+        # 2. Clear kill switch state (P0.5: default behavior)
+        if not keep_kill_switch:
+            try:
+                if self.kill_switch and self.kill_switch.is_active():
+                    self.kill_switch.acknowledge()
+                    logger.critical(
+                        "KILL_SWITCH_CLEARED_WITH_HALT",
+                        operator=operator,
+                        reason=self.kill_switch.reason.value if self.kill_switch.reason else "unknown",
+                    )
+                cleared_ks = True
+            except Exception as e:
+                logger.error("Failed to clear kill switch state", error=str(e), error_type=type(e).__name__)
+        else:
+            logger.info("keep_kill_switch=True — kill switch state preserved")
+            cleared_ks = True
+        
+        # 3. Reset invariant monitor state
+        self.invariant_monitor.state = SystemState.ACTIVE
+        self.invariant_monitor.violations.clear()
+        
+        success = cleared_halt and cleared_ks
+        logger.info(
+            "SAFETY_STATE_CLEAR_RESULT",
+            operator=operator,
+            halt_cleared=cleared_halt,
+            kill_switch_cleared=cleared_ks and not keep_kill_switch,
+            success=success,
+        )
+        return success
     
     def is_halted(self) -> bool:
         """Check if system is in persisted HALT state."""
@@ -517,6 +549,7 @@ class ProductionHardeningLayer:
         open_positions: List[Position],
         margin_utilization: Decimal,
         available_margin: Decimal,
+        refetch_equity_fn: Optional[Callable] = None,
     ) -> HardeningDecision:
         """
         Perform all pre-tick safety checks.
@@ -566,12 +599,13 @@ class ProductionHardeningLayer:
             self._current_cycle_id = self.cycle_guard.current_cycle.cycle_id \
                 if self.cycle_guard.current_cycle else f"fallback_{uuid.uuid4().hex[:8]}"
         
-        # 3. Check invariants
+        # 3. Check invariants (pass refetch_equity_fn for implausibility guard)
         state = await self.invariant_monitor.check_all(
             current_equity=current_equity,
             open_positions=open_positions,
             margin_utilization=margin_utilization,
             available_margin=available_margin,
+            refetch_equity_fn=refetch_equity_fn,
         )
         
         if state == SystemState.EMERGENCY:

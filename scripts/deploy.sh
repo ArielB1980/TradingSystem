@@ -41,6 +41,7 @@ GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 # Parse command line arguments
 SKIP_TESTS=false
 SKIP_COMMIT=false
+SKIP_REPLAY="${SKIP_REPLAY:-false}"
 COMMIT_MESSAGE=""
 FORCE_PUSH=false
 
@@ -54,6 +55,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_COMMIT=true
             shift
             ;;
+        --skip-replay)
+            SKIP_REPLAY=true
+            shift
+            ;;
         --message)
             COMMIT_MESSAGE="$2"
             shift 2
@@ -64,7 +69,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo -e "${RED}Unknown option: $1${NC}"
-            echo "Usage: $0 [--skip-tests] [--skip-commit] [--message \"commit message\"] [--force]"
+            echo "Usage: $0 [--skip-tests] [--skip-commit] [--skip-replay] [--message \"commit message\"] [--force]"
             exit 1
             ;;
     esac
@@ -141,6 +146,24 @@ if [ "$SKIP_TESTS" = false ]; then
     fi
 else
     print_warning "Skipping pre-deployment tests"
+fi
+
+# Step 1b: Run replay gate (unless skipped)
+if [ "$SKIP_REPLAY" = "true" ] || [ "$SKIP_REPLAY" = "1" ]; then
+    print_warning "Skipping replay gate (SKIP_REPLAY=$SKIP_REPLAY)"
+else
+    print_step "Running replay gate (seed=42)..."
+    if command -v make &> /dev/null; then
+        if make replay SEED=42 2>&1 | tee /tmp/deploy-replay.log; then
+            print_success "Replay gate passed (6/6 episodes)"
+        else
+            print_error "Replay gate FAILED — episodes did not pass"
+            print_warning "Use --skip-replay or SKIP_REPLAY=1 to bypass"
+            exit 1
+        fi
+    else
+        print_warning "make not found, skipping replay gate"
+    fi
 fi
 
 # Step 2: Commit and push to GitHub (unless skipped)

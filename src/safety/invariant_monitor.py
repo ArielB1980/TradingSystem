@@ -20,7 +20,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Callable, Coroutine, List, Optional, Dict, Any
 import asyncio
 import json
 import os
@@ -41,6 +41,12 @@ _PEAK_EQUITY_FILE = "peak_equity_state.json"
 
 # Epsilon to avoid float noise: only update peak when equity exceeds by > $0.01
 _PEAK_EQUITY_EPSILON = Decimal("0.01")
+
+# P0.4: Implausibility guard — if computed drawdown exceeds this, re-fetch equity
+# before halting. Prevents stale peak from bricking the system.
+_IMPLAUSIBLE_DRAWDOWN_THRESHOLD = Decimal("0.50")  # 50%
+# If peak > 2× current equity AND peak > this floor, it's "implausibly stale"
+_IMPLAUSIBLE_PEAK_MULTIPLIER = Decimal("2.0")
 
 
 def _peak_equity_path() -> Path:
@@ -223,6 +229,7 @@ class InvariantMonitor:
         open_positions: List[Any],  # List of Position objects
         margin_utilization: Decimal,
         available_margin: Decimal,
+        refetch_equity_fn: Optional[Callable[[], Coroutine[Any, Any, Decimal]]] = None,
     ) -> SystemState:
         """
         Check all invariants and update system state.
@@ -234,6 +241,8 @@ class InvariantMonitor:
             open_positions: List of open Position objects
             margin_utilization: Current margin usage as decimal (0.0 - 1.0)
             available_margin: Available margin in USD
+            refetch_equity_fn: Optional async callable that re-fetches equity from exchange.
+                Used by the implausibility guard to double-check before halting.
             
         Returns:
             Current system state after checks
@@ -256,6 +265,95 @@ class InvariantMonitor:
         if self._peak_equity > 0:
             drawdown_pct = (self._peak_equity - current_equity) / self._peak_equity
             
+            # P0.4: IMPLAUSIBILITY GUARD
+            # If drawdown > 50%, the peak is likely stale (e.g., funds withdrawn,
+            # stale state file). Instead of halting + kill switch (which caused
+            # the 2026-02-14 incident), we:
+            #   1. Re-fetch equity twice to rule out API glitch
+            #   2. If peak > 2× confirmed equity, declare peak stale → DEGRADED, not HALTED
+            #   3. Alert operator to run safety_reset
+            if drawdown_pct > _IMPLAUSIBLE_DRAWDOWN_THRESHOLD:
+                confirmed_equity = current_equity
+                stale_peak_suspected = False
+                
+                # Re-fetch equity twice (2-3s apart) to rule out glitch
+                if refetch_equity_fn:
+                    try:
+                        await asyncio.sleep(2)
+                        eq1 = await refetch_equity_fn()
+                        await asyncio.sleep(2)
+                        eq2 = await refetch_equity_fn()
+                        
+                        # Use the average if they're consistent (within 5%)
+                        if eq1 > 0 and eq2 > 0:
+                            diff_pct = abs(eq1 - eq2) / max(eq1, eq2)
+                            if diff_pct < Decimal("0.05"):
+                                confirmed_equity = (eq1 + eq2) / 2
+                            else:
+                                # Inconsistent reads — use the lower (safer) value
+                                confirmed_equity = min(eq1, eq2)
+                            
+                            logger.warning(
+                                "DRAWDOWN_IMPLAUSIBILITY_REFETCH",
+                                equity_original=str(current_equity),
+                                equity_refetch_1=str(eq1),
+                                equity_refetch_2=str(eq2),
+                                equity_confirmed=str(confirmed_equity),
+                                peak_equity=str(self._peak_equity),
+                            )
+                    except (OperationalError, DataError, Exception) as e:
+                        logger.error(
+                            "DRAWDOWN_IMPLAUSIBILITY_REFETCH_FAILED",
+                            error=str(e),
+                            error_type=type(e).__name__,
+                        )
+                        # Continue with original equity — don't let refetch failure block the check
+                
+                # Recalculate drawdown with confirmed equity
+                drawdown_pct = (self._peak_equity - confirmed_equity) / self._peak_equity
+                
+                # Check if peak is implausibly stale:
+                # peak > 2× confirmed equity
+                if (
+                    drawdown_pct > _IMPLAUSIBLE_DRAWDOWN_THRESHOLD
+                    and self._peak_equity > _IMPLAUSIBLE_PEAK_MULTIPLIER * confirmed_equity
+                ):
+                    stale_peak_suspected = True
+                    logger.critical(
+                        "STALE_PEAK_EQUITY_SUSPECTED",
+                        peak_equity=str(self._peak_equity),
+                        confirmed_equity=str(confirmed_equity),
+                        drawdown_pct=f"{drawdown_pct:.1%}",
+                        action="DEGRADED_NOT_HALTED — run safety_reset to fix peak",
+                    )
+                    
+                    # Alert via Telegram
+                    try:
+                        from src.monitoring.alerting import send_alert_sync
+                        send_alert_sync(
+                            "STALE_PEAK_EQUITY",
+                            f"Peak equity likely stale!\n"
+                            f"Peak: ${self._peak_equity:.2f}\n"
+                            f"Current: ${confirmed_equity:.2f}\n"
+                            f"Computed drawdown: {drawdown_pct:.1%}\n\n"
+                            f"Action: System entering DEGRADED (not HALTED).\n"
+                            f"Run: python -m src.tools.safety_reset --mode soft",
+                            urgent=True,
+                        )
+                    except Exception:
+                        pass  # Alert failure must not block
+                    
+                    # DEGRADED instead of CRITICAL — freeze new entries, preserve positions
+                    violations.append(InvariantViolation(
+                        invariant="stale_peak_equity_suspected",
+                        threshold=f"peak={self._peak_equity}, equity={confirmed_equity}",
+                        actual=f"drawdown={drawdown_pct:.1%} (implausible)",
+                        severity="WARNING",
+                    ))
+                    # Skip the normal drawdown check — we've handled it
+                    drawdown_pct = Decimal("0")  # Reset so normal check below doesn't re-trigger
+            
+            # Normal drawdown checks (only fire if not already handled by implausibility guard)
             # Critical level
             if drawdown_pct > self.invariants.max_equity_drawdown_pct:
                 violations.append(InvariantViolation(

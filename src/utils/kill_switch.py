@@ -29,13 +29,40 @@ def _kill_switch_state_path() -> Path:
 
 
 class KillSwitchReason(str, Enum):
-    """Reasons for kill switch activation."""
+    """Reasons for kill switch activation.
+    
+    Categories (used by startup behavior logic):
+    - EMERGENCY_RUNTIME: Invariant K broken, naked positions, reconciliation failure.
+      On startup: allow emergency actions to finish IF recent (< 2 min).
+    - MARGIN_CRITICAL / LIQUIDATION_BREACH: Risk pressure.
+      On startup: enter SAFE_HOLD (cancel non-SL orders, verify stops, do NOT flatten).
+    - OPERATIONAL_HALT: Manual halt, config mismatch, drawdown latch, data issues.
+      On startup: enter SAFE_HOLD (cancel non-SL orders, verify stops, do NOT flatten).
+    """
     MANUAL = "manual"
     API_ERROR = "api_error"
     MARGIN_CRITICAL = "margin_critical"
     LIQUIDATION_BREACH = "liquidation_breach"
     DATA_FAILURE = "data_failure"
     RECONCILIATION_FAILURE = "reconciliation_failure"
+
+    @property
+    def is_emergency_runtime(self) -> bool:
+        """True if this reason is an emergency runtime failure that may need immediate action."""
+        return self in (
+            KillSwitchReason.RECONCILIATION_FAILURE,
+            KillSwitchReason.LIQUIDATION_BREACH,
+        )
+
+    @property
+    def allows_auto_flatten_on_startup(self) -> bool:
+        """True only if this reason justifies auto-flattening positions on startup.
+        
+        CRITICAL: Most reasons should NOT auto-flatten. The safest posture on
+        restart is 'freeze + preserve stops', not 'panic flatten'.
+        Only recent emergency runtime failures may auto-flatten.
+        """
+        return self.is_emergency_runtime
 
 
 class KillSwitch:

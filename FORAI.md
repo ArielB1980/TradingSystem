@@ -1084,3 +1084,42 @@ Fixes:
 
 ### Lesson Learned
 Making circuit breaker methods async has a blast radius: every caller site needs `await`. In a codebase with 20+ breaker call sites in a single file, use find-all-replace carefully. The payoff is worth it — race conditions in half-open state are subtle and hard to reproduce but can cause cascading API exhaustion.
+
+---
+
+## Postmortem Archive — Replay Harness Build Bugs
+
+Three real bugs were discovered and fixed during the replay harness build. They are documented here as canonical postmortems to prevent regression and "we solved this once" amnesia.
+
+### PM-1: MagicMock Leak into LiveTrading Sub-Components
+
+**Symptom:** `TypeError: '>=' not supported between instances of 'MagicMock' and 'int'` when running replay episodes on the production server. The first few ticks would work, then internal comparisons would fail.
+
+**Root cause:** `patch("src.live.live_trading.KrakenClient", return_value=self._exchange)` replaced the `KrakenClient` *class* with a `MagicMock`. During `LiveTrading.__init__`, sub-components (DataAcquisition, FuturesAdapter, KillSwitch, CandleManager) stored references to *attributes* on the mock class object (e.g., `KrakenClient.futures_exchange`), which were themselves `MagicMock` objects — not the real `ReplayKrakenClient` instance.
+
+**Fix:** Changed the patch strategy to `patch(side_effect=_fake_kraken_client)` where the side effect is a callable returning the real `ReplayKrakenClient`. Added belt-and-suspenders explicit re-wiring of `lt.client`, `lt.execution_gateway.client`, `lt.kill_switch.client`, `lt.data_acq.client`, `lt.futures_adapter.client`, and `lt.candle_manager.client`.
+
+**Regression test:** All 6 replay episodes (especially Episode 1 Normal Market) — a `MagicMock` leak causes immediate `TypeError` on the first tick comparison. Unit test `tests/unit/test_replay_harness.py::TestReplayKrakenClient` verifies exchange sim operations without mocks.
+
+### PM-2: Over-broad `datetime` Module Mocking
+
+**Symptom:** Same `TypeError: '>=' not supported between instances of 'MagicMock' and 'int'` — persisted after PM-1 fix. Occurred during `_tick()` internal time comparisons.
+
+**Root cause:** `patch("src.live.live_trading.datetime")` in `runner.py::_run_tick()` replaced the *entire* `datetime` module with a `MagicMock`. This meant `datetime.min`, `datetime.timedelta`, `datetime.now()` etc. were all `MagicMock` objects. Any code that compared a timestamp with an integer (e.g., staleness checks) hit a `TypeError`.
+
+**Fix:** Removed the `datetime` patch entirely. The `SimClock` already controls exchange-side time. `LiveTrading._tick()` using real wall-clock `datetime.now(timezone.utc)` for logging and staleness checks is acceptable in the replay context — these are non-safety-critical timestamps.
+
+**Regression test:** All 6 replay episodes. Any over-broad module mock causes immediate `TypeError` on first tick. The lesson: never mock an entire standard library module when you only need to control one specific call.
+
+### PM-3: Bug Injection Episode Continued Instead of Crashing
+
+**Symptom:** Episode 6 (bug injection) reported `FAIL: Process continued after bug injection (60 ticks, expected ≤ 31)`. The harness ran all 60 ticks instead of stopping after the injected `AttributeError`.
+
+**Root cause:** The `BacktestRunner.run()` method's `try/except` block caught all `Exception` types (which includes `AttributeError`) and logged + continued. This violated the episode's pass/fail contract: a programming bug (`AttributeError`) must crash the process.
+
+**Fix:** Added an explicit `except AttributeError as e:` handler in `run()` that logs the error and `break`s the tick loop — simulating a process crash. This matches the production behavior where `AttributeError` is a programming bug that should cause systemd to restart the service.
+
+**Regression test:** Episode 6 specifically — it passes only if the process stops ticking after the bug injection point (tick ≤ 31 out of 60). Unit test coverage verifies `AttributeError` is not silently swallowed.
+
+### Lesson Learned
+When building a replay harness that monkey-patches production code, the patch surface area is a liability. Each `patch()` is an assumption about what the patched module exposes. Prefer *dependency injection* (pass the fake client in) over *module-level patching* (replace the class at import time). When you must patch, patch the narrowest possible target: one method, not an entire module. Run on the real server early — mock leaks that pass locally may fail in production's import graph.

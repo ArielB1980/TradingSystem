@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full replay replay-episode replay-sweep audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full replay replay-episode replay-sweep audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals safety-reset safety-reset-soft safety-reset-hard clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -33,6 +33,8 @@ help:
 	@echo "  make cancel-all-place-stops       Cancel ALL orders, dry-run place SL per position"
 	@echo "  make cancel-all-place-stops-live  Cancel ALL orders, then place SL per position (STOP_PCT=2)"
 	@echo "  make check-signals  Fetch worker logs, verify system is scanning for signals (needs DO_API_TOKEN)"
+	@echo "  make safety-reset  Show current safety state (dry-run)"
+	@echo "  make safety-reset-soft  Clear halt + kill switch + peak (requires --i-understand)"
 	@echo "  make test          Run unit tests"
 	@echo "  make lint          Lint code with ruff"
 	@echo "  make format        Format code with ruff"
@@ -192,11 +194,13 @@ deploy:
 	@echo ""
 	@echo "This will:"
 	@echo "  1. Run pre-deployment tests"
-	@echo "  2. Commit and push to GitHub"
-	@echo "  3. Deploy to production server"
+	@echo "  2. Run replay gate (seed=42)"
+	@echo "  3. Commit and push to GitHub"
+	@echo "  4. Deploy to production server"
+	@echo "  (Set SKIP_REPLAY=1 to bypass replay gate)"
 	@echo ""
 	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
-	./scripts/deploy.sh
+	SKIP_REPLAY=$${SKIP_REPLAY:-0} ./scripts/deploy.sh
 
 deploy-quick:
 	@echo "=========================================="
@@ -303,6 +307,18 @@ check-signals:
 		echo "❌ .env.local not found. Add DO_API_TOKEN for remote log fetch."; \
 		exit 1; \
 	fi
+
+safety-reset:
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	$(PYTHON) -m src.tools.safety_reset --dry-run
+
+safety-reset-soft:
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	$(PYTHON) -m src.tools.safety_reset --mode soft --reset-peak-to-current --i-understand
+
+safety-reset-hard:
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	$(PYTHON) -m src.tools.safety_reset --mode hard --reset-peak-to-current --i-understand
 
 test:
 	@echo "Running unit tests..."

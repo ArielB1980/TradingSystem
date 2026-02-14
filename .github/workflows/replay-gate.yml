@@ -17,6 +17,8 @@ on:
       - 'src/data/kraken_client.py'
       - 'src/live/**'
       - 'src/utils/circuit_breaker.py'
+      - 'src/utils/kill_switch.py'
+      - 'src/tools/safety_reset.py'
       - 'src/backtest/replay_harness/**'
     branches: [main]
 
