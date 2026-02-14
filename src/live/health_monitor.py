@@ -61,8 +61,13 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
     """
     V2 protection monitor loop with escalation policy.
 
-    If a naked position is detected in prod live, fail closed by activating
-    the kill switch (emergency flatten).
+    If a naked position is detected in prod live, attempt self-healing
+    (place missing stop) before escalating to kill switch.
+
+    Escalation ladder:
+      1-4 consecutive detections → WARN, let main loop / self-heal fix it
+      5   consecutive detections → attempt to place missing stops ourselves
+      6+  still naked after heal → activate kill switch
 
     Startup grace: The first check is delayed by 3x the normal interval (90s
     by default) to give the main tick loop time to place missing stops after a
@@ -77,10 +82,14 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
     await asyncio.sleep(startup_grace_seconds)
 
     consecutive_naked_count: Dict[str, int] = {}
-    # Require 3 consecutive detections (90s at 30s interval) before emergency kill.
-    # This gives the stop-order poller (12s interval) multiple chances to detect
-    # and process a legitimate stop fill before we escalate to kill switch.
-    ESCALATION_THRESHOLD = 3
+    # Escalation thresholds:
+    # - At HEAL_THRESHOLD: attempt to place missing stops (self-heal)
+    # - At KILL_THRESHOLD: if still naked after heal attempt, activate kill switch
+    # At 30s intervals: heal at 150s, kill at 180s — gives the system 2.5 minutes
+    # to self-recover before any destructive action.
+    HEAL_THRESHOLD = 5
+    KILL_THRESHOLD = 6
+    _heal_attempted = False
 
     while lt.active:
         if not lt.active:
@@ -95,15 +104,18 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                 for s in naked:
                     consecutive_naked_count[s] = consecutive_naked_count.get(s, 0) + 1
 
+                max_count = max(consecutive_naked_count.get(s, 0) for s in naked)
+
+                # ── TIER 3: Kill switch (heal failed) ──
                 persistent_naked = [
                     s
                     for s in naked
-                    if consecutive_naked_count.get(s, 0) >= ESCALATION_THRESHOLD
+                    if consecutive_naked_count.get(s, 0) >= KILL_THRESHOLD
                 ]
 
                 if persistent_naked:
                     logger.critical(
-                        "NAKED_POSITIONS_DETECTED (persistent)",
+                        "NAKED_POSITIONS_DETECTED (persistent, self-heal failed)",
                         naked_symbols=persistent_naked,
                         details=results,
                         consecutive_counts={
@@ -118,17 +130,78 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                             KillSwitchReason.RECONCILIATION_FAILURE, emergency=True
                         )
                         return
-                else:
+                    continue
+
+                # ── TIER 2: Self-heal attempt (place missing stops) ──
+                heal_candidates = [
+                    s
+                    for s in naked
+                    if consecutive_naked_count.get(s, 0) >= HEAL_THRESHOLD
+                ]
+
+                if heal_candidates and not _heal_attempted:
+                    _heal_attempted = True
                     logger.warning(
-                        "NAKED_POSITIONS_DETECTED (first occurrence, giving time to self-heal)",
-                        naked_symbols=naked,
-                        details=results,
+                        "NAKED_POSITIONS: attempting self-heal (placing missing stops)",
+                        naked_symbols=heal_candidates,
                         consecutive_counts={
-                            s: consecutive_naked_count.get(s, 0) for s in naked
+                            s: consecutive_naked_count[s] for s in heal_candidates
                         },
                     )
+                    try:
+                        raw_positions = await lt.client.get_all_futures_positions()
+                        from src.live.protection_ops import place_missing_stops_for_unprotected
+                        await place_missing_stops_for_unprotected(
+                            lt, raw_positions, max_per_tick=10
+                        )
+                        # Brief pause for exchange to process the new orders
+                        await asyncio.sleep(5)
+                        # Re-check immediately
+                        results2 = await lt._protection_monitor.check_all_positions()
+                        still_naked = [s for s, ok in results2.items() if not ok]
+                        if not still_naked:
+                            logger.info(
+                                "Self-heal SUCCESS: naked positions now protected",
+                                healed_symbols=heal_candidates,
+                            )
+                            consecutive_naked_count.clear()
+                            _heal_attempted = False
+                            await asyncio.sleep(interval_seconds)
+                            continue
+                        else:
+                            logger.warning(
+                                "Self-heal PARTIAL: some positions still naked after stop placement",
+                                still_naked=still_naked,
+                                healed=[s for s in heal_candidates if s not in still_naked],
+                            )
+                            # Let it escalate to KILL_THRESHOLD on next iteration
+                    except Exception as e:
+                        logger.error(
+                            "Self-heal FAILED: could not place missing stops",
+                            error=str(e),
+                            error_type=type(e).__name__,
+                        )
+                    continue
+
+                # ── TIER 1: Warning (give time to self-heal) ──
+                logger.warning(
+                    "NAKED_POSITIONS_DETECTED (monitoring, self-heal pending)",
+                    naked_symbols=naked,
+                    details=results,
+                    consecutive_counts={
+                        s: consecutive_naked_count.get(s, 0) for s in naked
+                    },
+                    heal_at=HEAL_THRESHOLD,
+                    kill_at=KILL_THRESHOLD,
+                )
             else:
+                if consecutive_naked_count:
+                    logger.info(
+                        "Naked position counters cleared (all positions protected)",
+                        previous_counts=dict(consecutive_naked_count),
+                    )
                 consecutive_naked_count.clear()
+                _heal_attempted = False
         except asyncio.CancelledError:
             raise
         except Exception as e:

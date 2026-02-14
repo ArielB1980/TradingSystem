@@ -28,6 +28,27 @@ from src.monitoring.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _symbol_variants(position) -> List[str]:
+    """
+    Return a list of symbol format variants to try when fetching orders.
+    Handles the PF_XXXUSD / XXX/USD / XXX/USD:USD mismatch.
+    """
+    variants = []
+    sym = position.symbol
+    fs = getattr(position, "futures_symbol", None)
+    if fs and fs != sym:
+        variants.append(fs)
+    variants.append(sym)
+    # If sym is like "TON/USD", also try "TON/USD:USD" and "PF_TONUSD"
+    if "/" in sym and ":USD" not in sym:
+        variants.append(sym + ":USD")
+    base = sym.replace("/USD", "").replace("/", "").replace(":USD", "").upper()
+    pf = f"PF_{base}USD"
+    if pf not in variants:
+        variants.append(pf)
+    return variants
+
+
 # ============ STOP ORDER STATUS CLASSIFICATION ============
 # Kraken Futures stop orders go through:  untouched → entered_book → filled
 # CCXT may or may not normalize these.  We classify explicitly to avoid
@@ -870,6 +891,7 @@ class PositionProtectionMonitor:
                 is_protected = layer1_protected
                 
                 # ---- LAYER 2: Stop-fill verification before declaring naked ----
+                # Check the specific order ID stored on the position.
                 if not layer1_protected and position.stop_order_id:
                     layer2_protected = await self._check_stop_was_filled(
                         position, exchange_size
@@ -881,6 +903,21 @@ class PositionProtectionMonitor:
                             stop_order_id=position.stop_order_id,
                         )
                     is_protected = layer2_protected
+                
+                # ---- LAYER 3: Broad stop search via recent orders ----
+                # The position's stop_order_id may be stale (e.g. stop was replaced
+                # by protection_ops but in-memory position wasn't updated).  Search
+                # ALL recent orders for this symbol to find any alive stop we missed.
+                if not is_protected:
+                    layer3_protected = await self._check_any_stop_for_symbol(
+                        position, exchange_orders
+                    )
+                    if layer3_protected:
+                        logger.info(
+                            "Protection check: Layer 3 found alive stop via broad search",
+                            symbol=position.symbol,
+                        )
+                    is_protected = layer3_protected
                 
                 results[position.symbol] = is_protected
                 
@@ -895,6 +932,117 @@ class PositionProtectionMonitor:
                     )
         
         return results
+
+    async def _check_any_stop_for_symbol(
+        self,
+        position: ManagedPosition,
+        exchange_orders: List[Dict],
+    ) -> bool:
+        """
+        LAYER 3: Broad stop search.
+
+        The position's ``stop_order_id`` may be stale (e.g. stop was replaced
+        by protection_ops / trailing-stop logic but the in-memory
+        ``ManagedPosition`` was never updated).
+
+        This layer re-scans ``exchange_orders`` looking for ANY alive stop
+        order that matches the symbol, including orders with different IDs.
+        It also fetches recent closed orders to catch stops that just filled
+        in the last few seconds (race between open-order query and fill).
+
+        Returns True if a plausible stop exists (alive or recently filled).
+        """
+        from src.data.symbol_utils import (
+            normalize_symbol_for_position_match,
+            position_symbol_matches_order,
+        )
+
+        pos_norm = normalize_symbol_for_position_match(position.symbol)
+
+        # 3a. Re-scan open orders with relaxed matching (any stop-like order)
+        for order in exchange_orders:
+            order_symbol = str(order.get("symbol") or "")
+            if normalize_symbol_for_position_match(order_symbol) != pos_norm:
+                continue
+
+            info = order.get("info") or {}
+            otype = str(
+                order.get("type")
+                or info.get("orderType")
+                or info.get("type")
+                or ""
+            ).lower()
+
+            # Any order with a stopPrice / triggerPrice for this symbol counts
+            has_stop_price = (
+                order.get("stopPrice") is not None
+                or order.get("triggerPrice") is not None
+                or info.get("stopPrice") is not None
+                or info.get("triggerPrice") is not None
+            )
+            is_stop_type = any(
+                t in otype for t in ("stop", "stp", "stop_loss", "stop-loss")
+            )
+            if "take_profit" in otype or "take-profit" in otype:
+                is_stop_type = False
+
+            if not (has_stop_price or is_stop_type):
+                continue
+
+            status = str(order.get("status") or "").lower()
+            if status in ALIVE_STOP_STATUSES or status in FINAL_STOP_STATUSES:
+                filled = float(order.get("filled") or 0)
+                if status in ALIVE_STOP_STATUSES or filled > 0:
+                    logger.info(
+                        "Layer 3: found stop order via broad search",
+                        symbol=position.symbol,
+                        order_id=str(order.get("id") or "")[:16],
+                        status=status,
+                        filled=filled,
+                        order_type=otype,
+                    )
+                    # Update in-memory stop_order_id so Layer 2 works next time
+                    new_id = order.get("id")
+                    if new_id and status in ALIVE_STOP_STATUSES:
+                        position.stop_order_id = str(new_id)
+                        logger.info(
+                            "Layer 3: updated stale stop_order_id",
+                            symbol=position.symbol,
+                            new_stop_order_id=str(new_id)[:16],
+                        )
+                    return True
+
+        # 3b. If we still found nothing, try fetching the order by ID one more
+        #     time with a broader symbol (futures_symbol).  Sometimes CCXT needs
+        #     the exact exchange symbol, not the spot/unified one.
+        # (Skipped if no fetch_order capability)
+        fetch_order = getattr(self.client, "fetch_order", None)
+        if fetch_order and position.stop_order_id:
+            for sym_variant in _symbol_variants(position):
+                try:
+                    order_data = await fetch_order(position.stop_order_id, sym_variant)
+                    if order_data:
+                        status = str(order_data.get("status") or "").lower()
+                        if status in ALIVE_STOP_STATUSES:
+                            logger.info(
+                                "Layer 3: stop found via fetch_order with variant symbol",
+                                symbol=position.symbol,
+                                variant=sym_variant,
+                                status=status,
+                            )
+                            return True
+                        if status in FINAL_STOP_STATUSES and float(order_data.get("filled") or 0) > 0:
+                            logger.info(
+                                "Layer 3: stop was recently filled (variant symbol lookup)",
+                                symbol=position.symbol,
+                                variant=sym_variant,
+                                status=status,
+                            )
+                            return True
+                except Exception:
+                    continue
+
+        return False
 
     async def _check_stop_was_filled(
         self,
