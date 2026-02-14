@@ -1236,6 +1236,105 @@ class TestStopSemanticValidation:
             assert "expected stop variant" in call_str
 
     # ------------------------------------------------------------------
+    # Counters and raw dump
+    # ------------------------------------------------------------------
+
+    def test_error_counter_increments(self, long_position):
+        """Semantic error counter should increment per occurrence."""
+        order_data = {
+            "id": "stop-1", "side": "buy", "type": "stop",
+            "amount": 10, "reduceOnly": True, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+        assert monitor._semantic_error_counts.get("ZRO/USD", 0) == 0
+
+        with patch("src.execution.production_safety.logger"):
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+
+        assert monitor._semantic_error_counts["ZRO/USD"] == 2
+
+    def test_warning_counter_increments(self, long_position):
+        """Semantic warning counter should increment per occurrence."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 7, "reduceOnly": True, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+
+        with patch("src.execution.production_safety.logger"):
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+
+        assert monitor._semantic_warning_counts["ZRO/USD"] == 3
+
+    def test_reduceonly_missing_counter(self, long_position):
+        """reduceOnly=None should increment the missing counter."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 10, "reduceOnly": None, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+
+        with patch("src.execution.production_safety.logger"):
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+
+        assert monitor._reduceonly_missing_counts["ZRO/USD"] == 1
+
+    def test_raw_dump_emitted_once_per_symbol(self, long_position):
+        """Raw CCXT dump should only be logged once per symbol per reset cycle."""
+        order_data = {
+            "id": "stop-1", "side": "buy", "type": "stop",
+            "amount": 10, "reduceOnly": True, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+
+            # raw dump logged exactly once (first error only)
+            dump_calls = [
+                c for c in mock_logger.warning.call_args_list
+                if "raw order payload" in str(c).lower()
+            ]
+            assert len(dump_calls) == 1
+
+    def test_reset_clears_counters(self, long_position):
+        """reset_semantic_counters should clear all state."""
+        order_data = {
+            "id": "stop-1", "side": "buy", "type": "stop",
+            "amount": 10, "reduceOnly": None, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+
+        with patch("src.execution.production_safety.logger"):
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+
+        assert monitor._semantic_error_counts.get("ZRO/USD", 0) > 0
+
+        with patch("src.execution.production_safety.logger"):
+            monitor.reset_semantic_counters()
+
+        assert monitor._semantic_error_counts == {}
+        assert monitor._semantic_warning_counts == {}
+        assert monitor._reduceonly_missing_counts == {}
+        assert monitor._raw_dump_emitted == set()
+
+    def test_get_semantic_counts(self, long_position):
+        """get_semantic_counts should return current state for monitoring."""
+        monitor = self._make_monitor()
+        monitor._semantic_error_counts["ZRO/USD"] = 3
+        monitor._semantic_warning_counts["ZRO/USD"] = 1
+        monitor._reduceonly_missing_counts["ETH/USD"] = 2
+
+        counts = monitor.get_semantic_counts()
+        assert counts["errors"] == {"ZRO/USD": 3}
+        assert counts["warnings"] == {"ZRO/USD": 1}
+        assert counts["reduceonly_missing"] == {"ETH/USD": 2}
+
+    # ------------------------------------------------------------------
     # Integration: mismatches still don't change the verdict
     # ------------------------------------------------------------------
 

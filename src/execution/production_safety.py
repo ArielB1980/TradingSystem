@@ -771,6 +771,13 @@ class PositionProtectionMonitor:
         self.client = exchange_client
         self.registry = registry
         self.enforcer = protection_enforcer
+        # Per-symbol semantic mismatch counters (reset daily via reset_semantic_counters)
+        self._semantic_warning_counts: Dict[str, int] = {}
+        self._semantic_error_counts: Dict[str, int] = {}
+        self._reduceonly_missing_counts: Dict[str, int] = {}
+        # Track which symbols have had a raw dump emitted (once per symbol per reset)
+        self._raw_dump_emitted: Set[str] = set()
+        self._counters_reset_at: datetime = datetime.now(timezone.utc)
         self.persistence = persistence
         self._running = False
     
@@ -1075,27 +1082,87 @@ class PositionProtectionMonitor:
                     "(expected stop variant or stopPrice set)"
                 )
 
-        # --- Emit logs ---
+        # --- Emit logs + update counters ---
         stop_oid = str(order_data.get("id") or "")
+        sym = position.symbol
+
+        # Auto-reset counters daily
+        now = datetime.now(timezone.utc)
+        if (now - self._counters_reset_at).total_seconds() > 86400:
+            self.reset_semantic_counters()
+
+        # Structured quantity fields for quick triage (always included)
+        qty_fields = {
+            "stop_amount": order_data.get("amount"),
+            "remaining_qty": float(position.remaining_qty),
+            "stop_price": order_data.get("stopPrice"),
+        }
+
+        # Track reduceOnly=missing separately
+        if any("reduceOnly=missing" in i for i in issues):
+            self._reduceonly_missing_counts[sym] = self._reduceonly_missing_counts.get(sym, 0) + 1
 
         if critical:
+            self._semantic_error_counts[sym] = self._semantic_error_counts.get(sym, 0) + 1
+            error_count = self._semantic_error_counts[sym]
+
             logger.error(
                 "Stop semantic CRITICAL mismatch: stop is ALIVE but likely NOT correct protection",
-                symbol=position.symbol,
+                symbol=sym,
                 stop_order_id=stop_oid,
                 position_side=pos_side_str,
                 expected_close_side=expected_side,
                 order_side=order_side or "unknown",
                 critical_issues=critical,
                 other_issues=issues if issues else None,
+                error_count_today=error_count,
+                **qty_fields,
             )
+
+            # One-time raw CCXT dump per symbol for forensic diagnosis
+            if sym not in self._raw_dump_emitted:
+                self._raw_dump_emitted.add(sym)
+                logger.warning(
+                    "Stop semantic: raw order payload dump (first error for symbol today)",
+                    symbol=sym,
+                    stop_order_id=stop_oid,
+                    raw_order_data=order_data,
+                )
+
         elif issues:
+            self._semantic_warning_counts[sym] = self._semantic_warning_counts.get(sym, 0) + 1
+
             logger.warning(
                 "Stop semantic mismatch: stop is ALIVE but may not be correct protection",
-                symbol=position.symbol,
+                symbol=sym,
                 stop_order_id=stop_oid,
                 issues=issues,
+                warning_count_today=self._semantic_warning_counts[sym],
+                **qty_fields,
             )
+
+    def reset_semantic_counters(self) -> None:
+        """Reset daily semantic mismatch counters. Called automatically after 24h."""
+        if self._semantic_error_counts or self._semantic_warning_counts:
+            logger.info(
+                "Stop semantic counters reset (daily)",
+                error_counts=dict(self._semantic_error_counts) if self._semantic_error_counts else None,
+                warning_counts=dict(self._semantic_warning_counts) if self._semantic_warning_counts else None,
+                reduceonly_missing=dict(self._reduceonly_missing_counts) if self._reduceonly_missing_counts else None,
+            )
+        self._semantic_warning_counts.clear()
+        self._semantic_error_counts.clear()
+        self._reduceonly_missing_counts.clear()
+        self._raw_dump_emitted.clear()
+        self._counters_reset_at = datetime.now(timezone.utc)
+
+    def get_semantic_counts(self) -> Dict[str, Dict[str, int]]:
+        """Return current semantic mismatch counters (for monitoring/Telegram)."""
+        return {
+            "errors": dict(self._semantic_error_counts),
+            "warnings": dict(self._semantic_warning_counts),
+            "reduceonly_missing": dict(self._reduceonly_missing_counts),
+        }
     
     def _close_position_from_stop_fill(
         self,
