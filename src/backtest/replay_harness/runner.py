@@ -230,6 +230,17 @@ class BacktestRunner:
         if hasattr(lt, "execution_gateway"):
             lt.execution_gateway.client = self._exchange
 
+        # Advance startup state machine to READY so _tick() is allowed.
+        # In real production, LiveTrading.run() goes through SYNCING →
+        # RECONCILING → READY. In replay we skip that (no real exchange
+        # sync needed) and jump straight to READY.
+        from src.runtime.startup_phases import StartupPhase
+        if hasattr(lt, "_startup_sm"):
+            lt._startup_sm.advance_to(StartupPhase.SYNCING, reason="replay: skip to READY")
+            lt._startup_sm.advance_to(StartupPhase.RECONCILING, reason="replay: skip to READY")
+            lt._startup_sm.advance_to(StartupPhase.READY, reason="replay: all startup steps bypassed")
+            logger.info("REPLAY_STARTUP_READY", phase=lt._startup_sm.phase.value)
+
         self._live_trading = lt
 
     async def _run_tick(self) -> None:
