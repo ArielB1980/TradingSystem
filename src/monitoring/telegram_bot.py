@@ -224,10 +224,12 @@ class TelegramCommandHandler:
             pnl_pct = (upnl / notional * 100) if notional > 0 else Decimal("0")
             pnl_pct_sign = "+" if pnl_pct >= 0 else ""
             
+            from src.monitoring.alerting import fmt_price, fmt_size
+
             lines.append(
                 f"{side_emoji} <b>{symbol}</b> ({side})\n"
-                f"  Entry: ${entry:.4f} → Mark: ${mark:.4f}\n"
-                f"  Size: {size} ({leverage}x)\n"
+                f"  Entry: ${fmt_price(entry)} → Mark: ${fmt_price(mark)}\n"
+                f"  Size: {fmt_size(size)} ({leverage}x)\n"
                 f"  {pnl_emoji} P&L: {upnl_sign}${upnl:.2f} ({pnl_pct_sign}{pnl_pct:.1f}%)\n"
             )
         

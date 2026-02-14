@@ -307,7 +307,7 @@ async def save_trade_history(
 
         # Send close alert via Telegram
         try:
-            from src.monitoring.alerting import send_alert
+            from src.monitoring.alerting import send_alert, fmt_price
 
             pnl_sign = "+" if net_pnl >= 0 else ""
             pnl_emoji = "\u2705" if net_pnl >= 0 else "\u274c"
@@ -315,7 +315,7 @@ async def save_trade_history(
                 "POSITION_CLOSED",
                 f"{pnl_emoji} Position closed: {position.symbol}\n"
                 f"Side: {position.side.value.upper()}\n"
-                f"Entry: ${position.entry_price} \u2192 Exit: ${exit_price}\n"
+                f"Entry: ${fmt_price(position.entry_price)} \u2192 Exit: ${fmt_price(exit_price)}\n"
                 f"P&L: {pnl_sign}${net_pnl:.2f}\n"
                 f"Reason: {exit_reason}\n"
                 f"Duration: {holding_hours:.1f}h",

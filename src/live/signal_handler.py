@@ -259,14 +259,14 @@ async def handle_signal_v2(
 
     # Send alert for new position
     try:
-        from src.monitoring.alerting import send_alert_sync
+        from src.monitoring.alerting import send_alert_sync, fmt_price, fmt_size
 
         send_alert_sync(
             "NEW_POSITION",
             f"New {signal.signal_type.value} position\n"
             f"Symbol: {signal.symbol}\n"
-            f"Size: {position_size} @ ${mark_price}\n"
-            f"Stop: ${position.initial_stop_price}",
+            f"Size: {fmt_size(position_size)} @ ${fmt_price(mark_price)}\n"
+            f"Stop: ${fmt_price(position.initial_stop_price)}",
         )
     except Exception:
         pass  # Alert failure must never block trading

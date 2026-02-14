@@ -23,6 +23,52 @@ _last_alert_times: dict[str, datetime] = {}
 _RATE_LIMIT_SECONDS = 300
 
 
+def fmt_price(value) -> str:
+    """Format a price/stop for notification display.
+
+    Rules:
+      >= $1:    2 decimal places  (e.g. 4728.69)
+      >= $0.01: 4 decimal places  (e.g. 0.0312)
+      < $0.01:  6 decimal places  (e.g. 0.000042)
+      None/invalid: '-'
+    """
+    if value is None:
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if num == 0:
+        return "0.00"
+    abs_val = abs(num)
+    if abs_val >= 1:
+        return f"{num:,.2f}"
+    if abs_val >= 0.01:
+        return f"{num:,.4f}"
+    return f"{num:,.6f}"
+
+
+def fmt_size(value) -> str:
+    """Format a position size for notification display.
+
+    Uses enough decimals to be meaningful but caps at 4.
+    """
+    if value is None:
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    abs_val = abs(num)
+    if abs_val >= 100:
+        return f"{num:,.2f}"
+    if abs_val >= 1:
+        return f"{num:,.4f}"
+    if abs_val >= 0.01:
+        return f"{num:,.4f}"
+    return f"{num:,.6f}"
+
+
 def _is_telegram(url: str) -> bool:
     return "api.telegram.org" in url
 
