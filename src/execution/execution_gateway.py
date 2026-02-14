@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Callable, Optional, Dict, List, Callable, Awaitable
 from datetime import datetime, timezone
 import asyncio
+import time
 
 from src.execution.position_state_machine import (
     ManagedPosition,
@@ -41,6 +42,12 @@ from src.execution.production_safety import (
 )
 from src.domain.models import Side, OrderType
 from src.monitoring.logger import get_logger
+from src.exceptions import (
+    OperationalError,
+    DataError,
+    InvariantError,
+    CircuitOpenError,
+)
 
 logger = get_logger(__name__)
 
@@ -86,6 +93,65 @@ class ExecutionResult:
     filled_price: Optional[Decimal] = None
 
 
+class _OrderRateLimiter:
+    """Sliding-window token bucket for order rate limiting.
+
+    Two windows: per-minute and per-10-seconds.
+    Raises InvariantError if either limit is exceeded — this is a logic failure,
+    not a transient condition.
+    """
+
+    def __init__(
+        self,
+        max_per_minute: int = 60,
+        max_per_10s: int = 10,
+    ):
+        self.max_per_minute = max_per_minute
+        self.max_per_10s = max_per_10s
+        self._timestamps: list[float] = []  # monotonic timestamps of placed orders
+        self.orders_blocked_total: int = 0
+
+    def check_and_record(self) -> None:
+        """Check rate limits and record a new order. Raises InvariantError if exceeded."""
+        now = time.monotonic()
+        # Prune timestamps older than 60s
+        cutoff_60s = now - 60.0
+        self._timestamps = [t for t in self._timestamps if t > cutoff_60s]
+
+        # Check per-minute limit
+        if len(self._timestamps) >= self.max_per_minute:
+            self.orders_blocked_total += 1
+            raise InvariantError(
+                f"Order rate limit exceeded: {len(self._timestamps)} orders in last 60s "
+                f"(max {self.max_per_minute}/min). Possible runaway loop."
+            )
+
+        # Check per-10s limit
+        cutoff_10s = now - 10.0
+        recent_10s = sum(1 for t in self._timestamps if t > cutoff_10s)
+        if recent_10s >= self.max_per_10s:
+            self.orders_blocked_total += 1
+            raise InvariantError(
+                f"Order rate limit exceeded: {recent_10s} orders in last 10s "
+                f"(max {self.max_per_10s}/10s). Possible runaway loop."
+            )
+
+        # Record this order
+        self._timestamps.append(now)
+
+    @property
+    def orders_last_minute(self) -> int:
+        now = time.monotonic()
+        cutoff = now - 60.0
+        return sum(1 for t in self._timestamps if t > cutoff)
+
+    @property
+    def orders_last_10s(self) -> int:
+        now = time.monotonic()
+        cutoff = now - 10.0
+        return sum(1 for t in self._timestamps if t > cutoff)
+
+
 class ExecutionGateway:
     """
     Single point of order flow.
@@ -112,6 +178,7 @@ class ExecutionGateway:
         on_partial_close: Optional[Callable[[str], None]] = None,
         instrument_spec_registry=None,
         on_trade_recorded: Optional[Callable] = None,
+        startup_machine=None,
     ):
         """
         Initialize the execution gateway.
@@ -136,6 +203,7 @@ class ExecutionGateway:
 
         self._on_partial_close = on_partial_close
         self._on_trade_recorded = on_trade_recorded
+        self._startup_machine = startup_machine  # Optional P2.3 startup state machine
         self._stop_replacer: Optional[AtomicStopReplacer] = None
         self._wal: Optional[WriteAheadIntentLog] = None
         self._event_enforcer: Optional[EventOrderingEnforcer] = None
@@ -152,14 +220,22 @@ class ExecutionGateway:
         self.metrics = {
             "orders_submitted": 0,
             "orders_filled": 0,
+            "orders_placed": 0,
             "orders_cancelled": 0,
             "orders_rejected": 0,
             "events_processed": 0,
             "errors": 0,
             "trades_recorded_total": 0,
             "trade_record_failures_total": 0,
+            "orders_blocked_by_rate_limit_total": 0,
         }
-        
+
+        # P0.2: Global order rate limiter — prevents runaway loops
+        self._order_rate_limiter = _OrderRateLimiter(
+            max_per_minute=60,
+            max_per_10s=10,
+        )
+
         # Fee config for trade recorder (bps → fraction, loaded lazily)
         self._maker_fee_rate: Optional[Decimal] = None
         self._taker_fee_rate: Optional[Decimal] = None
@@ -296,12 +372,15 @@ class ExecutionGateway:
             )
             return (True, None)
             
-        except Exception as e:
-            # Log but don't block on errors - this is a safety net, not a gate
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            # Log but don't block on transient/data errors — liquidity is a soft gate
             logger.warning(
                 "Entry liquidity check error",
                 symbol=symbol,
                 error=str(e),
+                error_type=type(e).__name__,
             )
             return (True, None)
     
@@ -317,6 +396,25 @@ class ExecutionGateway:
         When provided for OPEN_POSITION, used instead of action.symbol (spot) so
         Kraken Futures receives the correct unified symbol.
         """
+        # P2.3: Gate order placement on startup readiness (if startup machine is wired)
+        if self._startup_machine is not None:
+            try:
+                self._startup_machine.assert_ready()
+            except AssertionError as e:
+                logger.error(
+                    "Order blocked: system not ready",
+                    action_type=action.type.value,
+                    symbol=action.symbol,
+                    startup_phase=self._startup_machine.phase.value,
+                    error=str(e),
+                )
+                return ExecutionResult(
+                    success=False,
+                    client_order_id=action.client_order_id,
+                    error=f"System not ready: {e}"
+                )
+        # P0.2: Global order rate limit
+        self._order_rate_limiter.check_and_record()
         try:
             if action.type == ActionType.OPEN_POSITION:
                 return await self._execute_entry(action, order_symbol=order_symbol)
@@ -353,13 +451,16 @@ class ExecutionGateway:
                     error=f"Unhandled action type: {action.type}"
                 )
                 
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate to kill switch
+        except (OperationalError, DataError) as e:
             self.metrics["errors"] += 1
             logger.error(
                 "Execution failed",
                 action_type=action.type.value,
                 symbol=action.symbol,
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
             )
             return ExecutionResult(
                 success=False,
@@ -410,12 +511,15 @@ class ExecutionGateway:
                     client_order_id=action.client_order_id,
                     error=f"Liquidity check failed: {liquidity_reason}"
                 )
-        except Exception as e:
-            # Don't block entry on liquidity check errors - log and proceed
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            # Don't block entry on transient/data errors — log and proceed
             logger.warning(
                 "Liquidity check failed with error, proceeding with entry",
                 symbol=exchange_symbol,
                 error=str(e),
+                error_type=type(e).__name__,
             )
 
         # Track pending order (store exchange_symbol for order-status polling)
@@ -483,11 +587,13 @@ class ExecutionGateway:
                 exchange_order_id=exchange_order_id
             )
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             pending.status = "failed"
             self.metrics["orders_rejected"] += 1
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"Entry order failed: {e}")
+            logger.error(f"Entry order failed: {e}", error_type=type(e).__name__)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -563,10 +669,12 @@ class ExecutionGateway:
                 exchange_order_id=exchange_order_id
             )
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             pending.status = "failed"
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"Close order failed: {e}")
+            logger.error(f"Close order failed: {e}", error_type=type(e).__name__)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -642,9 +750,11 @@ class ExecutionGateway:
                 exchange_order_id=exchange_order_id
             )
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"Partial close failed: {e}")
+            logger.error(f"Partial close failed: {e}", error_type=type(e).__name__)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -711,9 +821,11 @@ class ExecutionGateway:
                 exchange_order_id=exchange_order_id
             )
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"Stop placement failed: {e}")
+            logger.error(f"Stop placement failed: {e}", error_type=type(e).__name__)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -776,8 +888,8 @@ class ExecutionGateway:
                 try:
                     await self.client.cancel_order(position.stop_order_id, action.symbol)
                     self.metrics["orders_cancelled"] += 1
-                except Exception as e:
-                    logger.warning(f"Failed to cancel old stop: {e}")
+                except (OperationalError, DataError) as e:
+                    logger.warning(f"Failed to cancel old stop: {e}", error_type=type(e).__name__)
             if not position.update_stop(action.price):
                 return ExecutionResult(
                     success=False,
@@ -805,7 +917,9 @@ class ExecutionGateway:
                 success=True,
                 client_order_id=action.client_order_id
             )
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
             return ExecutionResult(
                 success=False,
@@ -863,6 +977,22 @@ class ExecutionGateway:
         # Determine TP side (opposite of position side)
         tp_side = "sell" if position.side == Side.LONG else "buy"
         
+        # Register pending order for fill tracking
+        pending = PendingOrder(
+            client_order_id=action.client_order_id,
+            position_id=action.position_id,
+            symbol=action.symbol,
+            exchange_symbol=exchange_symbol,
+            purpose=OrderPurpose.EXIT_TP,
+            side=Side.SHORT if position.side == Side.LONG else Side.LONG,
+            size=action.size,
+            price=action.price,
+            order_type=OrderType.LIMIT,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        self._pending_orders[action.client_order_id] = pending
+        self.metrics["orders_submitted"] += 1
+        
         self._wal_record_intent(action, "place_tp", price=action.price, size=action.size)
         
         try:
@@ -879,6 +1009,7 @@ class ExecutionGateway:
             )
             
             exchange_order_id = result.get("id")
+            pending.exchange_order_id = exchange_order_id
             self._order_id_map[exchange_order_id] = action.client_order_id
             self._wal_mark_sent(action.client_order_id, exchange_order_id)
             
@@ -887,12 +1018,6 @@ class ExecutionGateway:
                 position.tp1_order_id = exchange_order_id
             elif action.client_order_id and action.client_order_id.startswith("tp2-"):
                 position.tp2_order_id = exchange_order_id
-            
-            # Also track in tp_order_ids list for legacy compatibility
-            if not position.tp_order_ids:
-                position.tp_order_ids = []
-            if exchange_order_id not in position.tp_order_ids:
-                position.tp_order_ids.append(exchange_order_id)
             self.persistence.save_position(position)
             
             self.metrics["orders_placed"] += 1
@@ -911,9 +1036,11 @@ class ExecutionGateway:
                 exchange_order_id=exchange_order_id
             )
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"TP placement failed: {e}", symbol=action.symbol, price=str(action.price))
+            logger.error(f"TP placement failed: {e}", error_type=type(e).__name__, symbol=action.symbol, price=str(action.price))
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -942,13 +1069,13 @@ class ExecutionGateway:
             self.metrics["orders_cancelled"] += 1
             self._wal_mark_completed(action.client_order_id)
             
-            # Remove from position's tp_order_ids
+            # Clear the corresponding TP slot
             position = self.registry.get_position(action.symbol)
-            if position and position.tp_order_ids:
-                position.tp_order_ids = [
-                    oid for oid in position.tp_order_ids 
-                    if oid != order_id_to_cancel
-                ]
+            if position:
+                if position.tp1_order_id == order_id_to_cancel:
+                    position.tp1_order_id = None
+                elif position.tp2_order_id == order_id_to_cancel:
+                    position.tp2_order_id = None
                 self.persistence.save_position(position)
             
             logger.info("TP order cancelled", order_id=order_id_to_cancel, symbol=action.symbol)
@@ -957,9 +1084,11 @@ class ExecutionGateway:
                 success=True,
                 client_order_id=action.client_order_id
             )
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.warning(f"Failed to cancel TP order: {e}", order_id=action.client_order_id)
+            logger.warning(f"Failed to cancel TP order: {e}", error_type=type(e).__name__, order_id=action.client_order_id)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -987,9 +1116,11 @@ class ExecutionGateway:
                 success=True,
                 client_order_id=action.client_order_id
             )
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self._wal_mark_failed(action.client_order_id, str(e))
-            logger.error(f"Failed to flatten orphan: {e}")
+            logger.error(f"Failed to flatten orphan: {e}", error_type=type(e).__name__)
             return ExecutionResult(
                 success=False,
                 client_order_id=action.client_order_id,
@@ -1007,8 +1138,9 @@ class ExecutionGateway:
                 self._maker_fee_rate = Decimal(str(cfg.exchange.maker_fee_bps)) / Decimal("10000")
                 self._taker_fee_rate = Decimal(str(cfg.exchange.taker_fee_bps)) / Decimal("10000")
                 self._funding_rate_daily_bps = Decimal(str(cfg.exchange.funding_rate_daily_bps))
-            except Exception:
+            except (ImportError, AttributeError, KeyError, ValueError, TypeError) as e:
                 # Conservative defaults if config can't be loaded
+                logger.warning("Fee rate config load failed, using defaults", error=str(e))
                 self._maker_fee_rate = Decimal("0.0002")   # 2 bps
                 self._taker_fee_rate = Decimal("0.0005")   # 5 bps
                 self._funding_rate_daily_bps = Decimal("10")
@@ -1067,10 +1199,11 @@ class ExecutionGateway:
                         f"Duration: {holding_str}",
                         urgent=True,
                     )
-                except Exception as alert_err:
+                except (OperationalError, DataError, OSError, RuntimeError) as alert_err:
                     logger.warning(
                         "Failed to send POSITION_CLOSED alert (non-fatal)",
                         error=str(alert_err),
+                        error_type=type(alert_err).__name__,
                     )
                 
                 # ---- Fire callback (risk manager update, etc.) ----
@@ -1080,12 +1213,15 @@ class ExecutionGateway:
                         result = self._on_trade_recorded(position, trade)
                         if asyncio.iscoroutine(result):
                             await result
-                    except Exception as cb_err:
+                    except (OperationalError, DataError, RuntimeError) as cb_err:
                         logger.warning(
                             "on_trade_recorded callback failed (non-fatal)",
                             error=str(cb_err),
+                            error_type=type(cb_err).__name__,
                         )
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             self.metrics["trade_record_failures_total"] += 1
             logger.error(
                 "TRADE_RECORD_FAILURE",
@@ -1242,8 +1378,10 @@ class ExecutionGateway:
             sym = pending.exchange_symbol or pending.symbol
             try:
                 order_data = await fetch_order(oid, sym)
-            except Exception as e:
-                logger.debug("poll order fetch failed", order_id=oid, symbol=sym, error=str(e))
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
+                logger.debug("poll order fetch failed", order_id=oid, symbol=sym, error=str(e), error_type=type(e).__name__)
                 continue
             if not order_data:
                 continue
@@ -1253,9 +1391,123 @@ class ExecutionGateway:
                 follow_up = await self.process_order_update(order_data)
                 if follow_up:
                     processed += 1
-            except Exception as e:
-                logger.warning("process_order_update failed", order_id=oid, error=str(e))
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
+                logger.warning("process_order_update failed", order_id=oid, error=str(e), error_type=type(e).__name__)
         return processed
+    
+    # ========== EMERGENCY / BYPASS ORDERS ==========
+    
+    async def place_emergency_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        size,
+        price=None,
+        stop_price=None,
+        reduce_only: bool = True,
+        reason: str = "emergency",
+    ) -> ExecutionResult:
+        """
+        Place an order through the gateway without a ManagementAction.
+        
+        Used by self-heal paths (missing stops, ShockGuard) that previously
+        bypassed the gateway.  Enforces:
+        - startup readiness (READY only)
+        - circuit breaker (via client)
+        - WAL logging
+        - metrics
+        
+        Does NOT require a ManagedPosition or ManagementAction.
+        """
+        # Enforce startup gate
+        if self._startup_machine is not None and not self._startup_machine.is_ready:
+            logger.error(
+                "Emergency order blocked: system not ready",
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                reason=reason,
+                phase=self._startup_machine.phase.value,
+            )
+            return ExecutionResult(
+                success=False,
+                client_order_id=f"emergency-{reason}",
+                error=f"System not ready (phase={self._startup_machine.phase.value})",
+            )
+
+        # P0.2: Global order rate limit (emergency orders count too)
+        self._order_rate_limiter.check_and_record()
+
+        import uuid
+        client_oid = f"emg-{reason}-{uuid.uuid4().hex[:8]}"
+        self._wal_record_raw_intent(client_oid, reason, symbol=symbol, side=side, size=str(size))
+        
+        try:
+            params: Dict = {"reduceOnly": reduce_only}
+            if stop_price is not None:
+                params["stopPrice"] = float(stop_price)
+            
+            result = await self.client.create_order(
+                symbol=symbol,
+                type=order_type,
+                side=side,
+                amount=float(size),
+                price=float(price) if price else None,
+                params=params,
+            )
+            
+            exchange_oid = result.get("id")
+            self.metrics["orders_placed"] += 1
+            logger.info(
+                "Emergency order placed",
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                size=str(size),
+                reason=reason,
+                exchange_order_id=exchange_oid,
+            )
+            return ExecutionResult(
+                success=True,
+                client_order_id=client_oid,
+                exchange_order_id=exchange_oid,
+            )
+
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except (OperationalError, DataError) as e:
+            self.metrics["errors"] += 1
+            logger.error(
+                "Emergency order failed",
+                symbol=symbol,
+                reason=reason,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return ExecutionResult(
+                success=False,
+                client_order_id=client_oid,
+                error=str(e),
+            )
+    
+    def _wal_record_raw_intent(self, client_oid: str, reason: str, **kwargs) -> None:
+        """Record a raw intent to WAL for emergency orders."""
+        if self._wal:
+            try:
+                self._wal.record_intent(ActionIntent(
+                    client_order_id=client_oid,
+                    position_id=kwargs.get("symbol", "unknown"),
+                    action_type=reason,
+                    status=ActionIntentStatus.PENDING,
+                    created_at=datetime.now(timezone.utc),
+                    metadata=kwargs,
+                ))
+            except Exception:
+                pass  # WAL failure must not block emergency order
     
     # ========== BATCH OPERATIONS ==========
     
@@ -1353,13 +1605,15 @@ class ExecutionGateway:
         """
         Startup procedure.
         
-        1. Load persisted state
-        2. Sync with exchange
-        3. Resolve discrepancies
+        1. Load persisted state from SQLite
+        2. Sync with exchange (orphan/qty reconciliation)
+        3. Import phantom positions
+        4. Cross-validate with Postgres (P1.5 Option A: dual-DB fix)
+        5. Persist reconciled state to SQLite (single source of truth after startup)
         """
         logger.info("ExecutionGateway starting up...")
         
-        # Load persisted registry
+        # 1. Load persisted registry from SQLite
         persisted_registry = self.persistence.load_registry()
         
         # Merge into current registry
@@ -1367,17 +1621,129 @@ class ExecutionGateway:
             if pos.symbol not in self.registry._positions:
                 self.registry._positions[pos.symbol] = pos
         
-        # Sync with exchange
+        # 2. Sync with exchange (handles orphans, qty mismatches)
         sync_result = await self.sync_with_exchange()
         
-        # Auto-import phantom positions (exchange has, registry doesn't)
+        # 3. Auto-import phantom positions (exchange has, registry doesn't)
         await self._import_phantom_positions()
+        
+        # 4. Cross-validate with Postgres and enrich SQLite positions
+        enriched = self._enrich_from_postgres()
+        
+        # 5. Persist fully reconciled state to SQLite
+        self.persistence.save_registry(self.registry)
         
         logger.info(
             "ExecutionGateway startup complete",
             positions=len(self.registry.get_all_active()),
-            issues=len(sync_result.get("issues", []))
+            issues=len(sync_result.get("issues", [])),
+            pg_enriched=enriched,
         )
+    
+    def _enrich_from_postgres(self) -> int:
+        """
+        P1.5 Option A: Cross-validate SQLite positions against Postgres.
+        
+        For each active position in the registry, checks the Postgres `positions`
+        table for supplementary data. If SQLite is missing key fields (entry price,
+        stop, TP levels) that Postgres has, backfill them. Logs any discrepancies
+        between the two databases.
+        
+        Returns the number of positions enriched.
+        """
+        enriched_count = 0
+        try:
+            from src.storage.repository import get_active_positions
+            pg_positions = get_active_positions()
+        except Exception as e:
+            logger.warning(
+                "Postgres enrichment skipped (DB unavailable or no positions)",
+                error=str(e),
+            )
+            return 0
+        
+        # Build Postgres lookup by normalized symbol
+        from src.data.symbol_utils import normalize_symbol_for_position_match
+        pg_by_norm: dict = {}
+        for pg_pos in pg_positions:
+            norm = normalize_symbol_for_position_match(pg_pos.symbol)
+            pg_by_norm[norm] = pg_pos
+        
+        for pos in self.registry.get_all_active():
+            norm = normalize_symbol_for_position_match(pos.symbol)
+            pg_pos = pg_by_norm.get(norm)
+            if not pg_pos:
+                continue
+            
+            changed = False
+            
+            # Backfill missing entry price from Postgres
+            if (not pos.initial_entry_price or pos.initial_entry_price == 0) and pg_pos.entry_price:
+                logger.info(
+                    "ENRICH: backfilling entry price from Postgres",
+                    symbol=pos.symbol,
+                    pg_entry_price=str(pg_pos.entry_price),
+                )
+                pos.initial_entry_price = pg_pos.entry_price
+                changed = True
+            
+            # Backfill missing stop price from Postgres
+            if (not pos.current_stop_price or pos.current_stop_price == 0) and pg_pos.initial_stop_price:
+                logger.info(
+                    "ENRICH: backfilling stop price from Postgres",
+                    symbol=pos.symbol,
+                    pg_stop_price=str(pg_pos.initial_stop_price),
+                )
+                pos.current_stop_price = pg_pos.initial_stop_price
+                if not pos.initial_stop_price:
+                    pos.initial_stop_price = pg_pos.initial_stop_price
+                changed = True
+            
+            # Backfill missing stop order ID from Postgres
+            if not pos.stop_order_id and pg_pos.stop_loss_order_id:
+                logger.info(
+                    "ENRICH: backfilling stop_order_id from Postgres",
+                    symbol=pos.symbol,
+                    pg_stop_order_id=pg_pos.stop_loss_order_id,
+                )
+                pos.stop_order_id = pg_pos.stop_loss_order_id
+                changed = True
+            
+            # Backfill missing TP prices from Postgres
+            if (not pos.initial_tp1_price or pos.initial_tp1_price == 0) and pg_pos.tp1_price:
+                pos.initial_tp1_price = pg_pos.tp1_price
+                changed = True
+            if (not pos.initial_tp2_price or pos.initial_tp2_price == 0) and pg_pos.tp2_price:
+                pos.initial_tp2_price = pg_pos.tp2_price
+                changed = True
+            
+            # Log any significant entry price discrepancy (SQLite vs Postgres)
+            if pos.initial_entry_price and pg_pos.entry_price:
+                sqlite_ep = pos.initial_entry_price
+                pg_ep = pg_pos.entry_price
+                if pg_ep > 0:
+                    drift_pct = abs(sqlite_ep - pg_ep) / pg_ep
+                    if drift_pct > Decimal("0.001"):  # >0.1% drift
+                        logger.warning(
+                            "DRIFT: SQLite vs Postgres entry price mismatch >0.1%",
+                            symbol=pos.symbol,
+                            sqlite_entry=str(sqlite_ep),
+                            pg_entry=str(pg_ep),
+                            drift_pct=f"{float(drift_pct):.4%}",
+                        )
+            
+            if changed:
+                self.persistence.save_position(pos)
+                enriched_count += 1
+        
+        if enriched_count > 0:
+            logger.info(
+                "Postgres enrichment complete",
+                positions_enriched=enriched_count,
+                pg_positions_available=len(pg_positions),
+            )
+        
+        return enriched_count
     
     async def _import_phantom_positions(self) -> None:
         """
@@ -1393,8 +1759,10 @@ class ExecutionGateway:
         try:
             positions = await self.client.get_all_futures_positions()
             orders = await self.client.get_futures_open_orders()
-        except Exception as e:
-            logger.error("Failed to fetch positions for phantom import", error=str(e))
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to fetch positions for phantom import", error=str(e), error_type=type(e).__name__)
             return
         
         imported = 0
@@ -1464,7 +1832,7 @@ class ExecutionGateway:
                 raw_price = stop_order.get("price") or stop_order.get("stopPrice") or stop_order.get("triggerPrice") or 0
                 try:
                     stop_price = Decimal(str(raw_price)) if raw_price else None
-                except Exception:
+                except (ValueError, TypeError, ArithmeticError):
                     stop_price = None
                 stop_id = stop_order.get("id")
             
@@ -1517,8 +1885,8 @@ class ExecutionGateway:
                 self.persistence.save_position(managed_pos)
                 imported += 1
                 logger.info("Phantom position imported", symbol=symbol, qty=str(qty), stop=str(stop_price))
-            except Exception as e:
-                logger.error("Failed to import phantom position", symbol=symbol, error=str(e))
+            except (OperationalError, DataError, KeyError, ValueError) as e:
+                logger.error("Failed to import phantom position", symbol=symbol, error=str(e), error_type=type(e).__name__)
         
         if imported > 0:
             logger.info("Phantom positions imported", count=imported)
@@ -1529,5 +1897,8 @@ class ExecutionGateway:
             **self.metrics,
             "pending_orders": len(self._pending_orders),
             "active_positions": len(self.registry.get_all_active()),
-            "manager_metrics": self.position_manager.metrics
+            "manager_metrics": self.position_manager.metrics,
+            "orders_blocked_by_rate_limit_total": self._order_rate_limiter.orders_blocked_total,
+            "orders_per_minute_current": self._order_rate_limiter.orders_last_minute,
+            "orders_per_10s_current": self._order_rate_limiter.orders_last_10s,
         }

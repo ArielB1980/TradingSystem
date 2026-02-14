@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import os
+
+from src.exceptions import OperationalError, DataError
 import time
 import subprocess
 import sys
@@ -43,7 +45,7 @@ def _metrics_json() -> Tuple[dict, int]:
         snap = get_latest_metrics_snapshot()
         out = snap if snap is not None else {}
         return ({"source": "worker_snapshot", "metrics": out}, 200)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         return ({"source": "worker_snapshot", "metrics": {}, "error": str(e)[:100]}, 200)
 
 
@@ -65,7 +67,7 @@ def _metrics_prometheus() -> Tuple[str, int]:
             else:
                 continue
         return ("\n".join(lines) + "\n", 200)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         return (f"# error: {e}\n", 200)
 
 
@@ -128,7 +130,7 @@ def get_worker_health_app(enable_debug: bool = False) -> FastAPI:
                 with db.get_session() as session:
                     session.execute(text("SELECT 1;"))
                 out["database"] = "connected"
-            except Exception as e:
+            except (OperationalError, DataError, OSError) as e:
                 out["database"] = f"error: {str(e)[:80]}"
                 out["status"] = "unhealthy"
         else:
@@ -229,7 +231,7 @@ async def health():
             with db.get_session() as session:
                 session.execute(text("SELECT 1;"))
             checks["database"] = "connected"
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             checks["database"] = f"error: {str(e)[:80]}"
             checks["status"] = "unhealthy"
 
@@ -237,7 +239,7 @@ async def health():
         from src.utils.kill_switch import read_kill_switch_state
         ks = read_kill_switch_state()
         checks["kill_switch_active"] = bool(ks.get("active"))
-    except Exception:
+    except (OperationalError, OSError, ValueError, RuntimeError):
         pass
 
     try:
@@ -252,9 +254,9 @@ async def health():
                 age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
                 checks["last_tick_age_seconds"] = round(age_sec, 1)
                 checks["worker_stale"] = age_sec > 300
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 checks["worker_stale"] = None
-    except Exception:
+    except (OperationalError, DataError, OSError):
         pass
 
     status_code = 200 if checks["status"] == "healthy" else 503
@@ -314,7 +316,7 @@ async def quick_test():
             with db.get_session() as session:
                 session.execute(text("SELECT 1;"))
             results["database"] = "connected"
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             results["database"] = f"error: {str(e)[:50]}"
     else:
         results["database"] = "not_configured"
@@ -385,7 +387,7 @@ async def test_system():
             content={"status": "timeout", "message": "Tests took too long (120s timeout)"},
             status_code=504
         )
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         return JSONResponse(
             content={
                 "status": "error",
@@ -410,7 +412,7 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
             event_type="DECISION_TRACE",
             symbol=symbol_filter,
         )
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         return {
             "status": "error",
             "message": str(e),
@@ -435,7 +437,7 @@ def _debug_signals_impl(symbol_filter: Optional[str] = None) -> dict:
         if isinstance(data, str):
             try:
                 data = json.loads(data)
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 data = {"error": "failed to parse details"}
         signal = data.get("signal", "NONE")
         quality = data.get("setup_quality", 0)
@@ -492,7 +494,7 @@ def _format_ts_cet(ts: str) -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         local = dt.astimezone(_CET)
         return local.strftime("%d %b %Y, %H:%M %Z")
-    except Exception:
+    except (ValueError, TypeError, KeyError):
         return ts
 
 

@@ -3,6 +3,7 @@ Tests for InvariantMonitor - the hard safety limit enforcement system.
 
 These tests verify that critical production safety invariants are properly enforced.
 """
+import os
 import pytest
 from decimal import Decimal
 from datetime import datetime, timezone
@@ -17,6 +18,16 @@ from src.safety.invariant_monitor import (
     get_invariant_monitor,
     init_invariant_monitor,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_peak_equity_persistence(tmp_path, monkeypatch):
+    """Prevent peak equity persistence from leaking between tests.
+    
+    Points the state file to a temp directory so tests don't read/write
+    the real ~/.trading_system/peak_equity_state.json.
+    """
+    monkeypatch.setenv("PEAK_EQUITY_STATE_PATH", str(tmp_path / "peak_equity_state.json"))
 
 
 class MockPosition:
@@ -48,8 +59,8 @@ class TestSystemInvariants:
         
         assert inv.max_equity_drawdown_pct == Decimal("0.15")  # 15%
         assert inv.max_open_notional_usd == Decimal("500000")
-        assert inv.max_concurrent_positions == 10
-        assert inv.max_margin_utilization_pct == Decimal("0.85")
+        assert inv.max_concurrent_positions == 27  # Must be >= auction_max_positions (25)
+        assert inv.max_margin_utilization_pct == Decimal("0.92")
         assert inv.max_rejected_orders_per_cycle == 5
         assert inv.max_api_errors_per_minute == 10
     
@@ -157,10 +168,10 @@ class TestInvariantMonitor:
         """Exceeding max concurrent positions should trigger HALTED state."""
         monitor, kill_switch = monitor_with_kill_switch
         
-        # Create 12 positions (exceeds 10 limit)
+        # Create 30 positions (exceeds 27 limit)
         positions = [
             MockPosition(f"COIN{i}/USD", Decimal("10000"))
-            for i in range(12)
+            for i in range(30)
         ]
         
         state = await monitor.check_all(
@@ -176,17 +187,17 @@ class TestInvariantMonitor:
     @pytest.mark.asyncio
     async def test_margin_utilization_warning(self, monitor):
         """Multiple warning conditions should trigger DEGRADED state."""
-        # Create 9 positions (above degraded threshold of 8) + high margin
-        positions = [MockPosition(f"COIN{i}/USD", Decimal("10000")) for i in range(9)]
+        # Create 24 positions (above degraded threshold of 22) + high margin (above 85%)
+        positions = [MockPosition(f"COIN{i}/USD", Decimal("10000")) for i in range(24)]
         
         state = await monitor.check_all(
             current_equity=Decimal("100000"),
             open_positions=positions,
-            margin_utilization=Decimal("0.75"),  # Above 70% warning threshold
-            available_margin=Decimal("25000"),
+            margin_utilization=Decimal("0.88"),  # Above 85% warning threshold
+            available_margin=Decimal("12000"),
         )
         
-        # Two warnings (positions=9 > degraded threshold 8, margin=75% > 70%)
+        # Two warnings (positions=24 > degraded threshold 22, margin=88% > 85%)
         assert state == SystemState.DEGRADED
         assert not monitor.is_trading_allowed()  # No new entries in degraded
         assert monitor.is_management_allowed()

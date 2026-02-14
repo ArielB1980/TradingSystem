@@ -41,6 +41,7 @@ from decimal import Decimal
 from typing import Dict, List, Any, Optional
 import json
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -444,8 +445,8 @@ class DecisionAuditLogger:
             logger.debug("Decision audits flushed", count=len(self._buffer))
             self._buffer.clear()
             
-        except Exception as e:
-            logger.error("Failed to flush decision audits", error=str(e))
+        except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
+            logger.error("Failed to flush decision audits", error=str(e), error_type=type(e).__name__)
     
     def _count_by_symbol(self, audits: List[DecisionAudit]) -> Dict[str, int]:
         """Count decisions by symbol."""

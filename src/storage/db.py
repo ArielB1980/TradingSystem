@@ -13,6 +13,7 @@ from typing import Generator, Dict, Any
 import os
 import time
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 _pool_logger = get_logger("db.pool")
@@ -59,7 +60,7 @@ class Database:
         """Create all tables."""
         try:
             Base.metadata.create_all(bind=self.engine)
-        except Exception as e:
+        except (OperationalError, OSError) as e:
             error_str = str(e).lower()
             # Log but don't fail for permission errors - these need manual fix
             import logging
@@ -99,7 +100,7 @@ class Database:
                 try:
                     conn.execute(sqlalchemy.text(stmt))
                     conn.commit()
-                except Exception as e:
+                except (OperationalError, OSError) as e:
                     err = str(e).lower()
                     if "already exists" in err or "duplicate" in err:
                         pass  # Column already present
@@ -107,7 +108,7 @@ class Database:
                         logging.warning(f"Migration warning: {stmt!r} -> {e}")
                     try:
                         conn.rollback()
-                    except Exception:
+                    except (OperationalError, OSError):
                         pass
 
     def drop_all(self):
@@ -197,7 +198,7 @@ def get_db() -> Database:
                         f"Check DATABASE_URL environment variable. "
                         f"Current database: {db_name}, Environment: {env}"
                     )
-        except Exception as e:
+        except (ValueError, TypeError, KeyError, OSError) as e:
             logger.warning("Failed to parse DATABASE_URL for logging", error=str(e))
         
         _db_instance = Database(database_url)

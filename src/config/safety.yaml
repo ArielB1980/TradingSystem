@@ -32,10 +32,13 @@ safety:
     max_open_notional_usd: 500000
     
     # Maximum number of concurrent positions (CRITICAL)
-    max_concurrent_positions: 10
+    # MUST be >= risk.auction_max_positions (currently 25) to avoid false HALTs.
+    # If safety < operational limit, the invariant monitor will HALT the system
+    # every time the auction fills its budget — same class of bug as Bug #1.
+    max_concurrent_positions: 27
     
     # Warning level for concurrent positions (triggers DEGRADED)
-    degraded_concurrent_positions: 8
+    degraded_concurrent_positions: 22
     
     # Maximum margin utilization (CRITICAL)
     # Used margin / total margin
@@ -109,7 +112,7 @@ environments:
     invariants:
       max_equity_drawdown_pct: 0.15
       max_open_notional_usd: 500000
-      max_concurrent_positions: 10
+      max_concurrent_positions: 27
     cycle_guard:
       min_cycle_interval_seconds: 60
     reconciliation:

@@ -15,6 +15,7 @@ from typing import Dict
 
 from sqlalchemy import text, func
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 from src.storage.db import get_db
 
@@ -69,7 +70,7 @@ class DatabasePruner:
                 )
                 return count
 
-            except Exception as e:
+            except (OperationalError, OSError) as e:
                 session.rollback()
                 logger.error("Failed to prune decision traces", error=str(e))
                 return 0
@@ -112,7 +113,7 @@ class DatabasePruner:
                             cutoff=cutoff.isoformat(),
                         )
                     total_deleted += count
-                except Exception as e:
+                except (OperationalError, OSError) as e:
                     logger.error(
                         "Failed to prune candles",
                         timeframe=timeframe,
@@ -122,7 +123,7 @@ class DatabasePruner:
             if total_deleted > 0:
                 try:
                     session.commit()
-                except Exception as e:
+                except (OperationalError, OSError) as e:
                     session.rollback()
                     logger.error(
                         "Failed to commit candle pruning", error=str(e)
@@ -169,7 +170,7 @@ class DatabasePruner:
                     stats[f"candles_{tf}"] = cnt
 
                 logger.info("DB_TABLE_STATS", **stats)
-            except Exception as e:
+            except (OperationalError, OSError) as e:
                 logger.warning("Failed to gather table stats", error=str(e))
 
         return stats

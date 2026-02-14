@@ -30,6 +30,8 @@ from src.storage.repository import (
     sync_active_positions,
 )
 
+from src.exceptions import OperationalError, DataError
+
 if TYPE_CHECKING:
     from src.live.live_trading import LiveTrading
 
@@ -108,8 +110,8 @@ async def sync_positions(
         except asyncio.TimeoutError:
             logger.error("Timeout fetching futures positions during sync")
             raw_positions = []
-        except Exception as e:
-            logger.error("Failed to fetch futures positions", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to fetch futures positions", error=str(e), error_type=type(e).__name__)
             raw_positions = []
 
     # Convert to domain objects
@@ -118,9 +120,9 @@ async def sync_positions(
         try:
             pos_obj = convert_to_position(lt, p)
             active_positions.append(pos_obj)
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             logger.error(
-                "Failed to convert position object", data=str(p), error=str(e)
+                "Failed to convert position object", data=str(p), error=str(e), error_type=type(e).__name__
             )
 
     # Update Risk Manager
@@ -131,8 +133,8 @@ async def sync_positions(
         await asyncio.to_thread(
             sync_active_positions, lt.risk_manager.current_positions
         )
-    except Exception as e:
-        logger.error("Failed to sync positions to DB", error=str(e))
+    except (OperationalError, DataError, OSError) as e:
+        logger.error("Failed to sync positions to DB", error=str(e), error_type=type(e).__name__)
 
     logger.info(
         f"Active Portfolio: {len(active_positions)} positions",
@@ -195,8 +197,8 @@ async def sync_account_state(lt: "LiveTrading") -> None:
                 "Daily loss tracking initialized", starting_equity=str(equity)
             )
 
-    except Exception as e:
-        logger.error("Failed to sync account state", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Failed to sync account state", error=str(e), error_type=type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -291,8 +293,8 @@ async def save_trade_history(
                     urgent=daily_loss_pct
                     > Decimal(str(lt.config.risk.daily_loss_limit_pct)),
                 )
-        except Exception as e:
-            logger.warning("Failed to update daily P&L tracking", error=str(e))
+        except (OperationalError, DataError, ImportError) as e:
+            logger.warning("Failed to update daily P&L tracking", error=str(e), error_type=type(e).__name__)
 
         logger.info(
             "Trade saved to history",
@@ -320,12 +322,13 @@ async def save_trade_history(
                 f"Reason: {exit_reason}\n"
                 f"Duration: {holding_hours:.1f}h",
             )
-        except Exception:
-            pass  # Alert failure must never block trade history
+        except (OperationalError, ImportError, OSError) as e:
+            logger.debug("Alert failure (non-blocking)", error=str(e))
 
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.error(
             "Failed to save trade history",
             symbol=position.symbol,
             error=str(e),
+            error_type=type(e).__name__,
         )

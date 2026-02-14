@@ -13,6 +13,7 @@ from src.data.kraken_client import KrakenClient
 from src.strategy.smc_engine import SMCEngine
 from src.risk.risk_manager import RiskManager
 from src.risk.basis_guard import BasisGuard
+from src.exceptions import OperationalError, DataError
 from src.domain.models import Candle, Signal, SignalType, Position, Trade, Side
 from src.storage.repository import save_candle, save_trade
 from src.storage.db import init_db
@@ -459,8 +460,8 @@ class BacktestEngine:
             await asyncio.sleep(0.5) # Faster for backtest
             try:
                 batch = await self.client.get_spot_ohlcv(symbol, timeframe, since=since, limit=720)
-            except Exception as e:
-                logger.warning("Rate limit hit", error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.warning("Rate limit hit", error=str(e), error_type=type(e).__name__)
                 await asyncio.sleep(5.0)
                 continue
 

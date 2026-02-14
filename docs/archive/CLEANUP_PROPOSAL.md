@@ -199,3 +199,12 @@ So we have legacy PM + Executor still in the live path alongside V2 + Gateway. `
 - **Tests:** Root `test_*` moved to `tests/`.
 - **Docs:** SYSTEM_AUDIT and FIXES_NEEDED status updated; DIGITALOCEAN_APP_DEPLOYMENT notes `.do/app.yaml`.
 - **Dashboard servers:** `combined_server` and `unified_server` docstrings state dev-only.
+
+---
+
+## Implemented (2026-02-11)
+
+- **Duplicate import:** Removed duplicate `from datetime import datetime, timezone` in `position_manager_v2.py`.
+- **Deploy docs:** Merged `DEPLOY_WORKER_RUNCOMMAND.md` into `DEPLOYMENT_WORKER_RUNCOMMAND.md`; deleted duplicate.
+- **Dead code:** Removed `src/services/market_discovery.py` (duplicate of `src/data/market_discovery.py`; unused).
+- **discovered_markets_loader:** Fixed docstring to reference `src.data.market_discovery` (was `src.services.market_discovery`).

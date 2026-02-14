@@ -27,6 +27,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 # Load env vars
+from src.exceptions import OperationalError, DataError
 from dotenv import load_dotenv
 load_dotenv(project_root / ".env")
 load_dotenv(project_root / ".env.local")
@@ -54,7 +55,7 @@ def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
-    except Exception:
+    except (ValueError, TypeError, KeyError):
         return None
 
 
@@ -125,7 +126,7 @@ def _load_json_file(path: Path) -> Dict[str, Any]:
         with open(path, "r") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
-    except Exception:
+    except (ValueError, TypeError, KeyError, OSError):
         return {}
 
 
@@ -206,10 +207,10 @@ def parse_log_file(log_path: Path, max_lines: int = 2000) -> List[Dict]:
                 
                 entries.append(entry)
                 
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 continue
         
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, OSError) as e:
         print(f"Failed to parse log: {e}")
     
     return entries
@@ -262,7 +263,7 @@ def _fetch_latest_candle_prices(symbols: List[str]) -> Dict[str, Decimal]:
             for row in rows
             if row["close"]
         }
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"Failed to fetch candle prices: {e}")
         return {}
 
@@ -325,12 +326,12 @@ def fetch_positions() -> List[Dict]:
                         pnl = (mark - entry_d) * abs(size_d)
                     elif side == "short":
                         pnl = (entry_d - mark) * abs(size_d)
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 pass
             pos["calculated_pnl"] = pnl
 
         return positions
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"Failed to fetch positions: {e}")
         return []
 
@@ -561,7 +562,7 @@ def parse_traces(traces: List[Dict]) -> Dict:
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
-            except:
+            except (ValueError, TypeError, KeyError):
                 payload = {}
         
         # Track coin reviews
@@ -709,7 +710,7 @@ def generate_html(data: Dict, positions: List[Dict]) -> str:
             pnl = p.get("calculated_pnl", Decimal("0"))
             try:
                 total_pnl += Decimal(str(pnl))
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 pass
             pnl_val = float(pnl)
             pnl_color = "#3fb950" if pnl_val >= 0 else "#f85149"
@@ -1437,7 +1438,7 @@ def update_dashboard():
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Dashboard updated: {coins_count} coins, {len(data.get('signals', []))} signals, {len(positions)} positions")
         
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         import traceback
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Error updating dashboard: {e}")
         traceback.print_exc()
@@ -1449,7 +1450,7 @@ def update_dashboard():
                     f"[{datetime.now().strftime('%H:%M:%S')}] "
                     "Market discovery page refreshed"
                 )
-        except Exception as discovery_error:
+        except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as discovery_error:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"Warning: failed to refresh discovery page: {discovery_error}"

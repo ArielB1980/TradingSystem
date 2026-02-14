@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List
 
+from src.exceptions import OperationalError, DataError
 from src.execution.equity import calculate_effective_equity
 from src.monitoring.logger import get_logger
 from src.storage.repository import get_active_position
@@ -77,11 +78,12 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         pos.initial_stop_price = db_pos.initial_stop_price
                         if hasattr(db_pos, "tp_order_ids"):
                             pos.tp_order_ids = db_pos.tp_order_ids
-                except Exception as e:
+                except (OperationalError, DataError) as e:
                     logger.warning(
                         "Failed to fetch DB position for protection merge",
                         symbol=futures_symbol,
                         error=str(e),
+                        error_type=type(e).__name__,
                     )
 
                 is_protective_live = pos.stop_loss_order_id is not None or (
@@ -108,11 +110,12 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         spot_symbol = f"{base_sym}/USD"
                 meta.spot_symbol = spot_symbol
                 open_positions_meta.append(meta)
-            except Exception as e:
+            except (ValueError, TypeError, KeyError) as e:
                 logger.error(
                     "Failed to convert position for auction",
                     symbol=pos_data.get("symbol"),
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
 
         signals_count = len(lt.auction_signals_this_tick)
@@ -121,8 +124,8 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         # Refresh instrument spec registry
         try:
             await lt.instrument_spec_registry.refresh()
-        except Exception as e:
-            logger.warning("Instrument spec refresh failed before auction", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.warning("Instrument spec refresh failed before auction", error=str(e), error_type=type(e).__name__)
 
         auction_budget_margin = equity * Decimal(str(lt.config.risk.auction_max_margin_util))
 
@@ -233,11 +236,12 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         approved=decision.approved,
                         rejection_reasons=decision.rejection_reasons,
                     )
-            except Exception as e:
+            except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:
                 logger.error(
                     "Failed to create candidate signal for auction",
                     symbol=signal.symbol,
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
 
         portfolio_state = {
@@ -274,8 +278,8 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             try:
                 await lt.client.close_position(symbol)
                 logger.info("Auction: Closed position", symbol=symbol)
-            except Exception as e:
-                logger.error("Auction: Failed to close position", symbol=symbol, error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.error("Auction: Failed to close position", symbol=symbol, error=str(e), error_type=type(e).__name__)
 
         # Refresh margin after closes
         balance_after_closes = await lt.client.get_futures_balance()
@@ -398,7 +402,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     symbol=signal.symbol,
                     error=err_str,
                 )
-            except Exception as e:
+            except (OperationalError, DataError) as e:
                 opens_failed += 1
                 reason = type(e).__name__
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
@@ -406,6 +410,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     "Auction: Failed to open position",
                     symbol=signal.symbol,
                     error=str(e),
+                    error_type=type(e).__name__,
                     exc_info=True,
                 )
 
@@ -421,5 +426,5 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         if opens_executed > 0 or len(plan.closes) > 0:
             lt._reconcile_requested = True
 
-    except Exception as e:
-        logger.error("Failed to run auction allocation", error=str(e))
+    except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:
+        logger.error("Failed to run auction allocation", error=str(e), error_type=type(e).__name__)

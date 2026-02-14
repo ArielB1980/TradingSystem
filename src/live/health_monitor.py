@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
+from src.exceptions import OperationalError, DataError
 from src.execution.equity import calculate_effective_equity
 from src.monitoring.logger import get_logger
 from src.utils.kill_switch import KillSwitchReason
@@ -49,7 +50,7 @@ async def run_order_polling(lt: "LiveTrading", interval_seconds: int = 12) -> No
                 logger.info("Order poll processed updates", count=n)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning("Order poll failed", error=str(e))
 
 
@@ -190,7 +191,7 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                                     f"Attempts: {metrics['stop_self_heal_attempts_total']}",
                                     urgent=False,
                                 )
-                            except Exception:
+                            except (OperationalError, ImportError, OSError):
                                 pass
                             consecutive_naked_count.clear()
                             _heal_attempted = False
@@ -214,10 +215,10 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                                     f"Failures: {metrics['stop_self_heal_failures_total']}",
                                     urgent=True,
                                 )
-                            except Exception:
+                            except (OperationalError, ImportError, OSError):
                                 pass
                             # Let it escalate to KILL_THRESHOLD on next iteration
-                    except Exception as e:
+                    except (OperationalError, DataError) as e:
                         metrics["stop_self_heal_failures_total"] += 1
                         logger.error(
                             "Self-heal FAILED: could not place missing stops",
@@ -235,7 +236,7 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                                 f"Failures: {metrics['stop_self_heal_failures_total']}",
                                 urgent=True,
                             )
-                        except Exception:
+                        except (OperationalError, ImportError, OSError):
                             pass
                     continue
 
@@ -281,7 +282,7 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                 )
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Protection check loop failed",
                 error=str(e),
@@ -372,7 +373,7 @@ async def run_trade_starvation_monitor(
                 closed_in_window = await asyncio.to_thread(count_trades_opened_since, cutoff)
                 open_in_window = await asyncio.to_thread(count_open_positions_opened_since, cutoff)
                 db_evidence = closed_in_window + open_in_window
-            except Exception:
+            except (OperationalError, DataError, OSError):
                 pass  # If DB unavailable, rely on cycle history only
 
             if window_signals >= min_signals_threshold and window_orders == 0:
@@ -419,7 +420,7 @@ async def run_trade_starvation_monitor(
 
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Trade starvation monitor failed",
                 error=str(e),
@@ -532,7 +533,7 @@ async def run_winner_churn_monitor(
 
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Winner churn monitor failed",
                 error=str(e),
@@ -585,7 +586,7 @@ async def run_trade_recording_monitor(
                 from src.storage.repository import get_trades_since
                 trades = await asyncio.to_thread(get_trades_since, cutoff)
                 trades_in_window = len(trades)
-            except Exception:
+            except (OperationalError, DataError, OSError):
                 pass  # DB may not be available
 
             # Check gateway failure counter
@@ -612,7 +613,7 @@ async def run_trade_recording_monitor(
                         "Check trade_recorder logs for TRADE_RECORD_FAILURE.",
                         urgent=False,
                     )
-                except Exception:
+                except (OperationalError, ImportError, OSError):
                     pass
             elif trades_in_window > 0 and _alerted:
                 _alerted = False
@@ -639,7 +640,7 @@ async def run_trade_recording_monitor(
 
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Trade recording monitor failed",
                 error=str(e),
@@ -681,7 +682,7 @@ async def get_system_status(lt: "LiveTrading") -> dict:
         result["margin_pct"] = (
             float((margin_used / equity) * 100) if equity > 0 else 0
         )
-    except Exception as e:
+    except (OperationalError, DataError) as e:
         logger.warning("Status: failed to get equity", error=str(e))
 
     try:
@@ -705,11 +706,11 @@ async def get_system_status(lt: "LiveTrading") -> dict:
                             p["unrealized_pnl"] = (mark - entry) * size
                         else:
                             p["unrealized_pnl"] = (entry - mark) * size
-            except Exception as e:
+            except (ValueError, TypeError, ArithmeticError, KeyError) as e:
                 logger.debug("Status: failed to enrich mark prices", error=str(e))
         
         result["positions"] = active_positions
-    except Exception as e:
+    except (OperationalError, DataError) as e:
         logger.warning("Status: failed to get positions", error=str(e))
 
     # System state
@@ -729,7 +730,7 @@ async def get_system_status(lt: "LiveTrading") -> dict:
     try:
         from src.storage.db import get_pool_status
         result["db_pool"] = get_pool_status()
-    except Exception:
+    except (OperationalError, DataError, OSError, ImportError):
         pass
 
     return result
@@ -789,7 +790,7 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
                                     p["unrealized_pnl"] = (mark - entry) * size
                                 else:
                                     p["unrealized_pnl"] = (entry - mark) * size
-                    except Exception:
+                    except (ValueError, TypeError, ArithmeticError, KeyError):
                         pass  # Graceful fallback to 0
 
                 today_trades = []
@@ -799,7 +800,7 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
                     since = now - timedelta(hours=24)
                     all_trades = await asyncio.to_thread(get_trades_since, since)
                     today_trades = all_trades if all_trades else []
-                except Exception:
+                except (OperationalError, DataError, OSError):
                     pass
 
                 wins = sum(
@@ -863,14 +864,14 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
 
                 lt.risk_manager.reset_daily_metrics(equity)
 
-            except Exception as e:
+            except (OperationalError, DataError) as e:
                 logger.warning(
                     "Failed to gather daily summary data", error=str(e)
                 )
 
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning("Daily summary loop error", error=str(e))
             await asyncio.sleep(3600)
 
@@ -1027,12 +1028,12 @@ async def try_auto_recovery(lt: "LiveTrading") -> bool:
                 f"Recovery #{len(lt._auto_recovery_attempts)} of {lt._AUTO_RECOVERY_MAX_PER_DAY}/day",
                 urgent=True,
             )
-        except Exception:
+        except (OperationalError, ImportError, OSError):
             pass
 
         return True
 
-    except Exception as e:
+    except (OperationalError, DataError) as e:
         logger.warning(
             "Auto-recovery: failed to check margin", error=str(e)
         )

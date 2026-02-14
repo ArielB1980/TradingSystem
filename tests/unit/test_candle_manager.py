@@ -36,7 +36,8 @@ async def test_update_candles_futures_fallback_when_spot_fails():
     """When spot OHLCV fails and use_futures_fallback=True, we use futures OHLCV."""
     with patch("src.data.candle_manager.get_latest_candle_timestamp", return_value=None):
         client = MagicMock()
-        client.get_spot_ohlcv = AsyncMock(side_effect=Exception("BadSymbol"))
+        from src.exceptions import DataError
+        client.get_spot_ohlcv = AsyncMock(side_effect=DataError("BadSymbol"))
         client.get_futures_ohlcv = AsyncMock(
             return_value=[
                 _candle("PF_ZILUSD", "15m", datetime.now(timezone.utc)),

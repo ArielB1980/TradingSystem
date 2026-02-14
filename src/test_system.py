@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.exceptions import OperationalError, DataError
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
 from src.storage.db import get_db
@@ -51,7 +52,7 @@ async def test_database():
                 result.fetchone()
                 print(f"✅ Database connected: {database_url.split('://')[0] if database_url else 'default'}")
             return True
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"❌ Database connection failed: {e}")
         return False
 
@@ -87,7 +88,7 @@ async def test_kraken_api(config):
                     print(f"✅ Futures API working - Balance retrieved")
                 else:
                     print("⚠️  Futures API returned no balance data")
-            except Exception as e:
+            except (OperationalError, DataError) as e:
                 print(f"⚠️  Futures API test failed (may need valid credentials): {e}")
         else:
             print("⚠️  Futures API credentials not configured")
@@ -95,7 +96,7 @@ async def test_kraken_api(config):
         await client.close()
         return True
         
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"❌ Kraken API connection failed: {e}")
         return False
 
@@ -145,7 +146,7 @@ async def test_data_acquisition(config):
                     success_count += 1
                 else:
                     print(f"    ⚠️  {symbol}: No candles returned")
-            except Exception as e:
+            except (OperationalError, DataError, OSError) as e:
                 print(f"    ❌ {symbol}: Failed - {e}")
         
         await client.close()
@@ -157,7 +158,7 @@ async def test_data_acquisition(config):
             print(f"\n❌ Data acquisition failed - No candles retrieved")
             return False
         
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"❌ Data acquisition test failed: {e}")
         import traceback
         traceback.print_exc()
@@ -239,7 +240,7 @@ async def test_signal_processing(config):
         await client.close()
         return True
         
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError) as e:
         print(f"❌ Signal processing test failed: {e}")
         import traceback
         traceback.print_exc()
@@ -258,7 +259,7 @@ async def run_all_tests():
         config = load_config(config_path)
         setup_logging(config.monitoring.log_level, config.monitoring.log_format)
         print(f"✅ Config loaded from {config_path}")
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         print(f"❌ Failed to load config: {e}")
         return False
     

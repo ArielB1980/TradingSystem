@@ -75,8 +75,8 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
         
         return count
         
-    except Exception as e:
-        logger.warning("Failed to query stop-outs", symbol=symbol, error=str(e))
+    except (OperationalError, DataError, OSError) as e:
+        logger.warning("Failed to query stop-outs", symbol=symbol, error=str(e), error_type=type(e).__name__)
         return 0
 
 
@@ -401,9 +401,9 @@ class SMCEngine:
                             elif ratio_val < self.config.atr_confirmation_threshold_low:
                                 required_candles = self.config.min_confirmation_candles
 
-                except Exception as e:
+                except (ValueError, TypeError, ArithmeticError, KeyError) as e:
                     # Fallback to default if ATR calc fails
-                    logger.warning("Adaptive confirmation failed, using default", error=str(e))
+                    logger.warning("Adaptive confirmation failed, using default", error=str(e), error_type=type(e).__name__)
 
             
             if ms_change:

@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Optional, Dict, Tuple, Any
 import json
+from src.exceptions import OperationalError, DataError
 from src.storage.db import Base, get_db
 from src.domain.models import Candle, Trade, Position, Side
 from src.monitoring.logger import get_logger
@@ -222,7 +223,7 @@ def save_candle(candle: Candle) -> None:
                 volume=candle.volume,
             )
             session.add(candle_model)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.error("Failed to save candle", symbol=candle.symbol, timeframe=candle.timeframe, error=str(e))
         raise  # Re-raise to allow caller to handle
 
@@ -305,7 +306,7 @@ def save_candles_bulk(candles: List[Candle]) -> int:
                         session.add(candle_model)
         
         return len(candles)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.error("Failed to save candles bulk", error=str(e), count=len(candles) if candles else 0)
         return 0  # Return 0 on failure (caller can retry)
 
@@ -568,7 +569,7 @@ def save_position(position: Position) -> None:
                     opened_at=position.opened_at,
                 )
                 session.add(position_model)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.error("Failed to save position", symbol=position.symbol, error=str(e))
         raise  # Re-raise - position persistence is critical
 
@@ -913,7 +914,7 @@ def record_event(
         
     try:
         details_json = json.dumps(details, default=decimal_default)
-    except Exception as e:
+    except (ValueError, TypeError) as e:
         details_json = json.dumps({"error": str(e), "original_type": str(type(details))})
     
     try:
@@ -927,7 +928,7 @@ def record_event(
                 details=details_json
             )
             session.add(event)
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.error("Failed to record event", event_type=event_type, symbol=symbol, error=str(e))
         # Don't re-raise - event logging failures shouldn't crash the system
 
@@ -1030,7 +1031,7 @@ def get_last_signal_per_symbol(limit_events: int = 2000) -> Dict[str, datetime]:
                             continue
                     out[sym] = ts
             return out
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.warning("get_last_signal_per_symbol failed, falling back to empty", error=str(e))
         return {}
 

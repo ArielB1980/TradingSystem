@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 from src.recording.models import MarketSnapshot
 from src.storage.db import Base
@@ -91,12 +92,12 @@ def _query_candle_meta(symbol: str) -> tuple[Dict[str, Optional[str]], Dict[str,
         try:
             ts = get_latest_candle_timestamp(symbol, tf)
             last_ts[tf] = ts.isoformat() if ts else None
-        except Exception:
+        except (OperationalError, DataError, OSError):
             last_ts[tf] = None
 
         try:
             counts[tf] = count_candles(symbol, tf)
-        except Exception:
+        except (OperationalError, DataError, OSError):
             counts[tf] = 0
 
     return last_ts, counts
@@ -123,8 +124,8 @@ async def _record_cycle(
     )
     try:
         tickers = await client.get_futures_tickers_bulk_full()
-    except Exception as exc:
-        logger.warning("bulk_ticker_fetch_failed", error=str(exc))
+    except (OperationalError, DataError) as exc:
+        logger.warning("bulk_ticker_fetch_failed", error=str(exc), error_type=type(exc).__name__)
         tickers = {}
     finally:
         await client.close()
@@ -135,7 +136,7 @@ async def _record_cycle(
         try:
             snap = _build_snapshot(symbol, now_utc, tickers)
             snapshots.append(snap)
-        except Exception as exc:
+        except (OperationalError, DataError, ValueError, TypeError, KeyError) as exc:
             # Record error snapshot so we have continuity
             snapshots.append(MarketSnapshot(
                 ts_utc=now_utc,
@@ -154,9 +155,9 @@ async def _record_cycle(
             ts=now_utc.isoformat(),
             tickers_available=len(tickers),
         )
-    except Exception as exc:
+    except (OperationalError, DataError, OSError) as exc:
         session.rollback()
-        logger.error("recording_batch_insert_failed", error=str(exc))
+        logger.error("recording_batch_insert_failed", error=str(exc), error_type=type(exc).__name__)
     finally:
         session.close()
 
@@ -249,9 +250,9 @@ async def run_recorder(
         try:
             written = await _record_cycle(symbols, session_factory, db_url)
             backoff = 0  # reset on success
-        except Exception as exc:
+        except (OperationalError, DataError, OSError) as exc:
             backoff = min(backoff * 2 or 2, 60)
-            logger.error("recording_cycle_error", error=str(exc), backoff=backoff)
+            logger.error("recording_cycle_error", error=str(exc), error_type=type(exc).__name__, backoff=backoff)
             await asyncio.sleep(backoff)
             continue
 

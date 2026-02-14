@@ -22,6 +22,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from src.exceptions import OperationalError, DataError
 from src.config.config import load_config
 from src.monitoring.logger import setup_logging, get_logger
 from src.data.kraken_client import KrakenClient
@@ -65,8 +66,8 @@ class IntegrationTest:
             # 3. Verify Results
             self._verify_results()
             
-        except Exception as e:
-            logger.error(f"Integration test failed: {e}", exc_info=True)
+        except (OperationalError, DataError, OSError) as e:
+            logger.error("Integration test failed", error=str(e), error_type=type(e).__name__, exc_info=True)
             self.errors.append(f"Test execution failed: {e}")
         
         finally:
@@ -97,7 +98,7 @@ class IntegrationTest:
                     self.warnings.append(f"No candles returned for {symbol}")
                 else:
                     logger.info(f"✓ Fetched {len(candles)} candles for {symbol}")
-            except Exception as e:
+            except (OperationalError, DataError, OSError) as e:
                 self.errors.append(f"Failed to fetch {symbol}: {e}")
         
         logger.info("Data acquisition test complete")
@@ -145,10 +146,10 @@ class IntegrationTest:
                 
                 self.stats['symbols_analyzed'] += 1
                 
-            except Exception as e:
+            except (OperationalError, DataError, OSError, ValueError, TypeError) as e:
                 self.errors.append(f"Error testing {symbol}: {e}")
                 self.stats['errors'] += 1
-                logger.error(f"Error testing {symbol}: {e}")
+                logger.error("Error testing symbol", symbol=symbol, error=str(e), error_type=type(e).__name__)
         
         logger.info("Trading service test complete")
     
@@ -180,10 +181,10 @@ class IntegrationTest:
             else:
                 self.errors.append(f"No signal returned for {symbol}")
         
-        except Exception as e:
+        except (ValueError, TypeError, ArithmeticError, KeyError) as e:
             # This is what we're trying to catch - bugs like trigger_price UnboundLocalError
             self.errors.append(f"Signal generation failed for {symbol}: {e}")
-            logger.error(f"✗ Signal generation failed for {symbol}: {e}")
+            logger.error("Signal generation failed for symbol", symbol=symbol, error=str(e), error_type=type(e).__name__)
             raise  # Re-raise to fail the test
     
     def _get_test_markets(self):

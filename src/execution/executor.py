@@ -21,6 +21,7 @@ from src.config.config import ExecutionConfig
 from src.monitoring.logger import get_logger
 from src.data.symbol_utils import normalize_symbol_for_position_match
 from src.data.fiat_currencies import has_disallowed_base
+from src.exceptions import OperationalError, DataError, InvariantError
 
 logger = get_logger(__name__)
 
@@ -106,8 +107,8 @@ class Executor:
                             await self.futures_adapter.cancel_order(order_id0, sym)
                         # Do not sync this order into local state; it's being removed.
                         continue
-                except Exception as e:
-                    logger.warning("Failed excluded-base order cleanup during sync; continuing", error=str(e))
+                except (OperationalError, DataError) as e:
+                    logger.warning("Failed excluded-base order cleanup during sync; continuing", error=str(e), error_type=type(e).__name__)
 
                 # Map CCXT structure to our Order domain model
                 
@@ -171,11 +172,12 @@ class Executor:
                 active_submission_count=len(self.submitted_orders)
             )
             
-        except Exception as e:
-            logger.error("Failed to sync open orders in Executor", error=str(e))
-            # Critical: We should probably raise here or ensure we don't trade blindly?
-            # For now, log error, as system can technically recover by active checks,
-            # but duplicate guard might be weak.
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to sync open orders in Executor", error=str(e), error_type=type(e).__name__)
+            # Transient API failures here are recoverable via next sync cycle.
+            # If persistent, circuit breaker will halt API calls.
 
     
     async def execute_signal(
@@ -311,11 +313,12 @@ class Executor:
                         # Sync this order to local state
                         await self.sync_open_orders()
                         return None
-                except Exception as e:
+                except (OperationalError, DataError) as e:
                     logger.warning(
                         "Failed to check exchange orders, proceeding with local check only",
                         symbol=futures_symbol,
-                        error=str(e)
+                        error=str(e),
+                        error_type=type(e).__name__,
                     )
 
 
@@ -377,7 +380,9 @@ class Executor:
                 
                 return entry_order
                 
-            except Exception as e:
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
                 err = str(e)
                 insufficient = "insufficient" in err.lower() or "insufficientavailablefunds" in err.lower()
                 if insufficient:
@@ -385,12 +390,14 @@ class Executor:
                         "Insufficient funds, skipping entry",
                         symbol=order_intent.signal.symbol,
                         error=err[:200],
+                        error_type=type(e).__name__,
                     )
                 else:
                     logger.error(
                         "Failed to submit entry order",
                         symbol=order_intent.signal.symbol,
                         error=err,
+                        error_type=type(e).__name__,
                     )
                 # CRITICAL: Add intent_hash even on failure to prevent immediate retry
                 self.order_intents_seen.add(intent_hash)
@@ -474,7 +481,9 @@ class Executor:
                     tp_order_id=tp_order.order_id,
                     price=str(take_profit_price),
                 )
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             logger.error(
                 "Failed to place protective orders",
                 entry_order_id=entry_order.order_id,
@@ -514,12 +523,13 @@ class Executor:
             if current_sl_id:
                 try:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
-                except Exception as e:
+                except (OperationalError, DataError) as e:
                     logger.warning(
                         "Old SL cancel failed (proceeding to place new SL)",
                         symbol=symbol,
                         old_sl_id=current_sl_id,
                         error=str(e),
+                        error_type=type(e).__name__,
                     )
             try:
                 sl_size = sl_notional
@@ -534,8 +544,10 @@ class Executor:
                 )
                 updated_sl_id = sl_order.order_id
                 logger.info("SL updated", symbol=symbol, old_id=current_sl_id, new_id=updated_sl_id, price=str(new_sl_price))
-            except Exception as e:
-                logger.error("Failed to place new SL", symbol=symbol, error=str(e))
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
+                logger.error("Failed to place new SL", symbol=symbol, error=str(e), error_type=type(e).__name__)
         
         # 2. Update TPs (TP Ladder Replacement)
         updated_tp_ids = current_tp_ids
@@ -544,8 +556,8 @@ class Executor:
                 for tp_id in current_tp_ids:
                     try:
                         await self.futures_adapter.cancel_order(tp_id, symbol)
-                    except Exception as e:
-                        logger.warning("Failed to cancel TP", order_id=tp_id, error=str(e))
+                    except (OperationalError, DataError) as e:
+                        logger.warning("Failed to cancel TP", order_id=tp_id, error=str(e), error_type=type(e).__name__)
 
                 new_tp_ids = []
                 step = Decimal("0.0001")
@@ -601,7 +613,7 @@ class Executor:
                     if instrument_spec_registry:
                         try:
                             venue_min_size = instrument_spec_registry.get_effective_min_size(symbol)
-                        except Exception:
+                        except (DataError, KeyError, ValueError, AttributeError):
                             venue_min_size = Decimal("0.001")
                 else:
                     # Legacy path: notional-based, no venue min filter. Backfill should use contract path (position_size_contracts + multi_tp_config) to get min-size and step semantics.
@@ -652,14 +664,18 @@ class Executor:
                             price=str(tp_price),
                             order_id=tp_order.order_id
                         )
-                    except Exception as e:
-                        logger.error(f"Failed to place TP{i+1}", symbol=symbol, error=str(e))
+                    except InvariantError:
+                        raise  # Safety violation — must propagate
+                    except (OperationalError, DataError) as e:
+                        logger.error(f"Failed to place TP{i+1}", symbol=symbol, error=str(e), error_type=type(e).__name__)
 
                 updated_tp_ids = new_tp_ids
                 logger.info("TP ladder updated", symbol=symbol, tp_count=len(new_tp_ids))
 
-            except Exception as e:
-                logger.error("Failed to update TP ladder", symbol=symbol, error=str(e))
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
+                logger.error("Failed to update TP ladder", symbol=symbol, error=str(e), error_type=type(e).__name__)
         
         return updated_sl_id, updated_tp_ids
 
@@ -672,8 +688,8 @@ class Executor:
              # Actually, KrakenClient now has close_position and cancel_all_orders.
              # We let the KillSwitch handle this directly usually.
              pass
-        except Exception as e:
-             logger.error("Emergency close all failed", error=str(e))
+        except (OperationalError, DataError) as e:
+             logger.error("Emergency close all failed", error=str(e), error_type=type(e).__name__)
 
     def _load_persisted_intent_hashes(self):
         """Load recent intent hashes from database on startup to prevent duplicates after restart."""
@@ -682,16 +698,16 @@ class Executor:
             persisted_hashes = load_recent_intent_hashes(lookback_hours=24)
             self.order_intents_seen.update(persisted_hashes)
             logger.info(f"Loaded {len(persisted_hashes)} persisted intent hashes from last 24h")
-        except Exception as e:
-            logger.warning(f"Failed to load persisted intent hashes: {e}")
+        except (OperationalError, DataError, ImportError, OSError) as e:
+            logger.warning(f"Failed to load persisted intent hashes: {e}", error_type=type(e).__name__)
 
     def _persist_intent_hash(self, intent_hash: str, intent: OrderIntent):
         """Persist intent hash to database for duplicate prevention after restart."""
         try:
             from src.storage.repository import save_intent_hash
             save_intent_hash(intent_hash, intent.signal.symbol, intent.signal.timestamp)
-        except Exception as e:
-            logger.warning(f"Failed to persist intent hash: {e}")
+        except (OperationalError, DataError, ImportError, OSError) as e:
+            logger.warning(f"Failed to persist intent hash: {e}", error_type=type(e).__name__)
 
     def _hash_intent(self, intent: OrderIntent) -> str:
         """Generate hash for order intent deduplication."""
@@ -808,12 +824,15 @@ class Executor:
                     reason=reason
                 )
 
-            except Exception as e:
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
                 logger.error(
                     "Failed to cancel order",
                     order_id=order.order_id,
                     symbol=order.symbol,
-                    error=str(e)
+                    error=str(e),
+                    error_type=type(e).__name__,
                 )
 
         return cancelled_count

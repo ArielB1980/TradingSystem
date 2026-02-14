@@ -18,6 +18,7 @@ from decimal import Decimal
 # Ensure src is in path
 sys.path.append(os.getcwd())
 
+from src.exceptions import OperationalError, DataError
 from src.config.config import load_config
 from src.data.kraken_client import KrakenClient
 from src.execution.execution_gateway import ExecutionGateway
@@ -33,8 +34,8 @@ async def main():
     try:
         config = load_config()
         logger.info("Configuration loaded")
-    except Exception as e:
-        logger.critical(f"Failed to load config: {e}")
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
+        logger.critical("Failed to load config", error=str(e), error_type=type(e).__name__)
         return
     
     # 2. Initialize Client
@@ -48,8 +49,8 @@ async def main():
         )
         await client.initialize()
         logger.info("Kraken Client Initialized")
-    except Exception as e:
-        logger.critical(f"Failed to init Kraken Client: {e}")
+    except (OperationalError, DataError, OSError) as e:
+        logger.critical("Failed to init Kraken Client", error=str(e), error_type=type(e).__name__)
         return
 
     # 3. Initialize Gateway

@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 app = typer.Typer(
@@ -136,7 +137,7 @@ def live(
     # Load configuration with error handling
     try:
         config = _load_config(config_path)
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         import sys
         import traceback
         print("=" * 80, file=sys.stderr)
@@ -151,7 +152,7 @@ def live(
     # Setup logging (may fail if config is invalid)
     try:
         _setup_logging_from_config(config, log_file=log_file)
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, ImportError, OSError) as e:
         import sys
         import traceback
         print("=" * 80, file=sys.stderr)
@@ -176,7 +177,7 @@ def live(
         from src.runtime.guards import assert_prod_live_prereqs, is_prod_live_env
 
         assert_prod_live_prereqs()
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.critical(
             "PROD_LIVE_GUARD_FAILED",
             error=str(e),
@@ -243,7 +244,7 @@ def live(
             # - On a droplet/VM, bind localhost to avoid exposing debug/metrics endpoints to the internet.
             try:
                 health_host = "0.0.0.0" if is_cloud_platform() else "127.0.0.1"
-            except Exception:
+            except (ImportError, OSError):
                 health_host = "127.0.0.1"
 
         # Reduce noisy warnings like "Invalid HTTP request received." (common from port scans).
@@ -259,8 +260,8 @@ def live(
                     log_level=health_log_level,
                     access_log=False,
                 )
-            except Exception as e:
-                logger.error("Health server error: %s", e, exc_info=True)
+            except (OperationalError, DataError, OSError) as e:
+                logger.error("Health server error: %s", e, error_type=type(e).__name__, exc_info=True)
         
         t = threading.Thread(target=_run_health, daemon=False)  # Non-daemon so it keeps running
         t.start()
@@ -291,7 +292,7 @@ def live(
         try:
             cfg_obj = sanitize_for_logging(config.model_dump())
             config_hash = stable_sha256_hex(cfg_obj)[:12]
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             config_hash = "unknown"
 
         git_sha = os.getenv("GIT_SHA") or os.getenv("GITHUB_SHA") or "unknown"
@@ -333,14 +334,14 @@ def live(
             if prod_lock is not None:
                 prod_lock.ping()
                 db_reachable = True
-        except Exception:
+        except (OperationalError, DataError, OSError):
             db_reachable = False
 
         try:
             from src.utils.kill_switch import KillSwitch
             ks = KillSwitch()
             ks_status = ks.get_status()
-        except Exception:
+        except (OperationalError, DataError, OSError):
             ks_status = {"active": None, "latched": None, "reason": None}
 
         logger.critical(
@@ -356,7 +357,7 @@ def live(
             exchange_reachable="unknown_pre_runtime",
             time_sync="unknown_best_effort",
         )
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.critical("Failed to acquire prod-live lock", error=str(e), error_type=type(e).__name__, exc_info=True)
         raise typer.Exit(1)
 
@@ -372,7 +373,7 @@ def live(
             logger.info("LiveTrading engine initialized successfully")
             logger.info("Starting main trading loop...")
             await engine.run()
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             logger.critical(
                 "Live trading engine failed",
                 error=str(e),
@@ -387,7 +388,7 @@ def live(
         asyncio.run(run_live())
     except KeyboardInterrupt:
         logger.info("Live trading stopped by user")
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         logger.critical(
             "Live trading failed with unhandled error",
             error=str(e),
@@ -406,7 +407,7 @@ def live(
         try:
             if prod_lock is not None:
                 prod_lock.release()
-        except Exception:
+        except (OperationalError, DataError, OSError):
             # Best effort: don't mask the original exception during shutdown.
             pass
 

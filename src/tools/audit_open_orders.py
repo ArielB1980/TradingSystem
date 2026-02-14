@@ -15,6 +15,7 @@ from decimal import Decimal
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from src.exceptions import OperationalError, DataError
 from src.config.config import load_config as get_config
 from src.data.kraken_client import KrakenClient
 from src.data.symbol_utils import pf_to_unified
@@ -31,14 +32,14 @@ def _stop_price(o: dict) -> Decimal | None:
         return None
     try:
         return Decimal(str(v))
-    except Exception:
+    except (ValueError, TypeError, KeyError):
         return None
 
 
 async def audit_open_orders(cancel_redundant: bool = False, cancel_orphaned: bool = False):
     try:
         config = get_config()
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         print(f"Config load failed: {e}")
         return
 
@@ -109,7 +110,7 @@ async def audit_open_orders(cancel_redundant: bool = False, cancel_orphaned: boo
                         await client.cancel_futures_order(o["id"], sym)
                         print(f"  Cancelled {o['id']} ({sym})")
                         cancelled += 1
-                    except Exception as e:
+                    except (OperationalError, DataError) as e:
                         print(f"  Failed to cancel {o['id']} ({sym}): {e}")
                 print(f"  Cancelled {cancelled} orphaned stop(s).")
             else:
@@ -143,14 +144,14 @@ async def audit_open_orders(cancel_redundant: bool = False, cancel_orphaned: boo
                         await client.cancel_futures_order(o["id"], sym)
                         print(f"  Cancelled {o['id']} ({sym})")
                         cancelled += 1
-                    except Exception as e:
+                    except (OperationalError, DataError) as e:
                         print(f"  Failed to cancel {o['id']} ({sym}): {e}")
             print(f"  Cancelled {cancelled} redundant stop(s).")
 
         print("\n=== EXPECTED RANGE ===")
         lo, hi = n_positions, n_positions * 4
         print(f"  With {n_positions} positions: 1 SL + up to 3 TPs each -> ~{lo}–{hi} orders. Yours: {len(orders)}.")
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"Audit failed: {e}")
         import traceback
 

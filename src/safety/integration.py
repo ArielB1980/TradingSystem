@@ -78,6 +78,7 @@ from src.config.safety_config import (
     log_safety_config_summary,
 )
 from src.domain.models import Side, Position
+from src.exceptions import OperationalError, DataError, InvariantError
 
 logger = get_logger(__name__)
 
@@ -174,8 +175,8 @@ class ProductionHardeningLayer:
         try:
             self.safety_config = load_safety_config(safety_config_path)
             log_safety_config_summary(self.safety_config)
-        except Exception as e:
-            logger.warning("Failed to load safety config, using defaults", error=str(e))
+        except (ValueError, TypeError, KeyError, FileNotFoundError, OSError) as e:
+            logger.warning("Failed to load safety config, using defaults", error=str(e), error_type=type(e).__name__)
             self.safety_config = {"safety": {}}
         
         # Initialize InvariantMonitor
@@ -190,8 +191,8 @@ class ProductionHardeningLayer:
                 max_drawdown=str(invariants.max_equity_drawdown_pct),
                 max_positions=invariants.max_concurrent_positions,
             )
-        except Exception as e:
-            logger.error("Failed to initialize InvariantMonitor", error=str(e))
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error("Failed to initialize InvariantMonitor", error=str(e), error_type=type(e).__name__)
             self.invariant_monitor = get_invariant_monitor()
         
         # Initialize CycleGuard
@@ -199,8 +200,8 @@ class ProductionHardeningLayer:
             cg_config = get_cycle_guard_config(self.safety_config)
             self.cycle_guard = init_cycle_guard(**cg_config)
             logger.info("CycleGuard initialized", **cg_config)
-        except Exception as e:
-            logger.error("Failed to initialize CycleGuard", error=str(e))
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error("Failed to initialize CycleGuard", error=str(e), error_type=type(e).__name__)
             self.cycle_guard = get_cycle_guard()
         
         # Initialize PositionDeltaReconciler
@@ -211,8 +212,8 @@ class ProductionHardeningLayer:
                 max_delta_per_order_usd=rec_config["max_delta_per_order_usd"],
             )
             logger.info("PositionDeltaReconciler initialized", **{k: str(v) for k, v in rec_config.items()})
-        except Exception as e:
-            logger.error("Failed to initialize PositionDeltaReconciler", error=str(e))
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error("Failed to initialize PositionDeltaReconciler", error=str(e), error_type=type(e).__name__)
             self.reconciler = get_delta_reconciler()
         
         # Initialize DecisionAuditLogger
@@ -222,8 +223,8 @@ class ProductionHardeningLayer:
                 max_buffer_size=audit_config["max_buffer_size"],
             )
             logger.info("DecisionAuditLogger initialized", **audit_config)
-        except Exception as e:
-            logger.error("Failed to initialize DecisionAuditLogger", error=str(e))
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error("Failed to initialize DecisionAuditLogger", error=str(e), error_type=type(e).__name__)
             self.decision_logger = get_decision_audit_logger()
         
         # Track current cycle
@@ -239,6 +240,12 @@ class ProductionHardeningLayer:
         Perform startup self-test.
         
         MUST be called before starting trading.
+        
+        Validates:
+        - Component initialization
+        - State persistence directory
+        - Persisted HALT state
+        - Config-safety threshold compatibility (prevents Bug #1 class errors)
         
         Returns:
             (success, list of error messages)
@@ -263,7 +270,7 @@ class ProductionHardeningLayer:
             test_file = self._state_dir / ".write_test"
             test_file.write_text("test")
             test_file.unlink()
-        except Exception as e:
+        except OSError as e:
             errors.append(f"State directory not writable: {e}")
         
         # 5. Check for persisted HALT state
@@ -276,6 +283,14 @@ class ProductionHardeningLayer:
                 f"Call clear_halt() to resume trading"
             )
         
+        # 6. CONFIG-SAFETY THRESHOLD COMPATIBILITY
+        # Prevents the class of bug where safety thresholds are tighter than
+        # operational thresholds, causing false HALTs every time the system
+        # operates at its intended capacity. (Same class as Bug #1: margin
+        # threshold mismatch.)
+        threshold_errors = self._validate_config_safety_compatibility()
+        errors.extend(threshold_errors)
+        
         success = len(errors) == 0
         
         if success:
@@ -285,54 +300,144 @@ class ProductionHardeningLayer:
         
         return success, errors
     
+    def _validate_config_safety_compatibility(self) -> List[str]:
+        """
+        Validate that safety thresholds are compatible with operational config.
+        
+        Rules:
+        1. safety.max_concurrent_positions >= risk.auction_max_positions
+        2. safety.max_margin_utilization_pct > risk.auction_max_margin_util
+        3. safety.degraded_margin_utilization_pct <= risk.auction_max_margin_util
+        4. safety.degraded_concurrent_positions < safety.max_concurrent_positions
+        
+        Returns:
+            List of error strings (empty = all good)
+        """
+        errors = []
+        inv = self.invariant_monitor.invariants
+        risk = getattr(self.config, "risk", None)
+        
+        if risk is None:
+            logger.warning("Config-safety validation skipped: no risk config found")
+            return errors
+        
+        # 1. Concurrent positions: safety halt must be >= operational max
+        operational_max_positions = getattr(risk, "auction_max_positions", None)
+        if operational_max_positions is None:
+            operational_max_positions = getattr(risk, "max_concurrent_positions", 2)
+        
+        if inv.max_concurrent_positions < operational_max_positions:
+            errors.append(
+                f"THRESHOLD_MISMATCH: safety.max_concurrent_positions ({inv.max_concurrent_positions}) "
+                f"< risk.auction_max_positions ({operational_max_positions}). "
+                f"The invariant monitor will HALT the system before the auction fills its budget. "
+                f"Set safety.max_concurrent_positions >= {operational_max_positions}."
+            )
+        
+        # 2. Margin utilization: safety halt must be > auction budget ceiling
+        auction_max_margin = Decimal(str(getattr(risk, "auction_max_margin_util", 0.90)))
+        if inv.max_margin_utilization_pct <= auction_max_margin:
+            errors.append(
+                f"THRESHOLD_MISMATCH: safety.max_margin_utilization_pct ({inv.max_margin_utilization_pct}) "
+                f"<= risk.auction_max_margin_util ({auction_max_margin}). "
+                f"The invariant monitor will HALT when the auction uses its full margin budget. "
+                f"Set safety.max_margin_utilization_pct > {auction_max_margin}."
+            )
+        
+        # 3. Degraded margin should be <= auction max (warning, not error)
+        if inv.degraded_margin_utilization_pct > auction_max_margin:
+            logger.warning(
+                "CONFIG_SAFETY_WARNING: degraded_margin_utilization_pct > auction_max_margin_util",
+                degraded_margin=str(inv.degraded_margin_utilization_pct),
+                auction_max_margin=str(auction_max_margin),
+                note="System will enter DEGRADED before auction fills budget",
+            )
+        
+        # 4. Degraded positions < max positions (internal consistency)
+        if inv.degraded_concurrent_positions >= inv.max_concurrent_positions:
+            errors.append(
+                f"THRESHOLD_INCONSISTENCY: safety.degraded_concurrent_positions "
+                f"({inv.degraded_concurrent_positions}) >= safety.max_concurrent_positions "
+                f"({inv.max_concurrent_positions}). Degraded threshold must be strictly less."
+            )
+        
+        if errors:
+            logger.critical(
+                "CONFIG_SAFETY_COMPATIBILITY_FAILED",
+                errors=errors,
+                safety_max_positions=inv.max_concurrent_positions,
+                safety_max_margin=str(inv.max_margin_utilization_pct),
+                operational_max_positions=operational_max_positions,
+                auction_max_margin=str(auction_max_margin),
+            )
+        else:
+            logger.info(
+                "CONFIG_SAFETY_COMPATIBILITY_OK",
+                safety_max_positions=inv.max_concurrent_positions,
+                operational_max_positions=operational_max_positions,
+                safety_max_margin=str(inv.max_margin_utilization_pct),
+                auction_max_margin=str(auction_max_margin),
+            )
+        
+        return errors
+    
     # ===== HALT STATE PERSISTENCE =====
     
     def _load_halt_state(self) -> Optional[PersistedHaltState]:
-        """Load persisted halt state from disk."""
+        """Load persisted halt state from disk.
+        
+        If state can't be loaded, crash before trading starts.
+        The READY gate ensures we never trade with corrupt halt state.
+        """
         if not self._state_file.exists():
             return None
         
         try:
             data = json.loads(self._state_file.read_text())
             return PersistedHaltState.from_dict(data)
-        except Exception as e:
-            logger.error("Failed to load halt state", error=str(e))
-            return None
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            # Corrupt state file — log and crash (safest: don't trade with unknown halt state)
+            logger.critical("Halt state file corrupt — cannot determine if HALT was active", error=str(e), error_type=type(e).__name__)
+            raise InvariantError(f"Corrupt halt state file: {e}") from e
+        except OSError as e:
+            logger.critical("Cannot read halt state file", error=str(e), error_type=type(e).__name__)
+            raise InvariantError(f"Cannot read halt state file: {e}") from e
     
     def _persist_halt_state(self, state: SystemState, reason: str, violations: List[str]):
-        """Persist halt state to disk."""
+        """Persist halt state to disk.
+        
+        If persistence fails, crash. systemd restart + halt state is safer
+        than continuing with unpersisted halt.
+        """
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        
+        halt_state = PersistedHaltState(
+            state=state.value,
+            reason=reason,
+            violations=violations,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            run_id=self._run_id,
+        )
+        
+        self._state_file.write_text(json.dumps(halt_state.to_dict(), indent=2))
+        logger.critical(
+            "HALT_STATE_PERSISTED",
+            state=state.value,
+            reason=reason,
+            file=str(self._state_file),
+        )
+        
+        # Send alert for halt state (alert failure must never block halt persistence)
         try:
-            self._state_dir.mkdir(parents=True, exist_ok=True)
-            
-            halt_state = PersistedHaltState(
-                state=state.value,
-                reason=reason,
-                violations=violations,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                run_id=self._run_id,
+            from src.monitoring.alerting import send_alert_sync
+            violations_str = "\n".join(f"• {v}" for v in violations[:5])
+            send_alert_sync(
+                "SYSTEM_HALTED",
+                f"System entered HALT state!\nReason: {reason}\nViolations:\n{violations_str}",
+                urgent=True,
             )
-            
-            self._state_file.write_text(json.dumps(halt_state.to_dict(), indent=2))
-            logger.critical(
-                "HALT_STATE_PERSISTED",
-                state=state.value,
-                reason=reason,
-                file=str(self._state_file),
-            )
-            
-            # Send alert for halt state
-            try:
-                from src.monitoring.alerting import send_alert_sync
-                violations_str = "\n".join(f"• {v}" for v in violations[:5])
-                send_alert_sync(
-                    "SYSTEM_HALTED",
-                    f"System entered HALT state!\nReason: {reason}\nViolations:\n{violations_str}",
-                    urgent=True,
-                )
-            except Exception:
-                pass  # Alert failure must never block halt persistence
-        except Exception as e:
-            logger.error("Failed to persist halt state", error=str(e))
+        except (OperationalError, ImportError, OSError) as e:
+            logger.warning("Failed to send HALT alert (non-blocking)", error=str(e), error_type=type(e).__name__)
     
     def clear_halt(self, operator: str = "unknown") -> bool:
         """
@@ -366,8 +471,10 @@ class ProductionHardeningLayer:
             self.invariant_monitor.violations.clear()
             
             return True
-        except Exception as e:
-            logger.error("Failed to clear halt state", error=str(e))
+        except InvariantError:
+            raise  # Corrupt state — must propagate
+        except OSError as e:
+            logger.error("Failed to clear halt state (filesystem)", error=str(e), error_type=type(e).__name__)
             return False
     
     def is_halted(self) -> bool:
@@ -619,13 +726,14 @@ class ProductionHardeningLayer:
             
             return delta
             
-        except Exception as e:
-            logger.error(
-                "Failed to reconcile signal",
-                symbol=getattr(signal, 'symbol', 'unknown'),
-                error=str(e),
-            )
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except DataError as e:
+            logger.error("Failed to reconcile signal (data)", symbol=getattr(signal, 'symbol', 'unknown'), error=str(e), error_type=type(e).__name__)
             return None
+        except Exception as e:
+            logger.exception("Unexpected error in reconcile_signal", symbol=getattr(signal, 'symbol', 'unknown'), error=str(e), error_type=type(e).__name__)
+            raise
     
     def reconcile_close(
         self,
@@ -657,9 +765,14 @@ class ProductionHardeningLayer:
             
             return delta
             
-        except Exception as e:
-            logger.error("Failed to reconcile close", symbol=symbol, error=str(e))
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except DataError as e:
+            logger.error("Failed to reconcile close (data)", symbol=symbol, error=str(e), error_type=type(e).__name__)
             return None
+        except Exception as e:
+            logger.exception("Unexpected error in reconcile_close", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            raise
     
     # ===== DECISION LOGGING (EXCEPTION-SAFE) =====
     
@@ -699,8 +812,11 @@ class ProductionHardeningLayer:
             
             if decision == "TRADE":
                 self.cycle_guard.record_signal_generated()
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to record decision", symbol=symbol, error=str(e), error_type=type(e).__name__)
         except Exception as e:
-            logger.error("Failed to record decision", symbol=symbol, error=str(e))
+            logger.exception("Unexpected error in record_decision", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            raise
     
     def record_execution_started(self, symbol: str, action_id: str):
         """Record that execution has started (for exception-safe audit)."""
@@ -731,8 +847,11 @@ class ProductionHardeningLayer:
             elif result in ("REJECTED", "ERROR"):
                 self.cycle_guard.record_order_rejected()
                 self.invariant_monitor.record_order_rejection()
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to record execution result", symbol=symbol, error=str(e), error_type=type(e).__name__)
         except Exception as e:
-            logger.error("Failed to record execution result", symbol=symbol, error=str(e))
+            logger.exception("Unexpected error in record_execution_result", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            raise
     
     def record_execution_failed(
         self,
@@ -755,8 +874,11 @@ class ProductionHardeningLayer:
                 result="EXCEPTION",
                 error=f"{error_type}: {error}",
             )
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to record execution failure", symbol=symbol, error=str(e), error_type=type(e).__name__)
         except Exception as e:
-            logger.error("Failed to record execution failure", symbol=symbol, error=str(e))
+            logger.exception("Unexpected error in record_execution_failed", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            raise
     
     def record_api_error(self):
         """Record an API error for rate limiting."""
@@ -802,8 +924,11 @@ class ProductionHardeningLayer:
             self._gate_checked_this_tick = False
             self._gate_decision = None
             
+        except (OperationalError, DataError) as e:
+            logger.error("Post-tick cleanup failed (transient)", error=str(e), error_type=type(e).__name__)
         except Exception as e:
-            logger.error("Post-tick cleanup failed", error=str(e))
+            logger.exception("Unexpected error in post_tick_cleanup", error=str(e), error_type=type(e).__name__)
+            raise
         finally:
             # Always release lock
             self._release_lock()

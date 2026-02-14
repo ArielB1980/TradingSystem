@@ -66,6 +66,9 @@ trading.db
 # Market discovery data and runtime data
 data/
 
+# Backtest results
+results/
+
 # State files (legacy and current)
 .kill_switch_state
 

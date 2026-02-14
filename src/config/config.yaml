@@ -99,6 +99,7 @@ risk:
 
   # Max risk per trade when using Kelly sizing
   max_risk_per_trade_entry_pct: 0.03  # Max 3% risk per trade (cap for Kelly)
+  max_loss_per_trade_usd: 500  # Max $ loss if stop hits; caps/rejects when notional * stop_distance_pct > this
 
   # Volatility sizing adjustments
   vol_sizing_atr_threshold_high: 1.5  # Reduce size if ATR > 1.5x average

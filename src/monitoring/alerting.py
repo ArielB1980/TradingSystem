@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 import aiohttp
 
+from src.exceptions import OperationalError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -137,9 +138,9 @@ async def send_alert(event_type: str, message: str, urgent: bool = False) -> Non
                 async with session.post(webhook_url, json=payload) as resp:
                     if resp.status >= 400:
                         logger.warning("Webhook alert failed", status=resp.status)
-    except Exception as e:
+    except (OperationalError, OSError, ConnectionError) as e:
         # Alert failures must never crash the trading system
-        logger.warning("Alert send failed (non-fatal)", event_type=event_type, error=str(e))
+        logger.warning("Alert send failed (non-fatal)", event_type=event_type, error=str(e), error_type=type(e).__name__)
 
 
 def send_alert_sync(event_type: str, message: str, urgent: bool = False) -> None:

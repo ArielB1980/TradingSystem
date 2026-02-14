@@ -23,6 +23,7 @@ import hashlib
 import json
 
 from src.domain.models import Side, OrderType
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 from src.data.symbol_utils import normalize_symbol_for_position_match
 
@@ -1407,7 +1408,7 @@ class PositionRegistry:
                             if exchange_entry_price_raw is not None:
                                 try:
                                     ref_price = Decimal(str(exchange_entry_price_raw))
-                                except Exception:
+                                except (ValueError, TypeError, ArithmeticError):
                                     pass
                             now = datetime.now(timezone.utc)
                             fill = FillRecord(
@@ -1448,7 +1449,7 @@ class PositionRegistry:
                         if exchange_entry_price_raw is not None:
                             try:
                                 exchange_entry_price = Decimal(str(exchange_entry_price_raw))
-                            except Exception:
+                            except (ValueError, TypeError, ArithmeticError):
                                 exchange_entry_price = None
 
                         sync_summary = pos.reconcile_quantity_to_exchange(

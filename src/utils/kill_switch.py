@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from src.monitoring.logger import get_logger
 from src.monitoring.alerting import send_alert_sync
+from src.exceptions import OperationalError, DataError, InvariantError
 
 logger = get_logger(__name__)
 
@@ -130,45 +131,40 @@ class KillSwitch:
                     # 1. Cancel non-SL orders (PRESERVE stop losses to protect positions)
                     # Cancelling SL orders leaves positions naked and has caused
                     # repeated losses. SL orders can only limit losses, never cause them.
-                    open_orders = await self.client.get_futures_open_orders()
-                    cancelled = 0
-                    preserved_sls = 0
-                    for order in open_orders:
-                        order_type = (order.get("type") or "").lower()
-                        # Also check the raw info for Kraken-specific order types
-                        info_type = ((order.get("info") or {}).get("orderType") or "").lower()
-                        is_reduce_only = order.get("reduceOnly", order.get("reduce_only", False))
+                    cancelled, preserved_sls = await self._cancel_non_sl_orders()
+                    
+                    # 2. VERIFICATION LOOP: "cancel submitted" is not "cancel effective".
+                    # Poll open orders and retry cancellation for any non-SL stragglers.
+                    # Max 3 retries with 2s backoff between each.
+                    for retry in range(3):
+                        import asyncio as _aio
+                        await _aio.sleep(2)
                         
-                        # A stop-loss is: type contains "stop" (but NOT "take_profit"),
-                        # and is reduce-only (protective, not an entry stop)
-                        is_stop_loss = (
-                            ("stop" in order_type or "stop" in info_type)
-                            and "take_profit" not in order_type
-                            and "take-profit" not in order_type
-                            and "take_profit" not in info_type
-                            and "take-profit" not in info_type
-                            and is_reduce_only
-                        )
-                        
-                        if is_stop_loss:
-                            preserved_sls += 1
+                        remaining = await self._count_non_sl_orders()
+                        if remaining == 0:
                             logger.info(
-                                "Kill switch: PRESERVING stop loss order",
-                                order_id=order.get("id"),
-                                symbol=order.get("symbol"),
-                                order_type=order_type,
+                                "Kill switch: Cancellation verified — no non-SL orders remain",
+                                verification_attempt=retry + 1,
                             )
-                            continue
+                            break
                         
-                        try:
-                            await self.client.cancel_futures_order(order["id"], order.get("symbol"))
-                            cancelled += 1
-                            logger.info("Futures order cancelled", order_id=order["id"])
-                        except Exception as e:
-                            logger.warning(
-                                "Kill switch: Failed to cancel order",
-                                order_id=order.get("id"),
-                                error=str(e),
+                        logger.warning(
+                            "Kill switch: Non-SL orders still open after cancellation, retrying",
+                            remaining_non_sl=remaining,
+                            retry=retry + 1,
+                        )
+                        retry_cancelled, retry_preserved = await self._cancel_non_sl_orders()
+                        cancelled += retry_cancelled
+                        preserved_sls = retry_preserved  # Use latest count
+                    else:
+                        # All retries exhausted
+                        final_remaining = await self._count_non_sl_orders()
+                        if final_remaining > 0:
+                            logger.critical(
+                                "Kill switch: CANCELLATION VERIFICATION FAILED — non-SL orders persist",
+                                remaining_non_sl=final_remaining,
+                                total_cancelled=cancelled,
+                                total_preserved_sls=preserved_sls,
                             )
                     
                     logger.info(
@@ -177,7 +173,7 @@ class KillSwitch:
                         preserved_stop_losses=preserved_sls,
                     )
                     
-                    # 2. If emergency: flatten all positions
+                    # 3. If emergency: flatten all positions
                     if emergency:
                          positions = await self.client.get_all_futures_positions()
                          for pos in positions:
@@ -185,16 +181,103 @@ class KillSwitch:
                              try:
                                  await self.client.close_position(symbol)
                                  logger.warning(f"Kill switch: Emergency closed position for {symbol}")
+                             except InvariantError:
+                                 raise  # Safety violation — must propagate
+                             except OperationalError as e:
+                                 logger.error("Kill switch: Failed to close position (transient)", kill_step="emergency_close", symbol=symbol, error=str(e), error_type=type(e).__name__)
                              except Exception as e:
-                                 logger.error(f"Kill switch: Failed to close {symbol}", error=str(e))
+                                 logger.exception("Kill switch: Unexpected error closing position", kill_step="emergency_close", symbol=symbol, error=str(e), error_type=type(e).__name__)
+                                 raise
+                except InvariantError:
+                    raise  # Safety violation — must propagate
+                except OperationalError as e:
+                    logger.critical("Kill switch action failed (transient)", kill_step="activate", error=str(e), error_type=type(e).__name__)
                 except Exception as e:
-                    logger.critical("Kill switch action failed", error=str(e))
+                    logger.exception("Kill switch: Unexpected error during activation", kill_step="activate", error=str(e), error_type=type(e).__name__)
+                    raise
             else:
                  logger.critical("Kill switch: No client attached, cannot execute actions")
 
             logger.critical(
                 "Manual acknowledgment required to restart trading"
             )
+    
+    @staticmethod
+    def _is_stop_loss_order(order: dict) -> bool:
+        """Classify whether an order is a protective stop loss.
+        
+        A stop-loss is: type contains "stop" (but NOT "take_profit"),
+        and is reduce-only (protective, not an entry stop).
+        """
+        order_type = (order.get("type") or "").lower()
+        info_type = ((order.get("info") or {}).get("orderType") or "").lower()
+        is_reduce_only = order.get("reduceOnly", order.get("reduce_only", False))
+        
+        return (
+            ("stop" in order_type or "stop" in info_type)
+            and "take_profit" not in order_type
+            and "take-profit" not in order_type
+            and "take_profit" not in info_type
+            and "take-profit" not in info_type
+            and is_reduce_only
+        )
+    
+    async def _cancel_non_sl_orders(self) -> tuple:
+        """Cancel all non-SL orders, preserving stop losses.
+        
+        Returns:
+            (cancelled_count, preserved_sl_count)
+        """
+        open_orders = await self.client.get_futures_open_orders()
+        cancelled = 0
+        preserved_sls = 0
+        
+        for order in open_orders:
+            if self._is_stop_loss_order(order):
+                preserved_sls += 1
+                logger.info(
+                    "Kill switch: PRESERVING stop loss order",
+                    order_id=order.get("id"),
+                    symbol=order.get("symbol"),
+                    order_type=(order.get("type") or "").lower(),
+                )
+                continue
+            
+            try:
+                await self.client.cancel_futures_order(order["id"], order.get("symbol"))
+                cancelled += 1
+                logger.info("Futures order cancelled", order_id=order["id"])
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except OperationalError as e:
+                logger.warning(
+                    "Kill switch: Failed to cancel order (transient)",
+                    kill_step="cancel_non_sl",
+                    order_id=order.get("id"),
+                    symbol=order.get("symbol"),
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Kill switch: Unexpected error cancelling order",
+                    kill_step="cancel_non_sl",
+                    order_id=order.get("id"),
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                raise
+        
+        return cancelled, preserved_sls
+    
+    async def _count_non_sl_orders(self) -> int:
+        """Count remaining non-SL open orders. Used for verification."""
+        try:
+            open_orders = await self.client.get_futures_open_orders()
+            return sum(1 for o in open_orders if not self._is_stop_loss_order(o))
+        except OperationalError as e:
+            logger.warning("Kill switch: Failed to count remaining orders (transient)", kill_step="verify_cancel", error=str(e), error_type=type(e).__name__)
+            return -1  # Unknown — caller should treat as potential issue
     
     def acknowledge(self) -> bool:
         """
@@ -249,55 +332,68 @@ class KillSwitch:
         }
 
     def _save_state(self) -> None:
-        """Persist kill switch state to file (data/ under repo root, or KILL_SWITCH_STATE_PATH)."""
-        try:
-            import json
-            path = _kill_switch_state_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            state = {
-                "active": self.active,
-                "latched": self.latched,
-                "activated_at": self.activated_at.isoformat() if self.activated_at else None,
-                "reason": self.reason.value if self.reason else None
-            }
-            with open(path, "w") as f:
-                json.dump(state, f)
-        except Exception as e:
-            logger.error("Failed to save kill switch state", error=str(e))
+        """Persist kill switch state to file (data/ under repo root, or KILL_SWITCH_STATE_PATH).
+        
+        If persistence fails, crash. Unpersisted kill switch state means a restart
+        could resume trading when it shouldn't.
+        """
+        import json
+        path = _kill_switch_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "active": self.active,
+            "latched": self.latched,
+            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "reason": self.reason.value if self.reason else None
+        }
+        with open(path, "w") as f:
+            json.dump(state, f)
+        # No try/except: if we can't persist kill switch state, crash is correct.
 
     def _load_state(self) -> None:
-        """Load persisted kill switch state from data/ or KILL_SWITCH_STATE_PATH."""
+        """Load persisted kill switch state from data/ or KILL_SWITCH_STATE_PATH.
+        
+        If state file is corrupt, default to ACTIVE (safest posture).
+        If state file can't be read, crash before trading starts.
+        """
+        import json
+        path = _kill_switch_state_path()
+        if not path.exists():
+            return
+
         try:
-            import json
-            path = _kill_switch_state_path()
-            if not path.exists():
-                return
             with open(path, "r") as f:
                 state = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            # Corrupt state file — default to ACTIVE (safest posture)
+            logger.critical("Kill switch state file corrupt — defaulting to ACTIVE", error=str(e), error_type=type(e).__name__)
+            self.active = True
+            self.latched = True
+            self.reason = KillSwitchReason.DATA_FAILURE
+            self.activated_at = datetime.now(timezone.utc)
+            return
+        # OSError (can't read) → crash (no try/except — READY gate prevents trading)
 
-            self.active = state.get("active", False)
-            self.latched = state.get("latched", False)
+        self.active = state.get("active", False)
+        self.latched = state.get("latched", False)
 
-            reason_str = state.get("reason")
-            if reason_str:
-                try:
-                    self.reason = KillSwitchReason(reason_str)
-                except ValueError:
-                    self.reason = None
+        reason_str = state.get("reason")
+        if reason_str:
+            try:
+                self.reason = KillSwitchReason(reason_str)
+            except ValueError:
+                self.reason = None
 
-            activated_at_str = state.get("activated_at")
-            if activated_at_str:
-                self.activated_at = datetime.fromisoformat(activated_at_str)
+        activated_at_str = state.get("activated_at")
+        if activated_at_str:
+            self.activated_at = datetime.fromisoformat(activated_at_str)
 
-            if self.active:
-                logger.warning(
-                    "Kill switch was active on startup",
-                    activated_at=activated_at_str,
-                    reason=self.reason.value if self.reason else "unknown"
-                )
-
-        except Exception as e:
-            logger.error("Failed to load kill switch state", error=str(e))
+        if self.active:
+            logger.warning(
+                "Kill switch was active on startup",
+                activated_at=activated_at_str,
+                reason=self.reason.value if self.reason else "unknown"
+            )
 
 
 # Global instance
@@ -327,6 +423,7 @@ def read_kill_switch_state() -> dict:
         out["latched"] = state.get("latched", False)
         out["reason"] = state.get("reason")
         out["activated_at"] = state.get("activated_at")
-    except Exception:
-        pass
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        # Corrupt or unreadable — return safest default (active=False but log)
+        logger.warning("read_kill_switch_state: state file unreadable", error=str(e), error_type=type(e).__name__)
     return out

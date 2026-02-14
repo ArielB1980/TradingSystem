@@ -5,6 +5,8 @@ Live trading uses MarketDiscoveryService (API-based) in src.data.market_discover
 """
 import json
 from pathlib import Path
+
+from src.exceptions import OperationalError, DataError
 from typing import List, Optional
 from datetime import datetime, timezone
 from src.monitoring.logger import get_logger
@@ -31,7 +33,7 @@ def load_discovered_mapping() -> Optional[dict]:
                 for spot, fut in mapping.items()
                 if not has_disallowed_base(spot) and not has_disallowed_base(fut)
             }
-    except Exception:
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError):
         return None
 
 
@@ -64,10 +66,10 @@ def load_discovered_markets() -> Optional[List[str]]:
             logger.warning("Discovered markets file is empty")
             return None
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse discovered markets file", error=str(e))
+        logger.error("Failed to parse discovered markets file", error=str(e), error_type=type(e).__name__)
         return None
-    except Exception as e:
-        logger.error("Failed to load discovered markets", error=str(e))
+    except (ValueError, TypeError, KeyError, OSError) as e:
+        logger.error("Failed to load discovered markets", error=str(e), error_type=type(e).__name__)
         return None
 
 
@@ -81,6 +83,6 @@ def get_discovered_markets_timestamp() -> Optional[datetime]:
             discovered_at_str = data.get("discovered_at", "")
             if discovered_at_str:
                 return datetime.fromisoformat(discovered_at_str.replace("Z", "+00:00"))
-    except Exception:
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError):
         pass
     return None

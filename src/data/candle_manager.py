@@ -7,6 +7,7 @@ from src.monitoring.logger import get_logger
 from src.domain.models import Candle
 from src.data.kraken_client import KrakenClient
 from src.storage.repository import load_candles_map, save_candles_bulk, get_latest_candle_timestamp
+from src.exceptions import OperationalError, DataError
 
 logger = get_logger(__name__)
 
@@ -194,7 +195,8 @@ class CandleManager:
                         candles = []
                 else:
                     candles = await self.client.get_spot_ohlcv(symbol, tf, since=since_ms, limit=300)
-            except Exception:
+            except (OperationalError, DataError) as e:
+                logger.debug("Spot OHLCV fetch failed", symbol=symbol, tf=tf, error=str(e))
                 candles = []
 
             if not candles and self.use_futures_fallback and self.spot_to_futures:
@@ -205,8 +207,8 @@ class CandleManager:
                         candles = _candles_with_symbol(raw, symbol)
                         used_futures = True
                         data_source = "futures_fallback"
-                except Exception:
-                    pass
+                except (OperationalError, DataError) as e:
+                    logger.debug("Futures OHLCV fallback failed", symbol=symbol, tf=tf, error=str(e))
 
             if not candles:
                 if not used_futures:
@@ -293,6 +295,6 @@ class CandleManager:
             
             if batch:
                 logger.debug("Batched save complete", candles_saved=len(batch))
-        except Exception as e:
-            logger.error("Failed to batch save candles", error=str(e))
+        except (OperationalError, DataError, OSError) as e:
+            logger.error("Failed to batch save candles", error=str(e), error_type=type(e).__name__)
             # Keep pending_candles for next attempt

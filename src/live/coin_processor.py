@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
+from src.exceptions import OperationalError, DataError
 from src.data.fiat_currencies import has_disallowed_base
 from src.monitoring.logger import get_logger
 
@@ -159,7 +160,7 @@ async def update_market_universe(lt: "LiveTrading") -> None:
                     f"Discovery returned {new_count} coins vs {last_discovered_count} last discovery -- rejected",
                     urgent=True,
                 )
-            except Exception:
+            except (OperationalError, ImportError, OSError):
                 pass
             return
 
@@ -187,5 +188,5 @@ async def update_market_universe(lt: "LiveTrading") -> None:
 
         logger.info("Market universe updated", count=len(lt.markets))
 
-    except Exception as e:
-        logger.error("Failed to update market universe", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Failed to update market universe", error=str(e), error_type=type(e).__name__)

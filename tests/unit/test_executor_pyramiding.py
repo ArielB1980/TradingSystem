@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from decimal import Decimal
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 from src.domain.models import (
     Signal,
@@ -131,7 +131,10 @@ async def test_pyramiding_guard_allows_when_no_position():
     adapter = MagicMock()
     adapter.map_spot_to_futures = MagicMock(return_value="ROSE/USD:USD")
     adapter.kraken_client = MagicMock()
-    adapter.kraken_client.get_futures_open_orders = MagicMock(return_value=[])
+    adapter.kraken_client.get_futures_open_orders = AsyncMock(return_value=[])
+    # Executor awaits place_order; return a mock order so flow continues
+    mock_order = MagicMock(client_order_id="test-entry-1")
+    adapter.place_order = AsyncMock(return_value=mock_order)
 
     config = ExecutionConfig(pyramiding_enabled=False)
 
