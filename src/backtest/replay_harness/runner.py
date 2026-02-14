@@ -193,7 +193,8 @@ class BacktestRunner:
     async def _initialize(self) -> None:
         """Initialize LiveTrading with the replay client.
 
-        We construct a minimal config and inject the replay client.
+        We patch KrakenClient so that construction returns our ReplayKrakenClient,
+        then re-wire every component that stored a reference to the client.
         """
         from src.config.config import load_config
 
@@ -216,19 +217,35 @@ class BacktestRunner:
         config.exchange.spot_markets = self._symbols
         config.exchange.futures_markets = self._symbols
 
-        # Build LiveTrading but inject our replay client
+        # Build LiveTrading with our replay client injected at construction time.
+        # The key is making KrakenClient(...) return self._exchange so every
+        # downstream component (DataAcquisition, FuturesAdapter, KillSwitch,
+        # CandleManager, ExecutionGateway) gets the real replay client — not a MagicMock.
         from src.live.live_trading import LiveTrading
 
-        # Monkey-patch KrakenClient construction
-        with patch("src.live.live_trading.KrakenClient", return_value=self._exchange):
+        exchange_ref = self._exchange
+
+        def _fake_kraken_client(*args, **kwargs):
+            """Return the replay exchange instead of constructing a real KrakenClient."""
+            return exchange_ref
+
+        with patch("src.live.live_trading.KrakenClient", side_effect=_fake_kraken_client):
             lt = LiveTrading(config)
 
-        # Override the client with our exchange sim
+        # Belt-and-suspenders: ensure client reference is the replay exchange
         lt.client = self._exchange
 
-        # Set up minimal execution gateway with the replay client
+        # Re-wire all sub-components that cached the client reference
         if hasattr(lt, "execution_gateway"):
             lt.execution_gateway.client = self._exchange
+        if hasattr(lt, "kill_switch"):
+            lt.kill_switch.client = self._exchange
+        if hasattr(lt, "data_acq"):
+            lt.data_acq.client = self._exchange
+        if hasattr(lt, "futures_adapter"):
+            lt.futures_adapter.client = self._exchange
+        if hasattr(lt, "candle_manager"):
+            lt.candle_manager.client = self._exchange
 
         # Advance startup state machine to READY so _tick() is allowed.
         # In real production, LiveTrading.run() goes through SYNCING →
