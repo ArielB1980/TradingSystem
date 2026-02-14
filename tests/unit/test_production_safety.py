@@ -1064,8 +1064,12 @@ class TestStopSemanticValidation:
     Test: _warn_if_stop_semantically_wrong detects substantive mismatches
     without changing the protection verdict.
 
-    These are warning-only checks. The stop is still treated as protected,
-    but logs make the issue observable for manual follow-up.
+    These are warning/error-level log checks. The stop is still treated as
+    protected, but logs make the issue observable for manual follow-up.
+
+    Two severity bands:
+      - CRITICAL (logger.error): wrong side, reduceOnly=False, amount < 25%, TP type
+      - WARNING (logger.warning): amount < 90%, reduceOnly missing, type ambiguous
     """
 
     @pytest.fixture
@@ -1095,119 +1099,145 @@ class TestStopSemanticValidation:
         pos.stop_order_id = "stop-1"
         return pos
 
-    @pytest.mark.asyncio
-    async def test_correct_stop_no_warning(self, long_position):
+    def _make_monitor(self):
+        mock_client = AsyncMock()
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
+        return PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
+
+    # ------------------------------------------------------------------
+    # Correct stop → no warnings or errors
+    # ------------------------------------------------------------------
+
+    def test_correct_stop_no_warning(self, long_position):
         """A correct stop (sell, reduceOnly, full size, stop type) should not warn."""
-        mock_client = AsyncMock()
         order_data = {
-            "id": "stop-1",
-            "side": "sell",
-            "type": "stop",
-            "amount": 10,
-            "reduceOnly": True,
-            "status": "entered_book",
-            "filled": 0,
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 10, "reduceOnly": True, "stopPrice": 2.17,
+            "status": "entered_book", "filled": 0,
         }
-
-        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
-        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
-
+        monitor = self._make_monitor()
         with patch("src.execution.production_safety.logger") as mock_logger:
             monitor._warn_if_stop_semantically_wrong(long_position, order_data)
-            # No warning calls about "semantic mismatch"
-            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
-            mismatch_warnings = [w for w in warning_calls if "semantic mismatch" in w.lower()]
-            assert len(mismatch_warnings) == 0, f"Unexpected warnings: {mismatch_warnings}"
+            assert mock_logger.warning.call_count == 0, "No warnings expected"
+            assert mock_logger.error.call_count == 0, "No errors expected"
 
-    @pytest.mark.asyncio
-    async def test_wrong_side_warns(self, long_position):
-        """A long position with a BUY stop (wrong side) should warn."""
-        mock_client = AsyncMock()
+    # ------------------------------------------------------------------
+    # CRITICAL issues → logger.error
+    # ------------------------------------------------------------------
+
+    def test_wrong_side_is_critical(self, long_position):
+        """A long position with a BUY stop should log at ERROR level."""
         order_data = {
-            "id": "stop-1",
-            "side": "buy",  # Wrong! Should be sell for a long position
-            "type": "stop",
-            "amount": 10,
-            "reduceOnly": True,
-            "status": "entered_book",
-            "filled": 0,
+            "id": "stop-1", "side": "buy", "type": "stop",
+            "amount": 10, "reduceOnly": True, "stopPrice": 2.17,
         }
-
-        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
-        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
-
+        monitor = self._make_monitor()
         with patch("src.execution.production_safety.logger") as mock_logger:
             monitor._warn_if_stop_semantically_wrong(long_position, order_data)
-            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
-            assert any("semantic mismatch" in w.lower() for w in warning_calls), (
-                f"Expected side mismatch warning, got: {warning_calls}"
-            )
+            assert mock_logger.error.call_count == 1
+            call_str = str(mock_logger.error.call_args)
+            assert "CRITICAL" in call_str
+            assert "side=buy" in call_str
 
-    @pytest.mark.asyncio
-    async def test_not_reduce_only_warns(self, long_position):
-        """reduceOnly=False on a protective stop should warn."""
-        mock_client = AsyncMock()
+    def test_reduce_only_false_is_critical(self, long_position):
+        """reduceOnly=False should log at ERROR level."""
         order_data = {
-            "id": "stop-1",
-            "side": "sell",
-            "type": "stop",
-            "amount": 10,
-            "reduceOnly": False,  # Should be True
-            "status": "entered_book",
-            "filled": 0,
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 10, "reduceOnly": False, "stopPrice": 2.17,
         }
-
-        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
-        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
-
+        monitor = self._make_monitor()
         with patch("src.execution.production_safety.logger") as mock_logger:
             monitor._warn_if_stop_semantically_wrong(long_position, order_data)
-            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
-            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+            assert mock_logger.error.call_count == 1
+            call_str = str(mock_logger.error.call_args)
+            assert "reduceOnly=False" in call_str
 
-    @pytest.mark.asyncio
-    async def test_undersized_stop_warns(self, long_position):
-        """A stop covering < 50% of position size should warn."""
-        mock_client = AsyncMock()
+    def test_amount_below_25pct_is_critical(self, long_position):
+        """Coverage < 25% should log at ERROR level (basically ineffective)."""
         order_data = {
-            "id": "stop-1",
-            "side": "sell",
-            "type": "stop",
-            "amount": 3,  # Only 30% of 10 — significantly undersized
-            "reduceOnly": True,
-            "status": "entered_book",
-            "filled": 0,
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 2, "reduceOnly": True, "stopPrice": 2.17,  # 20% of 10
         }
-
-        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
-        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
-
+        monitor = self._make_monitor()
         with patch("src.execution.production_safety.logger") as mock_logger:
             monitor._warn_if_stop_semantically_wrong(long_position, order_data)
-            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
-            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+            assert mock_logger.error.call_count == 1
+            call_str = str(mock_logger.error.call_args)
+            assert "basically ineffective" in call_str
 
-    @pytest.mark.asyncio
-    async def test_take_profit_type_warns(self, long_position):
-        """If the 'stop' is actually a take_profit, should warn."""
-        mock_client = AsyncMock()
+    def test_take_profit_type_is_critical(self, long_position):
+        """If the 'stop' is actually a take_profit, should log ERROR."""
         order_data = {
-            "id": "stop-1",
-            "side": "sell",
-            "type": "take_profit",  # Not a stop!
-            "amount": 10,
-            "reduceOnly": True,
-            "status": "entered_book",
-            "filled": 0,
+            "id": "stop-1", "side": "sell", "type": "take_profit",
+            "amount": 10, "reduceOnly": True,
         }
-
-        enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
-        monitor = PositionProtectionMonitor(mock_client, PositionRegistry(), enforcer)
-
+        monitor = self._make_monitor()
         with patch("src.execution.production_safety.logger") as mock_logger:
             monitor._warn_if_stop_semantically_wrong(long_position, order_data)
-            warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
-            assert any("semantic mismatch" in w.lower() for w in warning_calls)
+            assert mock_logger.error.call_count == 1
+            call_str = str(mock_logger.error.call_args)
+            assert "TP, not SL" in call_str
+
+    # ------------------------------------------------------------------
+    # Standard warnings → logger.warning
+    # ------------------------------------------------------------------
+
+    def test_amount_between_25_and_90_pct_warns(self, long_position):
+        """Coverage 25-90% should log WARNING (partial, not critical)."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 7, "reduceOnly": True, "stopPrice": 2.17,  # 70% of 10
+        }
+        monitor = self._make_monitor()
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            assert mock_logger.error.call_count == 0, "Should not be critical"
+            assert mock_logger.warning.call_count == 1
+            call_str = str(mock_logger.warning.call_args)
+            assert "won't fully protect" in call_str
+
+    def test_reduce_only_missing_warns_softly(self, long_position):
+        """reduceOnly=None (missing from response) should soft-warn, not error."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "stop",
+            "amount": 10, "reduceOnly": None, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            assert mock_logger.error.call_count == 0, "Missing != False"
+            assert mock_logger.warning.call_count == 1
+            call_str = str(mock_logger.warning.call_args)
+            assert "missing" in call_str
+
+    def test_type_market_with_stop_price_no_warn(self, long_position):
+        """type='market' but stopPrice present → legitimate stop-market, no warn."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "market",
+            "amount": 10, "reduceOnly": True, "stopPrice": 2.17,
+        }
+        monitor = self._make_monitor()
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            assert mock_logger.warning.call_count == 0
+            assert mock_logger.error.call_count == 0
+
+    def test_type_limit_without_stop_price_warns(self, long_position):
+        """type='limit' and no stopPrice → not a stop, should warn."""
+        order_data = {
+            "id": "stop-1", "side": "sell", "type": "limit",
+            "amount": 10, "reduceOnly": True, "stopPrice": None,
+        }
+        monitor = self._make_monitor()
+        with patch("src.execution.production_safety.logger") as mock_logger:
+            monitor._warn_if_stop_semantically_wrong(long_position, order_data)
+            assert mock_logger.warning.call_count == 1
+            call_str = str(mock_logger.warning.call_args)
+            assert "expected stop variant" in call_str
+
+    # ------------------------------------------------------------------
+    # Integration: mismatches still don't change the verdict
+    # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_semantic_check_does_not_change_verdict(self, long_position):
@@ -1221,15 +1251,16 @@ class TestStopSemanticValidation:
         mock_client.get_all_futures_positions.return_value = [
             {"symbol": "PF_ZROUSD", "contracts": 10}
         ]
-        # Stop is alive but semantically wrong (wrong side, not reduce-only)
+        # Stop is alive but semantically wrong in every way
         mock_client.fetch_order.return_value = {
             "id": "stop-1",
             "status": "entered_book",
             "filled": 0,
             "side": "buy",          # Wrong
             "type": "limit",        # Wrong
-            "amount": 2,            # Undersized
+            "amount": 2,            # Undersized (<25%)
             "reduceOnly": False,    # Wrong
+            "stopPrice": None,      # Missing
         }
 
         enforcer = ProtectionEnforcer(mock_client, SafetyConfig())

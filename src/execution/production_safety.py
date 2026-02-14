@@ -1004,55 +1004,96 @@ class PositionProtectionMonitor:
 
         Checks:
           1. Side matches position direction (long→sell stop, short→buy stop)
-          2. reduceOnly is True
-          3. Amount >= position remaining_qty
-          4. Type contains 'stop' (not a take-profit mislabeled)
+          2. reduceOnly is True (or unknown → soft warn)
+          3. Amount coverage: warn < 90%, error-level warn < 25%
+          4. Type is stop-like (stopPrice present OR type contains stop/stp)
 
-        Logs WARNING for each mismatch but does NOT change the protection
-        verdict.  This gives observability for "alive but wrong" stops
-        without introducing new kill-switch risk.
+        Logs WARNING (or ERROR for critical mismatches) but does NOT change
+        the protection verdict.  This gives observability for "alive but wrong"
+        stops without introducing new kill-switch risk.
         """
-        issues = []
+        issues = []       # Standard warnings
+        critical = []     # High-severity issues (logged at error level)
 
-        # --- Side check ---
+        # --- 1. Side check ---
+        # Log all three values (position side, expected close side, order side)
+        # so we can confirm venue semantics quickly.
         order_side = str(order_data.get("side") or "").lower()
+        pos_side_str = "long" if position.side == Side.LONG else "short"
+        expected_side = "sell" if position.side == Side.LONG else "buy"
         if order_side:
-            expected_side = "sell" if position.side == Side.LONG else "buy"
             if order_side != expected_side:
-                issues.append(f"side={order_side}, expected={expected_side}")
+                critical.append(
+                    f"side={order_side}, expected={expected_side} "
+                    f"(position_side={pos_side_str})"
+                )
+        # If order_side is empty, we can't check — skip silently.
 
-        # --- reduceOnly check ---
+        # --- 2. reduceOnly check ---
         reduce_only = order_data.get("reduceOnly")
-        if reduce_only is not None and not reduce_only:
-            issues.append("reduceOnly=False (expected True for protective stop)")
+        if reduce_only is None:
+            # Field missing from CCXT/Kraken response — soft warning so we learn
+            issues.append("reduceOnly=missing (expected True; field not in response)")
+        elif not reduce_only:
+            critical.append("reduceOnly=False (expected True for protective stop)")
 
-        # --- Amount check ---
+        # --- 3. Amount coverage (two-band) ---
         order_amount = order_data.get("amount")
         if order_amount is not None:
             try:
                 amount = float(order_amount)
                 remaining = float(position.remaining_qty)
-                if remaining > 0 and amount < remaining * 0.5:
-                    # Only warn if significantly undersized (< 50% of position)
-                    # Small differences can be normal (partial fills, rounding)
-                    issues.append(f"amount={amount}, remaining_qty={remaining} (undersized)")
+                if remaining > 0:
+                    coverage = amount / remaining
+                    if coverage < 0.25:
+                        critical.append(
+                            f"amount={amount}, remaining_qty={remaining}, "
+                            f"coverage={coverage:.0%} (basically ineffective, likely bug)"
+                        )
+                    elif coverage < 0.90:
+                        issues.append(
+                            f"amount={amount}, remaining_qty={remaining}, "
+                            f"coverage={coverage:.0%} (partial, won't fully protect)"
+                        )
             except (ValueError, TypeError):
                 pass
 
-        # --- Type check ---
+        # --- 4. Type check (resilient to Kraken naming) ---
+        # A legitimate stop can appear as type="market" with a stopPrice set,
+        # so we accept either: type contains stop/stp, OR stopPrice is present.
         order_type = str(order_data.get("type") or "").lower()
-        if order_type:
-            is_stop_type = any(t in order_type for t in ("stop", "stp"))
-            if not is_stop_type:
-                issues.append(f"type='{order_type}' (expected stop variant)")
-            if "take_profit" in order_type or "take-profit" in order_type:
-                issues.append(f"type='{order_type}' appears to be TP, not SL")
+        stop_price = order_data.get("stopPrice")
+        has_stop_in_type = any(t in order_type for t in ("stop", "stp"))
+        has_stop_price = stop_price is not None
 
-        if issues:
+        if order_type:
+            if "take_profit" in order_type or "take-profit" in order_type:
+                critical.append(f"type='{order_type}' appears to be TP, not SL")
+            elif not has_stop_in_type and not has_stop_price:
+                issues.append(
+                    f"type='{order_type}', stopPrice={stop_price} "
+                    "(expected stop variant or stopPrice set)"
+                )
+
+        # --- Emit logs ---
+        stop_oid = str(order_data.get("id") or "")
+
+        if critical:
+            logger.error(
+                "Stop semantic CRITICAL mismatch: stop is ALIVE but likely NOT correct protection",
+                symbol=position.symbol,
+                stop_order_id=stop_oid,
+                position_side=pos_side_str,
+                expected_close_side=expected_side,
+                order_side=order_side or "unknown",
+                critical_issues=critical,
+                other_issues=issues if issues else None,
+            )
+        elif issues:
             logger.warning(
                 "Stop semantic mismatch: stop is ALIVE but may not be correct protection",
                 symbol=position.symbol,
-                stop_order_id=str(order_data.get("id") or ""),
+                stop_order_id=stop_oid,
                 issues=issues,
             )
     
