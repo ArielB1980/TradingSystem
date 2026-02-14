@@ -14,6 +14,7 @@ import urllib.error
 from decimal import Decimal
 from typing import Optional
 from datetime import datetime, timezone
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -44,8 +45,8 @@ def _send_slack_webhook(url: str, level: str, title: str, message: str, metadata
         req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as _:
             pass
-    except Exception as e:
-        logger.warning("Slack webhook failed", error=str(e))
+    except (OperationalError, DataError, OSError, ConnectionError) as e:
+        logger.warning("Slack webhook failed", error=str(e), error_type=type(e).__name__)
 
 
 def _send_discord_webhook(url: str, level: str, title: str, message: str, metadata: Optional[dict] = None) -> None:
@@ -65,8 +66,8 @@ def _send_discord_webhook(url: str, level: str, title: str, message: str, metada
         req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as _:
             pass
-    except Exception as e:
-        logger.warning("Discord webhook failed", error=str(e))
+    except (OperationalError, DataError, OSError, ConnectionError) as e:
+        logger.warning("Discord webhook failed", error=str(e), error_type=type(e).__name__)
 
 
 class AlertSystem:
@@ -237,7 +238,7 @@ def get_alert_system(config: Optional[dict] = None) -> AlertSystem:
                     "max_position_size_usd": getattr(cfg.risk, "max_position_size_usd", 10000),
                     "max_daily_loss_pct": getattr(cfg.risk, "daily_loss_limit_pct", 5.0) * 100,
                 }
-            except Exception:
+            except (ImportError, OSError, ValueError, TypeError, KeyError):
                 config = {}
         _alert_system = AlertSystem(config)
     return _alert_system

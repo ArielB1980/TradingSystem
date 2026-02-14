@@ -8,6 +8,7 @@ Verifies correct handling of:
 - Case D: Duplicate/Stale local state (purge)
 """
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from decimal import Decimal
 from datetime import datetime, timezone
@@ -141,10 +142,12 @@ async def test_case_c_chaos_resolution(takeover, mock_gateway):
 async def test_case_d_duplicate_purge(takeover, mock_gateway):
     """Case D: Local stale state -> Purge before import."""
     symbol = "XRP/USD:USD"
-    
-    # Registry has stale position
+    # Purge uses existing.symbol as the registry key. Use a plain object so stop_order_id is falsy
+    # (MagicMock can make .stop_order_id truthy); purge branch is "no stop -> del _positions[existing.symbol]"
+    stale_pos = SimpleNamespace(symbol=symbol, stop_order_id=None)
     mock_gateway.registry.has_position.return_value = True
-    mock_gateway.registry._positions = {symbol: MagicMock()}
+    mock_gateway.registry.get_position.return_value = stale_pos
+    mock_gateway.registry._positions = {symbol: stale_pos}
     
     mock_gateway.client.get_futures_open_orders.return_value = []
     mock_gateway.client.get_all_futures_positions.return_value = [
@@ -172,8 +175,9 @@ async def test_emergency_quarantine_on_failure(takeover, mock_gateway):
     ]
     mock_gateway.client.get_futures_open_orders.return_value = []
     
-    # Stop placement FAILS
-    mock_gateway.client.place_futures_order.side_effect = Exception("API Error")
+    # Stop placement FAILS (OperationalError — transient API failure)
+    from src.exceptions import OperationalError
+    mock_gateway.client.place_futures_order.side_effect = OperationalError("API Error")
     mock_gateway.client.get_futures_mark_price.return_value = Decimal("0.1")
     
     stats = await takeover.execute_takeover()

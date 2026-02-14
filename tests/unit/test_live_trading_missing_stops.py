@@ -5,6 +5,7 @@ from decimal import Decimal
 
 
 from src.live.live_trading import _exchange_position_side, LiveTrading
+from src.execution.execution_gateway import ExecutionResult
 
 
 def test_exchange_position_side_prefers_explicit_side_field():
@@ -24,12 +25,19 @@ async def test_auto_place_missing_stops_uses_position_side_for_shorts():
     - KrakenClient positions have positive size + explicit `side`.
     - LiveTrading previously inferred side from size sign -> treated all as LONG.
     That caused SHORT positions to not get protective BUY stops above entry.
+
+    Updated P1.2: missing stops now route through execution_gateway.place_emergency_order.
     """
     dummy = SimpleNamespace()
     dummy.config = SimpleNamespace(system=SimpleNamespace(dry_run=False))
     dummy.client = AsyncMock()
     dummy.client.get_futures_open_orders.return_value = []
-    dummy.client.place_futures_order.return_value = {"id": "stop-1"}
+
+    # P1.2: stops now route through gateway
+    dummy.execution_gateway = AsyncMock()
+    dummy.execution_gateway.place_emergency_order.return_value = ExecutionResult(
+        success=True, client_order_id="emg-missing_stop-abc", exchange_order_id="stop-1"
+    )
 
     raw_positions = [
         {
@@ -42,11 +50,12 @@ async def test_auto_place_missing_stops_uses_position_side_for_shorts():
 
     await LiveTrading._place_missing_stops_for_unprotected(dummy, raw_positions, max_per_tick=3)
 
-    dummy.client.place_futures_order.assert_called_once()
-    kwargs = dummy.client.place_futures_order.call_args.kwargs
+    dummy.execution_gateway.place_emergency_order.assert_called_once()
+    kwargs = dummy.execution_gateway.place_emergency_order.call_args.kwargs
     assert kwargs["symbol"] == "XRP/USD:USD"
     assert kwargs["order_type"] == "stop"
     assert kwargs["reduce_only"] is True
     assert kwargs["side"] == "buy"  # SHORT protection must BUY to close
     assert kwargs["stop_price"] > Decimal("1.93136")  # SHORT stop must be above entry
+    assert kwargs["reason"] == "missing_stop"
 

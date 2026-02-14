@@ -41,6 +41,11 @@ class ExchangeConfig(BaseSettings):
     futures_api_key: Optional[str] = None
     futures_api_secret: Optional[str] = None
     use_testnet: bool = False
+
+    # Circuit breaker thresholds (P3.1)
+    circuit_breaker_failure_threshold: int = Field(default=5, ge=2, le=20, description="Consecutive failures before opening breaker")
+    circuit_breaker_rate_limit_threshold: int = Field(default=2, ge=1, le=10, description="Rate limit errors before opening breaker")
+    circuit_breaker_cooldown_seconds: float = Field(default=60.0, ge=10.0, le=300.0, description="Seconds before half-open probe")
     
     # Position size format (for exchange compatibility)
     # If True: exchange returns position size as notional USD (don't multiply by price)
@@ -73,6 +78,10 @@ class RiskConfig(BaseSettings):
     # Position size caps
     max_position_size_usd: float = Field(default=100000.0, ge=1000.0, le=1000000.0)  # Max notional position
     max_risk_per_trade_entry_pct: float = Field(default=0.02, ge=0.001, le=0.10)  # Max risk per trade for Kelly
+    max_loss_per_trade_usd: float = Field(
+        default=500.0, ge=10.0, le=50000.0,
+        description="Max dollar loss if stop hits. Rejects trades where abs(entry - stop) * size > this."
+    )
     
     # Margin-based caps (replace notional caps; vs 7x leverage)
     max_single_position_margin_pct_equity: float = Field(

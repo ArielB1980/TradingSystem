@@ -24,6 +24,7 @@ from src.execution.position_state_machine import (
 from src.data.symbol_utils import position_symbol_matches_order
 from src.domain.models import Side
 from src.monitoring.logger import get_logger
+from src.exceptions import OperationalError, DataError, InvariantError
 
 logger = get_logger(__name__)
 
@@ -234,8 +235,9 @@ class AtomicStopReplacer:
                     if any(o.get("id") == ctx.new_stop_order_id for o in open_orders):
                         ctx.new_stop_acked = True
                         break
-                except Exception:
-                    pass
+                except OperationalError as e:
+                    # Transient API error — retry on next poll iteration
+                    logger.debug("Stop ack poll: transient error, retrying", error=str(e))
                 
                 await asyncio.sleep(0.5)
             
@@ -248,8 +250,13 @@ class AtomicStopReplacer:
                 # Try to cancel the new stop we placed
                 try:
                     await self.client.cancel_futures_order(ctx.new_stop_order_id, exchange_symbol)
-                except Exception:
-                    pass
+                except OperationalError as e:
+                    logger.warning(
+                        "Failed to cancel unacked new stop (may need manual cleanup)",
+                        symbol=position.symbol,
+                        new_stop_id=ctx.new_stop_order_id,
+                        error=str(e),
+                    )
                 
                 return ctx
             
@@ -258,9 +265,15 @@ class AtomicStopReplacer:
                 try:
                     await self.client.cancel_futures_order(ctx.old_stop_order_id, exchange_symbol)
                     ctx.old_stop_cancelled = True
-                except Exception as e:
-                    # Old stop might have already triggered - that's OK
-                    logger.warning(f"Old stop cancel failed (may have triggered): {e}")
+                except (OperationalError, DataError) as e:
+                    # Old stop might have already triggered — that's OK
+                    logger.warning(
+                        "Old stop cancel failed (may have triggered)",
+                        symbol=position.symbol,
+                        old_stop_id=ctx.old_stop_order_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
                     ctx.old_stop_cancelled = True  # Treat as success
             
             logger.info(
@@ -272,13 +285,16 @@ class AtomicStopReplacer:
             
             return ctx
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
             ctx.failed = True
             ctx.error = str(e)
             logger.error(
                 "Atomic stop replace failed - KEEPING OLD STOP",
                 symbol=position.symbol,
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
             )
             return ctx
         
@@ -404,11 +420,14 @@ class ProtectionEnforcer:
             
             return True
             
-        except Exception as e:
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except (OperationalError, DataError) as e:
             logger.critical(
                 "EMERGENCY EXIT FAILED - MANUAL INTERVENTION REQUIRED",
                 symbol=position.symbol,
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
             )
             position.mark_orphaned()
             return False
@@ -827,8 +846,10 @@ class PositionProtectionMonitor:
         
         try:
             exchange_orders = await self.client.get_futures_open_orders()
-        except Exception as e:
-            logger.error(f"Failed to fetch orders for protection check: {e}")
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except (OperationalError, DataError) as e:
+            logger.error(f"Failed to fetch orders for protection check: {e}", error_type=type(e).__name__)
             return results
         
         # Diagnostic: log what orders are visible so future incidents are 30-second diagnoses
@@ -855,8 +876,10 @@ class PositionProtectionMonitor:
         # CRITICAL: Fetch actual positions from exchange to verify they exist
         try:
             exchange_positions = await self.client.get_all_futures_positions()
-        except Exception as e:
-            logger.error(f"Failed to fetch positions for protection check: {e}")
+        except InvariantError:
+            raise  # Safety violation — propagate
+        except (OperationalError, DataError) as e:
+            logger.error(f"Failed to fetch positions for protection check: {e}", error_type=type(e).__name__)
             # If we can't verify positions, assume protected to avoid false positives
             return results
         
@@ -1056,14 +1079,28 @@ class PositionProtectionMonitor:
                         reduce_only=reduce_only,
                         layer3_saves_total=self.layer3_saves_total,
                     )
-                    # Update in-memory stop_order_id so Layer 2 works next time
+                    # Update stop_order_id so Layer 2 works next time.
+                    # CRITICAL: Also persist to SQLite so the update survives
+                    # restarts. Without persistence, a restart reverts to the
+                    # stale ID and Layer 3 must re-discover every time.
                     new_id = order.get("id")
                     if new_id and status in ALIVE_STOP_STATUSES:
                         position.stop_order_id = str(new_id)
+                        if self.persistence:
+                            try:
+                                self.persistence.save_position(position)
+                            except (OperationalError, DataError, OSError) as persist_err:
+                                logger.warning(
+                                    "Layer 3: failed to persist stop_order_id update",
+                                    symbol=position.symbol,
+                                    error=str(persist_err),
+                                    error_type=type(persist_err).__name__,
+                                )
                         logger.info(
                             "Layer 3: updated stale stop_order_id",
                             symbol=position.symbol,
                             new_stop_order_id=str(new_id)[:16],
+                            persisted=bool(self.persistence),
                         )
                     return True
 
@@ -1098,7 +1135,13 @@ class PositionProtectionMonitor:
                                 layer3_saves_total=self.layer3_saves_total,
                             )
                             return True
-                except Exception:
+                except (OperationalError, DataError) as e:
+                    logger.debug(
+                        "Layer 3: fetch_order variant failed (trying next)",
+                        symbol=position.symbol,
+                        variant=sym_variant,
+                        error=str(e),
+                    )
                     continue
 
         return False
@@ -1132,12 +1175,13 @@ class PositionProtectionMonitor:
 
         try:
             order_data = await fetch_order(stop_oid, sym)
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Stop-fill verification: fetch_order failed",
                 symbol=position.symbol,
                 stop_order_id=stop_oid,
                 error=str(e),
+                error_type=type(e).__name__,
             )
             return False  # Can't verify, treat as naked
 
@@ -1423,7 +1467,7 @@ class PositionProtectionMonitor:
         if self.persistence:
             try:
                 self.persistence.save_position(position)
-            except Exception as e:
+            except (OperationalError, DataError, OSError) as e:
                 logger.warning(
                     "Failed to persist stop-fill closure",
                     symbol=position.symbol,
@@ -1443,11 +1487,12 @@ class PositionProtectionMonitor:
                 )
                 if trade and self.persistence:
                     self.persistence.save_position(position)  # save trade_recorded=True
-            except Exception as e:
+            except (OperationalError, DataError, OSError, ImportError) as e:
                 logger.warning(
                     "Failed to record trade after stop-fill closure",
                     symbol=position.symbol,
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
 
     async def run_periodic_check(self, interval_seconds: int = 30) -> None:
@@ -1469,8 +1514,10 @@ class PositionProtectionMonitor:
                         f"Protection check passed: {len(results)} positions verified"
                     )
                     
-            except Exception as e:
-                logger.error(f"Protection check failed: {e}")
+            except InvariantError:
+                raise  # Safety violation — must halt
+            except (OperationalError, DataError) as e:
+                logger.error(f"Protection check failed: {e}", error_type=type(e).__name__)
             
             await asyncio.sleep(interval_seconds)
     

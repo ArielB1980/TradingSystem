@@ -9,6 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from src.exceptions import OperationalError, DataError
 from src.domain.models import Signal, SignalType, Side
 from src.execution.equity import calculate_effective_equity
 from src.execution.position_manager_v2 import ActionType as ActionTypeV2
@@ -219,8 +220,8 @@ async def handle_signal_v2(
 
     try:
         lt.position_registry.register_position(position)
-    except Exception as e:
-        logger.error("Failed to register position", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Failed to register position", error=str(e), error_type=type(e).__name__)
         return _fail(f"Failed to register position: {e}")
 
     # 9. Execute entry via Execution Gateway
@@ -268,7 +269,7 @@ async def handle_signal_v2(
             f"Size: {fmt_size(position_size)} @ ${fmt_price(mark_price)}\n"
             f"Stop: ${fmt_price(position.initial_stop_price)}",
         )
-    except Exception:
+    except (OperationalError, ImportError, OSError):
         pass  # Alert failure must never block trading
 
     return _ok()

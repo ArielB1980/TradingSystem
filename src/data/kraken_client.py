@@ -35,7 +35,16 @@ from src.constants import (
     PRIVATE_API_REFILL_RATE,
     KRAKEN_FUTURES_BASE_URL,
 )
-from src.exceptions import APIError, AuthenticationError
+from src.exceptions import (
+    APIError,
+    AuthenticationError,
+    CircuitOpenError,
+    DataError,
+    InvariantError,
+    OperationalError,
+    RateLimitError,
+)
+from src.utils.circuit_breaker import APICircuitBreaker
 from src.utils.retry import retry_on_transient_errors
 
 logger = get_logger(__name__)
@@ -140,6 +149,10 @@ class KrakenClient:
         use_testnet: bool = False,
         *,
         market_cache_minutes: int = 60,
+        dry_run: bool = False,
+        breaker_failure_threshold: int = 5,
+        breaker_rate_limit_threshold: int = 2,
+        breaker_cooldown_seconds: float = 60.0,
     ):
         """
         Initialize Kraken client.
@@ -158,6 +171,9 @@ class KrakenClient:
         self.futures_api_secret = futures_api_secret
         self.use_testnet = use_testnet
         self._market_cache_minutes = max(1, market_cache_minutes)
+        self._dry_run = dry_run
+        if dry_run:
+            logger.warning("KrakenClient initialized in DRY_RUN mode — order placement will be refused")
 
         # Helper to sanitize base64 secrets
         def sanitize_secret(secret: str) -> str:
@@ -191,6 +207,14 @@ class KrakenClient:
         # Persistent HTTP session for connection reuse (created lazily)
         self._http_session: Optional[aiohttp.ClientSession] = None
 
+        # API-level circuit breaker (P2.1) — guards all outbound calls
+        self._api_breaker = APICircuitBreaker(
+            failure_threshold=breaker_failure_threshold,
+            rate_limit_threshold=breaker_rate_limit_threshold,
+            cooldown_seconds=breaker_cooldown_seconds,
+            name="kraken_api",
+        )
+
         logger.info("Kraken client configuration loaded")
     
     async def _get_http_session(self) -> aiohttp.ClientSession:
@@ -213,6 +237,128 @@ class KrakenClient:
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
             self._http_session = None
+
+    # -- Circuit-breaker guarded call (P2.1) --------------------------------
+
+    async def _guarded_call(self, coro, *, label: str = "api_call"):
+        """Execute an async coroutine through the API circuit breaker.
+
+        1. Check breaker — raises CircuitOpenError if OPEN
+        2. Await the coroutine
+        3. Record success / failure and classify the exception
+
+        All public API methods should delegate through this.
+        """
+        await self._api_breaker.can_execute()  # raises CircuitOpenError if open
+        try:
+            result = await coro
+            await self._api_breaker.record_success()
+            return result
+        except Exception as exc:
+            classified = self._classify_exception(exc)
+            is_rate_limit = isinstance(classified, RateLimitError)
+            # Only record breaker-triggering failures (OperationalError family)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(exc, is_rate_limit=is_rate_limit)
+            # Re-raise the classified exception
+            raise classified from exc
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> Exception:
+        """Map raw ccxt / aiohttp / stdlib exceptions to our hierarchy.
+
+        Rules:
+          - 5xx, timeout, connection reset, DNS -> OperationalError
+          - 429 rate-limit -> RateLimitError (subclass of OperationalError)
+          - Bad symbol, invalid order, min size -> DataError
+          - Auth failure -> InvariantError (halt)
+          - Already one of our types -> pass through
+        """
+        # Already classified
+        if isinstance(exc, (OperationalError, DataError, InvariantError)):
+            return exc
+
+        exc_str = str(exc).lower()
+
+        # --- Auth (escalate to halt) ---
+        if isinstance(exc, getattr(ccxt, "AuthenticationError", type(None))):
+            return InvariantError(f"Exchange auth failure: {exc}")
+
+        # --- Rate limit (fast-trigger breaker) ---
+        if isinstance(exc, getattr(ccxt, "RateLimitExceeded", type(None))):
+            return RateLimitError(f"Rate limit: {exc}")
+        if "429" in exc_str or "rate limit" in exc_str or "too many requests" in exc_str:
+            return RateLimitError(f"Rate limit: {exc}")
+
+        # --- Network / transient (breaker-triggering) ---
+        # P1.1: Narrow OSError to networky subclasses only.
+        # FileNotFoundError, PermissionError, etc. are deployment bugs, not transient.
+        _NETWORK_OSERRORS = (
+            ConnectionError,       # includes ConnectionResetError, etc.
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionRefusedError,
+            ConnectionAbortedError,
+        )
+        if isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError)):
+            return OperationalError(f"Network error: {exc}")
+        if isinstance(exc, _NETWORK_OSERRORS):
+            return OperationalError(f"Network error: {exc}")
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in (
+            # errno values for network-related OS errors
+            110,   # ETIMEDOUT
+            111,   # ECONNREFUSED
+            113,   # EHOSTUNREACH
+            101,   # ENETUNREACH
+            104,   # ECONNRESET
+        ):
+            return OperationalError(f"Network OS error (errno={exc.errno}): {exc}")
+        # Non-network OSError (FileNotFoundError, PermissionError) — let it crash
+        if isinstance(exc, getattr(ccxt, "NetworkError", type(None))):
+            return OperationalError(f"CCXT network error: {exc}")
+        if isinstance(exc, getattr(ccxt, "ExchangeNotAvailable", type(None))):
+            return OperationalError(f"Exchange unavailable: {exc}")
+        if isinstance(exc, getattr(ccxt, "RequestTimeout", type(None))):
+            return OperationalError(f"Request timeout: {exc}")
+
+        # P1.1: 5xx detection — only from CCXT structured errors, NOT string matching.
+        # Removed: `for code in ("500", "502", ...): if code in exc_str:` — too many false positives.
+        # CCXT wraps 5xx responses as ExchangeNotAvailable (handled above) or ExchangeError.
+        # For non-CCXT errors with HTTP status in the message, we check structured pattern only.
+        import re
+        if re.search(r"\bHTTP\s+5\d{2}\b", str(exc), re.IGNORECASE):
+            return OperationalError(f"HTTP 5xx: {exc}")
+
+        # --- Data / business errors (skip symbol, don't trip breaker) ---
+        if isinstance(exc, getattr(ccxt, "BadSymbol", type(None))):
+            return DataError(f"Bad symbol: {exc}")
+        if isinstance(exc, getattr(ccxt, "InvalidOrder", type(None))):
+            return DataError(f"Invalid order: {exc}")
+        if isinstance(exc, getattr(ccxt, "InsufficientFunds", type(None))):
+            return DataError(f"Insufficient funds: {exc}")
+        if isinstance(exc, getattr(ccxt, "BadRequest", type(None))):
+            return DataError(f"Bad request: {exc}")
+        for keyword in ("does not have market", "invalid symbol", "min size",
+                        "minimum", "insufficient", "not found"):
+            if keyword in exc_str:
+                return DataError(f"Business error: {exc}")
+
+        # --- ccxt.ExchangeError fallback ---
+        # P1.1: Only known-transient ccxt errors count as OperationalError.
+        # Unknown ExchangeError → DataError (won't trip breaker).
+        if isinstance(exc, getattr(ccxt, "DDoSProtection", type(None))):
+            return OperationalError(f"DDoS protection: {exc}")
+        if isinstance(exc, getattr(ccxt, "ExchangeError", type(None))):
+            # Unknown exchange error — treat as DataError (not breaker-triggering)
+            return DataError(f"Exchange error (unclassified): {exc}")
+
+        # Unknown — don't wrap. Let it crash (systemd restarts).
+        return exc
+
+    @property
+    def api_breaker(self) -> APICircuitBreaker:
+        """Expose breaker for metrics / health endpoints."""
+        return self._api_breaker
 
     def has_valid_spot_credentials(self) -> bool:
         """Check if spot API keys are present."""
@@ -357,30 +503,40 @@ class KrakenClient:
             Dict containing balance info
         """
         await self.private_limiter.wait_for_token()
-        
+        await self._api_breaker.can_execute()
+
         try:
             # Now fully async
             balance = await self.exchange.fetch_balance()
+            await self._api_breaker.record_success()
             logger.debug("Fetched spot balance")
             return balance
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch spot balance", error=str(e))
-            raise Exception(f"Spot API error: {str(e)}")
+            raise classified from e
 
     async def get_spot_ticker(self, symbol: str) -> Dict:
         """Get current spot ticker information."""
         await self.public_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
         try:
             ticker = await self.exchange.fetch_ticker(symbol)
+            await self._api_breaker.record_success()
             return ticker
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             # Don't log errors for invalid symbols - just skip them silently
             error_msg = str(e).lower()
             if "does not have market" in error_msg or "invalid symbol" in error_msg:
                 logger.debug(f"Symbol {symbol} not available on exchange, skipping", error=str(e))
             else:
                 logger.error(f"Failed to fetch spot ticker for {symbol}", error=str(e))
-            raise
+            raise classified from e
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """
@@ -457,7 +613,8 @@ class KrakenClient:
             List of Candle objects
         """
         await self.public_limiter.wait_for_token()
-        
+        await self._api_breaker.can_execute()
+
         try:
             # Wrap fetch in timeout to prevent hangs
             ohlcv = await asyncio.wait_for(
@@ -484,6 +641,7 @@ class KrakenClient:
                 )
                 candles.append(candle)
             
+            await self._api_breaker.record_success()
             logger.debug(
                 "Fetched spot OHLCV",
                 symbol=symbol,
@@ -491,8 +649,11 @@ class KrakenClient:
                 count=len(candles),
             )
             return candles
-            
+
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             err_detail = str(e)
             err_type = type(e).__name__
             resp = getattr(e, "response", None)
@@ -504,7 +665,7 @@ class KrakenClient:
                 error=err_detail,
                 error_type=err_type,
             )
-            raise
+            raise classified from e
     
     async def get_futures_ohlcv(
         self,
@@ -530,6 +691,7 @@ class KrakenClient:
             return []
         limit = limit or 300
         await self.public_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
         try:
             if not self.futures_exchange.markets:
                 await self.futures_exchange.load_markets()
@@ -558,9 +720,13 @@ class KrakenClient:
                     close=Decimal(str(c)),
                     volume=Decimal(str(v)),
                 ))
+            await self._api_breaker.record_success()
             logger.debug("Fetched futures OHLCV", symbol=futures_symbol, timeframe=timeframe, count=len(candles))
             return candles
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.debug("Futures OHLCV fetch failed", symbol=futures_symbol, timeframe=timeframe, error=str(e))
             return []
 
@@ -589,7 +755,8 @@ class KrakenClient:
             List of position dicts
         """
         await self.private_limiter.wait_for_token()
-        
+        await self._api_breaker.can_execute()
+
         if not self.futures_api_key or not self.futures_api_secret:
             raise ValueError("Futures API credentials not configured")
         
@@ -601,7 +768,7 @@ class KrakenClient:
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise Exception(f"Futures API error: {error_text}")
+                    raise OperationalError(f"Futures API error ({response.status}): {error_text}")
                 
                 data = await response.json()
                 logger.debug("Raw Positions Response", keys=list(data.keys()), count=len(data.get('openPositions', [])))
@@ -617,11 +784,15 @@ class KrakenClient:
                         'side': pos.get('side', 'long'),  # Use API's side field directly
                     })
                 
+                await self._api_breaker.record_success()
                 return positions
             
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch all futures positions", error=str(e))
-            raise
+            raise classified from e
     
     async def get_futures_instruments(self) -> List[Dict]:
         """
@@ -712,6 +883,7 @@ class KrakenClient:
         This ensures lookup works regardless of format used.
         """
         await self.public_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             session = await self._get_http_session()
@@ -786,10 +958,14 @@ class KrakenClient:
                 except Exception as e:
                     logger.debug("Could not add CCXT keys to bulk futures tickers", error=str(e))
 
+            await self._api_breaker.record_success()
             return results
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch bulk futures tickers", error=str(e))
-            raise
+            raise classified from e
 
     async def get_futures_tickers_bulk_full(self) -> Dict[str, FuturesTicker]:
         """
@@ -804,12 +980,13 @@ class KrakenClient:
         Each value is a FuturesTicker with: mark_price, bid, ask, volume_24h, open_interest, funding_rate
         """
         await self.public_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/tickers"
             session = await self._get_http_session()
             async with session.get(url) as response:
                 if response.status != 200:
-                    raise Exception(f"Futures API error: {await response.text()}")
+                    raise OperationalError(f"Futures API error ({response.status}): {await response.text()}")
                 data = await response.json()
 
             results: Dict[str, FuturesTicker] = {}
@@ -893,11 +1070,15 @@ class KrakenClient:
                 except Exception as e:
                     logger.debug("Could not add CCXT keys to bulk full futures tickers", error=str(e))
 
+            await self._api_breaker.record_success()
             logger.info("Fetched full futures tickers", count=len(results))
             return results
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch bulk full futures tickers", error=str(e))
-            raise
+            raise classified from e
     
     async def get_account_balance(self) -> Dict[str, Decimal]:
         """
@@ -960,19 +1141,35 @@ class KrakenClient:
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
 
+        # P0.1: Defense-in-depth DRY_RUN gate at transport boundary.
+        # No simulated success — raise OperationalError so callers know immediately.
+        if self._dry_run:
+            logger.warning(
+                "DRY_RUN_ACTIVE — refusing to send real order",
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                size=str(size),
+                price=str(price) if price else None,
+                stop_price=str(stop_price) if stop_price else None,
+                reduce_only=reduce_only,
+            )
+            raise OperationalError("dry_run_active: order placement refused at transport boundary")
+
         # Defense-in-depth: never place NEW (non-reduce-only) orders on excluded-base instruments
         # (fiat currencies + stablecoins).
         # Reduce-only exits/close operations are allowed so the system can unwind legacy exposure safely.
         if not reduce_only and has_disallowed_base(symbol):
-            raise ValueError(f"Blocked non-reduce-only order on excluded base instrument: {symbol}")
+            raise DataError(f"Blocked non-reduce-only order on excluded base instrument: {symbol}")
 
         # Reject zero or negative size to avoid venue "amount must be greater than minimum" errors
         size_f = float(size)
         if size_f <= 0:
-            raise ValueError(
+            raise DataError(
                 f"Order size must be positive (got {size}). "
                 "Check instrument min_size and size rounding."
             )
+        await self._api_breaker.can_execute()
 
         try:
             # Create params dict for extra options
@@ -1073,11 +1270,15 @@ class KrakenClient:
                 leverage_confirmed=leverage_set_success
             )
             
+            await self._api_breaker.record_success()
             return order
             
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Futures order placement failed", error=str(e))
-            raise Exception(f"Futures API error: {str(e)}")
+            raise classified from e
 
     async def create_order(
         self,
@@ -1129,14 +1330,19 @@ class KrakenClient:
         """
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
+        await self._api_breaker.can_execute()
             
         try:
             balance = await self.futures_exchange.fetch_balance()
+            await self._api_breaker.record_success()
             logger.debug("Fetched futures balance")
             return balance
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch futures balance", error=str(e))
-            raise Exception(f"Futures API error: {str(e)}")
+            raise classified from e
 
     @retry_on_transient_errors(max_retries=3, base_delay=1.0)
     async def get_futures_account_info(self) -> Dict[str, Any]:
@@ -1203,14 +1409,19 @@ class KrakenClient:
         
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
+        await self._api_breaker.can_execute()
             
         try:
             orders = await self.futures_exchange.fetch_open_orders()
+            await self._api_breaker.record_success()
             logger.debug("Fetched open futures orders", count=len(orders))
             return orders
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch futures open orders", error=str(e))
-            raise Exception(f"Futures API error: {str(e)}")
+            raise classified from e
 
     async def fetch_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
@@ -1258,14 +1469,28 @@ class KrakenClient:
         """
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
-        
+
+        if self._dry_run:
+            logger.warning(
+                "DRY_RUN_ACTIVE — refusing to cancel order",
+                order_id=order_id,
+                symbol=symbol,
+            )
+            raise OperationalError("dry_run_active: order cancellation refused at transport boundary")
+
+        await self._api_breaker.can_execute()
+
         try:
             await self.futures_exchange.cancel_order(order_id, symbol)
+            await self._api_breaker.record_success()
             logger.info("Futures order cancelled", order_id=order_id)
             return {"result": "success", "order_id": order_id}
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to cancel futures order", order_id=order_id, error=str(e))
-            raise Exception(f"Futures API error: {str(e)}")
+            raise classified from e
 
     async def edit_futures_order(
         self,
@@ -1284,6 +1509,15 @@ class KrakenClient:
         """
         if not self.futures_exchange:
             raise ValueError("Futures credentials not configured")
+
+        if self._dry_run:
+            logger.warning(
+                "DRY_RUN_ACTIVE — refusing to edit order",
+                order_id=order_id,
+                symbol=symbol,
+            )
+            raise OperationalError("dry_run_active: order edit refused at transport boundary")
+
         if not symbol:
             raise ValueError("symbol is required to edit futures order")
 

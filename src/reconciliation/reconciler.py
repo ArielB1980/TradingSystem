@@ -10,6 +10,7 @@ from typing import List, Dict, Optional, Callable, Any, Union, Awaitable
 from decimal import Decimal
 from datetime import datetime, timezone
 
+from src.exceptions import OperationalError, DataError, InvariantError
 from src.monitoring.logger import get_logger
 from src.data.kraken_client import KrakenClient
 from src.data.symbol_utils import normalize_to_base
@@ -100,7 +101,7 @@ class Reconciler:
                 if sym and (float(p.get("size") or 0)) != 0:
                     out[str(sym)] = p
             return out
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning("Failed to fetch exchange positions for reconciliation", error=str(e))
             return {}
 
@@ -150,9 +151,9 @@ class Reconciler:
                                 r = self.place_protection_callback(pos)
                                 if asyncio.iscoroutine(r):
                                     await r
-                            except Exception as e:
+                            except (OperationalError, DataError) as e:
                                 logger.warning("Adopt place protection failed", symbol=orig_sym, error=str(e))
-                    except Exception as e:
+                    except (OperationalError, DataError) as e:
                         logger.error("Adopt failed", symbol=orig_sym, error=str(e))
                 else:  # force_close
                     try:
@@ -179,7 +180,7 @@ class Reconciler:
                                 size=size,
                                 reason="unmanaged_position_policy=force_close",
                             )
-                    except Exception as e:
+                    except (OperationalError, DataError) as e:
                         logger.error("Force-close failed", symbol=orig_sym, error=str(e))
 
             # Zombies: we have it, exchange doesn't
@@ -190,7 +191,7 @@ class Reconciler:
                     delete_position(orig_sym)
                     summary["zombies_cleaned"] += 1
                     logger.info("RECONCILE_ZOMBIE_CLEANED", symbol=orig_sym, zombie_removed=True)
-                except Exception as e:
+                except (OperationalError, DataError, OSError) as e:
                     logger.warning("Failed to delete zombie", symbol=orig_sym, error=str(e))
 
             logger.info(
@@ -202,7 +203,7 @@ class Reconciler:
                 zombies_cleaned=summary["zombies_cleaned"],
             )
             logger.info("RECONCILE_END")
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.error("Reconciliation failed", error=str(e))
             raise
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from src.data.symbol_utils import exchange_position_side as _exchange_position_side
 from src.domain.models import Position, Side
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 if TYPE_CHECKING:
@@ -134,8 +135,8 @@ async def reconcile_protective_orders(
 
             await place_tp_backfill(lt, symbol, pos_data, db_pos, tp_plan, symbol_orders, current_price)
 
-        except Exception as e:
-            logger.error("TP backfill failed", symbol=symbol, error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("TP backfill failed", symbol=symbol, error=str(e), error_type=type(e).__name__)
             await async_record_event(
                 "TP_BACKFILL_SKIPPED", symbol, {"reason": f"error: {str(e)}"}
             )
@@ -271,11 +272,12 @@ async def reconcile_stop_loss_order_ids(lt: "LiveTrading", raw_positions: List[D
                                             entry_price=str(db_pos.entry_price),
                                             exchange_stop_price=str(stop_price_dec),
                                         )
-                                except Exception as e:
+                                except (ValueError, TypeError, KeyError) as e:
                                     logger.warning(
                                         "Failed to parse stop price from exchange order",
                                         symbol=symbol,
                                         error=str(e),
+                                        error_type=type(e).__name__,
                                     )
 
                         if db_pos.initial_stop_price and sl_order_id:
@@ -289,16 +291,17 @@ async def reconcile_stop_loss_order_ids(lt: "LiveTrading", raw_positions: List[D
 
                         await asyncio.to_thread(save_position, db_pos)
 
-            except Exception as e:
+            except (OperationalError, DataError, ValueError) as e:
                 logger.warning(
                     "Failed to reconcile stop loss order ID",
                     symbol=symbol,
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
                 continue
 
-    except Exception as e:
-        logger.error("Stop loss order ID reconciliation failed", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Stop loss order ID reconciliation failed", error=str(e), error_type=type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -328,8 +331,8 @@ async def place_missing_stops_for_unprotected(
         return
     try:
         open_orders = await lt.client.get_futures_open_orders()
-    except Exception as e:
-        logger.warning("Failed to fetch open orders for missing-stops check", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.warning("Failed to fetch open orders for missing-stops check", error=str(e), error_type=type(e).__name__)
         return
 
     naked: list = []
@@ -378,26 +381,37 @@ async def place_missing_stops_for_unprotected(
 
             unified = pf_to_unified(symbol) or symbol
         try:
-            await lt.client.place_futures_order(
+            # Route through gateway (single choke point — P1.2)
+            result = await lt.execution_gateway.place_emergency_order(
                 symbol=unified,
                 side=close_side,
                 order_type="stop",
                 size=size,
                 stop_price=stop_price,
                 reduce_only=True,
+                reason="missing_stop",
             )
-            logger.info(
-                "Placed missing stop for unprotected position",
-                symbol=symbol,
-                stop_price=str(stop_price),
-                size=str(size),
-            )
-            placed += 1
-        except Exception as e:
+            if result.success:
+                logger.info(
+                    "Placed missing stop for unprotected position",
+                    symbol=symbol,
+                    stop_price=str(stop_price),
+                    size=str(size),
+                    exchange_order_id=result.exchange_order_id,
+                )
+                placed += 1
+            else:
+                logger.warning(
+                    "Missing stop order rejected",
+                    symbol=symbol,
+                    error=result.error,
+                )
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Failed to place missing stop for unprotected position",
                 symbol=symbol,
                 error=str(e),
+                error_type=type(e).__name__,
             )
 
 
@@ -636,8 +650,8 @@ async def cleanup_orphan_reduce_only_orders(
 
     try:
         orders = await lt.client.get_futures_open_orders()
-    except Exception as e:
-        logger.error("Failed to fetch open orders for orphan cleanup", error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Failed to fetch open orders for orphan cleanup", error=str(e), error_type=type(e).__name__)
         return
 
     cancelled = 0
@@ -677,7 +691,7 @@ async def cleanup_orphan_reduce_only_orders(
                         order_id=oid,
                         order_type=o.get("type", "unknown"),
                     )
-                except Exception as e:
+                except (OperationalError, DataError) as e:
                     error_str = str(e)
                     if "invalidArgument" in error_str or "order_id" in error_str.lower():
                         logger.debug(
@@ -692,6 +706,7 @@ async def cleanup_orphan_reduce_only_orders(
                             symbol=sym,
                             order_id=oid,
                             error=str(e),
+                            error_type=type(e).__name__,
                         )
             else:
                 logger.debug(
@@ -700,12 +715,13 @@ async def cleanup_orphan_reduce_only_orders(
                     order_id=oid,
                 )
 
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
                 "Error processing orphan order",
                 symbol=o.get("symbol"),
                 order_id=o.get("id"),
                 error=str(e),
+                error_type=type(e).__name__,
             )
 
     if cancelled > 0:
@@ -771,9 +787,9 @@ async def place_tp_backfill(
         try:
             await lt.futures_adapter.cancel_order(tp_id, symbol)
             logger.debug("Cancelled existing TP for backfill", order_id=tp_id, symbol=symbol)
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning(
-                "Failed to cancel existing TP", order_id=tp_id, symbol=symbol, error=str(e)
+                "Failed to cancel existing TP", order_id=tp_id, symbol=symbol, error=str(e), error_type=type(e).__name__
             )
 
     try:
@@ -842,8 +858,8 @@ async def place_tp_backfill(
             tp_count=len(new_tp_ids),
         )
 
-    except Exception as e:
-        logger.error("Failed to place TP backfill", symbol=symbol, error=str(e))
+    except (OperationalError, DataError) as e:
+        logger.error("Failed to place TP backfill", symbol=symbol, error=str(e), error_type=type(e).__name__)
         await async_record_event(
             "TP_BACKFILL_SKIPPED", symbol, {"reason": f"placement_failed: {str(e)}"}
         )

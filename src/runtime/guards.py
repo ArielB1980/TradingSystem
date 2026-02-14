@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+from src.exceptions import OperationalError
 from src.monitoring.logger import get_logger
 from src.utils.secret_manager import get_database_url
 
@@ -198,7 +199,7 @@ class ProdLiveAdvisoryLock:
                 "db_name": (p.path or "").lstrip("/") or "unknown",
                 "db_user": p.username or "unknown",
             }
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             return {"db_host": "unknown", "db_port": None, "db_name": "unknown", "db_user": "unknown"}
 
     def schema_fingerprint(self) -> Optional[str]:
@@ -223,7 +224,7 @@ class ProdLiveAdvisoryLock:
                 f"{r[0]}:{r[1]}:{r[2]}:{r[3]}:{r[4]}" for r in rows
             ).encode("utf-8")
             return hashlib.sha256(payload).hexdigest()[:12]
-        except Exception:
+        except (OperationalError, OSError, ValueError):
             return None
 
     def release(self) -> None:
@@ -232,7 +233,7 @@ class ProdLiveAdvisoryLock:
             return
         try:
             self._conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": self.lock_key})
-        except Exception as e:
+        except (OperationalError, OSError) as e:
             logger.warning("PROD_LIVE_LOCK_RELEASE_FAILED", error=str(e), lock_key_short=self.lock_key_short)
         finally:
             try:
@@ -275,11 +276,11 @@ class ProdLiveAdvisoryLock:
                     try:
                         from src.utils.kill_switch import KillSwitch, KillSwitchReason
                         KillSwitch().activate_sync(KillSwitchReason.RECONCILIATION_FAILURE)
-                    except Exception:
+                    except (OperationalError, ImportError, OSError):
                         pass
                     try:
                         os.kill(os.getpid(), on_lost_signal)
-                    except Exception:
+                    except (OSError, ValueError):
                         pass
                     return
                 time.sleep(max(1, int(interval_seconds)))

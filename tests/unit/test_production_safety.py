@@ -116,8 +116,9 @@ class TestAtomicStopReplace:
         position.stop_order_id = "old-stop-123"
         position.current_stop_price = Decimal("49000")
         
-        # Mock: new stop placement FAILS
-        mock_client.place_futures_order.side_effect = Exception("Exchange error")
+        # Mock: new stop placement FAILS (OperationalError — transient API failure)
+        from src.exceptions import OperationalError
+        mock_client.place_futures_order.side_effect = OperationalError("Exchange error")
         
         replacer = AtomicStopReplacer(mock_client, config)
         
@@ -755,8 +756,9 @@ class TestStopFillNotNaked:
         assert len(position.exit_fills) == 1
         assert position.exit_fills[0].qty == Decimal("100")
 
-        # Persistence should have been called
-        mock_persistence.save_position.assert_called_once_with(position)
+        # Persistence: save_position called at least once for closed position (P3 may also call for trade_recorded)
+        mock_persistence.save_position.assert_any_call(position)
+        assert mock_persistence.save_position.call_count >= 1
 
     @pytest.mark.asyncio
     async def test_position_closed_on_exchange_treated_as_protected(self, mock_client, position):
@@ -795,8 +797,9 @@ class TestStopFillNotNaked:
         mock_client.get_all_futures_positions.return_value = [
             {"symbol": "PF_XRPUSD", "contracts": 100}
         ]
-        # fetch_order fails
-        mock_client.fetch_order.side_effect = Exception("API timeout")
+        # fetch_order fails (OperationalError — transient API failure)
+        from src.exceptions import OperationalError
+        mock_client.fetch_order.side_effect = OperationalError("API timeout")
 
         enforcer = ProtectionEnforcer(mock_client, SafetyConfig())
         monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
@@ -1389,6 +1392,7 @@ class TestStopOrderPolling:
             PendingOrder,
             OrderPurpose,
         )
+        from src.execution.position_manager_v2 import PositionManagerV2
         from src.domain.models import OrderType
 
         mock_client = AsyncMock()
@@ -1399,6 +1403,15 @@ class TestStopOrderPolling:
         gateway.client = mock_client
         gateway.registry = mock_registry
         gateway.persistence = mock_persistence
+        gateway.position_manager = PositionManagerV2(mock_registry)
+        gateway._on_partial_close = None
+        gateway._on_trade_recorded = None
+        gateway._wal = None
+        gateway._event_enforcer = None
+        gateway._startup_machine = None
+        gateway._stop_replacer = None
+        gateway._order_rate_limiter = MagicMock()
+        gateway._order_rate_limiter.check_and_record = MagicMock()
         gateway.metrics = {
             "orders_submitted": 0, "orders_filled": 0,
             "orders_cancelled": 0, "orders_rejected": 0,
@@ -1406,8 +1419,6 @@ class TestStopOrderPolling:
         }
         gateway._pending_orders = {}
         gateway._order_id_map = {}
-        gateway._event_enforcer = None
-        gateway._wal = None
 
         # Add a stop order to pending
         stop_pending = PendingOrder(

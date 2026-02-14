@@ -20,6 +20,7 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from src.exceptions import OperationalError, DataError
 from src.config.config import load_config as get_config
 from src.data.kraken_client import KrakenClient
 from src.data.symbol_utils import pf_to_unified, position_symbol_matches_order
@@ -48,7 +49,7 @@ async def place_missing_stops(
 ) -> None:
     try:
         config = get_config()
-    except Exception as e:
+    except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
         print(f"Config load failed: {e}")
         return
 
@@ -148,10 +149,10 @@ async def place_missing_stops(
                 )
                 print(f"  Placed stop {unified} @ {stop_price}")
                 placed += 1
-            except Exception as e:
+            except (OperationalError, DataError) as e:
                 print(f"  Failed {unified}: {e}")
         print(f"\nPlaced {placed} stop(s).")
-    except Exception as e:
+    except (OperationalError, DataError, OSError) as e:
         print(f"place_missing_stops failed: {e}")
         raise
     finally:

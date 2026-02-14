@@ -100,6 +100,10 @@ async def test_execute_entry_passes_action_leverage_to_client():
     gateway = _build_gateway()
     gateway.client.create_order.return_value = {"id": "exchange-entry-2"}
     gateway.registry.get_position.return_value = None
+    # _check_entry_liquidity calls await client.fetch_ticker(symbol); return real bid/ask so no coroutine comparison
+    gateway.client.fetch_ticker = AsyncMock(
+        return_value={"bid": 50000, "ask": 50010}
+    )
 
     action = ManagementAction(
         type=ActionType.OPEN_POSITION,

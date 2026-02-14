@@ -9,7 +9,7 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, select
@@ -145,5 +145,5 @@ def _to_dec(val: Any) -> Optional[Decimal]:
         return None
     try:
         return Decimal(str(val))
-    except Exception:
+    except (ValueError, TypeError, InvalidOperation):
         return None

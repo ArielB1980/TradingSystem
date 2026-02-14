@@ -7,6 +7,7 @@ Used by TradingService and LiveTrading.
 from decimal import Decimal
 from typing import Dict, Any, Tuple, Optional
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -73,7 +74,7 @@ async def calculate_effective_equity(
             if avail_margin == 0:
                 avail_margin += asset_equity
             logger.info("Valued non-USD collateral", asset=asset, qty=str(asset_qty), usd=str(asset_equity))
-        except Exception as ex:
+        except (OperationalError, DataError, ValueError) as ex:
             logger.warning("Could not value collateral", asset=asset, error=str(ex))
 
     return equity, avail_margin, margin_used

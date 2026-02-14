@@ -6,6 +6,7 @@ Prevents missing coin data issues.
 """
 from datetime import datetime, timezone
 from typing import List
+from src.exceptions import OperationalError, DataError
 from src.storage.repository import get_latest_traces, async_record_event
 from src.monitoring.logger import get_logger
 import asyncio
@@ -88,8 +89,8 @@ async def ensure_all_coins_have_traces(monitored_symbols: List[str]) -> dict:
             if created_count % 10 == 0:
                 logger.debug(f"Created {created_count}/{len(missing_symbols)} initial traces")
                 
-        except Exception as e:
-            logger.error(f"Failed to create initial trace for {symbol}", error=str(e))
+        except (OperationalError, DataError, ValueError) as e:
+            logger.error("Failed to create initial trace for symbol", symbol=symbol, error=str(e), error_type=type(e).__name__)
             errors.append({'symbol': symbol, 'error': str(e)})
     
     logger.info(

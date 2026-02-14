@@ -1,5 +1,7 @@
 import asyncio
 import os
+import time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import List, Dict, Optional, Any
@@ -41,6 +43,8 @@ from src.execution.production_safety import (
 )
 
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
+from src.exceptions import CircuitOpenError, OperationalError, DataError, InvariantError
+from src.runtime.startup_phases import StartupStateMachine, StartupPhase
 from src.domain.models import Candle, Signal, SignalType, Position, Side
 from src.storage.repository import record_event, record_metrics_snapshot
 from src.storage.maintenance import DatabasePruner
@@ -72,6 +76,9 @@ class LiveTrading:
     def __init__(self, config: Config):
         """Initialize live trading."""
         self.config = config
+
+        # ========== STARTUP STATE MACHINE (P2.3) ==========
+        self._startup_sm = StartupStateMachine()
 
         # ========== POSITION STATE MACHINE V2 ==========
         # Feature flag for gradual rollout (prod live hard-requires via runtime guard)
@@ -108,6 +115,10 @@ class LiveTrading:
             futures_api_secret=config.exchange.futures_api_secret,
             use_testnet=config.exchange.use_testnet,
             market_cache_minutes=cache_mins,
+            dry_run=config.system.dry_run,
+            breaker_failure_threshold=getattr(config.exchange, "circuit_breaker_failure_threshold", 5),
+            breaker_rate_limit_threshold=getattr(config.exchange, "circuit_breaker_rate_limit_threshold", 2),
+            breaker_cooldown_seconds=getattr(config.exchange, "circuit_breaker_cooldown_seconds", 60.0),
         )
         
         # CRITICAL: Verify client is not a mock
@@ -230,6 +241,7 @@ class LiveTrading:
                 on_partial_close=lambda _: setattr(self, "_last_partial_close_at", datetime.now(timezone.utc)),
                 instrument_spec_registry=getattr(self, "instrument_spec_registry", None),
                 on_trade_recorded=self._on_trade_recorded,
+                startup_machine=self._startup_sm,
             )
             
             logger.critical("State Machine V2 running - all orders via gateway")
@@ -299,8 +311,8 @@ class LiveTrading:
                 "ProductionHardeningLayer initialized",
                 trading_allowed=self.hardening.is_trading_allowed(),
             )
-        except Exception as e:
-            logger.warning("Failed to initialize ProductionHardeningLayer", error=str(e))
+        except (ValueError, TypeError, KeyError, ImportError, OSError) as e:
+            logger.warning("Failed to initialize ProductionHardeningLayer", error=str(e), error_type=type(e).__name__)
             self.hardening = None
         
         # ===== DATA SANITY GATE + QUALITY TRACKER =====
@@ -333,10 +345,10 @@ class LiveTrading:
                 )
             else:
                 raise TypeError("data_sanity config not found or wrong type")
-        except Exception:
+        except (ValueError, TypeError, KeyError) as e:
             self.sanity_thresholds = SanityThresholds()
             self.data_quality_tracker = DataQualityTracker()
-            logger.info("DataSanityGate initialized with defaults")
+            logger.debug("DataSanityGate init with defaults", error=str(e))
         
         logger.info("Live Trading initialized", 
                    markets=config.exchange.futures_markets,
@@ -373,8 +385,8 @@ class LiveTrading:
                 "pid": os.getpid(),
                 "mode": "LiveTradingEngine"
             })
-        except Exception as e:
-            logger.error("Failed to record startup event", error=str(e))
+        except (OperationalError, DataError, OSError) as e:
+            logger.error("Failed to record startup event", error=str(e), error_type=type(e).__name__)
         
         # Smoke Mode / Local Dev Limits
         max_loops = int(os.getenv("MAX_LOOPS", "-1"))
@@ -409,7 +421,7 @@ class LiveTrading:
             logger.info("Hardening self-test passed", run_id=self.hardening._run_id)
         
         try:
-            # 1. Initialize Client
+            # 1. Initialize Client (INITIALIZING phase)
             logger.info("Initializing Kraken client...")
             await self.client.initialize()
             
@@ -437,8 +449,11 @@ class LiveTrading:
             # 1.6 Startup: ensure all monitored coins have DECISION_TRACE (dashboard coverage)
             try:
                 await ensure_all_coins_have_traces(self._market_symbols())
-            except Exception as e:
-                logger.error("Startup trace validation failed", error=str(e))
+            except (OperationalError, DataError, OSError) as e:
+                logger.error("Startup trace validation failed", error=str(e), error_type=type(e).__name__)
+
+            # ===== PHASE: INITIALIZING → SYNCING =====
+            self._startup_sm.advance_to(StartupPhase.SYNCING, reason="client initialized, market discovered")
 
             # 2. Sync State (skip in dry run if no keys)
             if self.config.system.dry_run and not self.client.has_valid_futures_credentials():
@@ -449,8 +464,8 @@ class LiveTrading:
                     await self._sync_account_state()
                     await self._sync_positions()
                     await self.executor.sync_open_orders()
-                except Exception as e:
-                    logger.error("Initial sync failed", error=str(e))
+                except (OperationalError, DataError) as e:
+                    logger.error("Initial sync failed", error=str(e), error_type=type(e).__name__)
                     if not self.config.system.dry_run:
                         raise
             
@@ -461,8 +476,11 @@ class LiveTrading:
                     await self.execution_gateway.startup()
                     logger.info("Position State Machine V2 recovery complete",
                                active_positions=len(self.position_registry.get_all_active()) if self.position_registry else 0)
-                except Exception as e:
-                    logger.error("Position State Machine V2 startup failed", error=str(e))
+                except (OperationalError, DataError) as e:
+                    logger.error("Position State Machine V2 startup failed", error=str(e), error_type=type(e).__name__)
+
+            # ===== PHASE: SYNCING → RECONCILING =====
+            self._startup_sm.advance_to(StartupPhase.RECONCILING, reason="account/positions synced")
 
             # 2.6 Startup takeover & protect (V2 authoritative pass)
             # In V2 mode, do not use the legacy Reconciler (DB-only) as the source of truth.
@@ -487,7 +505,7 @@ class LiveTrading:
                         stats = await takeover.execute_takeover()
                         logger.critical("Startup takeover complete", **stats)
                         self.last_recon_time = datetime.now(timezone.utc)
-                    except Exception as ex:
+                    except (OperationalError, DataError) as ex:
                         logger.critical("Startup takeover failed", error=str(ex), exc_info=True)
                         if not self.config.system.dry_run:
                             raise
@@ -509,8 +527,8 @@ class LiveTrading:
                         self._run_protection_checks(interval_seconds=30)
                     )
                     logger.info("PositionProtectionMonitor started (interval=30s)")
-                except Exception as e:
-                    logger.error("Failed to start PositionProtectionMonitor", error=str(e))
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logger.error("Failed to start PositionProtectionMonitor", error=str(e), error_type=type(e).__name__)
 
             # 2.6b Order-status polling: detect entry fills, trigger PLACE_STOP (SL/TP)
             if self.use_state_machine_v2 and self.execution_gateway:
@@ -519,8 +537,8 @@ class LiveTrading:
                         self._run_order_polling(interval_seconds=12)
                     )
                     logger.info("Order-status polling started (interval=12s)")
-                except Exception as e:
-                    logger.error("Failed to start order poller", error=str(e))
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logger.error("Failed to start order poller", error=str(e), error_type=type(e).__name__)
 
             # 2.6c Daily P&L summary (runs once per day at midnight UTC)
             try:
@@ -528,8 +546,8 @@ class LiveTrading:
                     self._run_daily_summary()
                 )
                 logger.info("Daily summary task started")
-            except Exception as e:
-                logger.error("Failed to start daily summary task", error=str(e))
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start daily summary task", error=str(e), error_type=type(e).__name__)
 
             # 2.6d Runtime regression monitors (trade starvation + winner churn)
             try:
@@ -537,24 +555,24 @@ class LiveTrading:
                     self._run_trade_starvation_monitor(interval_seconds=300)
                 )
                 logger.info("Trade starvation monitor started (interval=300s)")
-            except Exception as e:
-                logger.error("Failed to start trade starvation monitor", error=str(e))
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start trade starvation monitor", error=str(e), error_type=type(e).__name__)
 
             try:
                 self._churn_monitor_task = asyncio.create_task(
                     self._run_winner_churn_monitor(interval_seconds=300)
                 )
                 logger.info("Winner churn monitor started (interval=300s)")
-            except Exception as e:
-                logger.error("Failed to start winner churn monitor", error=str(e))
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start winner churn monitor", error=str(e), error_type=type(e).__name__)
 
             try:
                 self._trade_recording_monitor_task = asyncio.create_task(
                     self._run_trade_recording_monitor(interval_seconds=300)
                 )
                 logger.info("Trade recording invariant monitor started (interval=300s)")
-            except Exception as e:
-                logger.error("Failed to start trade recording monitor", error=str(e))
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start trade recording monitor", error=str(e), error_type=type(e).__name__)
 
             # 2.6e Telegram command handler (/status, /positions, /help)
             try:
@@ -566,34 +584,44 @@ class LiveTrading:
                     self._telegram_handler.run()
                 )
                 logger.info("Telegram command handler started")
-            except Exception as e:
-                logger.error("Failed to start Telegram command handler", error=str(e))
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start Telegram command handler", error=str(e), error_type=type(e).__name__)
 
             # 3. Fast Startup - Load candles
             logger.info("Loading candles from database...")
             try:
                 # 3. Fast Startup - Load candles via Manager
                 await self.candle_manager.initialize(self._market_symbols())
-            except Exception as e:
-                logger.error("Failed to hydrate candles", error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.error("Failed to hydrate candles", error=str(e), error_type=type(e).__name__)
 
             # 4. Start Data Acquisition
             await self.data_acq.start()
             
-            # 4.5. Run first tick to hydrate runtime state
+            # ===== PHASE: RECONCILING → READY =====
+            # CRITICAL: READY must be set BEFORE first tick.
+            # No trading actions (including self-heal / ShockGuard) may run before READY.
+            self._startup_sm.advance_to(StartupPhase.READY, reason="all startup steps complete")
+            logger.info(
+                "STARTUP_COMPLETE",
+                startup_epoch=self._startup_sm.startup_epoch.isoformat() if self._startup_sm.startup_epoch else None,
+                status=self._startup_sm.get_status(),
+            )
+
+            # 4.5. Run first tick to hydrate runtime state (now safely after READY)
             if not (self.config.system.dry_run and not self.client.has_valid_futures_credentials()):
                 try:
                     await self._tick()
                     logger.info("Initial tick completed - runtime state hydrated")
-                except Exception as e:
-                    logger.error("Initial tick failed", error=str(e))
+                except (OperationalError, DataError) as e:
+                    logger.error("Initial tick failed", error=str(e), error_type=type(e).__name__)
             
             # 4.6. Validate position protection (startup safety gate)
             try:
                 await self._validate_position_protection()
-            except Exception as e:
-                logger.error("Position protection validation failed", error=str(e))
-            
+            except (OperationalError, DataError) as e:
+                logger.error("Position protection validation failed", error=str(e), error_type=type(e).__name__)
+
             # 5. Main Loop
             while self.active:
             # Check Smoke Mode Limits
@@ -635,13 +663,32 @@ class LiveTrading:
                 
                 try:
                     await self._tick()
+                except CircuitOpenError as e:
+                    # Circuit breaker is open — API is down, fail-fast without
+                    # counting this as an API error for the invariant monitor.
+                    # The breaker itself is the protection mechanism.
+                    logger.warning(
+                        "Tick skipped: API circuit breaker open",
+                        breaker_info=str(e)[:200],
+                    )
+                except InvariantError as e:
+                    logger.critical("INVARIANT VIOLATION in tick — triggering kill switch", error=str(e))
+                    if self.kill_switch:
+                        await self.kill_switch.activate(KillSwitchReason.INVARIANT_VIOLATION)
+                    break
+                except OperationalError as e:
+                    logger.warning("Operational error in tick (transient)", error=str(e))
+                except DataError as e:
+                    logger.warning("Data error in tick", error=str(e))
                 except Exception as e:
-                    logger.error("Error in live trading tick", error=str(e))
-                    if "API" in str(e):
-                         # Potential API failure - check if we should trigger kill switch
-                         pass
+                    # Unknown/unexpected exception — log but don't swallow.
+                    # Let it surface so systemd restarts if persistent.
+                    logger.error("Unexpected error in live trading tick", error=str(e), error_type=type(e).__name__)
+                    raise
                 
                 self.ticks_since_emit += 1
+                # P0.4: Write heartbeat file after each successful tick
+                self._write_heartbeat()
                 now = datetime.now(timezone.utc)
                 if (now - self.last_metrics_emit).total_seconds() >= 60.0:
                     try:
@@ -652,12 +699,26 @@ class LiveTrading:
                             "markets_count": len(self._market_symbols()),
                             "api_fetch_latency_ms": getattr(self, "last_fetch_latency_ms", None),
                             "coins_futures_fallback_used": self.candle_manager.get_futures_fallback_count(),
+                            "orders_per_minute": self.execution_gateway._order_rate_limiter.orders_last_minute,
+                            "orders_per_10s": self.execution_gateway._order_rate_limiter.orders_last_10s,
+                            "orders_blocked_total": self.execution_gateway._order_rate_limiter.orders_blocked_total,
                         })
                         self.last_metrics_emit = now
                         self.ticks_since_emit = 0
                         self.signals_since_emit = 0
-                    except Exception as ex:
+                        # P3.2: Alert on high order rate
+                        opm = self.execution_gateway._order_rate_limiter.orders_last_minute
+                        if opm >= 30:  # 50% of limit = warning threshold
+                            logger.warning(
+                                "HIGH_ORDER_RATE",
+                                orders_per_minute=opm,
+                                orders_per_10s=self.execution_gateway._order_rate_limiter.orders_last_10s,
+                                limit_per_minute=60,
+                            )
+                    except (OperationalError, DataError) as ex:
                         logger.warning("Failed to emit metrics snapshot", error=str(ex))
+                    except Exception as ex:
+                        logger.error("Unexpected error in metrics snapshot", error=str(ex), error_type=type(ex).__name__)
 
                 # Periodic reconciliation (positions: system vs exchange)
                 _recon_cfg = getattr(self.config, "reconciliation", None)
@@ -676,8 +737,10 @@ class LiveTrading:
                             self.last_recon_time = now
                             if run_after_orders:
                                 self._reconcile_requested = False
+                        except (OperationalError, DataError) as ex:
+                            logger.warning("Reconciliation failed (transient)", error=str(ex))
                         except Exception as ex:
-                            logger.warning("Reconciliation failed", error=str(ex))
+                            logger.error("Unexpected reconciliation error", error=str(ex), error_type=type(ex).__name__)
 
                 # ===== CYCLE SUMMARY (single log line per tick with key metrics) =====
                 now = datetime.now(timezone.utc)
@@ -698,6 +761,16 @@ class LiveTrading:
                         if inv_state != "active":
                             system_state = inv_state.upper()
                     
+                    # Circuit breaker status (P2.1 observability)
+                    breaker_state = "n/a"
+                    breaker_failures = 0
+                    try:
+                        bi = self.client.api_breaker.get_state_info()
+                        breaker_state = bi["state"]
+                        breaker_failures = bi["failure_count"] + bi["rate_limit_count"]
+                    except (OperationalError, DataError, KeyError, AttributeError) as e:
+                        logger.debug("Breaker state fetch failed (non-fatal)", error=str(e))
+
                     logger.info(
                         "CYCLE_SUMMARY",
                         cycle=loop_count,
@@ -706,9 +779,14 @@ class LiveTrading:
                         universe=len(self._market_symbols()),
                         system_state=system_state,
                         cooldowns_active=len(self._signal_cooldown),
+                        breaker=breaker_state,
+                        breaker_failures=breaker_failures,
                     )
-                except Exception as summary_err:
+                except (OperationalError, DataError) as summary_err:
                     logger.warning("CYCLE_SUMMARY_FAILED", error=str(summary_err), error_type=type(summary_err).__name__)
+                except Exception as summary_err:
+                    # Bug in summary logic — log but don't crash the loop for it
+                    logger.error("CYCLE_SUMMARY_BUG", error=str(summary_err), error_type=type(summary_err).__name__)
 
                 # Dynamic sleep to align with 1m intervals
                 elapsed = cycle_elapsed
@@ -729,6 +807,9 @@ class LiveTrading:
         except asyncio.CancelledError:
             logger.info("Live trading loop cancelled")
         except Exception as e:
+            # Mark startup as failed if we haven't reached READY yet
+            if not self._startup_sm.is_ready and not self._startup_sm.is_failed:
+                self._startup_sm.fail(reason=f"Exception during startup: {e}")
             # Log the exception and re-raise to ensure non-zero exit code
             logger.critical("Live trading failed with exception", error=str(e), exc_info=True)
             raise
@@ -772,6 +853,12 @@ class LiveTrading:
                 self._churn_monitor_task.cancel()
                 try:
                     await self._churn_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            if getattr(self, "_trade_recording_monitor_task", None) and not self._trade_recording_monitor_task.done():
+                self._trade_recording_monitor_task.cancel()
+                try:
+                    await self._trade_recording_monitor_task
                 except asyncio.CancelledError:
                     pass
             await self.data_acq.stop()
@@ -840,6 +927,13 @@ class LiveTrading:
         Single iteration of live trading logic.
         Optimized for batch processing (Phase 10).
         """
+        # Gate: no tick before READY (P0.1 invariant)
+        if not self._startup_sm.is_ready:
+            raise InvariantError(
+                f"_tick() called before READY (phase={self._startup_sm.phase.value}). "
+                "This is a startup ordering bug — no trading actions before READY."
+            )
+
         # 0. Kill Switch Check (HIGHEST PRIORITY)
         ks = self.kill_switch
         
@@ -851,8 +945,13 @@ class LiveTrading:
                 logger.warning("Cancelling all pending orders...")
                 cancelled = await self.client.cancel_all_orders()
                 logger.info(f"Kill switch: Cancelled {len(cancelled)} orders")
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except OperationalError as e:
+                logger.error("Kill switch: cancel_all transient failure", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
             except Exception as e:
-                logger.error("Failed to cancel orders during kill switch", error=str(e))
+                logger.exception("Kill switch: unexpected error in cancel_all", kill_step="cancel_all", error=str(e), error_type=type(e).__name__)
+                raise
 
             # Close all positions
             try:
@@ -864,13 +963,23 @@ class LiveTrading:
                         try:
                             await self.client.close_position(symbol)
                             logger.warning(f"Kill switch: Closed position for {symbol}")
+                        except InvariantError:
+                            raise  # Safety violation — must propagate
+                        except OperationalError as e:
+                            logger.error("Kill switch: close_position transient failure", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
                         except Exception as e:
-                            logger.error(f"Kill switch: Failed to close {symbol}", error=str(e))
+                            logger.exception("Kill switch: unexpected error closing position", kill_step="close_position", symbol=symbol, error=str(e), error_type=type(e).__name__)
+                            raise
 
                 if not positions or all(pos.get('size', 0) == 0 for pos in positions):
                     logger.info("Kill switch: No open positions to close")
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except OperationalError as e:
+                logger.error("Kill switch: close_all transient failure", kill_step="close_all", error=str(e), error_type=type(e).__name__)
             except Exception as e:
-                logger.error("Failed to close positions during kill switch", error=str(e))
+                logger.exception("Kill switch: unexpected error in close_all", kill_step="close_all", error=str(e), error_type=type(e).__name__)
+                raise
 
             # Stop processing
             return
@@ -880,8 +989,8 @@ class LiveTrading:
             cancelled_count = await self.executor.check_order_timeouts()
             if cancelled_count > 0:
                 logger.warning("Cancelled expired orders", count=cancelled_count)
-        except Exception as e:
-            logger.error("Failed to check order timeouts", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to check order timeouts", error=str(e), error_type=type(e).__name__)
         
         # 1. Check Data Health
         if not self.data_acq.is_healthy():
@@ -898,8 +1007,8 @@ class LiveTrading:
                 all_raw_positions = await self.client.get_all_futures_positions()
             # Pass positions to sync to avoid duplicate API call
             await self._sync_positions(all_raw_positions)
-        except Exception as e:
-            logger.error("Failed to sync positions", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to sync positions", error=str(e), error_type=type(e).__name__)
             return
 
         # 2.1 PRODUCTION HARDENING V2: Pre-tick Invariant Check
@@ -944,15 +1053,15 @@ class LiveTrading:
                         system_state=self.hardening.invariant_monitor.state.value,
                         management_allowed=self.hardening.is_management_allowed(),
                     )
-            except Exception as e:
-                logger.error("Production hardening pre-tick check failed", error=str(e))
+            except (OperationalError, DataError, ValueError) as e:
+                logger.error("Production hardening pre-tick check failed", error=str(e), error_type=type(e).__name__)
                 # Don't halt trading due to hardening check failure - log and continue
 
         # 2.5. Cleanup orphan reduce-only orders (SL/TP orders for closed positions)
         try:
             await self._cleanup_orphan_reduce_only_orders(all_raw_positions)
-        except Exception as e:
-            logger.error("Failed to cleanup orphan orders", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("Failed to cleanup orphan orders", error=str(e), error_type=type(e).__name__)
             # Don't return - continue with trading loop
 
         # 3. Batch Data Fetching (Optimization)
@@ -991,8 +1100,8 @@ class LiveTrading:
             # None => bulk fetch failed => Stage A skipped (fail-open).
             try:
                 map_futures_tickers_full = await self.client.get_futures_tickers_bulk_full()
-            except Exception as _e:
-                logger.warning("get_futures_tickers_bulk_full failed; sanity gate will skip Stage A", error=str(_e))
+            except (OperationalError, DataError) as _e:
+                logger.warning("get_futures_tickers_bulk_full failed; sanity gate will skip Stage A", error=str(_e), error_type=type(_e).__name__)
                 map_futures_tickers_full = None
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
@@ -1010,8 +1119,8 @@ class LiveTrading:
             if getattr(self, "instrument_spec_registry", None):
                 try:
                     await self.instrument_spec_registry.refresh()
-                except Exception as e:
-                    logger.warning("InstrumentSpecRegistry refresh failed (non-fatal)", error=str(e))
+                except (OperationalError, DataError) as e:
+                    logger.warning("InstrumentSpecRegistry refresh failed (non-fatal)", error=str(e), error_type=type(e).__name__)
             
             # ShockGuard: Evaluate shock conditions and update state
             if self.shock_guard:
@@ -1166,21 +1275,29 @@ class LiveTrading:
                                         reason=action_item.reason,
                                     )
                                     
-                                    # Place reduce-only market order to trim (reduce_only=True: exit, no dust)
+                                    # Route through gateway (P1.2 — single choke point)
                                     futures_symbol = symbol
-                                    await self.client.place_futures_order(
+                                    trim_result = await self.execution_gateway.place_emergency_order(
                                         symbol=futures_symbol,
                                         side=close_side,
                                         order_type="market",
-                                        size=float(trim_size_contracts),
+                                        size=trim_size_contracts,
                                         reduce_only=True,
+                                        reason="shockguard_trim",
                                     )
-                        except Exception as e:
+                                    if not trim_result.success:
+                                        logger.error(
+                                            "ShockGuard: trim order rejected by gateway",
+                                            symbol=symbol,
+                                            error=trim_result.error,
+                                        )
+                        except (OperationalError, DataError) as e:
                             logger.error(
                                 "ShockGuard: Failed to execute exposure reduction",
                                 symbol=action_item.symbol,
                                 action=action_item.action.value,
                                 error=str(e),
+                                error_type=type(e).__name__,
                             )
             
             # 2.4. Fetch open orders once, index by *normalized* symbol (for position hydration)
@@ -1211,8 +1328,8 @@ class LiveTrading:
                         orders_by_symbol[key].append(order)
             except RuntimeError:
                 raise  # Re-raise critical errors
-            except Exception as e:
-                logger.warning("Failed to fetch open orders for hydration", error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.warning("Failed to fetch open orders for hydration", error=str(e), error_type=type(e).__name__)
             
             # 2.5. TP Backfill / Reconciliation (after position sync and price data fetch)
             try:
@@ -1237,8 +1354,8 @@ class LiveTrading:
 
                 # Auto-place missing stops for unprotected positions (rate-limited per tick)
                 await self._place_missing_stops_for_unprotected(all_raw_positions, max_per_tick=3)
-            except Exception as e:
-                logger.error("TP backfill reconciliation failed", error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.error("TP backfill reconciliation failed", error=str(e), error_type=type(e).__name__)
                 # Don't return - continue with trading loop
             symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
             # Use futures_tickers for accurate coverage counting
@@ -1266,8 +1383,8 @@ class LiveTrading:
                         hint="Trading requires futures ticker; ensure bulk API keys match discovery (CCXT vs PF_*).",
                     )
                     self._last_ticker_skip_log = datetime.now(timezone.utc)
-        except Exception as e:
-            logger.error("Failed batch data fetch", error=str(e))
+        except (OperationalError, DataError) as e:
+            logger.error("Failed batch data fetch", error=str(e), error_type=type(e).__name__)
             return
 
         # 4. Parallel Analysis Loop
@@ -1319,7 +1436,7 @@ class LiveTrading:
                     if has_futures and getattr(self, "instrument_spec_registry", None):
                         try:
                             has_spec = self.instrument_spec_registry.get_spec(futures_symbol) is not None
-                        except Exception:
+                        except (ValueError, TypeError, KeyError, AttributeError):
                             has_spec = False
                     
                     skip_reason: Optional[str] = None
@@ -1377,13 +1494,23 @@ class LiveTrading:
                             )
                             if v2_actions:
                                 await self.execution_gateway.execute_actions(v2_actions)
-                        except Exception as e:
+                        except InvariantError:
+                            raise  # Safety violation — must propagate to kill switch
+                        except (OperationalError, DataError) as e:
                             logger.error(
                                 "V2 position evaluation failed",
                                 symbol=symbol,
                                 error=str(e),
                                 error_type=type(e).__name__,
                             )
+                        except Exception as e:
+                            logger.exception(
+                                "V2 position evaluation: unexpected error",
+                                symbol=symbol,
+                                error=str(e),
+                                error_type=type(e).__name__,
+                            )
+                            raise
                             
                     # ShockGuard: Skip signal generation if entries paused
                     if self.shock_guard and self.shock_guard.should_pause_entries():
@@ -1479,8 +1606,9 @@ class LiveTrading:
                                                 threshold=f"{max_entry_spread:.3%}",
                                                 signal=signal.signal_type.value,
                                             )
-                            except Exception:
-                                pass  # Fail-open: allow trade if check errors
+                            except (ValueError, TypeError, ArithmeticError, KeyError) as e:
+                                # Fail-open: allow trade if spread check has a data issue
+                                logger.debug("Spread check failed (fail-open)", symbol=spot_symbol, error=str(e))
 
                             if not spread_ok:
                                 return  # Skip this coin — spread too wide right now
@@ -1556,11 +1684,15 @@ class LiveTrading:
                                 timestamp=now
                             )
                             self.last_trace_log[spot_symbol] = now
-                        except Exception as e:
-                            logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e))
+                        except (OperationalError, DataError, OSError) as e:
+                            logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e), error_type=type(e).__name__)
 
+                except (OperationalError, DataError) as e:
+                    logger.warning(f"Error processing {spot_symbol}", error=str(e), error_type=type(e).__name__)
                 except Exception as e:
-                    logger.error(f"Error processing {spot_symbol}", error=str(e))
+                    # Unknown exception in per-coin processing — escape to tick-level handler
+                    logger.error(f"Unexpected error processing {spot_symbol}", error=str(e), error_type=type(e).__name__)
+                    raise
 
         # Execute parallel processing
         # Clear signal collection for this tick
@@ -1629,8 +1761,8 @@ class LiveTrading:
                 summary["data_quality_suspended"] = dq["suspended"]
                 logger.info("Coin processing status summary", **summary)
                 self.last_status_summary = now
-            except Exception as e:
-                logger.error("Failed to log status summary", error=str(e))
+            except (OperationalError, DataError, ValueError) as e:
+                logger.error("Failed to log status summary", error=str(e), error_type=type(e).__name__)
         
         # 4.5 CRITICAL: Validate all positions have stop loss protection
         # Legacy validation removed - using new _validate_position_protection after initial tick
@@ -1645,16 +1777,16 @@ class LiveTrading:
                 results = self.db_pruner.run_maintenance()
                 logger.info("Daily database maintenance complete", results=results)
                 self.last_maintenance_run = now
-            except Exception as e:
-                logger.error("Daily maintenance failed", error=str(e))
+            except (OperationalError, DataError, OSError) as e:
+                logger.error("Daily maintenance failed", error=str(e), error_type=type(e).__name__)
 
         # 8. Periodic data maintenance (hourly): stale/missing trace recovery
         if (now - self.last_data_maintenance).total_seconds() > 3600:
             try:
                 await periodic_data_maintenance(self._market_symbols(), max_age_hours=6.0)
                 self.last_data_maintenance = now
-            except Exception as e:
-                logger.error("Periodic data maintenance failed", error=str(e))
+            except (OperationalError, DataError) as e:
+                logger.error("Periodic data maintenance failed", error=str(e), error_type=type(e).__name__)
 
         # 9. PRODUCTION HARDENING V2: Post-tick Cleanup
         # CRITICAL: This must always run, even on exceptions
@@ -1711,6 +1843,31 @@ class LiveTrading:
         from src.live.exchange_sync import save_trade_history
         await save_trade_history(self, position, exit_price, exit_reason)
 
+    def _write_heartbeat(self) -> None:
+        """Write heartbeat file with timestamp and phase info.
+
+        External watchdog (systemd timer / sidecar) checks file staleness.
+        If timestamp > 60s old → process is hung → restart.
+        """
+        try:
+            import json
+            heartbeat_dir = Path("runtime")
+            heartbeat_dir.mkdir(parents=True, exist_ok=True)
+            heartbeat_path = heartbeat_dir / "heartbeat.json"
+            data = {
+                "timestamp": time.time(),
+                "iso": datetime.now(timezone.utc).isoformat(),
+                "phase": self._startup_sm.phase.value if self._startup_sm else "unknown",
+                "cycle": getattr(self, "_last_cycle_count", 0),
+                "kill_switch_active": self.kill_switch.is_active() if self.kill_switch else False,
+            }
+            # Atomic write: write to temp then rename
+            tmp_path = heartbeat_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(data))
+            tmp_path.rename(heartbeat_path)
+        except OSError as e:
+            logger.debug("Failed to write heartbeat", error=str(e))
+
     async def _on_trade_recorded(self, position, trade) -> None:
         """
         Callback fired by ExecutionGateway after a trade is recorded.
@@ -1751,12 +1908,13 @@ class LiveTrading:
                     f"Daily P&L: ${self.risk_manager.daily_pnl:.2f}",
                     urgent=daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct)),
                 )
-        except Exception as e:
+        except (OperationalError, DataError, ImportError) as e:
             from src.monitoring.logger import get_logger
             logger = get_logger(__name__)
             logger.warning(
                 "on_trade_recorded callback: failed to update risk manager (non-fatal)",
                 error=str(e),
+                error_type=type(e).__name__,
             )
 
 

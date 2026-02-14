@@ -18,6 +18,7 @@ from typing import Optional, Any, Callable, Awaitable
 
 import aiohttp
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -77,8 +78,8 @@ class TelegramCommandHandler:
                 await self._poll_updates()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                logger.warning("Telegram poll error (non-fatal)", error=str(e))
+            except (OperationalError, DataError, OSError) as e:
+                logger.warning("Telegram poll error (non-fatal)", error=str(e), error_type=type(e).__name__)
             
             await asyncio.sleep(5)  # Poll every 5 seconds
     
@@ -135,8 +136,8 @@ class TelegramCommandHandler:
                     if resp.status != 200:
                         body = await resp.text()
                         logger.warning("Telegram send failed", status=resp.status, body=body[:200])
-        except Exception as e:
-            logger.warning("Telegram send error", error=str(e))
+        except (OperationalError, OSError) as e:
+            logger.warning("Telegram send error", error=str(e), error_type=type(e).__name__)
     
     async def _handle_help(self) -> None:
         """Respond to /help."""
@@ -152,7 +153,7 @@ class TelegramCommandHandler:
         """Respond to /status with system overview."""
         try:
             data = await self._data_provider()
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             await self._send_message(f"❌ Failed to fetch status: {e}")
             return
         
@@ -194,7 +195,7 @@ class TelegramCommandHandler:
         """Respond to /positions with detailed position list."""
         try:
             data = await self._data_provider()
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             await self._send_message(f"❌ Failed to fetch positions: {e}")
             return
         
@@ -243,7 +244,7 @@ class TelegramCommandHandler:
             
             trades = await asyncio.to_thread(get_all_trades)
             trades = trades[:5]  # Last 5
-        except Exception as e:
+        except (OperationalError, DataError, OSError) as e:
             await self._send_message(f"❌ Failed to fetch trades: {e}")
             return
         

@@ -13,6 +13,7 @@ from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from src.domain.models import Order, OrderType, OrderStatus, Side
 from src.data.kraken_client import KrakenClient
+from src.exceptions import OperationalError, DataError
 from src.data.symbol_utils import futures_candidate_symbols
 from src.monitoring.logger import get_logger
 from src.execution.instrument_specs import (
@@ -290,7 +291,7 @@ class FuturesAdapter:
                         if p > 0:
                             price_use = p
                             price_from_mark_or_ticker = True
-                    except Exception:
+                    except (ValueError, TypeError, ArithmeticError, AttributeError):
                         pass
             if price_use is None or price_use <= 0:
                 raise ValueError(
@@ -471,7 +472,7 @@ class FuturesAdapter:
             
             return order
             
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.error(
                 "Failed to place futures order",
                 symbol=symbol,
@@ -501,7 +502,7 @@ class FuturesAdapter:
         try:
             await self.kraken_client.cancel_futures_order(order_id, symbol)
             logger.info("Order cancelled via adapter", order_id=order_id, symbol=symbol)
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             # Don't raise for invalidArgument errors - order may already be cancelled or not exist
             error_str = str(e)
             if "invalidArgument" in error_str or "order_id" in error_str.lower():

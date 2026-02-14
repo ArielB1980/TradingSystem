@@ -36,6 +36,7 @@ from src.domain.models import Side, OrderType
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.production_safety import AtomicStopReplacer, SafetyConfig
 from src.monitoring.logger import get_logger
+from src.exceptions import OperationalError, DataError, InvariantError
 
 logger = get_logger(__name__)
 
@@ -123,8 +124,10 @@ class ProductionTakeover:
         for symbol, pos_data in positions.items():
             try:
                 await self._process_single_position(symbol, pos_data, orders, stats)
-            except Exception as e:
-                logger.critical(f"Failed to process {symbol}: {e}", exc_info=True)
+            except InvariantError:
+                raise  # Safety violation — must propagate
+            except (OperationalError, DataError) as e:
+                logger.critical(f"Failed to process {symbol}: {e}", error_type=type(e).__name__, exc_info=True)
                 self.quarantined_positions.append(symbol)
                 stats["quarantined"] += 1
         
@@ -271,8 +274,8 @@ class ProductionTakeover:
             try:
                 if not self.config.dry_run:
                     await self.client.cancel_futures_order(order["id"], symbol)
-            except Exception as e:
-                logger.error(f"Failed to cancel {order['id']}: {e}")
+            except (OperationalError, DataError) as e:
+                logger.error(f"Failed to cancel {order['id']}: {e}", error_type=type(e).__name__)
         
         return None
 
@@ -345,8 +348,8 @@ class ProductionTakeover:
             if not self.config.dry_run:
                 try:
                     await self.client.cancel_futures_order(existing_stop["id"], symbol)
-                except Exception:
-                    pass
+                except (OperationalError, DataError) as e:
+                    logger.warning("Failed to cancel invalid stop during takeover", symbol=symbol, order_id=existing_stop["id"], error=str(e))
         
         # Case B (or failed A): Place fresh stop
         return await self._place_fresh_stop(symbol, pos_data)
@@ -363,8 +366,8 @@ class ProductionTakeover:
         try:
             mark_price = await self.client.get_futures_mark_price(symbol)
             current_price = Decimal(str(mark_price))
-        except Exception:
-            logger.warning(f"Could not fetch ticker for {symbol}, using entry price for stop calc")
+        except (OperationalError, DataError) as e:
+            logger.warning(f"Could not fetch ticker for {symbol}, using entry price for stop calc", error=str(e))
             current_price = entry_price
         
         pct = self.config.takeover_stop_pct
@@ -409,7 +412,7 @@ class ProductionTakeover:
             try:
                 # CCXT often returns id at top-level; Kraken Futures may also return sendStatus.order_id
                 stop_order_id = result.get("id") or (result.get("sendStatus") or {}).get("order_id")
-            except Exception:
+            except (KeyError, TypeError, AttributeError):
                 stop_order_id = None
             return StopProtection(
                 stop_price=stop_price,
@@ -420,8 +423,10 @@ class ProductionTakeover:
                 be_mode=False,
             )
             
-        except Exception as e:
-            logger.critical(f"FAILED TO PLACE STOP for {symbol}: {e}")
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            logger.critical(f"FAILED TO PLACE STOP for {symbol}: {e}", error_type=type(e).__name__)
             # Step 4 failsafe: Emergency Market Exit
             await self._emergency_flatten(symbol, qty, side)
             return None
@@ -441,8 +446,10 @@ class ProductionTakeover:
                 size=qty,
                 reduce_only=True
             )
-        except Exception as e:
-             logger.critical(f"FATAL: Could not flatten {symbol}: {e}")
+        except InvariantError:
+            raise  # Safety violation — must propagate
+        except (OperationalError, DataError) as e:
+            logger.critical(f"FATAL: Could not flatten {symbol}: {e}", error_type=type(e).__name__)
 
     async def _import_position(self, symbol: str, pos_data: Dict, stop: StopProtection) -> None:
         """Create ManagedPosition from truth."""

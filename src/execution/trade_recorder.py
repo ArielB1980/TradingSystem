@@ -20,6 +20,8 @@ from decimal import Decimal
 from typing import Optional
 
 from src.domain.models import Trade, Side
+from sqlalchemy.exc import IntegrityError as _IntegrityError
+from src.exceptions import OperationalError, DataError
 from src.execution.position_state_machine import (
     ManagedPosition,
     PositionState,
@@ -236,7 +238,7 @@ def record_closed_trade(
     try:
         from src.storage.repository import save_trade
         save_trade(trade)
-    except Exception as e:
+    except (OperationalError, DataError, OSError, _IntegrityError) as e:
         err_str = str(e).lower()
         if "duplicate" in err_str or "unique" in err_str or "integrity" in err_str:
             logger.warning(

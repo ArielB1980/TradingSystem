@@ -52,7 +52,7 @@ def _apply_prod_live_safe_mode_overrides(config: object, *, enabled: bool) -> di
             try:
                 setattr(risk, "replacement_enabled", False)
                 overrides["risk.replacement_enabled"] = (old, False)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 pass
 
     # Reconciliation: must stay on in safe mode (startup takeover + periodic sync).
@@ -63,7 +63,7 @@ def _apply_prod_live_safe_mode_overrides(config: object, *, enabled: bool) -> di
             try:
                 setattr(recon, "reconcile_enabled", True)
                 overrides["reconciliation.reconcile_enabled"] = (old, True)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 pass
 
         # Tighten cadence (optional conservative default): clamp to <= 60s.
@@ -72,7 +72,7 @@ def _apply_prod_live_safe_mode_overrides(config: object, *, enabled: bool) -> di
             try:
                 setattr(recon, "periodic_interval_seconds", 60)
                 overrides["reconciliation.periodic_interval_seconds"] = (old_int, 60)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 pass
 
     # Execution: pyramiding off in safe mode.
@@ -83,7 +83,7 @@ def _apply_prod_live_safe_mode_overrides(config: object, *, enabled: bool) -> di
             try:
                 setattr(execution, "pyramiding_enabled", False)
                 overrides["execution.pyramiding_enabled"] = (old, False)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 pass
 
     return overrides
@@ -93,20 +93,20 @@ def main() -> None:
     # --- Guardrails and lock BEFORE any config/runtime imports ---
     try:
         from src.runtime.guards import assert_prod_live_prereqs, acquire_prod_live_lock
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: could not import runtime guards: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     try:
         assert_prod_live_prereqs()
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: prod-live prereqs failed: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     # Keep the lock object alive for process lifetime.
     try:
         _prod_lock = acquire_prod_live_lock(exchange_name=str(_env("EXCHANGE_NAME", "kraken") or "kraken"), market_type="futures")
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: prod-live lock not acquired: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
@@ -114,20 +114,20 @@ def main() -> None:
     try:
         from src.config.config import load_config
         from src.monitoring.logger import setup_logging, get_logger
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: could not import config/logging: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     # Load config and initialize logging as early as possible (post-guards).
     try:
         config = load_config(_config_path())
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: failed to load config: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
     try:
         setup_logging(config.monitoring.log_level, config.monitoring.log_format)
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError) as e:
         print(f"FATAL: failed to setup logging: {type(e).__name__}: {e}", file=sys.stderr)
         raise SystemExit(1)
 
@@ -164,7 +164,7 @@ def main() -> None:
         try:
             cfg_obj = sanitize_for_logging(config.model_dump())
             config_hash = stable_sha256_hex(cfg_obj)[:12]
-        except Exception:
+        except (ValueError, TypeError, KeyError):
             config_hash = "unknown"
 
         git_sha = os.getenv("GIT_SHA") or os.getenv("GITHUB_SHA") or "unknown"
@@ -205,12 +205,12 @@ def main() -> None:
             if _prod_lock is not None:
                 _prod_lock.ping()
                 db_reachable = True
-        except Exception:
+        except (OSError, ConnectionError, RuntimeError):
             db_reachable = False
 
         try:
             ks_status = KillSwitch().get_status()
-        except Exception:
+        except (OSError, ValueError, RuntimeError):
             ks_status = {"active": None, "latched": None, "reason": None}
 
         logger.critical(
@@ -252,7 +252,7 @@ def main() -> None:
             t = threading.Thread(target=_run_health, name="worker-health", daemon=True)
             t.start()
             logger.info("Worker health server started", host=host, port=port)
-        except Exception as e:
+        except (OSError, ValueError, ImportError) as e:
             logger.critical("Failed to start worker health server", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise SystemExit(1)
 
@@ -286,7 +286,7 @@ def main() -> None:
         try:
             if _prod_lock is not None:
                 _prod_lock.release()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
 
 

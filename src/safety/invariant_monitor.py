@@ -19,13 +19,71 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import asyncio
+import json
+import os
 
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 from src.utils.kill_switch import KillSwitch, KillSwitchReason
 
 logger = get_logger(__name__)
+
+# ===== PEAK EQUITY PERSISTENCE =====
+# Prevents drawdown protection from resetting on restart.
+# Without this, a restart after 14% drawdown resets the high-water mark,
+# allowing another 15% before halt — cumulative 27% loss.
+
+_DEFAULT_STATE_DIR = Path.home() / ".trading_system"
+_PEAK_EQUITY_FILE = "peak_equity_state.json"
+
+# Epsilon to avoid float noise: only update peak when equity exceeds by > $0.01
+_PEAK_EQUITY_EPSILON = Decimal("0.01")
+
+
+def _peak_equity_path() -> Path:
+    """State file path: PEAK_EQUITY_STATE_PATH env, or ~/.trading_system/peak_equity_state.json."""
+    env_path = os.environ.get("PEAK_EQUITY_STATE_PATH")
+    if env_path:
+        return Path(env_path)
+    return _DEFAULT_STATE_DIR / _PEAK_EQUITY_FILE
+
+
+def _load_persisted_peak_equity() -> Optional[Decimal]:
+    """Load persisted peak equity from disk. Returns None if missing/corrupt."""
+    path = _peak_equity_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        value = Decimal(str(data["peak_equity"]))
+        if value > 0:
+            logger.info(
+                "Loaded persisted peak equity",
+                peak_equity=str(value),
+                updated_at=data.get("updated_at", "unknown"),
+            )
+            return value
+        return None
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError) as e:
+        logger.warning("Failed to load persisted peak equity", error=str(e))
+        return None
+
+
+def _save_persisted_peak_equity(peak_equity: Decimal) -> None:
+    """Persist peak equity to disk."""
+    try:
+        path = _peak_equity_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "peak_equity": str(peak_equity),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path.write_text(json.dumps(data, indent=2))
+    except OSError as e:
+        logger.warning("Failed to save persisted peak equity", error=str(e))
 
 
 class SystemState(str, Enum):
@@ -75,7 +133,8 @@ class SystemInvariants:
     max_open_notional_usd: Decimal = Decimal("500000")
     
     # Maximum concurrent open positions
-    max_concurrent_positions: int = 10
+    # Must be >= auction_max_positions to avoid false HALTs.
+    max_concurrent_positions: int = 27
     
     # Maximum margin utilization percentage
     # NOTE: Must be > auction_max_margin_util (0.90) to avoid premature HALT
@@ -98,7 +157,7 @@ class SystemInvariants:
     # These trigger DEGRADED state (warnings) before HALTED
     degraded_equity_drawdown_pct: Decimal = Decimal("0.10")  # 10% - WARNING
     degraded_margin_utilization_pct: Decimal = Decimal("0.85")  # 85%
-    degraded_concurrent_positions: int = 8
+    degraded_concurrent_positions: int = 22
 
 
 class InvariantMonitor:
@@ -135,8 +194,12 @@ class InvariantMonitor:
         # Rolling counters
         self._rejected_orders_this_cycle = 0
         self._api_errors: List[datetime] = []  # Timestamps of recent errors
-        self._peak_equity: Optional[Decimal] = None
         self._last_state_change: datetime = datetime.now(timezone.utc)
+        
+        # Peak equity: load from persisted state to survive restarts.
+        # Without persistence, every restart resets the high-water mark and
+        # allows another full drawdown cycle — cumulative losses compound.
+        self._peak_equity: Optional[Decimal] = _load_persisted_peak_equity()
         
         # History for debugging
         self._violation_history: List[InvariantViolation] = []
@@ -147,6 +210,7 @@ class InvariantMonitor:
             max_drawdown_pct=str(self.invariants.max_equity_drawdown_pct),
             max_notional=str(self.invariants.max_open_notional_usd),
             max_positions=self.invariants.max_concurrent_positions,
+            persisted_peak_equity=str(self._peak_equity) if self._peak_equity else "none",
         )
     
     def set_kill_switch(self, kill_switch: KillSwitch):
@@ -178,10 +242,16 @@ class InvariantMonitor:
         violations: List[InvariantViolation] = []
         
         # ===== 1. EQUITY DRAWDOWN CHECK =====
+        # Peak equity tracks the high-water mark for drawdown calculation.
+        # Persisted to disk so restarts don't "forgive" drawdown.
+        # Epsilon guard: only update when equity exceeds peak by > $0.01
+        # to avoid float noise from mark-to-market jitter.
         if self._peak_equity is None:
             self._peak_equity = current_equity
-        else:
-            self._peak_equity = max(self._peak_equity, current_equity)
+            _save_persisted_peak_equity(current_equity)
+        elif current_equity > self._peak_equity + _PEAK_EQUITY_EPSILON:
+            self._peak_equity = current_equity
+            _save_persisted_peak_equity(current_equity)
         
         if self._peak_equity > 0:
             drawdown_pct = (self._peak_equity - current_equity) / self._peak_equity
@@ -424,10 +494,22 @@ class InvariantMonitor:
         """
         Reset peak equity (e.g., after manual acknowledgment).
         
+        Also persists the new peak so it survives restarts.
+        
         Args:
-            new_peak: New peak value, or None to reset to current
+            new_peak: New peak value, or None to clear entirely
         """
         self._peak_equity = new_peak
+        if new_peak is not None:
+            _save_persisted_peak_equity(new_peak)
+        else:
+            # Remove the persisted file when explicitly clearing
+            try:
+                path = _peak_equity_path()
+                if path.exists():
+                    path.unlink()
+            except OSError as e:
+                logger.warning("Failed to remove persisted peak equity file", error=str(e))
         logger.info("Peak equity reset", new_peak=str(new_peak))
 
 

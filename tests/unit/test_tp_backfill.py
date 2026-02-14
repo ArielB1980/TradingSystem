@@ -65,6 +65,14 @@ def mock_config():
     config.coin_universe = Mock()
     config.coin_universe.enabled = False
     
+    # Data config (LiveTrading accesses config.data.data_sanity, min_healthy_coins, min_health_ratio)
+    # OHLCVFetcher uses config.data.max_concurrent_ohlcv for Semaphore (must be int)
+    config.data = Mock()
+    config.data.data_sanity = None
+    config.data.min_healthy_coins = 30
+    config.data.min_health_ratio = 0.25
+    config.data.max_concurrent_ohlcv = 8
+    
     # Liquidity filters (used by RiskManager in LiveTrading)
     config.liquidity_filters = None
     
@@ -422,6 +430,7 @@ class TestTPBackfillLogic:
         from src.live.live_trading import LiveTrading
         
         live_trading = LiveTrading(mock_config)
+        live_trading.position_registry = None  # V2 state machine not enabled in test
         live_trading.executor = Mock()
         live_trading.executor.update_protective_orders = AsyncMock(
             return_value=("sl_123", ["tp1_new", "tp2_new", "tp3_new"])

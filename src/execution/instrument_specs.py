@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.data.symbol_utils import futures_candidate_symbols
+from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
 
 logger = get_logger(__name__)
@@ -447,7 +448,7 @@ class InstrumentSpecRegistry:
             self._validate_specs_sanity()
             logger.debug("InstrumentSpecRegistry loaded from cache", count=len(specs), path=str(self._cache_path))
             return True
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError) as e:
             logger.warning("Failed to load instrument specs cache", path=str(self._cache_path), error=str(e))
             return False
 
@@ -499,7 +500,7 @@ class InstrumentSpecRegistry:
                                     size_step=str(spec.size_step),
                                 )
                                 break
-        except Exception as e:
+        except (OperationalError, DataError, ValueError, KeyError) as e:
             logger.debug("Failed to enrich specs from CCXT markets (non-critical)", error=str(e))
 
     def _validate_specs_sanity(self) -> None:
@@ -585,7 +586,7 @@ class InstrumentSpecRegistry:
             }
             with open(self._cache_path, "w") as f:
                 json.dump(data, f, indent=2)
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.warning("Failed to save instrument specs cache", path=str(self._cache_path), error=str(e))
 
     async def refresh(self) -> None:
@@ -598,7 +599,7 @@ class InstrumentSpecRegistry:
             return
         try:
             raw_list = await self._get_instruments_fn()
-        except Exception as e:
+        except (OperationalError, DataError) as e:
             logger.warning("Failed to fetch instruments for spec registry", error=str(e))
             if self._loaded_at == 0:
                 self._load_from_disk()

@@ -364,7 +364,7 @@ class PositionPersistence:
             
             return pos
             
-        except Exception as e:
+        except (ValueError, TypeError, KeyError) as e:
             logger.error(f"Failed to load position {row.get('position_id')}: {e}")
             return None
     
@@ -445,9 +445,19 @@ class PositionPersistence:
     # ========== REGISTRY PERSISTENCE ==========
     
     def save_registry(self, registry: PositionRegistry) -> None:
-        """Save entire registry state."""
+        """Save entire registry state, including recently closed positions.
+        
+        Persists both active positions (from _positions) and recently closed
+        positions (from _closed_positions, last 100). This ensures closed
+        position history survives restarts for trade recording and audit.
+        """
+        # Save all active positions
         for position in registry.get_all():
             self.save_position(position)
+        
+        # Save recently closed positions (last 100) so they survive restarts
+        for closed_pos in registry._closed_positions[-100:]:
+            self.save_position(closed_pos)
         
         # Save pending reversals
         data = registry.to_dict()

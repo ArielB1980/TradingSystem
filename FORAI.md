@@ -696,3 +696,391 @@ The system is **stable, fully operational, and significantly cleaner**. The code
 - Any safety thresholds in `safety.yaml`
 
 These were set based on backtests showing 78.9% win rate. Changing them without new forward-test data would be premature optimization.
+
+---
+
+## 20. P0/P1 Safety Hardening (Feb 14, 2026)
+
+### Architecture Audit Findings & Fixes
+
+A comprehensive code and architecture audit identified 4 capital-loss risks and 5 structural reliability issues. The following P0/P1 fixes were implemented:
+
+### Fix 1: Persist Peak Equity Across Restarts (P0)
+**File:** `src/safety/invariant_monitor.py`
+**Problem:** `_peak_equity` was in-memory only. Every restart (deploy, systemd restart) reset the high-water mark, allowing cumulative drawdown of 27% (0.85^2) before any halt.
+**Fix:**
+- Peak equity persisted to `~/.trading_system/peak_equity_state.json` (same dir as halt state)
+- Loaded on startup: `peak_equity = max(persisted_peak, current_equity)`
+- Epsilon guard: only updates when equity exceeds peak by > $0.01 (avoids mark-to-market jitter)
+- `reset_peak_equity()` also persists (or removes file when clearing)
+- Env override: `PEAK_EQUITY_STATE_PATH` for testing/non-default locations
+
+### Fix 2: `max_concurrent_positions` Mismatch (P0)
+**Files:** `src/config/safety.yaml`, `src/safety/invariant_monitor.py`, `src/config/safety_config.py`, `src/safety/integration.py`
+**Problem:** Safety threshold `max_concurrent_positions=10` but `auction_max_positions=25`. The invariant monitor would HALT at 11 positions — same class as Bug #1 (margin threshold mismatch).
+**Fix:**
+- `safety.yaml` base + prod override: `max_concurrent_positions: 27` (>25 auction limit)
+- `degraded_concurrent_positions: 22` (early warning before limit)
+- Python defaults updated to match
+- **Startup validation** added: `_validate_config_safety_compatibility()` in `ProductionHardeningLayer.self_test()` checks:
+  1. `safety.max_concurrent_positions >= risk.auction_max_positions`
+  2. `safety.max_margin_utilization_pct > risk.auction_max_margin_util`
+  3. `safety.degraded_concurrent_positions < safety.max_concurrent_positions`
+  4. Warning if `degraded_margin > auction_max_margin`
+- Fails fast on mismatch (systemd restarts cleanly; silent misconfig is worse than downtime)
+
+### Fix 3: Atomic Stop Order ID Persistence (P0-ish)
+**File:** `src/execution/production_safety.py`
+**Problem:** `PositionProtectionMonitor` Layer 3 broad stop search discovered stale `stop_order_id` and updated in-memory, but never persisted to SQLite. A restart before next `save_position()` would revert to the stale ID.
+**Fix:** Added `self.persistence.save_position(position)` after Layer 3 stop ID update (line ~1062). Wrapped in try/except to prevent persistence failure from blocking protection logic.
+
+### Fix 4: Kill Switch Cancellation Verification Loop (P1)
+**File:** `src/utils/kill_switch.py`
+**Problem:** "Cancel submitted" is not "cancel effective". The kill switch submitted cancel requests but never verified they succeeded. A partial failure left non-SL orders live while the system believed it was safe.
+**Fix:**
+- After initial cancel pass, polls open orders 3 times (2s backoff) to verify no non-SL orders remain
+- Retries cancellation for any stragglers on each pass
+- Logs CRITICAL if verification fails after all retries
+- Extracted SL classification into `_is_stop_loss_order()` and `_cancel_non_sl_orders()` for reuse
+- Added `_count_non_sl_orders()` helper for verification
+
+### Test Impact
+- 114 tests passing across all changed files, 0 new failures
+- 6 pre-existing failures in unrelated files (liquidity tiers, takeover, TP backfill)
+- Updated `tests/test_invariant_monitor.py` to match new defaults + added test isolation for peak equity persistence
+
+### Threshold Relationships (Updated — CRITICAL to maintain)
+```
+auction_max_positions (25)          < safety.max_concurrent_positions (27)
+                                      < safety.degraded_concurrent_positions (22)
+auction_max_margin_util (0.90)      < max_margin_utilization_pct (0.92)
+degraded_margin_utilization_pct (0.85) <= auction_max_margin_util (0.90)
+```
+
+---
+
+## 21. Post-Audit Hardening: Items 2-5 (Feb 14, 2026)
+
+### Item 2: Startup State Machine Wired to ExecutionGateway
+**Files:** `src/live/live_trading.py` (1-line change)
+**What:** The `StartupStateMachine` instance (`_startup_sm`) is now passed to the `ExecutionGateway` constructor via `startup_machine=self._startup_sm`. The gateway's `execute_action()` calls `assert_ready()` before any order placement. If the system is not in `READY` phase, it returns a failed `ExecutionResult` instead of placing orders. This is a regression-prevention gate — no refactor can accidentally trade during SYNC/RECONCILE.
+
+### Item 3: Circuit Breaker in CYCLE_SUMMARY
+**File:** `src/live/live_trading.py`
+**What:** The per-cycle summary log line now includes `breaker` (CLOSED/OPEN/HALF_OPEN), `breaker_failures` (total failure + rate limit count). This makes it trivial to spot "false opens" (threshold too sensitive) or "no opens during outage" (classification wrong) by tailing logs.
+
+### Item 4: Exception Hierarchy in Executor + Gateway
+**Files:** `src/execution/execution_gateway.py`, `src/execution/executor.py`
+**Problem:** ~30 `except Exception` blocks silently swallowed all errors, including programming bugs (`AttributeError`, `KeyError`). This masked real issues and made debugging hard.
+**Fix:**
+- Imported `OperationalError`, `DataError`, `InvariantError`, `CircuitOpenError`
+- Replaced every `except Exception` with structured handling:
+  - `except InvariantError: raise` — safety violations propagate to kill switch
+  - `except (OperationalError, DataError)` — transient/data errors handled locally (return failed result, log, continue)
+  - Everything else bubbles up → crash + systemd restart (correct for bugs)
+- Narrowed non-exchange catches (fee config, price parsing, intent hashing) to specific types (`ValueError`, `TypeError`, `ImportError`, `ArithmeticError`)
+- **Bonus bugs exposed and fixed:**
+  - `tp_order_ids` attribute didn't exist on `ManagedPosition` — was silently swallowed. Fixed to use `tp1_order_id`/`tp2_order_id` (the actual fields).
+  - `orders_placed` metrics key was missing from initialization dict.
+  - TP orders not registered in `_pending_orders` — fill tracking never worked for TPs. Fixed by adding `PendingOrder` creation in `_execute_place_tp`.
+  - Integration test `FakeExchange` raised bare `Exception` instead of `OperationalError`.
+  - Integration test double-executed follow-up actions (already executed by `process_order_update` internally).
+
+### Item 5: Dual-DB Fix — Option A (Postgres Cross-Validation)
+**File:** `src/execution/execution_gateway.py`
+**Problem:** SQLite (state machine) and Postgres (dashboard/risk) could diverge after crashes. A crash mid-update to SQLite leaves stale state that the system then trades on.
+**Fix:** Added `_enrich_from_postgres()` to the startup flow, called after exchange reconciliation and phantom import:
+1. Loads active positions from Postgres `positions` table
+2. For each active position in the registry, cross-references Postgres by normalized symbol
+3. Backfills missing fields: entry price, stop price, stop order ID, TP1/TP2 prices
+4. Logs any >1% entry price drift between SQLite and Postgres (potential data integrity issue)
+5. Persists the fully reconciled state to SQLite via `save_registry()` as the final startup step
+
+**Startup flow is now:**
+```
+1. Load SQLite → merge into registry
+2. Sync with exchange (orphan/qty/phantom)
+3. Import phantom positions
+4. Cross-validate with Postgres (enrich missing fields)
+5. Persist reconciled state to SQLite (single source of truth)
+```
+
+## 22. CTO Hardening Pass — P0 + P1 Capital Safety (Feb 14, 2026)
+
+### P0.1: Move `advance_to(READY)` before first tick
+**File:** `src/live/live_trading.py`
+**Problem:** `advance_to(READY)` was called AFTER the first tick, meaning self-heal paths (missing stops, ShockGuard) could fire before the system was fully initialized.
+**Fix:**
+1. Moved `advance_to(READY)` before the initial `_tick()` call — no trading actions before READY
+2. Added `InvariantError` guard at the top of `_tick()` — any call to `_tick()` before READY raises immediately
+
+### P0.2: Fix `production_safety.py` bare pass blocks
+**File:** `src/execution/production_safety.py`
+**Problem:** Three `except Exception: pass` blocks in atomic stop replacement silently swallowed all errors, including programming bugs. This could leave a position unprotected without any log entry.
+**Fix:** All blocks now:
+- Catch `OperationalError` specifically (transient API errors) → log + continue
+- Let `InvariantError` propagate to kill switch
+- Unknown exceptions bubble up → crash + systemd restart
+
+### P1.2: Route stop self-heal + ShockGuard through gateway
+**Files:** `src/execution/execution_gateway.py`, `src/live/protection_ops.py`, `src/live/live_trading.py`
+**Problem:** `place_missing_stops_for_unprotected` and ShockGuard TRIM bypassed the ExecutionGateway, meaning:
+- No startup readiness check
+- No WAL logging
+- No circuit breaker
+- No metrics
+**Fix:** Added `ExecutionGateway.place_emergency_order()` — a bypass-safe order path that:
+- Enforces startup readiness (READY only)
+- Records WAL intent
+- Routes through client (inherits circuit breaker)
+- Tracks metrics
+Routed `protection_ops.place_missing_stops_for_unprotected` and ShockGuard TRIM through it.
+
+### P1.1: Narrow circuit breaker classification
+**File:** `src/data/kraken_client.py`
+**Problem:** The classifier was too permissive:
+- `OSError` caught `FileNotFoundError`, `PermissionError` (deployment bugs, not transient)
+- String matching "500" triggered on unrelated error messages
+- Unknown `ccxt.ExchangeError` tripped breaker (should be DataError)
+**Fix:**
+1. Narrowed `OSError` to explicit network subclasses (`ConnectionError`, `BrokenPipeError`, etc.) plus errno whitelist (ETIMEDOUT, ECONNRESET, etc.)
+2. Replaced string "500" matching with `re.search(r"\bHTTP\s+5\d{2}\b", ...)` — structured pattern only
+3. `ccxt.DDoSProtection` → `OperationalError` (transient)
+4. Unknown `ccxt.ExchangeError` → `DataError` (won't trip breaker)
+
+### P1.3: Exception hierarchy in production_safety.py
+**File:** `src/execution/production_safety.py`
+**Problem:** 9 remaining `except Exception` blocks in critical safety code (stop replacement, protection check, stop-fill verification, emergency exit, periodic monitoring).
+**Fix:** All 9 blocks refactored:
+- `InvariantError` → `raise` (propagate to kill switch)
+- `(OperationalError, DataError)` → log + continue (expected transient failures)
+- Persistence errors → catch `(OperationalError, DataError, OSError)` (DB/filesystem)
+- Everything else → crash (systemd restarts correctly for bugs)
+
+## 23. Tier 1 Safety Kernel Hardening (Feb 14, 2026)
+
+Completed the "unknown bug → crash → systemd restart" invariant across the entire safety layer.
+
+### Tier 1A: Kill switch in live_trading.py (3 blocks)
+**File:** `src/live/live_trading.py` (kill switch path in `_tick()`)
+- 3 blocks (cancel_all, close_position, close_all) refactored:
+  - `InvariantError` → raise (always propagate)
+  - `OperationalError` → log with `kill_step` field + continue
+  - `Exception` → `logger.exception()` + **raise** (unknown = crash)
+- Added structured `kill_step=` field to every log for incident correlation
+
+### Tier 1B: safety/integration.py (16 blocks)
+**File:** `src/safety/integration.py` (ProductionHardeningLayer)
+- 5 `__init__` blocks narrowed from `Exception` to `(ValueError, TypeError, KeyError, FileNotFoundError, OSError)` — config/init errors only
+- `self_test()` narrowed to `OSError`
+- `_load_halt_state`: crash on corrupt file (`InvariantError`) — never trade with unknown halt state
+- `_persist_halt_state`: removed try/except entirely — if persistence fails, crash is correct
+- Alert sending narrowed to `(OperationalError, ImportError, OSError)` — alert failure doesn't block halt
+- `clear_halt`: `InvariantError` propagates, only `OSError` caught
+- 5 business methods (`reconcile_signal`, `reconcile_close`, `record_decision`, `record_execution_result`, `record_execution_failed`): `InvariantError` propagates, `(OperationalError, DataError)` logged, unknown → `logger.exception()` + raise
+- `post_tick_cleanup`: same pattern
+
+### Tier 1C: kill_switch.py (7 blocks)
+**File:** `src/utils/kill_switch.py`
+- `_save_state`: removed try/except — unpersisted kill switch state = crash (correct: restart will re-read)
+- `_load_state`: corrupt file → default to ACTIVE (safest posture). Unreadable file → crash
+- `activate()` emergency close loop: `InvariantError` propagates, `OperationalError` logged with `kill_step`, unknown → raise
+- `_cancel_non_sl_orders`: same pattern with `kill_step="cancel_non_sl"`
+- `_count_non_sl_orders`: narrowed to `OperationalError` only (returns -1 for unknown)
+- `read_kill_switch_state`: narrowed to `(json.JSONDecodeError, ValueError, OSError)`
+
+### Tier 2D: Tick loop hotspots (3 blocks)
+**File:** `src/live/live_trading.py`
+- Breaker state fetch: narrowed from `except Exception: pass` to `(OperationalError, DataError, KeyError, AttributeError)` with debug log
+- Spread check fail-open: narrowed from `except Exception: pass` to `(ValueError, TypeError, ArithmeticError, KeyError)` with debug log
+- V2 position evaluation: added `InvariantError` propagation + unknown → `logger.exception()` + raise
+
+## 24. Outstanding P2/P3 Items Cleanup (Feb 14, 2026)
+
+### P2: Tighten Postgres drift threshold to 0.1%
+**File:** `src/execution/execution_gateway.py`
+Changed `_enrich_from_postgres()` drift threshold from `Decimal("0.01")` (1%) to `Decimal("0.001")` (0.1%). Catches smaller data integrity issues before they compound.
+
+### P3: save_registry persists _closed_positions
+**File:** `src/execution/position_persistence.py`
+`save_registry()` now persists the last 100 closed positions (from `registry._closed_positions`) in addition to active positions. This ensures closed position history survives restarts for trade recording and audit.
+
+### P3: Exception hierarchy in candle_manager, exchange_sync, production_takeover
+**Files:** `src/data/candle_manager.py` (3 blocks), `src/live/exchange_sync.py` (7 blocks), `src/execution/production_takeover.py` (7 blocks)
+All `except Exception` blocks replaced with specific types:
+- OHLCV fetches: `(OperationalError, DataError)` — transient API failures
+- Data conversion: `(ValueError, TypeError, KeyError)` — malformed exchange data
+- DB persistence: `(OperationalError, DataError, OSError)` — storage failures
+- Order cancellation/placement: `InvariantError` propagates, `(OperationalError, DataError)` logged
+- Alert failures: `(OperationalError, ImportError, OSError)` — non-blocking
+Zero `except Exception` blocks remain in any of these files.
+
+## 25. Full-Codebase except Exception Elimination (Feb 14, 2026)
+
+Systematically replaced **~200 `except Exception` blocks across 40+ files** with specific exception types. After this sweep, only **26 intentional blocks remain** — all either top-level crash handlers, retry decorators, SQLAlchemy session rollback patterns, or "last resort" blocks that `logger.exception() + raise`.
+
+### Policy Applied Everywhere
+- **InvariantError** → always re-raise (safety violations halt)
+- **OperationalError/DataError** → log + continue (transient exchange/data issues)
+- **OSError** → for persistence/file operations
+- **ValueError/TypeError/KeyError** → for data parsing/formatting
+- **Unknown Exception** → `logger.exception() + raise` (let systemd restart)
+
+### Files Changed (grouped by area)
+
+**Live Trading Core:**
+- `src/live/live_trading.py` — 36 blocks narrowed (startup init, background tasks, tick helpers)
+- `src/live/protection_ops.py` — 11 blocks (TP backfill, orphan cleanup, stop reconciliation)
+- `src/live/health_monitor.py` — 22 blocks (monitors, self-heal, daily summary, auto-recovery)
+- `src/live/auction_runner.py` — 7 blocks (position allocation, spec refresh)
+- `src/live/signal_handler.py` — 2 blocks (position registration, alerts)
+- `src/live/coin_processor.py` — 2 blocks (universe updates, alerts)
+- `src/live/startup_validator.py` — 1 block (trace creation)
+
+**Execution Layer:**
+- `src/execution/position_state_machine.py` — 2 blocks (Decimal parsing)
+- `src/execution/instrument_specs.py` — 4 blocks (cache load/save, CCXT enrich, fetch)
+- `src/execution/futures_adapter.py` — 3 blocks (mark price parse, order placement, cancellation)
+- `src/execution/trade_recorder.py` — 1 block (save_trade with IntegrityError catch)
+- `src/execution/equity.py` — 1 block (collateral valuation)
+- `src/execution/position_persistence.py` — 1 block (load position from row)
+
+**Storage Layer:**
+- `src/storage/db.py` — 4 blocks (schema create, migrations, URL parse) — session rollback left as-is
+- `src/storage/repository.py` — 6 blocks (save candle/position, events, signals)
+- `src/storage/maintenance.py` — 4 blocks (prune, commit, table stats)
+
+**Safety & Infrastructure:**
+- `src/reconciliation/reconciler.py` — 6 blocks (exchange sync, adopt, force-close, zombies)
+- `src/safety/invariant_monitor.py` — 3 blocks (peak equity load/save/remove)
+- `src/runtime/guards.py` — 5 blocks (URL parse, schema, lock release, kill switch)
+- `src/entrypoints/prod_live.py` — 15 blocks (config overrides, FATAL guards, health server)
+
+**Monitoring & Dashboard:**
+- `src/monitoring/telegram_bot.py` — 5 blocks (poll, send, status, positions, trades)
+- `src/monitoring/alerting.py` — 1 block (alert send)
+- `src/monitoring/alerts.py` — 3 blocks (Slack, Discord, config)
+- `src/monitoring/decision_audit.py` — 1 block (flush buffer)
+- `src/health.py` — 12 blocks (metrics, DB, kill switch, debug signals)
+- `src/dashboard/static_dashboard.py` — 10 blocks (timestamps, JSON, candles, positions, HTML)
+
+**Strategy & Risk:**
+- `src/strategy/smc_engine.py` — 2 blocks (stop-outs query, adaptive confirmation)
+- `src/strategy/indicators.py` — 3 blocks (RSI divergence, swing points)
+- `src/risk/symbol_cooldown.py` — 1 block (symbol loss query)
+
+**Tools & CLI:**
+- `src/cli.py` — 12 blocks (config, logging, health, live engine)
+- `src/tools/run_takeover.py` — 2 blocks
+- `src/tools/audit_open_orders.py` — 5 blocks
+- `src/tools/place_missing_stops.py` — 3 blocks
+- `src/utils/discovered_markets_loader.py` — 3 blocks (file load/parse)
+
+**Other:**
+- `src/backtest/backtest_engine.py` — 1 block (rate limit)
+- `src/replay/replay_ticker_provider.py` — 1 block (Decimal conversion)
+- `src/recording/kraken_futures_recorder.py` — 6 blocks (candle meta, tickers, snapshots)
+- `src/test_integration.py` — 4 blocks
+- `src/test_system.py` — 7 blocks
+
+### Intentional Remaining `except Exception` (26 blocks)
+1. **`prod_live.py`** (2): Top-level crash handler → SystemExit(1)
+2. **`guards.py`** (1): DB heartbeat health check
+3. **`db.py`** (1): SQLAlchemy session rollback pattern (must catch all)
+4. **`live_trading.py`** (10): Last-resort log+raise blocks, non-critical loop continuations
+5. **`execution_gateway.py`** (2): WAL failure + Postgres enrichment
+6. **`kill_switch.py`** (3): Emergency close log+raise (Tier 1C work)
+7. **`safety/integration.py`** (6): Safety kernel log+raise (Tier 1B work)
+8. **`retry.py`** (1): Retry decorator (catches all by design)
+
+### Test Fix
+- `test_trade_recorder.py::test_duplicate_pk_sets_flag_anyway`: Added `sqlalchemy.exc.IntegrityError` to the catch clause in `trade_recorder.py` since the narrowed `(OperationalError, DataError, OSError)` didn't cover SQLAlchemy's native integrity error.
+
+### Lesson Learned
+When narrowing `except Exception` in persistence code, always check if SQLAlchemy-native exceptions (e.g., `IntegrityError`, `OperationalError`) are used alongside custom exception types. SQLAlchemy exceptions don't inherit from custom app exceptions.
+
+## 26. CTO Audit: Capital Safety, Concurrency, Tests, Observability (Feb 14, 2026)
+
+Full CTO-level audit produced prioritized action items across safety, concurrency, testing, and observability. All implemented.
+
+### P0.1: DRY_RUN Gate at Transport Boundary
+**Files:** `src/data/kraken_client.py`, `src/live/live_trading.py`
+- Added `dry_run: bool = False` parameter to `KrakenClient.__init__`
+- `place_futures_order()`, `cancel_futures_order()`, `edit_futures_order()` now check `self._dry_run` and raise `OperationalError("dry_run_active")` before any exchange call
+- No simulated success — callers (tools, REPL, scripts) fail loudly
+- `LiveTrading.__init__` passes `config.system.dry_run` to the client
+
+**Why:** Defense-in-depth. Even if orchestration-layer DRY_RUN check is bypassed, the lowest transport layer refuses to send real orders.
+
+### P0.2: Global Order Rate Limiter
+**File:** `src/execution/execution_gateway.py`
+- New `_OrderRateLimiter` class: sliding-window token bucket with two windows (60 orders/minute, 10 orders/10 seconds)
+- `check_and_record()` raises `InvariantError` if either limit exceeded (logic failure, not transient)
+- Wired into `execute_action()` and `place_emergency_order()` — covers ALL order paths
+- Tracks `orders_blocked_total`, `orders_last_minute`, `orders_last_10s` metrics
+
+**Why:** Prevents runaway tick loops, recursion bugs, broken auction filters, and infinite self-heal loops from placing hundreds of orders.
+
+### P0.3: Max Dollar Loss Per Trade
+**Files:** `src/config/config.py`, `src/risk/risk_manager.py`, `src/config/config.yaml`
+- New config field: `max_loss_per_trade_usd: float = Field(default=500.0, ge=10.0, le=50000.0)`
+- In `validate_trade()`, after all sizing adjustments: `estimated_loss_at_stop = position_notional * stop_distance_pct`
+- If loss exceeds cap: attempts to cap notional first; if even min notional would lose too much, rejects trade
+- Logged as `binding_constraint = MAX_USD`
+
+**Why:** Closes the leverage blind spot. A wide stop on a volatile coin at high leverage could lose more than expected. This is the explicit "max dollars at risk per trade" assertion that was missing.
+
+### P0.4: Trading Activity Heartbeat
+**File:** `src/live/live_trading.py`
+- After each successful tick, writes `runtime/heartbeat.json` with: epoch timestamp, ISO time, startup phase, cycle count, kill switch status
+- Atomic write (write to .tmp, rename) to prevent partial reads
+- External watchdog (systemd timer or sidecar) checks file staleness → if >60s old, process is hung
+
+**Why:** Crash detection ≠ hung loop detection. A deadlocked event loop sends no heartbeats, but doesn't crash. This catches deadlocks, DNS hangs, blocking I/O, and event loop starvation.
+
+### P1.1: Circuit Breaker Lock Consistency
+**Files:** `src/utils/circuit_breaker.py`, `src/data/kraken_client.py`, `tests/unit/test_circuit_breaker_api.py`
+- `can_execute()`, `record_success()`, `record_failure()`, `force_open()`, `force_close()` are now `async` and use `async with self._lock` for all state mutations
+- All callers in `kraken_client.py` now `await` these methods (they were already in async methods)
+- All 20 circuit breaker unit tests updated to use `@pytest.mark.asyncio` and `await`
+
+**Why:** Two concurrent API calls could race through the half-open state. With async lock, state transitions are atomic. `_state`, `_failure_count`, `_probe_in_flight` are now consistently protected.
+
+### P1.2: Orphaned Background Task Cleanup
+**File:** `src/live/live_trading.py`
+- Added `_trade_recording_monitor_task` to the shutdown `finally` block (cancel + await + suppress CancelledError)
+- Matches the pattern used for all other background tasks
+
+**Why:** The task could keep running after shutdown, writing to a closed DB or logging after teardown.
+
+### P1.3: time.sleep in cli.py
+- Verified: `time.sleep(1)` at cli.py:270 is in sync context (before `asyncio.run()`), not blocking the event loop. No change needed.
+
+### P2: Fix All Broken Tests (27 → 0 failures)
+**Files:** `tests/conftest.py`, `tests/unit/test_tp_backfill.py`, `tests/unit/test_execution_gateway_order_updates.py`, `tests/unit/test_executor_pyramiding.py`, `tests/unit/test_liquidity_filters_tiers.py`, `tests/unit/test_production_takeover.py`, `tests/unit/test_production_safety.py`
+
+Fixes:
+- **DATABASE_URL (20 tests):** Added `os.environ["DATABASE_URL"]` in `tests/conftest.py` + mock `get_db` fixture for all unit tests
+- **Mock/implementation mismatches:** Fixed `AsyncMock` return values for ticker, open orders, and place_order
+- **Liquidity filter tests:** Updated to reflect pinned Tier A behavior (BTC, ETH, DOGE bypass volume/spread filters)
+- **Production takeover Case D:** Fixed mock to use `SimpleNamespace` with `stop_order_id=None` so purge branch runs
+- **Production safety:** Fixed `save_position` assertion from `assert_called_once` to `assert_any_call` (P3 change causes double save)
+- **TP backfill:** Added `config.data.max_concurrent_ohlcv = 8` to mock config
+
+**Result:** 451 tests pass, 0 failures.
+
+### P3.1: Configurable Circuit Breaker Thresholds
+**Files:** `src/config/config.py`, `src/data/kraken_client.py`, `src/live/live_trading.py`
+- Added to `ExchangeConfig`: `circuit_breaker_failure_threshold`, `circuit_breaker_rate_limit_threshold`, `circuit_breaker_cooldown_seconds`
+- `KrakenClient.__init__` accepts these as keyword-only params, passes to `APICircuitBreaker`
+- `LiveTrading.__init__` wires config values with `getattr` defaults for backward compatibility
+- ShockGuard was already configurable via `RiskConfig` — no change needed
+
+### P3.2: Order-Rate Metrics + Alerting
+**File:** `src/live/live_trading.py`
+- Metrics snapshot now includes `orders_per_minute`, `orders_per_10s`, `orders_blocked_total`
+- When `orders_per_minute >= 30` (50% of limit), logs `HIGH_ORDER_RATE` warning with rate details
+- Runs once per minute (same cadence as metrics emit)
+
+### Lesson Learned
+Making circuit breaker methods async has a blast radius: every caller site needs `await`. In a codebase with 20+ breaker call sites in a single file, use find-all-replace carefully. The payoff is worth it — race conditions in half-open state are subtle and hard to reproduce but can cause cascading API exhaustion.

@@ -247,20 +247,12 @@ class Indicators:
                 
             return "none"
             
-        except Exception as e:
+        except (ValueError, TypeError, ArithmeticError, KeyError) as e:
             logger.warning(
                 "Error detecting RSI divergence",
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
             )
-            return "none"
-            
-            if latest_price_high > prev_price_high and latest_rsi_high < prev_rsi_high:
-                return "bearish"
-                
-            return "none"
-            
-        except Exception as e:
-            logger.warning("RSI Divergence check failed", error=str(e))
             return "none"
     
     @staticmethod
@@ -384,10 +376,11 @@ class Indicators:
             
             return [Decimal(str(p)) for p in swing_points]
             
-        except Exception as e:
+        except (ValueError, TypeError, ArithmeticError, KeyError) as e:
             logger.error(
                 "Swing point detection failed",
                 error=str(e),
+                error_type=type(e).__name__,
                 exc_info=True
             )
             return []

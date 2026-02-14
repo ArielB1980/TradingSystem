@@ -500,6 +500,34 @@ class RiskManager:
             available_margin=str(available_margin) if available_margin is not None else "n/a",
         )
 
+        # P0.3: Max dollar loss per trade — explicit cap on worst-case loss if stop hits.
+        # Computed after all sizing adjustments (caps, boosts) so it reflects actual position size.
+        max_loss_per_trade_usd = Decimal(str(getattr(self.config, "max_loss_per_trade_usd", 500.0)))
+        if position_notional > 0 and stop_distance_pct > 0:
+            # Dollar loss = notional * stop_distance_pct
+            estimated_loss_at_stop = position_notional * stop_distance_pct
+            if estimated_loss_at_stop > max_loss_per_trade_usd:
+                # Try to cap position size first
+                capped_notional = max_loss_per_trade_usd / stop_distance_pct
+                if capped_notional >= min_notional_viable:
+                    logger.info(
+                        "Capping position by max_loss_per_trade_usd",
+                        symbol=signal.symbol,
+                        before=str(position_notional),
+                        after=str(capped_notional),
+                        estimated_loss=str(estimated_loss_at_stop),
+                        max_loss=str(max_loss_per_trade_usd),
+                        stop_distance_pct=str(stop_distance_pct),
+                    )
+                    position_notional = capped_notional
+                    binding_constraint = BindingConstraint.MAX_USD
+                    binding_constraints.append(BindingConstraint.MAX_USD)
+                else:
+                    rejection_reasons.append(
+                        f"Max loss ${estimated_loss_at_stop:.0f} exceeds ${max_loss_per_trade_usd:.0f} per trade "
+                        f"(stop distance {stop_distance_pct:.2%}, even min notional would lose too much)"
+                    )
+
         # Determine Effective Leverage for monitoring ONLY
         effective_leverage = position_notional / account_equity
         if effective_leverage > requested_leverage:

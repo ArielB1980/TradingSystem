@@ -232,17 +232,17 @@ def test_classify_tier_medium_liquidity():
 
 
 def test_classify_tier_low_liquidity():
-    """Low liquidity markets should be classified as Tier C."""
+    """Low liquidity markets (non-pinned) should be classified as Tier C."""
     registry = MarketRegistry(MagicMock(), MagicMock())
-    
+    # Use a non-pinned symbol: DOGE is pinned Tier A, so use e.g. PEPE/USD for low liquidity = C
     pair = MarketPair(
-        spot_symbol="DOGE/USD",
-        futures_symbol="PF_DOGEUSD",
+        spot_symbol="PEPE/USD",
+        futures_symbol="PF_PEPEUSD",
         spot_volume_24h=Decimal("200000"),
         futures_open_interest=Decimal("100000"),  # $100k OI (below $1M)
         spot_spread_pct=Decimal("0.01"),
         futures_spread_pct=Decimal("0.0100"),  # 1.0% spread
-        futures_volume_24h=Decimal("200000"),  # $200k
+        futures_volume_24h=Decimal("200000"),  # $200k (below $500k Tier B, vol/spread fail Tier A/B)
         funding_rate=Decimal("0.0005"),
         is_eligible=True,
     )
@@ -286,35 +286,66 @@ def test_classify_tier_pinned_majors_always_tier_a(spot_symbol, futures_symbol):
 
 @pytest.mark.asyncio
 async def test_apply_filters_futures_primary_mode(mock_config):
-    """In futures_primary mode, markets should pass based on futures metrics."""
+    """In futures_primary mode, markets pass on futures vol/spread; pinned Tier A (BTC, ETH, DOGE) bypass filters."""
     client = FakeKrakenClientWithFuturesTickers()
     registry = MarketRegistry(client, mock_config)
     
     # Discover markets
     pairs = await registry.discover_markets()
     
-    # BTC and ETH should pass (high OI, low spread)
-    # DOGE should fail (low OI below $500k threshold)
+    # BTC, ETH, DOGE are pinned Tier A and bypass volume/spread gates (OI is log-only, not a gate)
     assert "BTC/USD" in pairs
     assert "ETH/USD" in pairs
-    assert "DOGE/USD" not in pairs  # OI too low
+    assert "DOGE/USD" in pairs  # Pinned Tier A — bypasses filters
 
 
 @pytest.mark.asyncio
 async def test_apply_filters_rejects_low_open_interest(mock_config):
-    """Markets with low open interest should be rejected."""
-    # Set a high OI requirement
-    mock_config.liquidity_filters.min_futures_open_interest = Decimal("20000000")  # $20M
-    
-    client = FakeKrakenClientWithFuturesTickers()
+    """Open interest is log-only (not a gate); volume/spread are the gates. Test volume gate rejects."""
+    # OI is no longer a filter gate (Kraken misreports). Use volume: non-pinned symbol with low vol is rejected.
+    low_vol_futures = {
+        "PF_XBTUSD": FuturesTicker(
+            symbol="PF_XBTUSD",
+            mark_price=Decimal("50000"),
+            bid=Decimal("49995"),
+            ask=Decimal("50005"),
+            volume_24h=Decimal("100000000"),
+            open_interest=Decimal("50000000"),
+            funding_rate=Decimal("0.0001"),
+        ),
+        "PF_LINKUSD": FuturesTicker(
+            symbol="PF_LINKUSD",
+            mark_price=Decimal("20"),
+            bid=Decimal("19.9"),
+            ask=Decimal("20.1"),
+            volume_24h=Decimal("100000"),  # $100k < $500k Tier C threshold
+            open_interest=Decimal("1000000"),
+            funding_rate=Decimal("0.0001"),
+        ),
+    }
+    spot_markets = {
+        "BTC/USD": {"id": "xbtusd", "base": "XBT", "quote": "USD", "active": True},
+        "LINK/USD": {"id": "linkusd", "base": "LINK", "quote": "USD", "active": True},
+    }
+    futures_markets = {
+        "BTC/USD": {"symbol": "PF_XBTUSD", "base": "XBT", "quote": "USD", "active": True},
+        "LINK/USD": {"symbol": "PF_LINKUSD", "base": "LINK", "quote": "USD", "active": True},
+    }
+    spot_tickers = {
+        "BTC/USD": {"quoteVolume": 50_000_000, "bid": 50000, "ask": 50010, "last": 50005},
+        "LINK/USD": {"quoteVolume": 5_000_000, "bid": 20, "ask": 20.02, "last": 20.01},
+    }
+    client = FakeKrakenClientWithFuturesTickers(
+        spot_markets=spot_markets,
+        futures_markets=futures_markets,
+        spot_tickers=spot_tickers,
+        futures_tickers=low_vol_futures,
+    )
     registry = MarketRegistry(client, mock_config)
-    
     pairs = await registry.discover_markets()
-    
-    # Only BTC should pass (OI = $50M)
-    # ETH has $15M OI, below $20M threshold
+    # BTC passes (pinned Tier A). LINK is not pinned and has low vol -> rejected by volume gate
     assert "BTC/USD" in pairs
-    assert "ETH/USD" not in pairs
+    assert "LINK/USD" not in pairs
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full replay replay-episode replay-sweep audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -14,6 +14,9 @@ help:
 	@echo "  make backfill      Download 250 days of historical data for all coins"
 	@echo "  make backtest-quick  Quick backtest (scripts/backtest/run_quick_backtest.py)"
 	@echo "  make backtest-full   Full backtest (scripts/backtest/run_full_backtest.py)"
+	@echo "  make replay          Run all 6 replay episodes (SEED=42 default)"
+	@echo "  make replay-episode  Run a single episode: make replay-episode EP=1_normal SEED=42"
+	@echo "  make replay-sweep    Run all episodes across seeds 1-5 (robustness)"
 	@echo "  make run           Run bot in local mode (dry-run)"
 	@echo "  make smoke         Run smoke test (30s)"
 	@echo "  make integration   Run integration test (5 mins, tests all code paths)"
@@ -64,6 +67,37 @@ backtest-full:
 	else \
 		echo "❌ .env.local not found. Run 'make validate' first."; exit 1; \
 	fi
+
+EP ?=
+SEED ?= 42
+
+replay:
+	@mkdir -p results/replay
+	@echo "Running all 6 replay backtest episodes (seed=$(SEED))..."
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	ENV=local DRY_RUN=0 $(PYTHON) -m src.backtest.replay_harness.run_episodes \
+		--seed $(SEED) --data-dir data/replay --output results/replay 2>&1 | tee results/replay/run.log
+
+replay-episode:
+	@if [ -z "$(EP)" ]; then \
+		echo "Usage: make replay-episode EP=1_normal"; \
+		echo "Available: 1_normal, 2_high_vol, 3_drought, 4_outage, 5_restart, 6_bug"; \
+		echo "Optional: SEED=N (default 42)"; \
+		exit 1; \
+	fi
+	@mkdir -p results/replay
+	@echo "Running replay episode: $(EP) (seed=$(SEED))..."
+	@if [ -f .env.local ]; then set -a; source .env.local; set +a; fi; \
+	ENV=local DRY_RUN=0 $(PYTHON) -m src.backtest.replay_harness.run_episodes \
+		--episode $(EP) --seed $(SEED) --data-dir data/replay --output results/replay 2>&1 | tee results/replay/$(EP).log
+
+replay-sweep:
+	@echo "Running replay across seeds 1-5 (robustness sweep)..."
+	@for s in 1 2 3 4 5; do \
+		echo ""; echo "=== SEED $$s ==="; \
+		$(MAKE) replay SEED=$$s || exit 1; \
+	done
+	@echo ""; echo "All seeds passed."
 
 venv:
 	python3 -m venv .venv

@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, Tuple
 from decimal import Decimal
 
+from src.exceptions import OperationalError, DataError
 from src.data.symbol_utils import normalize_to_base as normalize_symbol
 from src.monitoring.logger import get_logger
 
@@ -79,8 +80,8 @@ def get_symbol_loss_stats(symbol: str, lookback_hours: int = 24) -> Tuple[int, f
         
         return stats
         
-    except Exception as e:
-        logger.warning("Failed to query symbol losses", symbol=symbol, error=str(e))
+    except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:
+        logger.warning("Failed to query symbol losses", symbol=symbol, error=str(e), error_type=type(e).__name__)
         return 0, 0.0
 
 
