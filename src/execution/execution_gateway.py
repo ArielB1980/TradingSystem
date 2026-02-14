@@ -111,6 +111,7 @@ class ExecutionGateway:
         use_safety: bool = True,
         on_partial_close: Optional[Callable[[str], None]] = None,
         instrument_spec_registry=None,
+        on_trade_recorded: Optional[Callable] = None,
     ):
         """
         Initialize the execution gateway.
@@ -123,6 +124,7 @@ class ExecutionGateway:
             safety_config: Config for AtomicStopReplacer, etc. (default SafetyConfig())
             use_safety: If True, wire AtomicStopReplacer, WAL, EventOrderingEnforcer
             instrument_spec_registry: Optional registry for venue min_size; used to guard partial closes
+            on_trade_recorded: Optional async callback(position, trade) called after trade recording
         """
         self.client = exchange_client
         self.registry = registry or get_position_registry()
@@ -133,6 +135,7 @@ class ExecutionGateway:
         self._use_safety = use_safety
 
         self._on_partial_close = on_partial_close
+        self._on_trade_recorded = on_trade_recorded
         self._stop_replacer: Optional[AtomicStopReplacer] = None
         self._wal: Optional[WriteAheadIntentLog] = None
         self._event_enforcer: Optional[EventOrderingEnforcer] = None
@@ -1018,6 +1021,10 @@ class ExecutionGateway:
         This is the SINGLE convergence point for all close paths.
         Called after persistence.save_position() in every code path
         that can transition a position to CLOSED.
+        
+        After successful recording:
+        1. Sends POSITION_CLOSED Telegram notification
+        2. Fires on_trade_recorded callback (for risk manager, etc.)
         """
         if position.state != PositionState.CLOSED or position.trade_recorded:
             return
@@ -1036,6 +1043,48 @@ class ExecutionGateway:
                 self.metrics["trades_recorded_total"] += 1
                 # Re-persist to save trade_recorded=True
                 self.persistence.save_position(position)
+                
+                # ---- Send POSITION_CLOSED notification ----
+                try:
+                    from src.monitoring.alerting import send_alert, fmt_price, fmt_size
+                    
+                    pnl_sign = "+" if trade.net_pnl >= 0 else ""
+                    pnl_emoji = "\u2705" if trade.net_pnl >= 0 else "\u274c"
+                    holding = trade.holding_period_hours
+                    holding_str = f"{float(holding):.1f}h" if holding else "?"
+                    exit_reason = trade.exit_reason or "unknown"
+                    
+                    await send_alert(
+                        "POSITION_CLOSED",
+                        f"{pnl_emoji} Position closed: {trade.symbol}\n"
+                        f"Side: {trade.side.value.upper()}\n"
+                        f"Size: {fmt_size(trade.size)}\n"
+                        f"Entry: ${fmt_price(trade.entry_price)} \u2192 Exit: ${fmt_price(trade.exit_price)}\n"
+                        f"Gross P&L: {pnl_sign}${float(trade.gross_pnl):.2f}\n"
+                        f"Fees: ${float(trade.fees):.2f}\n"
+                        f"Net P&L: {pnl_sign}${float(trade.net_pnl):.2f}\n"
+                        f"Reason: {exit_reason}\n"
+                        f"Duration: {holding_str}",
+                        urgent=True,
+                    )
+                except Exception as alert_err:
+                    logger.warning(
+                        "Failed to send POSITION_CLOSED alert (non-fatal)",
+                        error=str(alert_err),
+                    )
+                
+                # ---- Fire callback (risk manager update, etc.) ----
+                if self._on_trade_recorded:
+                    try:
+                        import asyncio
+                        result = self._on_trade_recorded(position, trade)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as cb_err:
+                        logger.warning(
+                            "on_trade_recorded callback failed (non-fatal)",
+                            error=str(cb_err),
+                        )
         except Exception as e:
             self.metrics["trade_record_failures_total"] += 1
             logger.error(

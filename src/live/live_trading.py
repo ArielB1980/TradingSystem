@@ -229,6 +229,7 @@ class LiveTrading:
                 persistence=self.position_persistence,
                 on_partial_close=lambda _: setattr(self, "_last_partial_close_at", datetime.now(timezone.utc)),
                 instrument_spec_registry=getattr(self, "instrument_spec_registry", None),
+                on_trade_recorded=self._on_trade_recorded,
             )
             
             logger.critical("State Machine V2 running - all orders via gateway")
@@ -1709,6 +1710,54 @@ class LiveTrading:
         """Save closed position to trade history -- delegates to exchange_sync module."""
         from src.live.exchange_sync import save_trade_history
         await save_trade_history(self, position, exit_price, exit_reason)
+
+    async def _on_trade_recorded(self, position, trade) -> None:
+        """
+        Callback fired by ExecutionGateway after a trade is recorded.
+        
+        Updates risk manager daily PnL tracking and checks daily loss limits.
+        This replaces the old save_trade_history() risk manager update path
+        that was orphaned when V2 moved to trade_recorder.
+        """
+        try:
+            from src.execution.equity import calculate_effective_equity
+            
+            net_pnl = trade.net_pnl
+            setup_type = getattr(position, "setup_type", None)
+            
+            # Get current equity for risk manager
+            balance = await self.client.get_futures_balance()
+            base = getattr(self.config.exchange, "base_currency", "USD")
+            equity_now, _, _ = await calculate_effective_equity(
+                balance, base_currency=base, kraken_client=self.client
+            )
+            self.risk_manager.record_trade_result(net_pnl, equity_now, setup_type)
+            
+            # Check if daily loss limit approached
+            daily_loss_pct = (
+                abs(self.risk_manager.daily_pnl) / self.risk_manager.daily_start_equity
+                if self.risk_manager.daily_start_equity > 0
+                and self.risk_manager.daily_pnl < 0
+                else Decimal("0")
+            )
+            if daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct * 0.7)):
+                from src.monitoring.alerting import send_alert
+                
+                limit_pct = self.config.risk.daily_loss_limit_pct * 100
+                await send_alert(
+                    "DAILY_LOSS_WARNING",
+                    f"Daily loss at {daily_loss_pct:.1%} of equity\n"
+                    f"Limit: {limit_pct:.0f}%\n"
+                    f"Daily P&L: ${self.risk_manager.daily_pnl:.2f}",
+                    urgent=daily_loss_pct > Decimal(str(self.config.risk.daily_loss_limit_pct)),
+                )
+        except Exception as e:
+            from src.monitoring.logger import get_logger
+            logger = get_logger(__name__)
+            logger.warning(
+                "on_trade_recorded callback: failed to update risk manager (non-fatal)",
+                error=str(e),
+            )
 
 
     # -----------------------------------------------------------------------

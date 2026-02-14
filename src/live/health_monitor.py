@@ -92,6 +92,8 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
     _heal_attempted = False
 
     # ── Self-heal counters (readable via lt for dashboards / alerts) ──
+    from src.monitoring.alerting import send_alert
+    
     # Stored on the LiveTrading object so they survive across function calls
     # and are accessible from other monitors.
     if not hasattr(lt, "_stop_heal_metrics"):
@@ -180,6 +182,16 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                                 stop_self_heal_success_total=metrics["stop_self_heal_success_total"],
                                 stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                             )
+                            try:
+                                await send_alert(
+                                    "SELF_HEAL_SUCCESS",
+                                    f"Stop self-heal succeeded\n"
+                                    f"Healed: {', '.join(heal_candidates)}\n"
+                                    f"Attempts: {metrics['stop_self_heal_attempts_total']}",
+                                    urgent=False,
+                                )
+                            except Exception:
+                                pass
                             consecutive_naked_count.clear()
                             _heal_attempted = False
                             await asyncio.sleep(interval_seconds)
@@ -193,6 +205,17 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                                 stop_self_heal_failures_total=metrics["stop_self_heal_failures_total"],
                                 stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                             )
+                            try:
+                                await send_alert(
+                                    "SELF_HEAL_PARTIAL",
+                                    f"Stop self-heal partial — still naked:\n"
+                                    f"{', '.join(still_naked)}\n"
+                                    f"Healed: {', '.join(s for s in heal_candidates if s not in still_naked) or 'none'}\n"
+                                    f"Failures: {metrics['stop_self_heal_failures_total']}",
+                                    urgent=True,
+                                )
+                            except Exception:
+                                pass
                             # Let it escalate to KILL_THRESHOLD on next iteration
                     except Exception as e:
                         metrics["stop_self_heal_failures_total"] += 1
@@ -203,6 +226,17 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                             stop_self_heal_failures_total=metrics["stop_self_heal_failures_total"],
                             stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                         )
+                        try:
+                            await send_alert(
+                                "SELF_HEAL_FAILED",
+                                f"Stop self-heal FAILED\n"
+                                f"Symbols: {', '.join(heal_candidates)}\n"
+                                f"Error: {str(e)[:100]}\n"
+                                f"Failures: {metrics['stop_self_heal_failures_total']}",
+                                urgent=True,
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 # ── TIER 1: Warning (give time to self-heal) ──
@@ -652,7 +686,29 @@ async def get_system_status(lt: "LiveTrading") -> dict:
 
     try:
         positions = await lt.client.get_all_futures_positions()
-        result["positions"] = [p for p in positions if p.get("size", 0) != 0]
+        active_positions = [p for p in positions if p.get("size", 0) != 0]
+        
+        # Enrich positions with mark prices and compute unrealized PnL
+        # Kraken's openpositions endpoint does NOT return unrealizedPnl or markPrice
+        if active_positions:
+            try:
+                mark_prices = await lt.client.get_futures_tickers_bulk()
+                for p in active_positions:
+                    sym = p.get("symbol", "")
+                    mark = mark_prices.get(sym)
+                    if mark is not None:
+                        p["mark_price"] = mark
+                        entry = p.get("entry_price", Decimal("0"))
+                        size = p.get("size", Decimal("0"))
+                        side = p.get("side", "long")
+                        if side == "long":
+                            p["unrealized_pnl"] = (mark - entry) * size
+                        else:
+                            p["unrealized_pnl"] = (entry - mark) * size
+            except Exception as e:
+                logger.debug("Status: failed to enrich mark prices", error=str(e))
+        
+        result["positions"] = active_positions
     except Exception as e:
         logger.warning("Status: failed to get positions", error=str(e))
 
@@ -716,6 +772,25 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
                 open_positions = [
                     p for p in positions if p.get("size", 0) != 0
                 ]
+
+                # Enrich open positions with mark prices and computed unrealized PnL
+                if open_positions:
+                    try:
+                        mark_prices = await lt.client.get_futures_tickers_bulk()
+                        for p in open_positions:
+                            sym = p.get("symbol", "")
+                            mark = mark_prices.get(sym)
+                            if mark is not None:
+                                p["mark_price"] = mark
+                                entry = p.get("entry_price", Decimal("0"))
+                                size = p.get("size", Decimal("0"))
+                                sd = p.get("side", "long")
+                                if sd == "long":
+                                    p["unrealized_pnl"] = (mark - entry) * size
+                                else:
+                                    p["unrealized_pnl"] = (entry - mark) * size
+                    except Exception:
+                        pass  # Graceful fallback to 0
 
                 today_trades = []
                 try:
