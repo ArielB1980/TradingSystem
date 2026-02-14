@@ -801,7 +801,11 @@ class PositionProtectionMonitor:
         self._counters_reset_at: datetime = datetime.now(timezone.utc)
         self.persistence = persistence
         self._running = False
-    
+
+        # ── Layer 3 / self-heal counters ──
+        # Readable from health_monitor to detect systemic instability.
+        self.layer3_saves_total: int = 0
+
     async def check_all_positions(self) -> Dict[str, bool]:
         """
         Check all positions for protection.
@@ -939,27 +943,33 @@ class PositionProtectionMonitor:
         exchange_orders: List[Dict],
     ) -> bool:
         """
-        LAYER 3: Broad stop search.
+        LAYER 3: Broad stop search with strict validation.
 
         The position's ``stop_order_id`` may be stale (e.g. stop was replaced
         by protection_ops / trailing-stop logic but the in-memory
         ``ManagedPosition`` was never updated).
 
         This layer re-scans ``exchange_orders`` looking for ANY alive stop
-        order that matches the symbol, including orders with different IDs.
-        It also fetches recent closed orders to catch stops that just filled
-        in the last few seconds (race between open-order query and fill).
+        order that matches the symbol.  To avoid binding to the wrong order,
+        every candidate must pass ALL of:
 
-        Returns True if a plausible stop exists (alive or recently filled).
+          1. Symbol matches (normalized)
+          2. reduceOnly == True
+          3. Correct side (long position → sell stop, short → buy stop)
+          4. Amount covers ≥ 25% of position remaining_qty
+          5. Type is stop-like (has stopPrice/triggerPrice OR type contains stop/stp)
+          6. NOT a take-profit order
+
+        Returns True if a validated stop exists (alive or recently filled).
         """
-        from src.data.symbol_utils import (
-            normalize_symbol_for_position_match,
-            position_symbol_matches_order,
-        )
+        from src.data.symbol_utils import normalize_symbol_for_position_match
 
         pos_norm = normalize_symbol_for_position_match(position.symbol)
+        expected_side = "sell" if position.side == Side.LONG else "buy"
+        pos_qty = float(position.remaining_qty) if position.remaining_qty else 0.0
+        min_coverage = pos_qty * 0.25  # Must cover at least 25%
 
-        # 3a. Re-scan open orders with relaxed matching (any stop-like order)
+        # 3a. Re-scan open orders with strict validation
         for order in exchange_orders:
             order_symbol = str(order.get("symbol") or "")
             if normalize_symbol_for_position_match(order_symbol) != pos_norm:
@@ -973,7 +983,11 @@ class PositionProtectionMonitor:
                 or ""
             ).lower()
 
-            # Any order with a stopPrice / triggerPrice for this symbol counts
+            # ── Check 6: Exclude take-profit orders ──
+            if "take_profit" in otype or "take-profit" in otype:
+                continue
+
+            # ── Check 5: Must be stop-like ──
             has_stop_price = (
                 order.get("stopPrice") is not None
                 or order.get("triggerPrice") is not None
@@ -983,23 +997,64 @@ class PositionProtectionMonitor:
             is_stop_type = any(
                 t in otype for t in ("stop", "stp", "stop_loss", "stop-loss")
             )
-            if "take_profit" in otype or "take-profit" in otype:
-                is_stop_type = False
-
             if not (has_stop_price or is_stop_type):
                 continue
 
+            # ── Check 2: Must be reduceOnly ──
+            reduce_only = (
+                order.get("reduceOnly")
+                or order.get("reduce_only")
+                or info.get("reduceOnly")
+                or info.get("reduce_only")
+            )
+            # If reduceOnly is explicitly False, skip.
+            # If absent (None), allow — some exchanges don't populate it.
+            reduce_only_present = any(
+                k in order or k in info
+                for k in ("reduceOnly", "reduce_only")
+            )
+            if reduce_only_present and not reduce_only:
+                logger.debug(
+                    "Layer 3: skipping non-reduceOnly stop candidate",
+                    symbol=position.symbol,
+                    order_id=str(order.get("id") or "")[:16],
+                )
+                continue
+
+            # ── Check 3: Correct side ──
+            order_side = str(order.get("side") or "").lower()
+            if order_side and order_side != expected_side:
+                continue
+
+            # ── Check 4: Amount coverage ──
+            order_amount = float(order.get("amount") or order.get("remaining") or 0)
+            if order_amount < min_coverage and min_coverage > 0:
+                logger.debug(
+                    "Layer 3: stop candidate below 25%% coverage threshold",
+                    symbol=position.symbol,
+                    order_amount=order_amount,
+                    position_qty=pos_qty,
+                    min_coverage=min_coverage,
+                )
+                continue
+
+            # ── All checks passed — this is a valid protective stop ──
             status = str(order.get("status") or "").lower()
             if status in ALIVE_STOP_STATUSES or status in FINAL_STOP_STATUSES:
                 filled = float(order.get("filled") or 0)
                 if status in ALIVE_STOP_STATUSES or filled > 0:
+                    self.layer3_saves_total += 1
                     logger.info(
-                        "Layer 3: found stop order via broad search",
+                        "Layer 3: found validated stop order via broad search",
                         symbol=position.symbol,
                         order_id=str(order.get("id") or "")[:16],
                         status=status,
                         filled=filled,
                         order_type=otype,
+                        order_side=order_side,
+                        order_amount=order_amount,
+                        reduce_only=reduce_only,
+                        layer3_saves_total=self.layer3_saves_total,
                     )
                     # Update in-memory stop_order_id so Layer 2 works next time
                     new_id = order.get("id")
@@ -1024,19 +1079,23 @@ class PositionProtectionMonitor:
                     if order_data:
                         status = str(order_data.get("status") or "").lower()
                         if status in ALIVE_STOP_STATUSES:
+                            self.layer3_saves_total += 1
                             logger.info(
                                 "Layer 3: stop found via fetch_order with variant symbol",
                                 symbol=position.symbol,
                                 variant=sym_variant,
                                 status=status,
+                                layer3_saves_total=self.layer3_saves_total,
                             )
                             return True
                         if status in FINAL_STOP_STATUSES and float(order_data.get("filled") or 0) > 0:
+                            self.layer3_saves_total += 1
                             logger.info(
                                 "Layer 3: stop was recently filled (variant symbol lookup)",
                                 symbol=position.symbol,
                                 variant=sym_variant,
                                 status=status,
+                                layer3_saves_total=self.layer3_saves_total,
                             )
                             return True
                 except Exception:

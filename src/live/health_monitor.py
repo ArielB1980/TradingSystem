@@ -91,6 +91,16 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
     KILL_THRESHOLD = 6
     _heal_attempted = False
 
+    # ── Self-heal counters (readable via lt for dashboards / alerts) ──
+    # Stored on the LiveTrading object so they survive across function calls
+    # and are accessible from other monitors.
+    if not hasattr(lt, "_stop_heal_metrics"):
+        lt._stop_heal_metrics = {
+            "stop_self_heal_attempts_total": 0,
+            "stop_self_heal_success_total": 0,
+            "stop_self_heal_failures_total": 0,
+        }
+
     while lt.active:
         if not lt.active:
             break
@@ -141,12 +151,15 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
 
                 if heal_candidates and not _heal_attempted:
                     _heal_attempted = True
+                    metrics = lt._stop_heal_metrics
+                    metrics["stop_self_heal_attempts_total"] += 1
                     logger.warning(
                         "NAKED_POSITIONS: attempting self-heal (placing missing stops)",
                         naked_symbols=heal_candidates,
                         consecutive_counts={
                             s: consecutive_naked_count[s] for s in heal_candidates
                         },
+                        stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                     )
                     try:
                         raw_positions = await lt.client.get_all_futures_positions()
@@ -160,26 +173,35 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                         results2 = await lt._protection_monitor.check_all_positions()
                         still_naked = [s for s, ok in results2.items() if not ok]
                         if not still_naked:
+                            metrics["stop_self_heal_success_total"] += 1
                             logger.info(
                                 "Self-heal SUCCESS: naked positions now protected",
                                 healed_symbols=heal_candidates,
+                                stop_self_heal_success_total=metrics["stop_self_heal_success_total"],
+                                stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                             )
                             consecutive_naked_count.clear()
                             _heal_attempted = False
                             await asyncio.sleep(interval_seconds)
                             continue
                         else:
+                            metrics["stop_self_heal_failures_total"] += 1
                             logger.warning(
                                 "Self-heal PARTIAL: some positions still naked after stop placement",
                                 still_naked=still_naked,
                                 healed=[s for s in heal_candidates if s not in still_naked],
+                                stop_self_heal_failures_total=metrics["stop_self_heal_failures_total"],
+                                stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                             )
                             # Let it escalate to KILL_THRESHOLD on next iteration
                     except Exception as e:
+                        metrics["stop_self_heal_failures_total"] += 1
                         logger.error(
                             "Self-heal FAILED: could not place missing stops",
                             error=str(e),
                             error_type=type(e).__name__,
+                            stop_self_heal_failures_total=metrics["stop_self_heal_failures_total"],
+                            stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
                         )
                     continue
 
@@ -202,6 +224,27 @@ async def run_protection_checks(lt: "LiveTrading", interval_seconds: int = 30) -
                     )
                 consecutive_naked_count.clear()
                 _heal_attempted = False
+
+            # ── Periodic metrics snapshot (every check, in structured log) ──
+            # Allows grep / alerting on systemic instability.
+            metrics = lt._stop_heal_metrics
+            layer3_saves = (
+                lt._protection_monitor.layer3_saves_total
+                if getattr(lt, "_protection_monitor", None)
+                and hasattr(lt._protection_monitor, "layer3_saves_total")
+                else 0
+            )
+            if (
+                metrics["stop_self_heal_attempts_total"] > 0
+                or layer3_saves > 0
+            ):
+                logger.info(
+                    "STOP_HEAL_METRICS",
+                    stop_self_heal_attempts_total=metrics["stop_self_heal_attempts_total"],
+                    stop_self_heal_success_total=metrics["stop_self_heal_success_total"],
+                    stop_self_heal_failures_total=metrics["stop_self_heal_failures_total"],
+                    layer3_saves_total=layer3_saves,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
