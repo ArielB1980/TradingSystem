@@ -236,6 +236,9 @@ class ManagedPosition:
     exit_reason: Optional[ExitReason] = None
     exit_time: Optional[datetime] = None
     
+    # ========== TRADE RECORDING ==========
+    trade_recorded: bool = False  # Set True once trade_recorder persists this position's trade
+    
     # ========== METADATA ==========
     setup_type: Optional[str] = None
     regime: Optional[str] = None
@@ -336,6 +339,17 @@ class ManagedPosition:
             return None
         total_value = sum(f.qty * f.price for f in self.entry_fills)
         total_qty = self.filled_entry_qty
+        if total_qty == 0:
+            return None
+        return total_value / total_qty
+    
+    @property
+    def avg_exit_price(self) -> Optional[Decimal]:
+        """Volume-weighted average exit price from exit fills."""
+        if not self.exit_fills:
+            return None
+        total_value = sum(f.qty * f.price for f in self.exit_fills)
+        total_qty = self.filled_exit_qty
         if total_qty == 0:
             return None
         return total_value / total_qty
@@ -572,13 +586,11 @@ class ManagedPosition:
         remaining = self.remaining_qty
         
         if remaining <= 0:
-            # Fully closed
-            self.state = PositionState.CLOSED
-            self.exit_time = datetime.now(timezone.utc)
-            logger.info(
-                "Position CLOSED",
-                symbol=self.symbol,
-                exit_reason=self.exit_reason.value if self.exit_reason else "unknown"
+            # Fully closed — use final fill timestamp as the authoritative close time
+            fill_time = event.timestamp if event.timestamp else None
+            self._mark_closed(
+                self.exit_reason or ExitReason.STOP_LOSS,
+                exit_time=fill_time,
             )
         elif self.state == PositionState.EXIT_PENDING:
             # Partial exit fill
@@ -796,12 +808,33 @@ class ManagedPosition:
         )
         return True
     
+    # ========== CENTRALIZED CLOSE ==========
+    
+    def _mark_closed(self, reason: ExitReason, exit_time: Optional[datetime] = None) -> None:
+        """
+        Single entry point for transitioning to CLOSED.
+        
+        All code paths that close a position MUST call this method instead of
+        setting ``self.state = PositionState.CLOSED`` directly.  This ensures:
+        - exit_reason and exit_time are always set consistently
+        - trade_recorded stays False (recording happens at the gateway layer)
+        - No qty / price / fill mutation — pure state + timestamp update
+        """
+        self.state = PositionState.CLOSED
+        if self.exit_reason is None:
+            self.exit_reason = reason
+        self.exit_time = exit_time or datetime.now(timezone.utc)
+        self.updated_at = datetime.now(timezone.utc)
+        logger.info(
+            "Position CLOSED",
+            symbol=self.symbol,
+            exit_reason=self.exit_reason.value if self.exit_reason else "unknown",
+            trade_recorded=self.trade_recorded,
+        )
+    
     def force_close(self, reason: ExitReason) -> None:
         """Force immediate close (for emergencies)."""
-        self.exit_reason = reason
-        self.exit_time = datetime.now(timezone.utc)
-        self.state = PositionState.CLOSED
-        self.updated_at = datetime.now(timezone.utc)
+        self._mark_closed(reason)
     
     def mark_error(self, error_message: str) -> None:
         """Mark position as ERROR state."""
@@ -878,9 +911,7 @@ class ManagedPosition:
         )
         self.exit_fills.append(fill)
         if self.remaining_qty <= qty_epsilon:
-            self.state = PositionState.CLOSED
-            self.exit_reason = ExitReason.RECONCILIATION
-            self.exit_time = now
+            self._mark_closed(ExitReason.RECONCILIATION, exit_time=now)
         self.updated_at = now
         _ = self.remaining_qty  # Re-assert invariant B
         return (
@@ -971,7 +1002,8 @@ class ManagedPosition:
                 {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
                 for f in self.exit_fills
             ],
-            "processed_event_hashes": list(self.processed_event_hashes)
+            "processed_event_hashes": list(self.processed_event_hashes),
+            "trade_recorded": self.trade_recorded,
         }
     
     @classmethod
@@ -1032,6 +1064,7 @@ class ManagedPosition:
             ))
         
         pos.processed_event_hashes = set(data.get("processed_event_hashes", []))
+        pos.trade_recorded = data.get("trade_recorded", False)
         
         return pos
 
@@ -1352,8 +1385,7 @@ class PositionRegistry:
                     issues.append((symbol, "ORPHANED: Registry has position, exchange does not"))
                 elif exchange_pos is None and pos.remaining_qty <= 0:
                     # Position has no remaining qty and exchange has nothing - mark as closed
-                    pos.state = PositionState.CLOSED
-                    pos.exit_reason = ExitReason.RECONCILIATION
+                    pos._mark_closed(ExitReason.RECONCILIATION)
                     orphaned_symbols.append(symbol)
                     issues.append((symbol, "STALE: Registry has empty position, marking closed"))
                 elif exchange_pos is not None:
@@ -1401,8 +1433,7 @@ class PositionRegistry:
                         else:
                             # Non-PENDING zero-qty position: truly stale from prior restart.
                             # Close and archive so startup import can adopt the live position.
-                            pos.state = PositionState.CLOSED
-                            pos.exit_reason = ExitReason.RECONCILIATION
+                            pos._mark_closed(ExitReason.RECONCILIATION)
                             orphaned_symbols.append(symbol)
                             issues.append((symbol, f"STALE_ZERO_QTY: Registry {pos.remaining_qty} vs Exchange {exchange_qty}"))
                             logger.info(

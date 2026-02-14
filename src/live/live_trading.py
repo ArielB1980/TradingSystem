@@ -547,6 +547,14 @@ class LiveTrading:
             except Exception as e:
                 logger.error("Failed to start winner churn monitor", error=str(e))
 
+            try:
+                self._trade_recording_monitor_task = asyncio.create_task(
+                    self._run_trade_recording_monitor(interval_seconds=300)
+                )
+                logger.info("Trade recording invariant monitor started (interval=300s)")
+            except Exception as e:
+                logger.error("Failed to start trade recording monitor", error=str(e))
+
             # 2.6e Telegram command handler (/status, /positions, /help)
             try:
                 from src.monitoring.telegram_bot import TelegramCommandHandler
@@ -800,6 +808,11 @@ class LiveTrading:
         """Winner churn sentinel -- delegates to health_monitor module."""
         from src.live.health_monitor import run_winner_churn_monitor
         await run_winner_churn_monitor(self, interval_seconds)
+
+    async def _run_trade_recording_monitor(self, interval_seconds: int = 300) -> None:
+        """Trade recording invariant monitor -- delegates to health_monitor module."""
+        from src.live.health_monitor import run_trade_recording_monitor
+        await run_trade_recording_monitor(self, interval_seconds)
 
     def _convert_to_position(self, data: Dict) -> Position:
         """Convert raw exchange position dict to Position domain object -- delegates to exchange_sync module."""

@@ -109,6 +109,7 @@ class TradeModel(Base):
     side = Column(String, nullable=False)
     entry_price = Column(Numeric(precision=20, scale=8), nullable=False)
     exit_price = Column(Numeric(precision=20, scale=8), nullable=False)
+    size = Column(Numeric(precision=20, scale=8), nullable=True)  # qty contracts
     size_notional = Column(Numeric(precision=20, scale=2), nullable=False)
     leverage = Column(Numeric(precision=10, scale=2), nullable=False)
     
@@ -121,6 +122,10 @@ class TradeModel(Base):
     exited_at = Column(DateTime, nullable=False)
     holding_period_hours = Column(Numeric(precision=10, scale=2), nullable=False)
     exit_reason = Column(String, nullable=False)
+    
+    # Fill-type breakdown (nullable for backward compat with existing rows)
+    maker_fills_count = Column(Integer, nullable=True)
+    taker_fills_count = Column(Integer, nullable=True)
 
 
 class PositionModel(Base):
@@ -482,6 +487,7 @@ def save_trade(trade: Trade) -> None:
             side=trade.side.value,
             entry_price=trade.entry_price,
             exit_price=trade.exit_price,
+            size=getattr(trade, "size", None),
             size_notional=trade.size_notional,
             leverage=trade.leverage,
             gross_pnl=trade.gross_pnl,
@@ -492,6 +498,8 @@ def save_trade(trade: Trade) -> None:
             exited_at=trade.exited_at,
             holding_period_hours=trade.holding_period_hours,
             exit_reason=trade.exit_reason,
+            maker_fills_count=getattr(trade, "maker_fills_count", None),
+            taker_fills_count=getattr(trade, "taker_fills_count", None),
         )
         session.add(trade_model)
 

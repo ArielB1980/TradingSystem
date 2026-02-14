@@ -275,28 +275,36 @@ class RiskDecision:
 class Trade:
     """
     Completed trade (entry → exit).
+    
+    One row per position lifecycle (round trip).  Written exactly once
+    when the position transitions to CLOSED.
     """
     trade_id: str
     symbol: str  # Futures symbol
     side: Side
-    entry_price: Decimal
-    exit_price: Decimal
-    size_notional: Decimal
+    entry_price: Decimal   # VWAP across entry fills
+    exit_price: Decimal    # VWAP across exit fills
+    size: Decimal          # Position size in contracts (filled_entry_qty)
+    size_notional: Decimal # Notional value at entry (size * entry_price)
     leverage: Decimal
     
-    # P&L
+    # P&L — fees and funding kept SEPARATE (never mixed)
     gross_pnl: Decimal
-    fees: Decimal
-    funding: Decimal
-    net_pnl: Decimal
+    fees: Decimal          # Estimated trading fees (from maker/taker schedule)
+    funding: Decimal       # Estimated funding cost (from holding period + rate)
+    net_pnl: Decimal       # gross_pnl - fees - funding
     
     # Timing
     entered_at: datetime
-    exited_at: datetime
+    exited_at: datetime    # Timestamp of final exit fill (exchange time)
     holding_period_hours: Decimal
     
     # Exit reason
-    exit_reason: str  # "stop_loss", "take_profit", "manual", "kill_switch"
+    exit_reason: str  # "stop_loss", "take_profit", "manual", "kill_switch", "reconciliation"
+    
+    # Fill-type breakdown (for fee accuracy tracking)
+    maker_fills_count: int = 0
+    taker_fills_count: int = 0
     
     # Metadata
     setup_type: Optional[str] = None

@@ -180,6 +180,14 @@ class PositionPersistence:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+            # Trade recording flag (v2.1)
+            try:
+                self._conn.execute(
+                    "ALTER TABLE positions ADD COLUMN trade_recorded INTEGER DEFAULT 0"
+                )
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
     
     # ========== POSITION CRUD ==========
     
@@ -198,8 +206,9 @@ class PositionPersistence:
                     entry_order_id, stop_order_id, pending_exit_order_id,
                     setup_type, regime, trade_type, intent_confirmed,
                     created_at, updated_at,
-                    processed_event_hashes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    processed_event_hashes,
+                    trade_recorded
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position.position_id,
                 position.symbol,
@@ -231,7 +240,8 @@ class PositionPersistence:
                 1 if position.intent_confirmed else 0,
                 position.created_at.isoformat(),
                 position.updated_at.isoformat(),
-                json.dumps(list(position.processed_event_hashes))
+                json.dumps(list(position.processed_event_hashes)),
+                1 if position.trade_recorded else 0,
             ))
             
             # Save fills
@@ -340,6 +350,7 @@ class PositionPersistence:
             pos.regime = row.get("regime")
             pos.trade_type = row.get("trade_type")
             pos.intent_confirmed = bool(row.get("intent_confirmed", 0))
+            pos.trade_recorded = bool(row.get("trade_recorded", 0))
             pos.created_at = datetime.fromisoformat(row["created_at"])
             pos.updated_at = datetime.fromisoformat(row["updated_at"])
             

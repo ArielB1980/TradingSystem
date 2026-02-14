@@ -152,8 +152,15 @@ class ExecutionGateway:
             "orders_cancelled": 0,
             "orders_rejected": 0,
             "events_processed": 0,
-            "errors": 0
+            "errors": 0,
+            "trades_recorded_total": 0,
+            "trade_record_failures_total": 0,
         }
+        
+        # Fee config for trade recorder (bps → fraction, loaded lazily)
+        self._maker_fee_rate: Optional[Decimal] = None
+        self._taker_fee_rate: Optional[Decimal] = None
+        self._funding_rate_daily_bps: Decimal = Decimal("10")
 
     def _wal_record_intent(
         self,
@@ -986,6 +993,58 @@ class ExecutionGateway:
                 error=str(e)
             )
     
+    # ========== TRADE RECORDING ==========
+    
+    def _get_fee_rates(self) -> tuple:
+        """Lazily load fee rates from config (bps → fraction)."""
+        if self._maker_fee_rate is None:
+            try:
+                from src.config.config import load_config
+                cfg = load_config()
+                self._maker_fee_rate = Decimal(str(cfg.exchange.maker_fee_bps)) / Decimal("10000")
+                self._taker_fee_rate = Decimal(str(cfg.exchange.taker_fee_bps)) / Decimal("10000")
+                self._funding_rate_daily_bps = Decimal(str(cfg.exchange.funding_rate_daily_bps))
+            except Exception:
+                # Conservative defaults if config can't be loaded
+                self._maker_fee_rate = Decimal("0.0002")   # 2 bps
+                self._taker_fee_rate = Decimal("0.0005")   # 5 bps
+                self._funding_rate_daily_bps = Decimal("10")
+        return self._maker_fee_rate, self._taker_fee_rate
+    
+    async def _maybe_record_trade(self, position: ManagedPosition) -> None:
+        """
+        Record a trade if the position is CLOSED and not yet recorded.
+        
+        This is the SINGLE convergence point for all close paths.
+        Called after persistence.save_position() in every code path
+        that can transition a position to CLOSED.
+        """
+        if position.state != PositionState.CLOSED or position.trade_recorded:
+            return
+        
+        maker_rate, taker_rate = self._get_fee_rates()
+        
+        try:
+            from src.execution.trade_recorder import record_closed_trade_async
+            trade = await record_closed_trade_async(
+                position,
+                maker_fee_rate=maker_rate,
+                taker_fee_rate=taker_rate,
+                funding_rate_daily_bps=self._funding_rate_daily_bps,
+            )
+            if trade:
+                self.metrics["trades_recorded_total"] += 1
+                # Re-persist to save trade_recorded=True
+                self.persistence.save_position(position)
+        except Exception as e:
+            self.metrics["trade_record_failures_total"] += 1
+            logger.error(
+                "TRADE_RECORD_FAILURE",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                error=str(e),
+            )
+    
     # ========== ORDER EVENT HANDLING ==========
     
     async def process_order_update(self, order_data: Dict) -> List[ManagementAction]:
@@ -1089,6 +1148,8 @@ class ExecutionGateway:
         position = self.registry.get_position(pending.symbol)
         if position:
             self.persistence.save_position(position)
+            # Record trade if position just transitioned to CLOSED
+            await self._maybe_record_trade(position)
         
         for action in follow_up:
             await self.execute_action(action)
@@ -1214,6 +1275,14 @@ class ExecutionGateway:
             logger.info("Persisted orphaned positions", count=orphaned_count)
         if qty_synced_count > 0:
             logger.warning("Persisted quantity-synced positions", count=qty_synced_count)
+        
+        # Record trades for any positions that reconciliation closed
+        for symbol, issue in issues:
+            if "STALE" in issue or "QTY_SYNCED" in issue:
+                for closed_pos in self.registry._closed_positions:
+                    if closed_pos.symbol == symbol and closed_pos.state == PositionState.CLOSED:
+                        await self._maybe_record_trade(closed_pos)
+                        break
         
         # Get corrective actions
         actions = self.position_manager.reconcile(exchange_positions, orders, issues=issues)

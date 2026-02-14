@@ -393,6 +393,113 @@ async def run_winner_churn_monitor(
 
 
 # ---------------------------------------------------------------------------
+# Trade recording invariant monitor
+# ---------------------------------------------------------------------------
+
+async def run_trade_recording_monitor(
+    lt: "LiveTrading",
+    check_interval_seconds: int = 300,
+) -> None:
+    """
+    Advisory monitor: alert if positions are closing but no trades are
+    being recorded to the database.
+
+    Invariant: if position_fills exist in the last 24 h (from the SQLite
+    persistence layer) AND the Postgres trades table has 0 new rows in the
+    same window, something is broken.
+
+    This does NOT trigger the kill switch — it logs an ERROR and (optionally)
+    sends a Telegram alert.
+    """
+    _alerted = False
+
+    # Warm-up: let the system start and record at least one cycle
+    await asyncio.sleep(max(check_interval_seconds, 180))
+
+    while lt.active:
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=24)
+
+            # Source 1: closed positions in recent history (SQLite registry)
+            recent_closes = 0
+            if lt.position_registry:
+                for pos in lt.position_registry.get_closed_history(limit=200):
+                    exit_t = pos.exit_time
+                    if exit_t and exit_t >= cutoff:
+                        recent_closes += 1
+
+            # Source 2: trades recorded in Postgres
+            trades_in_window = 0
+            try:
+                from src.storage.repository import get_trades_since
+                trades = await asyncio.to_thread(get_trades_since, cutoff)
+                trades_in_window = len(trades)
+            except Exception:
+                pass  # DB may not be available
+
+            # Check gateway failure counter
+            record_failures = 0
+            if lt.execution_gateway:
+                record_failures = lt.execution_gateway.metrics.get("trade_record_failures_total", 0)
+
+            # Invariant check 1: positions closing but no trades recorded
+            if recent_closes > 0 and trades_in_window == 0 and not _alerted:
+                _alerted = True
+                logger.error(
+                    "TRADE_RECORDING_INVARIANT_VIOLATION: positions closed but no trades recorded in 24h",
+                    recent_closes=recent_closes,
+                    trades_recorded=trades_in_window,
+                    record_failures=record_failures,
+                    window_hours=24,
+                )
+                try:
+                    from src.monitoring.alerting import send_alert
+                    await send_alert(
+                        "TRADE_RECORDING_STALL",
+                        f"{recent_closes} positions closed in 24h but 0 trades recorded.\n"
+                        f"Record failures: {record_failures}\n"
+                        "Check trade_recorder logs for TRADE_RECORD_FAILURE.",
+                        urgent=False,
+                    )
+                except Exception:
+                    pass
+            elif trades_in_window > 0 and _alerted:
+                _alerted = False
+                logger.info(
+                    "Trade recording invariant restored",
+                    trades_recorded=trades_in_window,
+                )
+
+            # Invariant check 2: any recording failures in this process lifetime
+            if record_failures > 0:
+                logger.warning(
+                    "Trade record failures detected",
+                    trade_record_failures_total=record_failures,
+                    trades_recorded=trades_in_window,
+                )
+
+            logger.debug(
+                "Trade recording check",
+                recent_closes=recent_closes,
+                trades_recorded=trades_in_window,
+                record_failures=record_failures,
+                alerted=_alerted,
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "Trade recording monitor failed",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+        await asyncio.sleep(check_interval_seconds)
+
+
+# ---------------------------------------------------------------------------
 # System status (Telegram data provider)
 # ---------------------------------------------------------------------------
 

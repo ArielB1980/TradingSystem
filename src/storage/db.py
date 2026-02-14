@@ -4,6 +4,7 @@ Database engine and session management.
 PostgreSQL only - SQLite is no longer supported.
 Includes connection-pool observability via SQLAlchemy pool events.
 """
+import sqlalchemy
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.pool import Pool
@@ -78,6 +79,36 @@ class Database:
                 # Other errors - log and re-raise
                 logging.warning(f"Table creation warning (may be expected): {e}")
                 raise
+        # Run lightweight column migrations for existing tables
+        self._run_migrations()
+    
+    def _run_migrations(self):
+        """Add columns that may be missing on existing deployments.
+        
+        Uses ADD COLUMN IF NOT EXISTS (Postgres >=9.6).  Wrapped in
+        try/except per-statement so one failure doesn't block others.
+        """
+        import logging
+        migrations = [
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS size NUMERIC(20,8)",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS maker_fills_count INTEGER",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS taker_fills_count INTEGER",
+        ]
+        with self.engine.connect() as conn:
+            for stmt in migrations:
+                try:
+                    conn.execute(sqlalchemy.text(stmt))
+                    conn.commit()
+                except Exception as e:
+                    err = str(e).lower()
+                    if "already exists" in err or "duplicate" in err:
+                        pass  # Column already present
+                    else:
+                        logging.warning(f"Migration warning: {stmt!r} -> {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
     def drop_all(self):
         """Drop all tables (use with caution!)."""

@@ -1199,9 +1199,7 @@ class PositionProtectionMonitor:
         position.exit_fills.append(fill)
 
         if position.remaining_qty <= 0:
-            position.state = PositionState.CLOSED
-            position.exit_reason = ExitReason.STOP_LOSS
-            position.exit_time = now
+            position._mark_closed(ExitReason.STOP_LOSS, exit_time=now)
 
         position.updated_at = now
 
@@ -1221,6 +1219,26 @@ class PositionProtectionMonitor:
             except Exception as e:
                 logger.warning(
                     "Failed to persist stop-fill closure",
+                    symbol=position.symbol,
+                    error=str(e),
+                )
+        
+        # Record trade if position just closed
+        if position.state == PositionState.CLOSED and not position.trade_recorded:
+            try:
+                from src.execution.trade_recorder import record_closed_trade
+                from decimal import Decimal as _D
+                # Use conservative defaults; config rates loaded by gateway
+                trade = record_closed_trade(
+                    position,
+                    maker_fee_rate=_D("0.0002"),
+                    taker_fee_rate=_D("0.0005"),
+                )
+                if trade and self.persistence:
+                    self.persistence.save_position(position)  # save trade_recorded=True
+            except Exception as e:
+                logger.warning(
+                    "Failed to record trade after stop-fill closure",
                     symbol=position.symbol,
                     error=str(e),
                 )
