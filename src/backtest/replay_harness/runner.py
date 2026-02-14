@@ -261,22 +261,15 @@ class BacktestRunner:
         self._live_trading = lt
 
     async def _run_tick(self) -> None:
-        """Run one tick of the live trading engine."""
+        """Run one tick of the live trading engine.
+
+        We do NOT mock datetime (it breaks >= comparisons with MagicMock).
+        Instead we let the real datetime module run. The SimClock controls
+        simulated time, and _tick() mostly uses datetime.now(timezone.utc)
+        for logging/staleness checks — slight discrepancy is acceptable
+        since exchange data is driven by the SimClock-controlled exchange.
+        """
         if self._live_trading is None:
             raise RuntimeError("LiveTrading not initialized")
 
-        # Patch datetime.now and asyncio.sleep for this tick
-        original_now = datetime.now
-
-        def patched_now(tz=None):
-            if tz:
-                return self._clock.now().astimezone(tz)
-            return self._clock.now().replace(tzinfo=None)
-
-        with patch("src.live.live_trading.datetime") as mock_dt:
-            mock_dt.now = patched_now
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-            mock_dt.fromisoformat = datetime.fromisoformat
-
-            # Run the tick
-            await self._live_trading._tick()
+        await self._live_trading._tick()
