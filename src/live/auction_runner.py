@@ -351,7 +351,10 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         notional_override=str(candidate.position_notional),
                         refreshed_margin=str(refreshed_available_margin),
                     )
-                    result = await lt._handle_signal(signal, spot_price_val, mark_price_val)
+                    result = await lt._handle_signal(
+                        signal, spot_price_val, mark_price_val,
+                        notional_override=candidate.position_notional,
+                    )
                     if result.get("order_placed", False):
                         opens_executed += 1
                         lt._auction_entry_log[signal.symbol] = datetime.now(timezone.utc)

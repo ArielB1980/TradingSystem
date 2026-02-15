@@ -510,6 +510,15 @@ class LiveTrading:
                         if not self.config.system.dry_run:
                             raise
 
+            # 2.6a Retry trade recording for positions closed before last restart
+            if self.use_state_machine_v2 and self.execution_gateway:
+                try:
+                    retried = await self.execution_gateway.retry_unrecorded_trades()
+                    if retried > 0:
+                        logger.info("Startup trade recording retry recorded trades", count=retried)
+                except (OperationalError, DataError) as e:
+                    logger.error("Startup trade recording retry failed", error=str(e), error_type=type(e).__name__)
+
             # 2.6 PositionProtectionMonitor (Invariant K) - periodic check when V2 live
             if (
                 self.use_state_machine_v2
@@ -1880,10 +1889,16 @@ class LiveTrading:
 
     async def _handle_signal(
         self, signal: Signal, spot_price: Decimal, mark_price: Decimal,
+        notional_override: "Optional[Decimal]" = None,
     ) -> dict:
-        """Signal processing -- delegates to signal_handler module."""
+        """Signal processing -- delegates to signal_handler module.
+
+        Args:
+            notional_override: When set (auction execution path), used as
+                base notional in risk sizing and enables utilisation boost.
+        """
         from src.live.signal_handler import handle_signal
-        return await handle_signal(self, signal, spot_price, mark_price)
+        return await handle_signal(self, signal, spot_price, mark_price, notional_override=notional_override)
 
     async def _handle_signal_v2(
         self, signal: Signal, spot_price: Decimal, mark_price: Decimal,

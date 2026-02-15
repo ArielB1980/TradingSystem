@@ -573,11 +573,15 @@ async def run_trade_recording_monitor(
             cutoff = now - timedelta(hours=24)
 
             # Source 1: closed positions in recent history (SQLite registry)
+            # Only count positions where trade recording has NOT completed.
+            # Positions with trade_recorded=True have been processed (either
+            # a Trade was persisted, or the recorder determined nothing to
+            # record, e.g. reconciliation closures with 0 fills).
             recent_closes = 0
             if lt.position_registry:
                 for pos in lt.position_registry.get_closed_history(limit=200):
                     exit_t = pos.exit_time
-                    if exit_t and exit_t >= cutoff:
+                    if exit_t and exit_t >= cutoff and not pos.trade_recorded:
                         recent_closes += 1
 
             # Source 2: trades recorded in Postgres

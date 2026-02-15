@@ -28,6 +28,7 @@ class BindingConstraint(str, Enum):
     SINGLE_MARGIN = "single_margin"
     AGGREGATE_MARGIN = "aggregate_margin"
     AVAILABLE_MARGIN = "available_margin"
+    UTILISATION_BOOST = "utilisation_boost"
     MIN_NOTIONAL_REJECT = "min_notional_reject"
 
 
@@ -453,14 +454,17 @@ class RiskManager:
                 notional=str(position_notional),
             )
 
-        # Post-sizing utilisation boost (auction mode): if margin utilisation below target, scale notional up (bounded), clamped to single/aggregate caps.
-        # skip_margin_check=True means "auction path: margin validated elsewhere"; boost is intended to run here.
-        # Risk sanity: only boost when sizing is leverage_based. With stop-distance-based sizing (fixed/kelly/volatility),
-        # notional = f(stop_distance); boosting notional would increase dollar risk for the same stop and violate risk-per-trade.
-        # With leverage_based, risk is % of buying power, so scaling notional does not change that assumption.
+        # Post-sizing utilisation boost (auction mode only): if margin utilisation
+        # below target, scale notional up (bounded by hard caps).
+        # Gate: only fires when auction provides a notional_override (i.e. the
+        # execution path was auction-selected). Non-auction single-signal trades
+        # never get boosted.
+        # Risk sanity: only boost when sizing is leverage_based. With stop-distance-
+        # based sizing (fixed/kelly/volatility), notional = f(stop_distance); boosting
+        # would increase dollar risk for the same stop and violate risk-per-trade.
         if (
             getattr(self.config, "auction_mode_enabled", False)
-            and skip_margin_check
+            and notional_override is not None
             and sizing_method == "leverage_based"
             and position_notional >= min_notional_viable
             and aggregate_margin_remaining is not None
@@ -474,23 +478,61 @@ class RiskManager:
                 target_margin = target_min * account_equity - existing_margin
                 target_notional = (target_margin * requested_leverage) if target_margin > 0 else position_notional
                 max_factor = Decimal(str(getattr(self.config, "utilisation_boost_max_factor", 2.0)))
-                capped_boost = min(
-                    target_notional,
-                    position_notional * max_factor,
-                    per_position_ceiling,
-                    aggregate_margin_remaining * requested_leverage,
-                )
+
+                # Compute max notional cap (tier-specific or global)
+                _max_usd_global = Decimal(str(self.config.max_position_size_usd))
+                _tier_max = tier_max_size if tier_max_size else _max_usd_global
+                _effective_max_usd = min(_tier_max, _max_usd_global)
+
+                # Hard caps: every one of these must hold
+                caps = [
+                    target_notional,                                     # what target util needs
+                    position_notional * max_factor,                      # config max boost factor
+                    per_position_ceiling,                                # single-position margin cap
+                    aggregate_margin_remaining * requested_leverage,     # aggregate margin cap
+                    _effective_max_usd,                                  # explicit notional cap
+                ]
+                # Also cap by exchange available margin (prevents insufficientAvailableFunds)
+                if available_margin is not None and available_margin > 0:
+                    caps.append(available_margin * Decimal("0.95") * requested_leverage)
+
+                capped_boost = min(caps)
+
                 if capped_boost > position_notional:
-                    logger.debug(
-                        "Utilisation boost applied",
+                    # Identify which cap was the binding one
+                    boost_binding = "max_factor"
+                    if capped_boost == per_position_ceiling:
+                        boost_binding = "single_margin"
+                    elif capped_boost == aggregate_margin_remaining * requested_leverage:
+                        boost_binding = "aggregate_margin"
+                    elif available_margin is not None and capped_boost == available_margin * Decimal("0.95") * requested_leverage:
+                        boost_binding = "available_margin"
+                    elif capped_boost == _effective_max_usd:
+                        boost_binding = "max_usd"
+                    elif capped_boost == target_notional:
+                        boost_binding = "target_util"
+                    elif capped_boost == position_notional * max_factor:
+                        boost_binding = "max_factor"
+
+                    boost_factor = capped_boost / position_notional if position_notional > 0 else Decimal("0")
+                    logger.info(
+                        "UTILISATION_BOOST_APPLIED",
                         symbol=signal.symbol,
-                        before=str(position_notional),
-                        after=str(capped_boost),
-                        current_util=str(current_util),
-                        target_min=str(target_min),
+                        old_notional=str(position_notional),
+                        boosted_notional=str(capped_boost),
+                        boost_factor=f"{boost_factor:.2f}",
+                        current_util=f"{current_util:.3f}",
+                        target_min_util=str(target_min),
+                        binding_cap=boost_binding,
+                        max_factor=str(max_factor),
+                        per_position_ceiling=str(per_position_ceiling),
+                        aggregate_remaining=str(aggregate_margin_remaining * requested_leverage),
+                        available_margin_cap=str(available_margin * Decimal("0.95") * requested_leverage) if available_margin is not None else "n/a",
                     )
                     position_notional = capped_boost
                     utilisation_boost_applied = True
+                    binding_constraint = BindingConstraint.UTILISATION_BOOST
+                    binding_constraints.append(BindingConstraint.UTILISATION_BOOST)
         
         logger.debug(
             f"Validating trade: {len(self.current_positions)} active positions",

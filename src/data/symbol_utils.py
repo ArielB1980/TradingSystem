@@ -22,6 +22,7 @@ def normalize_symbol_for_position_match(symbol: str) -> str:
     Canonical form for "same asset" comparison across formats.
 
     ROSE/USD, ROSE/USD:USD, PF_ROSEUSD, PI_ROSEUSD -> ROSEUSD.
+    BTC/USD, PF_XBTUSD -> BTCUSD  (XBT→BTC alias applied).
     Used so the pyramiding guard treats exchange positions (e.g. PF_*)
     and mapped futures symbols (e.g. ROSE/USD:USD) as the same market.
     """
@@ -31,6 +32,12 @@ def normalize_symbol_for_position_match(symbol: str) -> str:
     s = s.replace("PF_", "").replace("PI_", "").replace("FI_", "")
     s = s.split(":")[0]
     s = s.replace("/", "").replace("-", "").replace("_", "")
+    # Kraken legacy alias: XBT is BTC.  Without this, PF_XBTUSD ("XBTUSD")
+    # and BTC/USD ("BTCUSD") are treated as different positions, causing
+    # reconciliation to orphan the registry entry and leave the exchange
+    # position unprotected.
+    if s.startswith("XBT"):
+        s = "BTC" + s[3:]
     return s
 
 

@@ -7,7 +7,7 @@ All functions receive a typed reference to the LiveTrading host.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from src.exceptions import OperationalError, DataError
 from src.domain.models import Signal, SignalType, Side
@@ -26,6 +26,7 @@ async def handle_signal(
     signal: Signal,
     spot_price: Decimal,
     mark_price: Decimal,
+    notional_override: Optional[Decimal] = None,
 ) -> dict:
     """
     Process signal through Position State Machine V2.
@@ -35,6 +36,8 @@ async def handle_signal(
         signal: Trading signal
         spot_price: Current spot price
         mark_price: Current futures mark price
+        notional_override: When set (auction execution path), used as base
+            notional in risk sizing and enables utilisation boost.
 
     Returns:
         dict with keys:
@@ -53,7 +56,7 @@ async def handle_signal(
             "rejection_reasons": ["trade_paused"],
         }
 
-    return await handle_signal_v2(lt, signal, spot_price, mark_price)
+    return await handle_signal_v2(lt, signal, spot_price, mark_price, notional_override=notional_override)
 
 
 async def handle_signal_v2(
@@ -61,12 +64,18 @@ async def handle_signal_v2(
     signal: Signal,
     spot_price: Decimal,
     mark_price: Decimal,
+    notional_override: Optional[Decimal] = None,
 ) -> dict:
     """
     Process signal through Position State Machine V2.
 
     CRITICAL: All orders flow through ExecutionGateway.
     No direct exchange calls allowed.
+
+    Args:
+        notional_override: When set (auction execution path), used as base
+            notional and enables utilisation boost. Auction already validated
+            margin budget so skip_margin_check is set True.
 
     Returns:
         {"order_placed": bool, "reason": str | None}
@@ -114,6 +123,8 @@ async def handle_signal_v2(
         spot_price,
         mark_price,
         available_margin=available_margin,
+        notional_override=notional_override,
+        skip_margin_check=(notional_override is not None),
         symbol_tier=symbol_tier,
     )
 

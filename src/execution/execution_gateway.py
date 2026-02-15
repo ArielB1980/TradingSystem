@@ -1171,6 +1171,12 @@ class ExecutionGateway:
                 taker_fee_rate=taker_rate,
                 funding_rate_daily_bps=self._funding_rate_daily_bps,
             )
+            if trade is None and position.trade_recorded:
+                # Recorder returned None but marked trade_recorded=True
+                # (missing VWAP, zero qty, or duplicate). Persist the flag
+                # so the skip doesn't repeat on every restart.
+                self.persistence.save_position(position)
+                return
             if trade:
                 self.metrics["trades_recorded_total"] += 1
                 # Re-persist to save trade_recorded=True
@@ -1229,6 +1235,65 @@ class ExecutionGateway:
                 symbol=position.symbol,
                 error=str(e),
             )
+        except Exception as e:
+            # Catch-all: unexpected exceptions (TypeError, ValueError, etc.)
+            # during PnL/fee computation must NOT silently drop trade recording.
+            self.metrics["trade_record_failures_total"] += 1
+            logger.error(
+                "TRADE_RECORD_FAILURE_UNEXPECTED",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+    
+    async def retry_unrecorded_trades(self) -> int:
+        """
+        Retry trade recording for closed positions that were never recorded.
+        
+        Called once during startup, after registry load + reconciliation.
+        Prevents permanent TRADE_RECORDING_STALL when a restart interrupted
+        recording or a previous recording attempt failed silently.
+        
+        Returns count of trades successfully recorded.
+        """
+        if not self.registry:
+            return 0
+        
+        recorded = 0
+        candidates = [
+            pos for pos in self.registry.get_closed_history(limit=200)
+            if pos.state == PositionState.CLOSED and not pos.trade_recorded
+        ]
+        
+        if not candidates:
+            return 0
+        
+        logger.info(
+            "Retrying trade recording for unrecorded closed positions",
+            count=len(candidates),
+        )
+        
+        for pos in candidates:
+            try:
+                await self._maybe_record_trade(pos)
+                if pos.trade_recorded:
+                    recorded += 1
+            except InvariantError:
+                raise
+            except Exception as e:
+                logger.error(
+                    "Startup trade recording retry failed",
+                    position_id=pos.position_id,
+                    symbol=pos.symbol,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+        
+        if recorded > 0:
+            logger.info("Startup trade recording retry complete", recorded=recorded)
+        
+        return recorded
     
     # ========== ORDER EVENT HANDLING ==========
     
@@ -1584,6 +1649,22 @@ class ExecutionGateway:
                     if closed_pos.symbol == symbol and closed_pos.state == PositionState.CLOSED:
                         await self._maybe_record_trade(closed_pos)
                         break
+        
+        # Auto-import phantom positions at runtime (not just startup).
+        # Without this, a symbol-normalization miss or race condition can
+        # leave an exchange position unprotected until the next restart.
+        has_phantoms = any("PHANTOM" in issue for _, issue in issues)
+        if has_phantoms:
+            try:
+                await self._import_phantom_positions()
+            except InvariantError:
+                raise
+            except Exception as e:
+                logger.error(
+                    "Runtime phantom import failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
         
         # Get corrective actions
         actions = self.position_manager.reconcile(exchange_positions, orders, issues=issues)

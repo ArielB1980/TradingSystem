@@ -356,7 +356,7 @@ liquidity_filters:
       slippage_cap_pct: 0.002
       allow_live_trading: true
     C:  # Lower liquidity (opportunistic/defensive)
-      max_leverage: 2.0  # Conservative - thin markets
+      max_leverage: 3.0  # Was 2.0; raised to reduce fee drag on small accounts while staying conservative
       max_position_size_usd: 25000
       slippage_cap_pct: 0.003
       allow_live_trading: true
