@@ -314,6 +314,28 @@ if ! ssh -i "$SSH_KEY" "$SERVER" "systemctl cat $SERVICE_NAME >/dev/null 2>&1"; 
     fi
 fi
 
+# Step 3b: Ensure cron jobs are installed (idempotent)
+print_step "Ensuring cron jobs are installed for user '$TRADING_USER'..."
+CRON_LINE="0 3 * * 0 ${TRADING_DIR}/scripts/weekly_replay_sweep.sh >> ${TRADING_DIR}/logs/cron-replay.log 2>&1"
+ssh -i "$SSH_KEY" "$SERVER" << CRON_EOF
+    # Read existing crontab (suppress "no crontab" warning)
+    EXISTING=\$(su - $TRADING_USER -c "crontab -l 2>/dev/null" || true)
+
+    if echo "\$EXISTING" | grep -qF "weekly_replay_sweep.sh"; then
+        echo "Cron job already installed — skipping"
+    else
+        # Append to existing crontab (preserve any other entries)
+        (echo "\$EXISTING"; echo ""; echo "# Weekly replay sweep — seeds 1-5, Sundays 3AM UTC"; echo "$CRON_LINE") | su - $TRADING_USER -c "crontab -"
+        echo "Cron job installed for $TRADING_USER"
+    fi
+CRON_EOF
+
+if [ $? -eq 0 ]; then
+    print_success "Cron jobs verified"
+else
+    print_warning "Could not verify cron jobs (non-fatal)"
+fi
+
 # Step 4: Restart service
 print_step "Restarting service: $SERVICE_NAME"
 ssh -i "$SSH_KEY" "$SERVER" "systemctl restart $SERVICE_NAME" || {

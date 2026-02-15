@@ -698,7 +698,7 @@ class Executor:
             persisted_hashes = load_recent_intent_hashes(lookback_hours=24)
             self.order_intents_seen.update(persisted_hashes)
             logger.info(f"Loaded {len(persisted_hashes)} persisted intent hashes from last 24h")
-        except (OperationalError, DataError, ImportError, OSError) as e:
+        except (OperationalError, DataError, ImportError, OSError, RuntimeError) as e:
             logger.warning(f"Failed to load persisted intent hashes: {e}", error_type=type(e).__name__)
 
     def _persist_intent_hash(self, intent_hash: str, intent: OrderIntent):

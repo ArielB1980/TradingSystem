@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 from src.backtest.replay_harness.sim_clock import SimClock
 from src.backtest.replay_harness.data_store import ReplayDataStore
@@ -82,10 +83,57 @@ class BacktestRunner:
         self._exchange: Optional[ReplayKrakenClient] = None
         self._metrics: Optional[ReplayMetrics] = None
         self._live_trading: Optional[Any] = None  # LiveTrading instance
+        self._db_patches: List[Any] = []  # Active unittest.mock patchers
+
+    def _setup_db_mock(self) -> None:
+        """Mock the database layer so replay doesn't need DATABASE_URL.
+
+        We inject a fake ``_db_instance`` into ``src.storage.db`` **before**
+        any repository function calls ``get_db()``.  The mock provides a
+        no-op session context manager so all writes silently succeed and all
+        reads return empty results.
+        """
+        # Build a mock session that behaves like a SQLAlchemy session.
+        # Key requirement: every chainable method returns the same mock,
+        # and terminal methods return sensible defaults (empty list, 0, None)
+        # so downstream code that does `count > 0` or `for row in all()` works.
+        mock_session = MagicMock()
+        mock_session.query.return_value = mock_session  # chainable
+        mock_session.filter.return_value = mock_session
+        mock_session.filter_by.return_value = mock_session
+        mock_session.order_by.return_value = mock_session
+        mock_session.limit.return_value = mock_session
+        mock_session.offset.return_value = mock_session
+        mock_session.all.return_value = []
+        mock_session.first.return_value = None
+        mock_session.one_or_none.return_value = None
+        mock_session.count.return_value = 0
+        mock_session.scalar.return_value = 0
+        mock_session.delete.return_value = 0  # row count for bulk delete
+
+        @contextmanager
+        def _fake_session():
+            yield mock_session
+
+        mock_db = MagicMock()
+        mock_db.get_session = _fake_session
+
+        # Patch the global singleton so get_db() returns our mock
+        p = patch("src.storage.db._db_instance", mock_db)
+        p.start()
+        self._db_patches.append(p)
+        logger.info("REPLAY_DB_MOCK_INSTALLED")
+
+    def _teardown_db_mock(self) -> None:
+        """Remove database mock patches."""
+        for p in self._db_patches:
+            p.stop()
+        self._db_patches.clear()
 
     async def run(self) -> ReplayMetrics:
         """Execute the full replay backtest. Returns metrics."""
         self._setup()
+        self._setup_db_mock()
         await self._initialize()
 
         tick_count = 0
@@ -174,6 +222,7 @@ class BacktestRunner:
             trades=self._metrics.total_trades,
         )
 
+        self._teardown_db_mock()
         return self._metrics
 
     def _setup(self) -> None:
