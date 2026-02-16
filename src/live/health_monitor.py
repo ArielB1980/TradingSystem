@@ -804,8 +804,12 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
                     since = now - timedelta(hours=24)
                     all_trades = await asyncio.to_thread(get_trades_since, since)
                     today_trades = all_trades if all_trades else []
-                except (OperationalError, DataError, OSError):
-                    pass
+                except Exception as trades_err:
+                    logger.warning(
+                        "Failed to load trades for daily summary",
+                        error=str(trades_err),
+                        error_type=type(trades_err).__name__,
+                    )
 
                 wins = sum(
                     1 for t in today_trades if getattr(t, "net_pnl", 0) > 0

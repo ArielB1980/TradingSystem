@@ -269,16 +269,27 @@ async def handle_signal_v2(
             },
         )
 
-    # Send alert for new position
+    # Send alert for new position (urgent=True to bypass rate limit — each open matters)
     try:
         from src.monitoring.alerting import send_alert_sync, fmt_price, fmt_size
 
+        tp_line = ""
+        if tp1_price:
+            tp_line = f"TP1: ${fmt_price(tp1_price)}"
+            if tp2_price:
+                tp_line += f" | TP2: ${fmt_price(tp2_price)}"
+            tp_line += "\n"
+
         send_alert_sync(
             "NEW_POSITION",
-            f"New {signal.signal_type.value} position\n"
+            f"New {signal.signal_type.value.upper()} position\n"
             f"Symbol: {signal.symbol}\n"
             f"Size: {fmt_size(position_size)} @ ${fmt_price(mark_price)}\n"
-            f"Stop: ${fmt_price(position.initial_stop_price)}",
+            f"Notional: ${float(decision.position_notional):.2f} ({decision.leverage}x)\n"
+            f"Stop: ${fmt_price(position.initial_stop_price)}\n"
+            f"{tp_line}"
+            f"{'Boosted' if decision.utilisation_boost_applied else 'Base sizing'}",
+            urgent=True,
         )
     except (OperationalError, ImportError, OSError):
         pass  # Alert failure must never block trading

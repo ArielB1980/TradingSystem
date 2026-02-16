@@ -774,6 +774,7 @@ def get_all_trades() -> List[Trade]:
                 side=Side(tm.side),
                 entry_price=Decimal(str(tm.entry_price)),
                 exit_price=Decimal(str(tm.exit_price)),
+                size=Decimal(str(tm.size)) if tm.size is not None else Decimal("0"),
                 size_notional=Decimal(str(tm.size_notional)),
                 leverage=Decimal(str(tm.leverage)),
                 gross_pnl=Decimal(str(tm.gross_pnl)),
@@ -784,6 +785,8 @@ def get_all_trades() -> List[Trade]:
                 exited_at=tm.exited_at.replace(tzinfo=timezone.utc),
                 holding_period_hours=Decimal(str(tm.holding_period_hours)),
                 exit_reason=tm.exit_reason,
+                maker_fills_count=tm.maker_fills_count or 0,
+                taker_fills_count=tm.taker_fills_count or 0,
             )
             for tm in trade_models
         ]
@@ -813,6 +816,7 @@ def get_trades_since(since: datetime) -> List[Trade]:
                 side=Side(tm.side),
                 entry_price=Decimal(str(tm.entry_price)),
                 exit_price=Decimal(str(tm.exit_price)),
+                size=Decimal(str(tm.size)) if tm.size is not None else Decimal("0"),
                 size_notional=Decimal(str(tm.size_notional)),
                 leverage=Decimal(str(tm.leverage)),
                 gross_pnl=Decimal(str(tm.gross_pnl)),
@@ -823,6 +827,8 @@ def get_trades_since(since: datetime) -> List[Trade]:
                 exited_at=tm.exited_at.replace(tzinfo=timezone.utc),
                 holding_period_hours=Decimal(str(tm.holding_period_hours)),
                 exit_reason=tm.exit_reason,
+                maker_fills_count=tm.maker_fills_count or 0,
+                taker_fills_count=tm.taker_fills_count or 0,
             )
             for tm in trade_models
         ]
