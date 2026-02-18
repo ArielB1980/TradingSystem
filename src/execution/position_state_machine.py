@@ -1149,6 +1149,39 @@ class PositionRegistry:
         with self._lock:
             return list(self._positions.values())
     
+    # ========== HARD RESET (startup hygiene) ==========
+
+    def hard_reset(self, reason: str) -> List[ManagedPosition]:
+        """
+        Close all active positions and clear the registry.
+
+        Used at startup when the exchange is provably flat (0 positions,
+        0 orders) to eliminate stale registry debris that would otherwise
+        trigger orphan detection and the kill switch.
+
+        Returns the list of positions that were closed so the caller can
+        persist them.
+        """
+        with self._lock:
+            closed: List[ManagedPosition] = []
+            for pos in self._positions.values():
+                pos.state = PositionState.CLOSED
+                pos.exit_reason = pos.exit_reason or ExitReason.RECONCILIATION
+                pos.updated_at = datetime.now(timezone.utc)
+                self._closed_positions.append(pos)
+                closed.append(pos)
+            self._positions.clear()
+            self._pending_reversals.clear()
+
+        if closed:
+            logger.critical(
+                "STARTUP_REGISTRY_RESET: %d stale positions closed",
+                len(closed),
+                reason=reason,
+                symbols=[p.symbol for p in closed],
+            )
+        return closed
+
     # ========== POSITION REGISTRATION ==========
     
     def can_open_position(self, symbol: str, side: Side) -> Tuple[bool, str]:

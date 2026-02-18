@@ -1686,6 +1686,7 @@ class ExecutionGateway:
         """
         Startup procedure.
         
+        0. Registry hygiene: if exchange is flat, wipe stale registry
         1. Load persisted state from SQLite
         2. Sync with exchange (orphan/qty reconciliation)
         3. Import phantom positions
@@ -1701,6 +1702,43 @@ class ExecutionGateway:
         for pos in persisted_registry.get_all():
             if pos.symbol not in self.registry._positions:
                 self.registry._positions[pos.symbol] = pos
+        
+        # 0. REGISTRY HYGIENE: if exchange is provably flat, wipe stale registry.
+        # Exchange is always source of truth. If the exchange has zero
+        # positions AND zero open orders but the registry carried forward
+        # stale entries from a prior run, clear them now to prevent the
+        # orphan → kill-switch cascade.
+        active_count = len(self.registry.get_all_active())
+        if active_count > 0:
+            try:
+                exchange_positions = await self.client.get_all_futures_positions()
+                live_count = sum(
+                    1 for p in exchange_positions
+                    if float(p.get("contracts", p.get("size", 0))) != 0
+                )
+                open_orders = await self.client.get_futures_open_orders()
+                order_count = len(open_orders) if open_orders else 0
+
+                if live_count == 0 and order_count == 0:
+                    closed = self.registry.hard_reset(
+                        reason=f"exchange flat (0 positions, 0 orders) "
+                               f"but registry had {active_count} stale entries"
+                    )
+                    for pos in closed:
+                        self.persistence.save_position(pos)
+                elif live_count == 0 and order_count > 0:
+                    logger.warning(
+                        "Registry hygiene: exchange has 0 positions but %d "
+                        "open orders — skipping wipe (possible pending state)",
+                        order_count,
+                        registry_positions=active_count,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Registry hygiene check failed — proceeding with normal reconciliation",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
         
         # 2. Sync with exchange (handles orphans, qty mismatches)
         sync_result = await self.sync_with_exchange()
