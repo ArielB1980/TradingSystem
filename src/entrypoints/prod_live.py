@@ -265,12 +265,25 @@ def main() -> None:
             )
             raise SystemExit(1)
 
+    # --- Crash capture: faulthandler + SIGUSR2 before any runtime code ---
+    try:
+        from src.runtime.crash_capture import setup_all as _setup_crash_capture
+        _setup_crash_capture()
+        logger.info("Crash capture enabled (faulthandler + SIGUSR2 → logs/fault.log)")
+    except Exception as e:
+        logger.warning("Crash capture setup failed (non-fatal)", error=str(e), error_type=type(e).__name__)
+
     # Run the live engine.
     try:
         import asyncio
         from src.live.live_trading import LiveTrading
+        from src.runtime.crash_capture import (
+            install_asyncio_exception_handler,
+            write_crash_log,
+        )
 
         async def _run() -> None:
+            install_asyncio_exception_handler(asyncio.get_running_loop())
             engine = LiveTrading(config)
             await engine.run()
 
@@ -280,6 +293,11 @@ def main() -> None:
         raise SystemExit(0)
     except Exception as e:
         logger.critical("Live trading crashed", error=str(e), error_type=type(e).__name__, exc_info=True)
+        try:
+            from src.runtime.crash_capture import write_crash_log
+            write_crash_log(e, context="prod_live_main")
+        except Exception:
+            pass
         raise SystemExit(1)
     finally:
         # Best-effort lock release (optional; lock is session-scoped and will release on process exit).

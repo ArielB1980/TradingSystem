@@ -688,18 +688,22 @@ class LiveTrading:
                         self.last_discovery_time = now
                 
                 loop_start = datetime.now(timezone.utc)
-                
+                cycle_id = f"tick_{loop_count}_{int(loop_start.timestamp())}"
+
+                try:
+                    record_event("CYCLE_TICK_BEGIN", "system", {"cycle_id": cycle_id, "loop_count": loop_count})
+                except Exception:
+                    pass
+
                 try:
                     await self._tick()
                 except CircuitOpenError as e:
-                    # Circuit breaker is open — API is down, fail-fast without
-                    # counting this as an API error for the invariant monitor.
-                    # The breaker itself is the protection mechanism.
                     logger.warning(
                         "Tick skipped: API circuit breaker open",
                         breaker_info=str(e)[:200],
                     )
                 except InvariantError as e:
+                    self._record_tick_crash(cycle_id, e)
                     logger.critical("INVARIANT VIOLATION in tick — triggering kill switch", error=str(e))
                     if self.kill_switch:
                         await self.kill_switch.activate(KillSwitchReason.INVARIANT_VIOLATION)
@@ -709,10 +713,13 @@ class LiveTrading:
                 except DataError as e:
                     logger.warning("Data error in tick", error=str(e))
                 except Exception as e:
-                    # Unknown/unexpected exception — log but don't swallow.
-                    # Let it surface so systemd restarts if persistent.
-                    logger.error("Unexpected error in live trading tick", error=str(e), error_type=type(e).__name__)
+                    self._record_tick_crash(cycle_id, e)
                     raise
+                else:
+                    try:
+                        record_event("CYCLE_TICK_END", "system", {"cycle_id": cycle_id, "loop_count": loop_count})
+                    except Exception:
+                        pass
                 
                 self.ticks_since_emit += 1
                 # P0.4: Write heartbeat file after each successful tick
@@ -944,6 +951,23 @@ class LiveTrading:
         """Build Reconciler -- delegates to exchange_sync module."""
         from src.live.exchange_sync import build_reconciler
         return build_reconciler(self)
+
+    def _record_tick_crash(self, cycle_id: str, exc: BaseException) -> None:
+        """Best-effort: record CYCLE_TICK_CRASH to DB and crash log file."""
+        try:
+            from src.storage.repository import record_event as _rec
+            _rec("CYCLE_TICK_CRASH", "system", {
+                "cycle_id": cycle_id,
+                "exception_type": type(exc).__name__,
+                "exception_msg": str(exc)[:500],
+            })
+        except Exception:
+            pass
+        try:
+            from src.runtime.crash_capture import write_crash_log
+            write_crash_log(exc, context="tick", cycle_id=cycle_id)
+        except Exception:
+            pass
 
     async def _validate_position_protection(self):
         """Startup position protection validation -- delegates to health_monitor module."""
