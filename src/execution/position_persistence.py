@@ -485,13 +485,30 @@ class PositionPersistence:
         # Move terminal and stale zero-qty positions out of active registry
         terminal_symbols: List[str] = []
         stale_zero_symbols: List[str] = []
+        corrupted_symbols: List[str] = []
         qty_epsilon = Decimal("0.0001")
         for symbol, pos in registry._positions.items():
             if pos.is_terminal:
                 registry._closed_positions.append(pos)
                 terminal_symbols.append(symbol)
                 continue
-            if pos.remaining_qty <= qty_epsilon:
+            try:
+                rem_qty = pos.remaining_qty
+            except Exception as inv_err:
+                logger.critical(
+                    "Corrupted position: remaining_qty invariant violated — force-closing",
+                    symbol=symbol,
+                    entry_qty=str(pos.filled_entry_qty),
+                    exit_qty=str(pos.filled_exit_qty),
+                    error=str(inv_err),
+                )
+                pos.state = PositionState.CLOSED
+                if pos.exit_reason is None:
+                    pos.exit_reason = ExitReason.RECONCILIATION
+                registry._closed_positions.append(pos)
+                corrupted_symbols.append(symbol)
+                continue
+            if rem_qty <= qty_epsilon:
                 old_state = pos.state
                 pos.state = PositionState.CLOSED
                 if pos.exit_reason is None:
@@ -505,16 +522,17 @@ class PositionPersistence:
                 )
         
         # Remove non-active positions from _positions
-        for symbol in terminal_symbols + stale_zero_symbols:
+        for symbol in terminal_symbols + stale_zero_symbols + corrupted_symbols:
             del registry._positions[symbol]
         
         logger.info(
             "Registry loaded from persistence",
-            total_positions=len(registry._positions) + len(terminal_symbols) + len(stale_zero_symbols),
+            total_positions=len(registry._positions) + len(terminal_symbols) + len(stale_zero_symbols) + len(corrupted_symbols),
             active_positions=len(registry._positions),
             terminal_moved=len(terminal_symbols),
             stale_zero_moved=len(stale_zero_symbols),
-            pending_reversals=len(registry._pending_reversals)
+            corrupted_closed=len(corrupted_symbols),
+            pending_reversals=len(registry._pending_reversals),
         )
         
         return registry
