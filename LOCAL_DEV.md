@@ -7,31 +7,42 @@ This guide explains how to run the trading system locally on your machine for de
 ### Required Software
 
 - **Python 3.11+** (required)
+- **PostgreSQL** (required — system uses PostgreSQL only, no SQLite)
 - **Git** (required)
 - **Make** (usually pre-installed on macOS)
 
 ### Installing Python on macOS
 
-Check if Python 3.11+ is installed:
 ```bash
-python3 --version
+python3 --version   # Needs 3.11+
+brew install python@3.11   # If missing
 ```
 
-If not installed or version is too old:
+### Installing PostgreSQL on macOS
 
-**Option 1: Using Homebrew (recommended)**
+If you already have PostgreSQL running on port 5432, you can use that.
+Otherwise, install via Homebrew on port 5433 (avoids conflicts):
+
 ```bash
-# Install Homebrew if not already installed
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install postgresql@17
 
-# Install Python
-brew install python@3.11
+# Configure to use port 5433 (avoids conflict with existing PG installs)
+echo "port = 5433" >> /opt/homebrew/var/postgresql@17/postgresql.conf
+echo 'unix_socket_directories = '"'"'/tmp'"'"'' >> /opt/homebrew/var/postgresql@17/postgresql.conf
+
+# Start and create the database
+brew services start postgresql@17
+export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"
+createdb -p 5433 trading_local
+
+# Verify
+psql -p 5433 trading_local -c "SELECT 1;"
 ```
 
-**Option 2: Download from python.org**
-- Visit https://www.python.org/downloads/
-- Download Python 3.11 or newer for macOS
-- Run the installer
+The DATABASE_URL for `.env.local` is:
+```
+DATABASE_URL=postgresql://<your-username>@localhost:5433/trading_local
+```
 
 ---
 
@@ -59,10 +70,10 @@ This will:
 make validate
 ```
 
-This creates `.env.local` from the template. The default settings are safe for testing:
-- `DRY_RUN=1` (no real trades)
-- Local SQLite database
-- No API keys required
+This creates `.env.local` from the template. Then edit it to set:
+- `DRY_RUN=1` (no real trades — already set)
+- `DATABASE_URL=postgresql://<your-username>@localhost:5433/trading_local`
+- API keys can be left blank for DRY_RUN=1 smoke tests
 
 ### 3. Run Smoke Test
 
@@ -113,16 +124,16 @@ Press `Ctrl+C` to stop.
 ### Directory Structure
 
 ```
-TradingSystem-1/
+TradingSystem/
 ├── .venv/          # Python virtual environment (gitignored)
-├── .local/         # Local data directory (gitignored)
-│   └── bot.db      # SQLite database
 ├── logs/           # Application logs (gitignored)
 │   ├── run.log     # Main run logs
 │   └── smoke.log   # Smoke test logs
 ├── .env.local      # Your local secrets (gitignored)
 └── .env.local.example  # Template (committed)
 ```
+
+The database is PostgreSQL (not SQLite). Local default: `trading_local` on port 5433.
 
 ### Runner & Risk Config (config.yaml)
 
@@ -213,21 +224,20 @@ make install
 
 ---
 
-### ❌ "Database is locked"
+### ❌ "DATABASE_URL is required but not set"
 
-**Problem:** Multiple instances trying to access the same SQLite database.
+**Problem:** No PostgreSQL connection configured.
 
 **Solution:**
 ```bash
-# Check if bot is already running
-make status
+# Ensure PostgreSQL is running
+pg_isready -p 5433  # Should say "accepting connections"
 
-# Kill any running instances
-pkill -f "python run.py"
+# If not running:
+brew services start postgresql@17
 
-# Delete database and start fresh
-rm -rf .local/bot.db
-make smoke
+# Ensure DATABASE_URL is in .env.local:
+# DATABASE_URL=postgresql://<your-username>@localhost:5433/trading_local
 ```
 
 ---
@@ -343,15 +353,16 @@ pkill -f "python run.py"
 
 ## Production vs Local
 
-| Aspect | Local (This Guide) | Production (DigitalOcean) |
+| Aspect | Local (This Guide) | Production (Droplet) |
 |--------|-------------------|---------------------------|
 | Config | `.env.local` file | Injected env vars |
-| Database | SQLite (`.local/bot.db`) | PostgreSQL |
+| Database | PostgreSQL (port 5433) | PostgreSQL (port 5432) |
 | API Keys | Optional (DRY_RUN=1) | Required |
-| Entrypoint | `make run` | `python run.py live --force` |
-| Logs | `logs/run.log` | Stdout (captured by DO) |
+| Entrypoint | `make run` / `make smoke` | `python -m src.entrypoints.prod_live` |
+| Logs | `logs/run.log` | `logs/run.log` via systemd |
+| Deploy | N/A | `make deploy` |
 
-**Important:** `.env.local` is NEVER used in production. Production reads from environment variables set in DigitalOcean App Platform.
+**Important:** `.env.local` is NEVER used in production. Production reads from environment variables set on the Droplet. The production entrypoint (`prod_live`) explicitly refuses to load dotenv files.
 
 ---
 

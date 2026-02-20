@@ -271,6 +271,19 @@ multi_tp:
       tp1_close_pct: 0.50
       tp2_close_pct: 0.40
 
+## Spot DCA (Daily accumulation of spot assets)
+spot_dca:
+  enabled: true
+  asset: SOL                    # Spot asset to buy
+  quote_currency: USD           # Currency to spend
+  schedule_hour_utc: 0          # Midnight UTC
+  schedule_minute_utc: 0
+  use_full_balance: true        # Spend all available USD on spot
+  # fixed_amount_usd: 50.0     # Uncomment to buy fixed amount instead
+  min_purchase_usd: 5.0         # Skip if balance < $5
+  # max_purchase_usd: 1000.0   # Uncomment to cap single purchase
+  reserve_usd: 0.0              # Keep $0 in reserve
+
 ## Data Acquisition
 data:
   # WebSocket settings
