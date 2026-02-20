@@ -138,14 +138,24 @@ def test_smc_golden_output(request):
     with open(GOLDEN_FIXTURE_PATH) as f:
         golden = json.load(f)
 
+    # Fields that hold float-derived values subject to platform rounding
+    _FLOAT_TOLERANCE_FIELDS = {"adx", "atr", "ema200_slope", "score"}
+
     # Compare each field for clear error messages
     for key in golden:
         assert key in current_output, f"Missing field '{key}' in current output"
-        if golden[key] != current_output[key]:
+        g_val, c_val = golden[key], current_output[key]
+        if g_val != c_val:
+            if key in _FLOAT_TOLERANCE_FIELDS:
+                try:
+                    if abs(float(g_val) - float(c_val)) < 1e-10:
+                        continue
+                except (ValueError, TypeError):
+                    pass
             pytest.fail(
                 f"SMC output diverged on '{key}':\n"
-                f"  Golden:  {golden[key]}\n"
-                f"  Current: {current_output[key]}\n\n"
+                f"  Golden:  {g_val}\n"
+                f"  Current: {c_val}\n\n"
                 f"If this change is intentional, regenerate the fixture:\n"
                 f"  pytest tests/unit/test_smc_golden_output.py "
                 f"--regenerate-golden -s"
