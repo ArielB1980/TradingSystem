@@ -1395,10 +1395,9 @@ class ExecutionGateway:
             pending.status = "rejected"
             self.metrics["orders_rejected"] += 1
         
-        position = self.registry.get_position(pending.symbol)
+        position = self.registry.get_position_any_state(pending.symbol)
         if position:
             self.persistence.save_position(position)
-            # Record trade if position just transitioned to CLOSED
             await self._maybe_record_trade(position)
         
         for action in follow_up:

@@ -1138,6 +1138,11 @@ class PositionRegistry:
             if pos and not pos.is_terminal:
                 return pos
             return None
+
+    def get_position_any_state(self, symbol: str) -> Optional[ManagedPosition]:
+        """Get position for symbol regardless of state (including terminal/closed)."""
+        with self._lock:
+            return self._find_position_by_normalized(symbol)
     
     def get_all_active(self) -> List[ManagedPosition]:
         """Get all active positions."""
