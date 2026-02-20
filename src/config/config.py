@@ -651,6 +651,24 @@ class SystemConfig(BaseSettings):
     dry_run: bool = False  # If True, no real orders are placed
 
 
+class SpotDCAConfig(BaseSettings):
+    """Spot DCA (Dollar Cost Averaging) configuration.
+    
+    When enabled, the system uses the available USD balance on the spot account
+    to purchase the configured asset at the scheduled time each day.
+    """
+    enabled: bool = False
+    asset: str = "SOL"                    # Base asset to purchase (e.g. "SOL", "BTC", "ETH")
+    quote_currency: str = "USD"           # Quote currency to spend
+    schedule_hour_utc: int = Field(default=0, ge=0, le=23)   # Hour (UTC) to execute
+    schedule_minute_utc: int = Field(default=0, ge=0, le=59)  # Minute (UTC)
+    use_full_balance: bool = True         # If True, spend all available quote balance
+    fixed_amount_usd: Optional[float] = Field(default=None, ge=1.0)  # Fixed USD amount (overrides use_full_balance)
+    min_purchase_usd: float = Field(default=5.0, ge=1.0)  # Skip if available < this
+    max_purchase_usd: Optional[float] = Field(default=None, ge=1.0)  # Cap single purchase (None = no cap)
+    reserve_usd: float = Field(default=0.0, ge=0.0)  # Keep this much USD in reserve, don't spend it
+
+
 class Config(BaseSettings):
     """Main configuration class."""
     model_config = SettingsConfigDict(
@@ -667,6 +685,7 @@ class Config(BaseSettings):
     liquidity_filters: LiquidityFilters = Field(default_factory=LiquidityFilters)  # NEW
     execution: ExecutionConfig
     multi_tp: Optional[MultiTPConfig] = None
+    spot_dca: SpotDCAConfig = Field(default_factory=SpotDCAConfig)
     data: DataConfig
     reconciliation: ReconciliationConfig
     monitoring: MonitoringConfig

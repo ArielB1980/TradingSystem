@@ -1088,9 +1088,11 @@ class KrakenClient:
             Dict of currency -> balance
         """
         await self.private_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
         
         try:
-            balance = self.exchange.fetch_balance()
+            balance = await self.exchange.fetch_balance()
+            await self._api_breaker.record_success()
             return {
                 currency: Decimal(str(amount))
                 for currency, amount in balance['total'].items()
@@ -1098,9 +1100,75 @@ class KrakenClient:
             }
             
         except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
             logger.error("Failed to fetch account balance", error=str(e))
-            raise
+            raise classified from e
     
+    async def place_spot_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        amount: Decimal,
+        price: Optional[Decimal] = None,
+    ) -> Dict[str, Any]:
+        """
+        Place an order on the Kraken spot exchange using the spot CCXT instance.
+        
+        Args:
+            symbol: Spot symbol (e.g. "SOL/USD")
+            side: "buy" or "sell"
+            order_type: "market" or "limit"
+            amount: Quantity of base asset to buy/sell
+            price: Limit price (required for limit orders, ignored for market)
+            
+        Returns:
+            CCXT order response dict
+        """
+        if not self.exchange:
+            raise OperationalError("Spot exchange not initialized")
+        
+        if not self.has_valid_spot_credentials():
+            raise OperationalError("Spot API credentials not configured")
+        
+        dry_run = os.environ.get("DRY_RUN", "0") == "1"
+        if dry_run:
+            logger.info(
+                "DRY_RUN: Spot order skipped",
+                symbol=symbol, side=side, order_type=order_type,
+                amount=str(amount), price=str(price) if price else "market",
+            )
+            return {"id": "dry-run", "status": "dry_run", "symbol": symbol, "side": side, "amount": str(amount)}
+        
+        await self.private_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
+        
+        try:
+            params = {}
+            result = await self.exchange.create_order(
+                symbol=symbol,
+                type=order_type,
+                side=side,
+                amount=float(amount),
+                price=float(price) if price else None,
+                params=params,
+            )
+            await self._api_breaker.record_success()
+            logger.info(
+                "Spot order placed",
+                symbol=symbol, side=side, order_type=order_type,
+                amount=str(amount), order_id=result.get("id"),
+            )
+            return result
+        except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
+            logger.error("Failed to place spot order", error=str(e), symbol=symbol, side=side)
+            raise classified from e
+
     async def place_futures_order(
         self,
         symbol: str,

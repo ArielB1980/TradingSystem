@@ -558,6 +558,15 @@ class LiveTrading:
             except (ValueError, TypeError, RuntimeError) as e:
                 logger.error("Failed to start daily summary task", error=str(e), error_type=type(e).__name__)
 
+            # 2.6c.2 Spot DCA (daily scheduled spot purchases)
+            try:
+                self._spot_dca_task = asyncio.create_task(
+                    self._run_spot_dca()
+                )
+                logger.info("Spot DCA task started")
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start spot DCA task", error=str(e), error_type=type(e).__name__)
+
             # 2.6d Runtime regression monitors (trade starvation + winner churn)
             try:
                 self._starvation_monitor_task = asyncio.create_task(
@@ -870,6 +879,12 @@ class LiveTrading:
                     await self._daily_summary_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_spot_dca_task", None) and not self._spot_dca_task.done():
+                self._spot_dca_task.cancel()
+                try:
+                    await self._spot_dca_task
+                except asyncio.CancelledError:
+                    pass
             if getattr(self, "_telegram_cmd_task", None) and not self._telegram_cmd_task.done():
                 if getattr(self, "_telegram_handler", None):
                     self._telegram_handler.stop()
@@ -921,6 +936,11 @@ class LiveTrading:
         """Daily P&L summary at midnight UTC -- delegates to health_monitor module."""
         from src.live.health_monitor import run_daily_summary
         await run_daily_summary(self)
+
+    async def _run_spot_dca(self) -> None:
+        """Daily spot DCA purchase -- delegates to spot_dca module."""
+        from src.live.spot_dca import run_spot_dca
+        await run_spot_dca(self)
 
     async def _run_trade_starvation_monitor(self, interval_seconds: int = 300) -> None:
         """Trade starvation sentinel -- delegates to health_monitor module."""
