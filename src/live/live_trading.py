@@ -1470,7 +1470,7 @@ class LiveTrading:
 
                 # Auto-place missing stops for unprotected positions (rate-limited per tick)
                 await self._place_missing_stops_for_unprotected(all_raw_positions, max_per_tick=3)
-            except (OperationalError, DataError) as e:
+            except (OperationalError, DataError, ValueError) as e:
                 logger.error("TP backfill reconciliation failed", error=str(e), error_type=type(e).__name__)
                 # Don't return - continue with trading loop
             symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
