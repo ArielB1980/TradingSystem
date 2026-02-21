@@ -701,8 +701,8 @@ class LiveTrading:
 
                 try:
                     record_event("CYCLE_TICK_BEGIN", "system", {"cycle_id": cycle_id, "loop_count": loop_count})
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to record CYCLE_TICK_BEGIN event", error=str(e))
 
                 try:
                     await self._tick()
@@ -727,8 +727,8 @@ class LiveTrading:
                 else:
                     try:
                         record_event("CYCLE_TICK_END", "system", {"cycle_id": cycle_id, "loop_count": loop_count})
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to record CYCLE_TICK_END event", error=str(e))
                 
                 self.ticks_since_emit += 1
                 # P0.4: Write heartbeat file after each successful tick
@@ -981,13 +981,13 @@ class LiveTrading:
                 "exception_type": type(exc).__name__,
                 "exception_msg": str(exc)[:500],
             })
-        except Exception:
-            pass
+        except Exception as db_err:
+            logger.warning("Failed to record tick crash to DB", error=str(db_err))
         try:
             from src.runtime.crash_capture import write_crash_log
             write_crash_log(exc, context="tick", cycle_id=cycle_id)
-        except Exception:
-            pass
+        except Exception as log_err:
+            logger.warning("Failed to write crash log file", error=str(log_err))
 
     async def _validate_position_protection(self):
         """Startup position protection validation -- delegates to health_monitor module."""
@@ -1170,8 +1170,12 @@ class LiveTrading:
                         management_allowed=self.hardening.is_management_allowed(),
                     )
             except (OperationalError, DataError, ValueError) as e:
-                logger.error("Production hardening pre-tick check failed", error=str(e), error_type=type(e).__name__)
-                # Don't halt trading due to hardening check failure - log and continue
+                logger.critical(
+                    "Production hardening pre-tick check failed — SKIPPING TICK",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                return
 
         # 2.5. Cleanup orphan reduce-only orders (SL/TP orders for closed positions)
         try:
@@ -1723,8 +1727,13 @@ class LiveTrading:
                                                 signal=signal.signal_type.value,
                                             )
                             except (ValueError, TypeError, ArithmeticError, KeyError) as e:
-                                # Fail-open: allow trade if spread check has a data issue
-                                logger.debug("Spread check failed (fail-open)", symbol=spot_symbol, error=str(e))
+                                spread_ok = False
+                                logger.warning(
+                                    "Spread check failed — BLOCKING entry (fail-closed)",
+                                    symbol=spot_symbol,
+                                    error=str(e),
+                                    error_type=type(e).__name__,
+                                )
 
                             if not spread_ok:
                                 return  # Skip this coin — spread too wide right now

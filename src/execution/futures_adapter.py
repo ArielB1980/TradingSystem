@@ -304,7 +304,12 @@ class FuturesAdapter:
                     f"symbol={symbol!r} client_order_id={client_order_id!r} size_notional={size_notional!r}"
                 )
         else:
-            price_use = price if price is not None else Decimal("0")
+            if price is None or price <= 0:
+                raise ValueError(
+                    f"Non-market order ({order_type.value}) requires explicit positive price; "
+                    f"got price={price!r}. symbol={symbol!r}"
+                )
+            price_use = price
         # Invariant: market orders are sized only from mark/ticker (never size_notional/1).
         assert (
             order_type != OrderType.MARKET or price_from_mark_or_ticker or (price and price > 0)

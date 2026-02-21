@@ -393,11 +393,26 @@ class RiskManager:
                 binding_constraints.append(BindingConstraint.AGGREGATE_MARGIN)
 
         if position_notional < min_notional_viable:
-            binding_constraint = BindingConstraint.MIN_NOTIONAL_REJECT
-            binding_constraints.append(BindingConstraint.MIN_NOTIONAL_REJECT)
             rejection_reasons.append(
                 f"Position notional ${position_notional:.2f} below minimum ${min_notional_viable} "
                 f"after equity cap (equity=${account_equity:.2f})"
+            )
+            logger.warning(
+                "MIN_NOTIONAL_HARD_REJECT",
+                symbol=signal.symbol,
+                position_notional=str(position_notional),
+                min_notional_viable=str(min_notional_viable),
+                equity=str(account_equity),
+            )
+            return RiskDecision(
+                approved=False,
+                rejection_reasons=rejection_reasons,
+                position_notional=Decimal("0"),
+                leverage=requested_leverage,
+                margin_required=Decimal("0"),
+                liquidation_buffer_pct=Decimal("0"),
+                basis_divergence_pct=Decimal("0"),
+                estimated_fees_funding=Decimal("0"),
             )
 
         # Cap by available margin (prevents Kraken "insufficientAvailableFunds")

@@ -192,7 +192,15 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     available_margin=auction_budget_margin,
                     symbol_tier=symbol_tier,
                 )
-                if decision.position_notional > 0 and decision.margin_required > 0:
+                if not decision.approved:
+                    logger.info(
+                        "Auction candidate rejected by risk manager",
+                        symbol=signal.symbol,
+                        score=signal.score,
+                        rejection_reasons=decision.rejection_reasons,
+                        position_notional=str(decision.position_notional),
+                    )
+                elif decision.position_notional > 0 and decision.margin_required > 0:
                     stop_distance = (
                         abs(signal.entry_price - signal.stop_loss) / signal.entry_price
                         if signal.stop_loss
@@ -217,15 +225,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         score=signal.score,
                         notional=str(decision.position_notional),
                         margin=str(decision.margin_required),
-                        approved=decision.approved,
                     )
-                    if not decision.approved:
-                        logger.debug(
-                            "Candidate included in auction despite rejection (auction can optimize)",
-                            symbol=signal.symbol,
-                            score=signal.score,
-                            rejection_reasons=decision.rejection_reasons,
-                        )
                 else:
                     logger.warning(
                         "Signal not added to auction candidates",

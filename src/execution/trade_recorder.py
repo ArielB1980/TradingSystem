@@ -124,26 +124,25 @@ def record_closed_trade(
     exit_vwap = position.avg_exit_price
 
     if entry_vwap is None or exit_vwap is None:
-        # Can't compute PnL without price data.  This happens for
-        # positions that were force-closed without any fills.
         logger.warning(
-            "Cannot record trade: missing VWAP",
+            "Cannot record trade yet: missing VWAP — will retry after backfill",
             position_id=position.position_id,
             symbol=position.symbol,
+            has_entry_vwap=entry_vwap is not None,
+            has_exit_vwap=exit_vwap is not None,
             has_entry_fills=len(position.entry_fills),
             has_exit_fills=len(position.exit_fills),
         )
-        position.trade_recorded = True  # Don't retry endlessly
         return None
 
     # ---- Size ----
     qty = position.filled_entry_qty
     if qty <= 0:
         logger.warning(
-            "Cannot record trade: zero filled qty",
+            "Cannot record trade yet: zero filled qty — will retry after backfill",
             position_id=position.position_id,
+            symbol=position.symbol,
         )
-        position.trade_recorded = True
         return None
 
     size_notional = qty * entry_vwap
