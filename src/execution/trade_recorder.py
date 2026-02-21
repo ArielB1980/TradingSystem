@@ -123,13 +123,25 @@ def record_closed_trade(
     entry_vwap = position.avg_entry_price
     exit_vwap = position.avg_exit_price
 
-    if entry_vwap is None or exit_vwap is None:
-        logger.warning(
-            "Cannot record trade yet: missing VWAP — will retry after backfill",
+    # Fallback: if entry VWAP is zero/None but initial_entry_price is set
+    # (common for orphaned/imported positions with synthetic fills)
+    if (entry_vwap is None or entry_vwap == 0) and position.initial_entry_price and position.initial_entry_price > 0:
+        logger.info(
+            "Using initial_entry_price as fallback for missing/zero avg_entry_price",
             position_id=position.position_id,
             symbol=position.symbol,
-            has_entry_vwap=entry_vwap is not None,
-            has_exit_vwap=exit_vwap is not None,
+            initial_entry_price=str(position.initial_entry_price),
+            avg_entry_price=str(entry_vwap),
+        )
+        entry_vwap = position.initial_entry_price
+
+    if entry_vwap is None or entry_vwap == 0 or exit_vwap is None or exit_vwap == 0:
+        logger.warning(
+            "Cannot record trade yet: missing/zero VWAP — will retry after backfill",
+            position_id=position.position_id,
+            symbol=position.symbol,
+            entry_vwap=str(entry_vwap),
+            exit_vwap=str(exit_vwap),
             has_entry_fills=len(position.entry_fills),
             has_exit_fills=len(position.exit_fills),
         )

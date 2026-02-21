@@ -50,7 +50,10 @@ safety:
     
     # Maximum single position as % of equity
     # Prevents over-concentration in one asset
-    max_single_position_pct_equity: 0.25
+    # Note: for small accounts (<$1000), each position is naturally a larger
+    # fraction of equity. 35% prevents any single position from dominating
+    # while accommodating 10+ position portfolios on small accounts.
+    max_single_position_pct_equity: 0.35
 
     # ===== OPERATIONAL LIMITS =====
     
