@@ -1154,6 +1154,10 @@ class ExecutionGateway:
         Called after persistence.save_position() in every code path
         that can transition a position to CLOSED or ORPHANED.
         
+        If exit fills are missing (common for orphaned positions whose stop
+        was filled by the exchange), queries Kraken for the actual fill data
+        before recording.
+        
         After successful recording:
         1. Sends POSITION_CLOSED Telegram notification
         2. Fires on_trade_recorded callback (for risk manager, etc.)
@@ -1161,6 +1165,10 @@ class ExecutionGateway:
         terminal_states = (PositionState.CLOSED, PositionState.ORPHANED)
         if position.state not in terminal_states or position.trade_recorded:
             return
+        
+        # If no exit fills, try to backfill from exchange before recording
+        if not position.exit_fills and position.filled_entry_qty > 0:
+            await self._backfill_exit_fills(position)
         
         maker_rate, taker_rate = self._get_fee_rates()
         
@@ -1173,31 +1181,7 @@ class ExecutionGateway:
                 funding_rate_daily_bps=self._funding_rate_daily_bps,
             )
             if trade is None and position.trade_recorded:
-                # Recorder returned None but marked trade_recorded=True
-                # (missing VWAP, zero qty, or duplicate). Persist the flag
-                # so the skip doesn't repeat on every restart.
                 self.persistence.save_position(position)
-                # Still send a notification for orphaned positions even
-                # without exact P&L (the exchange closed it, we know).
-                try:
-                    from src.monitoring.alerting import send_alert, fmt_price, fmt_size
-                    entry_str = f"${fmt_price(position.avg_entry_price)}" if position.avg_entry_price else "?"
-                    reason = position.exit_reason.value if position.exit_reason else position.state.value
-                    await send_alert(
-                        "POSITION_CLOSED",
-                        f"\u26a0\ufe0f Position closed (exchange): {position.symbol}\n"
-                        f"Side: {position.side.value.upper()}\n"
-                        f"Size: {fmt_size(position.filled_entry_qty)}\n"
-                        f"Entry: {entry_str}\n"
-                        f"P&L: unavailable (exit fill data missing)\n"
-                        f"Reason: {reason}",
-                        urgent=True,
-                    )
-                except Exception as alert_err:
-                    logger.warning(
-                        "Failed to send degraded POSITION_CLOSED alert",
-                        error=str(alert_err),
-                    )
                 return
             if trade:
                 self.metrics["trades_recorded_total"] += 1
@@ -1269,6 +1253,141 @@ class ExecutionGateway:
                 error_type=type(e).__name__,
             )
     
+    async def _backfill_exit_fills(self, position: ManagedPosition) -> None:
+        """
+        Query Kraken for exit fill data when exit_fills are missing.
+        
+        For orphaned positions, the exchange filled a stop/TP order but
+        the system missed the fill event. This method fetches the actual
+        fill price and quantity from the exchange so P&L can be computed
+        accurately instead of guessed.
+        
+        Strategy:
+        1. Check stop_order_id, tp1_order_id, tp2_order_id via fetch_order
+        2. For any filled orders, create FillRecord entries
+        3. If no order IDs available, use fetch_my_trades as fallback
+        """
+        from src.execution.position_state_machine import FillRecord, Side
+        
+        symbol = position.symbol
+        exit_side = Side.SHORT if position.side == Side.LONG else Side.LONG
+        fills_added = 0
+        
+        # Try known order IDs first (stop, tp1, tp2)
+        order_ids = []
+        if position.stop_order_id:
+            order_ids.append(("stop_loss", position.stop_order_id))
+        if position.tp1_order_id:
+            order_ids.append(("tp1", position.tp1_order_id))
+        if position.tp2_order_id:
+            order_ids.append(("tp2", position.tp2_order_id))
+        
+        for label, order_id in order_ids:
+            try:
+                order_data = await self.client.fetch_order(order_id, symbol)
+                if not order_data:
+                    continue
+                
+                status = order_data.get("status", "")
+                filled = Decimal(str(order_data.get("filled", 0)))
+                avg_price = order_data.get("average", 0)
+                
+                if status in ("closed", "filled") and filled > 0 and avg_price:
+                    fill = FillRecord(
+                        fill_id=f"backfill-{label}-{order_id[:12]}",
+                        order_id=order_id,
+                        side=exit_side,
+                        qty=filled,
+                        price=Decimal(str(avg_price)),
+                        timestamp=datetime.now(timezone.utc),
+                        is_entry=False,
+                    )
+                    position.exit_fills.append(fill)
+                    fills_added += 1
+                    logger.info(
+                        "Backfilled exit fill from exchange",
+                        symbol=symbol,
+                        label=label,
+                        order_id=order_id,
+                        filled=str(filled),
+                        price=str(avg_price),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch order for fill backfill",
+                    symbol=symbol,
+                    label=label,
+                    order_id=order_id,
+                    error=str(e),
+                )
+        
+        # Fallback: if no fills found via order IDs, try fetch_my_trades
+        if fills_added == 0:
+            try:
+                # Fetch recent trades for this symbol
+                ccxt_symbol = symbol
+                if not ccxt_symbol.endswith(":USD"):
+                    # Convert PF_XBTUSD -> BTC/USD:USD format for CCXT
+                    base = symbol.replace("PF_", "").replace("USD", "")
+                    ccxt_symbol = f"{base}/USD:USD"
+                
+                since_ms = None
+                if position.entry_fills:
+                    earliest = min(f.timestamp for f in position.entry_fills)
+                    since_ms = int(earliest.timestamp() * 1000)
+                
+                trades = await self.client.get_futures_fills(
+                    symbol=ccxt_symbol,
+                    since=since_ms,
+                    limit=50,
+                )
+                
+                entry_qty = position.filled_entry_qty
+                entry_side_str = "buy" if position.side == Side.LONG else "sell"
+                exit_side_str = "sell" if position.side == Side.LONG else "buy"
+                
+                for t in trades:
+                    t_side = (t.get("side", "") or "").lower()
+                    t_amount = Decimal(str(t.get("amount", 0)))
+                    t_price = Decimal(str(t.get("price", 0)))
+                    
+                    if t_side == exit_side_str and t_amount > 0 and t_price > 0:
+                        fill = FillRecord(
+                            fill_id=f"backfill-trade-{t.get('id', 'unknown')}",
+                            order_id=t.get("order", "unknown"),
+                            side=exit_side,
+                            qty=t_amount,
+                            price=t_price,
+                            timestamp=datetime.now(timezone.utc),
+                            is_entry=False,
+                        )
+                        position.exit_fills.append(fill)
+                        fills_added += 1
+                        logger.info(
+                            "Backfilled exit fill from trade history",
+                            symbol=symbol,
+                            trade_id=t.get("id"),
+                            amount=str(t_amount),
+                            price=str(t_price),
+                        )
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch trade history for fill backfill",
+                    symbol=symbol,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+        
+        if fills_added > 0:
+            logger.info(
+                "Exit fills backfilled from exchange",
+                symbol=symbol,
+                fills_added=fills_added,
+                total_exit_fills=len(position.exit_fills),
+                avg_exit_price=str(position.avg_exit_price),
+            )
+            self.persistence.save_position(position)
+
     async def retry_unrecorded_trades(self) -> int:
         """
         Retry trade recording for closed positions that were never recorded.
@@ -1283,9 +1402,10 @@ class ExecutionGateway:
             return 0
         
         recorded = 0
+        terminal_states = (PositionState.CLOSED, PositionState.ORPHANED)
         candidates = [
             pos for pos in self.registry.get_closed_history(limit=200)
-            if pos.state == PositionState.CLOSED and not pos.trade_recorded
+            if pos.state in terminal_states and not pos.trade_recorded
         ]
         
         if not candidates:

@@ -1106,6 +1106,45 @@ class KrakenClient:
             logger.error("Failed to fetch account balance", error=str(e))
             raise classified from e
     
+    async def get_futures_fills(
+        self,
+        symbol: Optional[str] = None,
+        since: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch recent futures trade fills (my trades) from the exchange.
+        
+        Args:
+            symbol: Filter by symbol (e.g. "BTC/USD:USD"). None = all.
+            since: Timestamp in ms to fetch from. None = recent.
+            limit: Max number of trades to return.
+            
+        Returns:
+            List of trade dicts with id, order, symbol, side, amount, price, timestamp, fee, etc.
+        """
+        if not self.futures_exchange:
+            raise OperationalError("Futures exchange not initialized")
+        
+        await self.private_limiter.wait_for_token()
+        await self._api_breaker.can_execute()
+        
+        try:
+            trades = await self.futures_exchange.fetch_my_trades(
+                symbol=symbol,
+                since=since,
+                limit=limit,
+            )
+            await self._api_breaker.record_success()
+            logger.debug("Fetched futures fills", count=len(trades), symbol=symbol)
+            return trades
+        except Exception as e:
+            classified = self._classify_exception(e)
+            if isinstance(classified, OperationalError) and not isinstance(classified, CircuitOpenError):
+                await self._api_breaker.record_failure(e, is_rate_limit=isinstance(classified, RateLimitError))
+            logger.error("Failed to fetch futures fills", error=str(e), symbol=symbol)
+            raise classified from e
+
     async def place_spot_order(
         self,
         symbol: str,
