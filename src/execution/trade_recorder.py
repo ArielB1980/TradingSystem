@@ -108,7 +108,8 @@ def record_closed_trade(
         The persisted Trade, or None if already recorded / not eligible.
     """
     # ---- Guards ----
-    if position.state != PositionState.CLOSED:
+    terminal_states = (PositionState.CLOSED, PositionState.ORPHANED)
+    if position.state not in terminal_states:
         return None
     if position.trade_recorded:
         logger.debug(

@@ -1148,17 +1148,18 @@ class ExecutionGateway:
     
     async def _maybe_record_trade(self, position: ManagedPosition) -> None:
         """
-        Record a trade if the position is CLOSED and not yet recorded.
+        Record a trade if the position is terminal and not yet recorded.
         
         This is the SINGLE convergence point for all close paths.
         Called after persistence.save_position() in every code path
-        that can transition a position to CLOSED.
+        that can transition a position to CLOSED or ORPHANED.
         
         After successful recording:
         1. Sends POSITION_CLOSED Telegram notification
         2. Fires on_trade_recorded callback (for risk manager, etc.)
         """
-        if position.state != PositionState.CLOSED or position.trade_recorded:
+        terminal_states = (PositionState.CLOSED, PositionState.ORPHANED)
+        if position.state not in terminal_states or position.trade_recorded:
             return
         
         maker_rate, taker_rate = self._get_fee_rates()
@@ -1176,6 +1177,27 @@ class ExecutionGateway:
                 # (missing VWAP, zero qty, or duplicate). Persist the flag
                 # so the skip doesn't repeat on every restart.
                 self.persistence.save_position(position)
+                # Still send a notification for orphaned positions even
+                # without exact P&L (the exchange closed it, we know).
+                try:
+                    from src.monitoring.alerting import send_alert, fmt_price, fmt_size
+                    entry_str = f"${fmt_price(position.avg_entry_price)}" if position.avg_entry_price else "?"
+                    reason = position.exit_reason.value if position.exit_reason else position.state.value
+                    await send_alert(
+                        "POSITION_CLOSED",
+                        f"\u26a0\ufe0f Position closed (exchange): {position.symbol}\n"
+                        f"Side: {position.side.value.upper()}\n"
+                        f"Size: {fmt_size(position.filled_entry_qty)}\n"
+                        f"Entry: {entry_str}\n"
+                        f"P&L: unavailable (exit fill data missing)\n"
+                        f"Reason: {reason}",
+                        urgent=True,
+                    )
+                except Exception as alert_err:
+                    logger.warning(
+                        "Failed to send degraded POSITION_CLOSED alert",
+                        error=str(alert_err),
+                    )
                 return
             if trade:
                 self.metrics["trades_recorded_total"] += 1
@@ -1641,11 +1663,14 @@ class ExecutionGateway:
         if qty_synced_count > 0:
             logger.warning("Persisted quantity-synced positions", count=qty_synced_count)
         
-        # Record trades for any positions that reconciliation closed
+        # Record trades for any positions that reconciliation closed or orphaned
+        recordable_issues = ("STALE", "QTY_SYNCED", "ORPHANED")
         for symbol, issue in issues:
-            if "STALE" in issue or "QTY_SYNCED" in issue:
+            if any(tag in issue for tag in recordable_issues):
                 for closed_pos in self.registry._closed_positions:
-                    if closed_pos.symbol == symbol and closed_pos.state == PositionState.CLOSED:
+                    if closed_pos.symbol == symbol and closed_pos.state in (
+                        PositionState.CLOSED, PositionState.ORPHANED
+                    ):
                         await self._maybe_record_trade(closed_pos)
                         break
         
