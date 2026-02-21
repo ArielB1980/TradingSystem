@@ -239,6 +239,7 @@ class ManagedPosition:
     
     # ========== TRADE RECORDING ==========
     trade_recorded: bool = False  # Set True once trade_recorder persists this position's trade
+    trade_record_attempts: int = 0  # How many times recording was attempted (cap retries)
     
     # ========== METADATA ==========
     setup_type: Optional[str] = None
@@ -1005,6 +1006,7 @@ class ManagedPosition:
             ],
             "processed_event_hashes": list(self.processed_event_hashes),
             "trade_recorded": self.trade_recorded,
+            "trade_record_attempts": self.trade_record_attempts,
         }
     
     @classmethod
@@ -1066,6 +1068,7 @@ class ManagedPosition:
         
         pos.processed_event_hashes = set(data.get("processed_event_hashes", []))
         pos.trade_recorded = data.get("trade_recorded", False)
+        pos.trade_record_attempts = data.get("trade_record_attempts", 0)
         
         return pos
 

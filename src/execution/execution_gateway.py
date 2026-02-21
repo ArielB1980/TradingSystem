@@ -280,6 +280,7 @@ class ExecutionGateway:
     # Configurable thresholds for entry-time liquidity check
     ENTRY_MAX_SPREAD_PCT = Decimal("0.005")  # 0.5% max spread at entry time
     ENTRY_MIN_DEPTH_RATIO = Decimal("2.0")  # Order book depth must be 2x order size
+    PRICE_DRIFT_ALERT_PCT = Decimal("0.001")  # 0.1% threshold for SQLite vs Postgres entry price drift
     
     async def _check_entry_liquidity(
         self, 
@@ -1139,8 +1140,11 @@ class ExecutionGateway:
                 self._taker_fee_rate = Decimal(str(cfg.exchange.taker_fee_bps)) / Decimal("10000")
                 self._funding_rate_daily_bps = Decimal(str(cfg.exchange.funding_rate_daily_bps))
             except (ImportError, AttributeError, KeyError, ValueError, TypeError) as e:
-                # Conservative defaults if config can't be loaded
-                logger.warning("Fee rate config load failed, using defaults", error=str(e))
+                logger.warning(
+                    "Fee rate config load failed — using conservative defaults (maker=2bps, taker=5bps)",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
                 self._maker_fee_rate = Decimal("0.0002")   # 2 bps
                 self._taker_fee_rate = Decimal("0.0005")   # 5 bps
                 self._funding_rate_daily_bps = Decimal("10")
@@ -1164,6 +1168,29 @@ class ExecutionGateway:
         """
         terminal_states = (PositionState.CLOSED, PositionState.ORPHANED)
         if position.state not in terminal_states or position.trade_recorded:
+            return
+        
+        MAX_RECORD_ATTEMPTS = 10
+        position.trade_record_attempts += 1
+        if position.trade_record_attempts > MAX_RECORD_ATTEMPTS:
+            logger.critical(
+                "TRADE_RECORD_EXHAUSTED: giving up after max attempts",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                attempts=position.trade_record_attempts,
+            )
+            position.trade_recorded = True
+            try:
+                from src.monitoring.alerting import send_alert
+                await send_alert(
+                    "TRADE_RECORD_EXHAUSTED",
+                    f"Trade recording permanently failed for {position.symbol} "
+                    f"(position {position.position_id}) after {MAX_RECORD_ATTEMPTS} attempts. "
+                    f"Manual intervention required.",
+                    urgent=True,
+                )
+            except Exception:
+                pass
             return
         
         # If no exit fills, try to backfill from exchange before recording
@@ -1242,16 +1269,23 @@ class ExecutionGateway:
                 error=str(e),
             )
         except Exception as e:
-            # Catch-all: unexpected exceptions (TypeError, ValueError, etc.)
-            # during PnL/fee computation must NOT silently drop trade recording.
             self.metrics["trade_record_failures_total"] += 1
-            logger.error(
+            logger.critical(
                 "TRADE_RECORD_FAILURE_UNEXPECTED",
                 position_id=position.position_id,
                 symbol=position.symbol,
                 error=str(e),
                 error_type=type(e).__name__,
             )
+            try:
+                from src.monitoring.alerting import send_alert
+                await send_alert(
+                    "TRADE_RECORD_FAILURE",
+                    f"Failed to record trade for {position.symbol}: {type(e).__name__}: {e}",
+                    urgent=True,
+                )
+            except Exception:
+                pass
     
     async def _backfill_exit_fills(self, position: ManagedPosition) -> None:
         """
@@ -1712,8 +1746,13 @@ class ExecutionGateway:
                     created_at=datetime.now(timezone.utc),
                     metadata=kwargs,
                 ))
-            except Exception:
-                pass  # WAL failure must not block emergency order
+            except Exception as wal_err:
+                logger.warning(
+                    "WAL write failed for emergency order (proceeding without WAL)",
+                    client_oid=client_oid,
+                    reason=reason,
+                    error=str(wal_err),
+                )
     
     # ========== BATCH OPERATIONS ==========
     
@@ -1986,7 +2025,7 @@ class ExecutionGateway:
                 pg_ep = pg_pos.entry_price
                 if pg_ep > 0:
                     drift_pct = abs(sqlite_ep - pg_ep) / pg_ep
-                    if drift_pct > Decimal("0.001"):  # >0.1% drift
+                    if drift_pct > self.PRICE_DRIFT_ALERT_PCT:
                         logger.warning(
                             "DRIFT: SQLite vs Postgres entry price mismatch >0.1%",
                             symbol=pos.symbol,
@@ -2070,7 +2109,24 @@ class ExecutionGateway:
             
             side_str = pos.get("side", "long").lower()
             side = Side.LONG if side_str == "long" else Side.SHORT
-            entry_price = Decimal(str(pos.get("entryPrice", pos.get("entry_price", 0))))
+            raw_entry = pos.get("entryPrice", pos.get("entry_price", 0))
+            try:
+                entry_price = Decimal(str(raw_entry))
+            except (ValueError, TypeError, ArithmeticError) as parse_err:
+                logger.critical(
+                    "PHANTOM_IMPORT_SKIPPED: unparseable entry price",
+                    symbol=symbol,
+                    raw_entry=str(raw_entry),
+                    error=str(parse_err),
+                )
+                continue
+            if entry_price <= 0:
+                logger.critical(
+                    "PHANTOM_IMPORT_SKIPPED: zero/negative entry price",
+                    symbol=symbol,
+                    entry_price=str(entry_price),
+                )
+                continue
             qty = Decimal(str(size))
             
             # Find stop order
@@ -2099,13 +2155,17 @@ class ExecutionGateway:
                     stop_price = None
                 stop_id = stop_order.get("id")
             
-            # Calculate default stop if none found
+            PHANTOM_DEFAULT_STOP_PCT = Decimal("0.02")  # 2% emergency stop for imported positions with no stop on exchange
             if not stop_price or stop_price == 0:
-                pct = Decimal("0.02")
+                logger.warning(
+                    "PHANTOM_IMPORT: no stop order found on exchange — using default 2% emergency stop",
+                    symbol=symbol,
+                    entry_price=str(entry_price),
+                )
                 if side == Side.LONG:
-                    stop_price = entry_price * (1 - pct)
+                    stop_price = entry_price * (1 - PHANTOM_DEFAULT_STOP_PCT)
                 else:
-                    stop_price = entry_price * (1 + pct)
+                    stop_price = entry_price * (1 + PHANTOM_DEFAULT_STOP_PCT)
             
             # Create position
             pid = f"pos-{symbol.replace('/', '')}-import-{int(datetime.now().timestamp())}"
@@ -2149,7 +2209,24 @@ class ExecutionGateway:
                 imported += 1
                 logger.info("Phantom position imported", symbol=symbol, qty=str(qty), stop=str(stop_price))
             except (OperationalError, DataError, KeyError, ValueError) as e:
-                logger.error("Failed to import phantom position", symbol=symbol, error=str(e), error_type=type(e).__name__)
+                logger.critical(
+                    "PHANTOM_IMPORT_FAILED: exchange position not tracked — manual check required",
+                    symbol=symbol,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                try:
+                    from src.monitoring.alerting import send_alert
+                    import asyncio
+                    await send_alert(
+                        "PHANTOM_IMPORT_FAILED",
+                        f"Failed to import exchange position {symbol}: {e}\n"
+                        f"This position EXISTS on exchange but is NOT tracked by the bot. "
+                        f"Manual intervention required.",
+                        urgent=True,
+                    )
+                except Exception:
+                    pass
         
         if imported > 0:
             logger.info("Phantom positions imported", count=imported)

@@ -269,8 +269,8 @@ class TestForceClose:
         mock_save.assert_called_once()
 
     @patch("src.storage.repository.save_trade")
-    def test_force_close_no_exit_fills_still_marks_recorded(self, mock_save):
-        """Force-close with no exit fills can't compute VWAP — marks recorded to avoid retry."""
+    def test_force_close_no_exit_fills_leaves_unrecorded_for_retry(self, mock_save):
+        """Force-close with no exit fills can't compute VWAP — leaves unrecorded for backfill retry."""
         pos = _make_position()
         _add_entry_fill(pos)
         # No exit fills
@@ -279,7 +279,7 @@ class TestForceClose:
         trade = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
 
         assert trade is None  # Can't compute PnL
-        assert pos.trade_recorded is True  # But don't retry endlessly
+        assert pos.trade_recorded is False  # Stays False so backfill retry can succeed
         mock_save.assert_not_called()
 
 
@@ -550,5 +550,5 @@ class TestSkipNonEligible:
 
         result = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
         assert result is None
-        assert pos.trade_recorded is True  # Don't retry
+        assert pos.trade_recorded is False  # Stays False for backfill retry
         mock_save.assert_not_called()

@@ -496,8 +496,9 @@ class PositionPersistence:
                 rem_qty = pos.remaining_qty
             except Exception as inv_err:
                 logger.critical(
-                    "Corrupted position: remaining_qty invariant violated — force-closing",
+                    "CORRUPTED_POSITION: remaining_qty invariant violated — force-closing + alerting",
                     symbol=symbol,
+                    position_id=pos.position_id,
                     entry_qty=str(pos.filled_entry_qty),
                     exit_qty=str(pos.filled_exit_qty),
                     error=str(inv_err),
@@ -507,6 +508,18 @@ class PositionPersistence:
                     pos.exit_reason = ExitReason.RECONCILIATION
                 registry._closed_positions.append(pos)
                 corrupted_symbols.append(symbol)
+                try:
+                    from src.monitoring.alerting import send_alert
+                    import asyncio
+                    asyncio.get_event_loop().create_task(send_alert(
+                        "CORRUPTED_POSITION",
+                        f"Position {symbol} ({pos.position_id}) had negative remaining_qty "
+                        f"(entry={pos.filled_entry_qty}, exit={pos.filled_exit_qty}). "
+                        f"Force-closed during startup. Investigate data inconsistency.",
+                        urgent=True,
+                    ))
+                except Exception:
+                    pass
                 continue
             if rem_qty <= qty_epsilon:
                 old_state = pos.state

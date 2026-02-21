@@ -613,8 +613,13 @@ class Executor:
                     if instrument_spec_registry:
                         try:
                             venue_min_size = instrument_spec_registry.get_effective_min_size(symbol)
-                        except (DataError, KeyError, ValueError, AttributeError):
-                            venue_min_size = Decimal("0.001")
+                        except (DataError, KeyError, ValueError, AttributeError) as spec_err:
+                            logger.warning(
+                                "Could not fetch venue min_size — skipping TP placement for safety",
+                                symbol=symbol,
+                                error=str(spec_err),
+                            )
+                            return (updated_sl_id, [])
                     # Unsplittable position: if no TP quantity meets venue minimum, skip TPs entirely
                     placeable = [q for q in qtys if q.quantize(step, rounding=ROUND_DOWN) >= venue_min_size]
                     if not placeable and venue_min_size > 0:
