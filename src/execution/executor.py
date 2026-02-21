@@ -519,7 +519,8 @@ class Executor:
             sl_notional = Decimal("0")
 
         updated_sl_id = current_sl_id
-        if new_sl_price and sl_notional > 0:
+        has_contracts = position_size_contracts is not None and position_size_contracts > 0
+        if new_sl_price and (sl_notional > 0 or has_contracts):
             if current_sl_id:
                 try:
                     await self.futures_adapter.cancel_order(current_sl_id, symbol)
@@ -532,15 +533,15 @@ class Executor:
                         error_type=type(e).__name__,
                     )
             try:
-                sl_size = sl_notional
                 sl_order = await self.futures_adapter.place_order(
                     symbol=symbol,
                     side=protective_side,
-                    size_notional=sl_size,
+                    size_notional=sl_notional if not has_contracts else Decimal("0"),
                     leverage=Decimal("1"),
                     order_type=OrderType.STOP_LOSS,
                     price=new_sl_price,
-                    reduce_only=True
+                    reduce_only=True,
+                    size_contracts_override=position_size_contracts if has_contracts else None,
                 )
                 updated_sl_id = sl_order.order_id
                 logger.info("SL updated", symbol=symbol, old_id=current_sl_id, new_id=updated_sl_id, price=str(new_sl_price))
@@ -609,12 +610,23 @@ class Executor:
                         if qtys[-1] <= 0:
                             qtys.pop()
                             tp_prices_to_use = tp_prices_to_use[: len(qtys)]
-                    # Invariant: only place TP if tp_qty >= venue_min_size (avoid dust/reject loops)
                     if instrument_spec_registry:
                         try:
                             venue_min_size = instrument_spec_registry.get_effective_min_size(symbol)
                         except (DataError, KeyError, ValueError, AttributeError):
                             venue_min_size = Decimal("0.001")
+                    # Unsplittable position: if no TP quantity meets venue minimum, skip TPs entirely
+                    placeable = [q for q in qtys if q.quantize(step, rounding=ROUND_DOWN) >= venue_min_size]
+                    if not placeable and venue_min_size > 0:
+                        logger.info(
+                            "Position too small for multi-TP split, placing SL only",
+                            symbol=symbol,
+                            position_contracts=str(position_size_contracts),
+                            venue_min_size=str(venue_min_size),
+                            size_step=str(step),
+                            computed_qtys=[str(q) for q in qtys],
+                        )
+                        return (updated_sl_id, [])
                 else:
                     # Legacy path: notional-based, no venue min filter. Backfill should use contract path (position_size_contracts + multi_tp_config) to get min-size and step semantics.
                     tp_splits = getattr(self.config, "tp_splits", [Decimal("0.35"), Decimal("0.35"), Decimal("0.30")])
@@ -625,15 +637,15 @@ class Executor:
                         qtys.append(base_size * split_pct)
                     tp_prices_to_use = new_tp_prices
 
+                use_contract_path = position_size_contracts is not None and multi_tp_config
                 for i, tp_price in enumerate(tp_prices_to_use):
                     if i >= len(qtys):
                         break
                     qty_or_notional = qtys[i]
-                    if position_size_contracts is not None and multi_tp_config:
-                        # Quantize to venue step before min check (avoid passing min but failing step at venue)
+                    tp_contracts_override = None
+                    if use_contract_path:
                         qty_or_notional = (qty_or_notional.quantize(step, rounding=ROUND_DOWN) if step > 0 else qty_or_notional)
                         if qty_or_notional < venue_min_size:
-                            # Skip this TP; we do not roll this qty into the next TP (explicit: bias toward larger runner).
                             logger.debug(
                                 "Skipping TP below venue min",
                                 symbol=symbol,
@@ -642,6 +654,7 @@ class Executor:
                                 venue_min_size=str(venue_min_size),
                             )
                             continue
+                        tp_contracts_override = qty_or_notional
                         tp_notional = qty_or_notional * tp_price
                     else:
                         tp_notional = qty_or_notional
@@ -655,7 +668,8 @@ class Executor:
                             leverage=Decimal("1"),
                             order_type=OrderType.TAKE_PROFIT,
                             price=tp_price,
-                            reduce_only=True
+                            reduce_only=True,
+                            size_contracts_override=tp_contracts_override,
                         )
                         new_tp_ids.append(tp_order.order_id)
                         logger.info(

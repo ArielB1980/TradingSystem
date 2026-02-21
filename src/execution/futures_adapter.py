@@ -238,16 +238,21 @@ class FuturesAdapter:
         reduce_only: bool = False,
         *,
         mark_price: Optional[Decimal] = None,
+        size_contracts_override: Optional[Decimal] = None,
     ) -> Order:
         """
         Place order on Kraken Futures.
 
         mark_price: If provided, used for contract sizing when order is market and price is missing (avoids wrong size from fallback).
+        size_contracts_override: If provided, skip notional→contract conversion entirely.
+            The value is used as-is (still validated against min_size and size_step).
+            Eliminates precision loss from notional round-trips for reduce-only orders
+            where the exact contract count is already known.
         
         Args:
             symbol: Futures symbol (e.g., "PF_XBTUSD" on Kraken)
             side: Order side (LONG/SHORT)
-            size_notional: Position size in USD notional
+            size_notional: Position size in USD notional (ignored when size_contracts_override set)
             leverage: Leverage to use (capped at max_leverage)
             order_type: Order type
             price: Limit price (required for limit orders)
@@ -308,7 +313,47 @@ class FuturesAdapter:
         effective_leverage: Optional[Decimal]
         contract_size = Decimal("1")
         
-        if self.instrument_spec_registry:
+        # Direct contract sizing: skip notional→contract conversion entirely
+        if size_contracts_override is not None and size_contracts_override > 0:
+            size_contracts = size_contracts_override
+            effective_leverage = leverage
+            if self.instrument_spec_registry:
+                await self.instrument_spec_registry.refresh()
+                spec = self.instrument_spec_registry.get_spec(symbol)
+                if spec:
+                    contract_size = spec.contract_size
+                    # Still validate step alignment and min size
+                    size_contracts, align_reason = ensure_size_step_aligned(
+                        spec, size_contracts, reduce_only=reduce_only
+                    )
+                    if align_reason:
+                        logger.warning(
+                            "AUCTION_OPEN_REJECTED",
+                            symbol=symbol,
+                            reason=align_reason,
+                            spec_summary={"min_size": str(spec.min_size), "size_step": str(spec.size_step)},
+                        )
+                        raise ValueError(f"Size step alignment failed: {align_reason}")
+                    effective_min = self.instrument_spec_registry.get_effective_min_size(symbol)
+                    if effective_min and size_contracts < effective_min:
+                        logger.warning(
+                            "AUCTION_OPEN_REJECTED",
+                            symbol=symbol,
+                            reason="SIZE_BELOW_MIN",
+                            spec_summary={"min_size": str(effective_min), "size_contracts": str(size_contracts)},
+                        )
+                        raise ValueError(f"Size {size_contracts} below minimum {effective_min} for {symbol}")
+                    effective_lev, lev_reason = resolve_leverage(spec, max(1, int(leverage)))
+                    if lev_reason:
+                        raise ValueError(f"Leverage rejected: {lev_reason}")
+                    effective_leverage = Decimal(str(effective_lev)) if effective_lev is not None else None
+            logger.info(
+                "Using direct contract size (no notional conversion)",
+                symbol=symbol,
+                contracts=float(size_contracts),
+                reduce_only=reduce_only,
+            )
+        elif self.instrument_spec_registry:
             await self.instrument_spec_registry.refresh()
             spec = self.instrument_spec_registry.get_spec(symbol)
             if not spec:
