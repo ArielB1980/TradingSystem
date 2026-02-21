@@ -22,7 +22,6 @@ PRODUCTION_ENTRYPOINTS = [
     "src.entrypoints.prod_live",
     "src.health",
     "src.cli",
-    "src.dashboard.static_dashboard",
 ]
 
 

@@ -168,17 +168,6 @@ def get_worker_health_app(enable_debug: bool = False) -> FastAPI:
         body, status = _metrics_prometheus()
         return PlainTextResponse(body, status_code=status)
 
-    @w.get("/dashboard")
-    async def dashboard_info():
-        """Dashboard is served separately by static_dashboard.py."""
-        return JSONResponse(
-            content={
-                "message": "Dashboard is served by static_dashboard.py on its own port.",
-                "detail": "Run: python -m src.dashboard.static_dashboard",
-            },
-            status_code=200,
-        )
-
     return w
 
 
@@ -282,17 +271,6 @@ async def metrics_prometheus():
     body, status = _metrics_prometheus()
     return PlainTextResponse(body, status_code=status)
 
-
-@app.get("/api/dashboard")
-async def dashboard_routing_debug():
-    """Dashboard is served by static_dashboard.py on its own port."""
-    return JSONResponse(
-        status_code=200,
-        content={
-            "message": "Dashboard is served by static_dashboard.py on its own port.",
-            "detail": "Run: python -m src.dashboard.static_dashboard",
-        }
-    )
 
 
 @app.get("/api/quick-test")

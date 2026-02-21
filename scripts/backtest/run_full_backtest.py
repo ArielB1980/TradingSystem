@@ -106,27 +106,34 @@ async def run_full_backtest():
     all_trade_pnls = []
     coin_performance = []
     
+    starting_equity = Decimal(str(config.backtest.initial_capital)) if hasattr(config.backtest, 'initial_capital') else Decimal("10000")
+    
     for result in successful:
         metrics = result['metrics']
         total_trades += metrics.total_trades
         winning_trades += metrics.winning_trades
         losing_trades += metrics.losing_trades
-        total_pnl += metrics.net_pnl
+        net_pnl = metrics.total_pnl - metrics.total_fees
+        total_pnl += net_pnl
         
-        # Track per-coin performance
+        return_pct = float(net_pnl / starting_equity * 100) if starting_equity > 0 else 0.0
+        
         coin_performance.append({
             'symbol': result['symbol'],
             'tier': tier_map.get(result['symbol'], 'Unknown'),
             'trades': metrics.total_trades,
-            'pnl': float(metrics.net_pnl),
+            'pnl': float(net_pnl),
             'win_rate': metrics.win_rate if metrics.total_trades > 0 else 0,
-            'return_pct': float(metrics.total_return_pct)
+            'return_pct': return_pct,
+            'runner_exits': getattr(metrics, 'runner_exits', 0),
+            'runner_avg_r': getattr(metrics, 'runner_avg_r', 0.0),
+            'runner_exits_beyond_3r': getattr(metrics, 'runner_exits_beyond_3r', 0),
+            'runner_max_r': getattr(metrics, 'runner_max_r', 0.0),
+            'max_drawdown': float(metrics.max_drawdown),
         })
         
-        # Collect all trade PnLs for statistics
-        # Note: BacktestMetrics doesn't store individual trades, so we approximate
         if metrics.total_trades > 0:
-            avg_pnl = metrics.net_pnl / metrics.total_trades
+            avg_pnl = net_pnl / metrics.total_trades
             all_trade_pnls.extend([float(avg_pnl)] * metrics.total_trades)
     
     # Sort by PnL
@@ -191,6 +198,24 @@ async def run_full_backtest():
         avg_pnl = stats['pnl'] / stats['coins'] if stats['coins'] > 0 else 0
         print(f"Tier {tier}: {stats['coins']:>3} coins, {stats['trades']:>5} trades, "
               f"${stats['pnl']:>12,.2f} total, ${avg_pnl:>10,.2f} avg/coin")
+    
+    # Runner mode metrics
+    total_runner_exits = sum(c.get('runner_exits', 0) for c in coin_performance)
+    total_beyond_3r = sum(c.get('runner_exits_beyond_3r', 0) for c in coin_performance)
+    runner_avg_rs = [c['runner_avg_r'] for c in coin_performance if c.get('runner_exits', 0) > 0]
+    runner_max_rs = [c['runner_max_r'] for c in coin_performance if c.get('runner_max_r', 0) > 0]
+    max_dd = max((c.get('max_drawdown', 0) for c in coin_performance), default=0)
+    
+    print(f"\n" + "-"*80)
+    print("RUNNER MODE METRICS")
+    print("-"*80)
+    print(f"Runner exits: {total_runner_exits}")
+    print(f"Runner exits beyond 3R: {total_beyond_3r}")
+    if runner_avg_rs:
+        print(f"Average runner R-multiple: {sum(runner_avg_rs)/len(runner_avg_rs):.2f}")
+    if runner_max_rs:
+        print(f"Best single runner: {max(runner_max_rs):.2f}R")
+    print(f"Max drawdown (worst coin): {max_dd:.2f}%")
     
     print("\n" + "="*80)
     

@@ -202,6 +202,7 @@ class LiveTrading:
                 max_margin_util=config.risk.auction_max_margin_util,
                 max_per_cluster=config.risk.auction_max_per_cluster,
                 max_per_symbol=config.risk.auction_max_per_symbol,
+                direction_concentration_penalty=config.risk.auction_direction_concentration_penalty,
             )
             self.auction_allocator = AuctionAllocator(
                 limits=limits,
@@ -567,6 +568,15 @@ class LiveTrading:
             except (ValueError, TypeError, RuntimeError) as e:
                 logger.error("Failed to start spot DCA task", error=str(e), error_type=type(e).__name__)
 
+            # 2.6c.3 WebSocket candle feed (real-time 15m OHLC from Kraken)
+            try:
+                self._ws_candle_task = asyncio.create_task(
+                    self._run_ws_candle_feed()
+                )
+                logger.info("WebSocket candle feed task started")
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start WS candle feed task", error=str(e), error_type=type(e).__name__)
+
             # 2.6d Runtime regression monitors (trade starvation + winner churn)
             try:
                 self._starvation_monitor_task = asyncio.create_task(
@@ -885,6 +895,14 @@ class LiveTrading:
                     await self._spot_dca_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_ws_candle_feed", None):
+                await self._ws_candle_feed.stop()
+            if getattr(self, "_ws_candle_task", None) and not self._ws_candle_task.done():
+                self._ws_candle_task.cancel()
+                try:
+                    await self._ws_candle_task
+                except asyncio.CancelledError:
+                    pass
             if getattr(self, "_telegram_cmd_task", None) and not self._telegram_cmd_task.done():
                 if getattr(self, "_telegram_handler", None):
                     self._telegram_handler.stop()
@@ -941,6 +959,22 @@ class LiveTrading:
         """Daily spot DCA purchase -- delegates to spot_dca module."""
         from src.live.spot_dca import run_spot_dca
         await run_spot_dca(self)
+
+    async def _run_ws_candle_feed(self) -> None:
+        """Stream 15m OHLC candles from Kraken WebSocket v2 into CandleManager."""
+        from src.data.ws_candle_feed import KrakenCandleFeed
+        symbols = self._market_symbols()
+        if not symbols:
+            logger.warning("No symbols for WS candle feed -- skipping")
+            return
+        self._ws_candle_feed = KrakenCandleFeed(
+            candle_manager=self.candle_manager,
+            symbols=symbols,
+            interval=15,
+            max_retries=self.config.data.ws_reconnect_max_retries,
+            backoff_base=self.config.data.ws_reconnect_backoff_seconds,
+        )
+        await self._ws_candle_feed.run()
 
     async def _run_trade_starvation_monitor(self, interval_seconds: int = 300) -> None:
         """Trade starvation sentinel -- delegates to health_monitor module."""

@@ -61,6 +61,7 @@ class PortfolioLimits:
     max_per_symbol: int = 1  # One position per symbol
     max_net_long: Optional[Decimal] = None  # Optional net exposure cap
     max_net_short: Optional[Decimal] = None
+    direction_concentration_penalty: float = 10.0  # Score penalty at maximum directional imbalance
 
 
 @dataclass
@@ -404,41 +405,56 @@ class AuctionAllocator:
         
         return value
     
+    def _direction_penalty(self, direction: Side, long_count: int, short_count: int) -> float:
+        """Compute directional concentration penalty for a candidate.
+        
+        Returns a score penalty that increases as the portfolio becomes more
+        directionally imbalanced. Zero penalty at 50/50 balance, max penalty
+        when 100% of positions are on the same side as this candidate.
+        """
+        total = long_count + short_count
+        if total == 0:
+            return 0.0
+        same_side = long_count if direction == Side.LONG else short_count
+        imbalance_ratio = same_side / total  # 1.0 = all same direction
+        # Scale: 0 penalty at 50% or below, linearly up to max at 100%
+        penalty = self.limits.direction_concentration_penalty * max(0.0, imbalance_ratio - 0.5) * 2
+        return penalty
+
     def _select_winners(
         self,
         contenders: List[Contender],
         portfolio_state: Dict[str, any],
     ) -> List[Contender]:
         """
-        Select winners under constraints.
+        Select winners under constraints with dynamic directional penalty.
         
         Iterate sorted list and add to winners if:
         - len(WINNERS) < MAX_POSITIONS
         - Adding keeps within margin cap, per-cluster/per-symbol caps, exposure caps
+        
+        Directional concentration penalty is applied dynamically: as the
+        winner set becomes more imbalanced, same-direction candidates need
+        increasingly higher base scores to be selected.
         """
         winners = []
         margin_used = Decimal("0")
         cluster_counts: Dict[str, int] = {}
         symbol_counts: Dict[str, int] = {}
-        net_long = Decimal("0")
-        net_short = Decimal("0")
+        long_count = 0
+        short_count = 0
         available_margin = Decimal(str(portfolio_state.get("available_margin", 0)))
         max_margin = available_margin * Decimal(str(self.limits.max_margin_util))
         
         for contender in contenders:
-            # Check position limit
             if len(winners) >= self.limits.max_positions:
                 break
             
-            # Check margin limit
             if margin_used + contender.required_margin > max_margin:
                 continue
             
-            # Check symbol cap (normalize symbols for matching spot vs futures)
-            # Candidates use spot symbols (e.g., "PROMPT/USD"), positions use futures (e.g., "PF_PROMPTUSD")
             contender_normalized = _normalize_symbol_for_matching(contender.symbol)
             
-            # Check if any existing winner has the same normalized symbol
             existing_count = 0
             for winner in winners:
                 winner_normalized = _normalize_symbol_for_matching(winner.symbol)
@@ -448,34 +464,61 @@ class AuctionAllocator:
             if existing_count >= self.limits.max_per_symbol:
                 continue
             
-            # Check cluster cap
             cluster_count = cluster_counts.get(contender.cluster, 0)
             if cluster_count >= self.limits.max_per_cluster:
-                # Apply concentration penalty (soft reject)
-                # For now, hard reject if at cap
                 continue
             
-            # Check net exposure caps (if configured)
+            # Net exposure caps
             if self.limits.max_net_long is not None:
                 if contender.direction == Side.LONG:
-                    if net_long + contender.required_margin > self.limits.max_net_long:
+                    net_long_margin = sum(
+                        w.required_margin for w in winners if w.direction == Side.LONG
+                    )
+                    if net_long_margin + contender.required_margin > self.limits.max_net_long:
                         continue
             if self.limits.max_net_short is not None:
                 if contender.direction == Side.SHORT:
-                    if net_short + contender.required_margin > self.limits.max_net_short:
+                    net_short_margin = sum(
+                        w.required_margin for w in winners if w.direction == Side.SHORT
+                    )
+                    if net_short_margin + contender.required_margin > self.limits.max_net_short:
                         continue
             
-            # All checks passed - add to winners
+            # Dynamic directional concentration penalty
+            dir_penalty = self._direction_penalty(contender.direction, long_count, short_count)
+            adjusted_value = contender.value - dir_penalty
+            
+            # Reject if penalty pushes value negative (not worth the concentration risk)
+            if adjusted_value < 0 and not contender.locked:
+                logger.debug(
+                    "Contender rejected by directional penalty",
+                    symbol=contender.symbol,
+                    direction=contender.direction.value,
+                    base_value=f"{contender.value:.1f}",
+                    penalty=f"{dir_penalty:.1f}",
+                    long_count=long_count,
+                    short_count=short_count,
+                )
+                continue
+            
             winners.append(contender)
             margin_used += contender.required_margin
             cluster_counts[contender.cluster] = cluster_count + 1
-            # Track by normalized symbol for proper matching
             symbol_counts[contender_normalized] = symbol_counts.get(contender_normalized, 0) + 1
             
             if contender.direction == Side.LONG:
-                net_long += contender.required_margin
+                long_count += 1
             else:
-                net_short += contender.required_margin
+                short_count += 1
+        
+        if long_count + short_count > 0:
+            logger.info(
+                "Auction directional balance",
+                long_count=long_count,
+                short_count=short_count,
+                imbalance_ratio=f"{max(long_count, short_count) / (long_count + short_count):.1%}",
+                max_penalty=f"{self.limits.direction_concentration_penalty:.1f}",
+            )
         
         return winners
     

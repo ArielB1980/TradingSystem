@@ -92,8 +92,12 @@ async def run_quick_backtest():
             print(f"  Total Trades: {m.total_trades}")
             print(f"  Win Rate: {m.win_rate:.1f}%")
             print(f"  Total PnL: ${float(m.total_pnl):,.2f}")
+            print(f"  Fees: ${float(m.total_fees):,.2f}")
             return_pct = float(m.total_pnl / Decimal("10000") * 100) if m.total_pnl else 0
             print(f"  Total Return: {return_pct:.2f}%")
+            if getattr(m, 'runner_exits', 0) > 0:
+                print(f"  Runner exits: {m.runner_exits} (beyond 3R: {m.runner_exits_beyond_3r})")
+                print(f"  Runner avg R: {m.runner_avg_r:.2f}, best: {m.runner_max_r:.2f}R")
         else:
             print(f"  FAILED: {result['error']}")
     

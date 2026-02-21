@@ -105,9 +105,23 @@ def backtest(
             typer.echo(f"Start Equity:  ${config.backtest.starting_equity:,.2f}")
             typer.echo(f"End Equity:    ${end_equity:,.2f}")
             typer.echo(f"PnL:           ${metrics.total_pnl:,.2f} ({total_return_pct:.2f}%)")
+            typer.echo(f"Fees:          ${metrics.total_fees:,.2f}")
+            typer.echo(f"Net PnL:       ${metrics.total_pnl - metrics.total_fees:,.2f}")
             typer.echo(f"Max Drawdown:  {metrics.max_drawdown:.2%}")
             typer.echo(f"Trades:        {metrics.total_trades} ({metrics.winning_trades}W-{metrics.losing_trades}L)")
             typer.echo(f"Win Rate:      {metrics.win_rate:.1f}%")
+            if getattr(metrics, 'profit_factor', 0) > 0:
+                typer.echo(f"Profit Factor: {metrics.profit_factor:.2f}")
+            
+            if getattr(metrics, 'runner_exits', 0) > 0:
+                typer.echo("-"*60)
+                typer.echo("RUNNER METRICS")
+                typer.echo(f"TP1 fills:     {metrics.tp1_fills}")
+                typer.echo(f"TP2 fills:     {metrics.tp2_fills}")
+                typer.echo(f"Runner exits:  {metrics.runner_exits}")
+                typer.echo(f"Runner avg R:  {metrics.runner_avg_r:.2f}")
+                typer.echo(f"Beyond 3R:     {metrics.runner_exits_beyond_3r}")
+                typer.echo(f"Best runner:   {metrics.runner_max_r:.2f}R")
             typer.echo("="*60 + "\n")
             
         finally:
@@ -498,33 +512,6 @@ def kill_switch_cmd(
         console.print("Valid actions: activate, deactivate, status")
         raise typer.Exit(1)
 
-
-@app.command()
-def dashboard(
-    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
-    port: int = typer.Option(8000, "--port", help="Port to bind to"),
-):
-    """
-    Launch the static HTML Web Dashboard.
-    
-    Example:
-        python src/cli.py dashboard
-    """
-    import subprocess
-    import sys
-    import webbrowser
-    
-    url = f"http://{host}:{port}"
-    typer.secho(f"Dashboard running at: {url}", fg=typer.colors.GREEN, bold=True)
-    
-    # Auto-open browser (use localhost for browser even if binding to 0.0.0.0)
-    browser_url = url.replace("0.0.0.0", "127.0.0.1")
-    webbrowser.open(browser_url)
-    
-    # Run static dashboard
-    subprocess.run([
-        sys.executable, "-m", "src.dashboard.static_dashboard",
-    ])
 
 
 @app.command()

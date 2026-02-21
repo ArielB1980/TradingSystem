@@ -120,6 +120,8 @@ class RiskConfig(BaseSettings):
     auction_partial_close_cooldown_seconds: int = Field(default=0, ge=0, le=300)
     auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
+    auction_direction_concentration_penalty: float = Field(default=10.0, ge=0.0, le=50.0, description="Score penalty at max directional imbalance (all positions same side)")
+
     # Target margin utilisation band: when below target_min, boost notional (bounded) to deploy more capital.
     # Only applied when sizing_method is leverage_based (risk sanity: stop-distance-based sizing would violate risk-per-trade if we boosted).
     target_margin_util_min: float = Field(default=0.70, ge=0.50, le=0.90, description="Below this, utilisation boost may scale notional up (clamped to single/aggregate caps)")

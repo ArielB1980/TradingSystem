@@ -78,6 +78,7 @@ risk:
   auction_max_closes_per_cycle: 5  # Maximum closes per cycle
   auction_entry_cost: 2.0  # Entry cost penalty in score points
   auction_exit_cost: 2.0  # Exit cost penalty in score points
+  auction_direction_concentration_penalty: 10.0  # Score penalty at max directional imbalance (all positions same side)
   target_margin_util_min: 0.70  # Below this, utilisation boost may scale notional (clamped to caps)
   utilisation_boost_max_factor: 2.0  # Max factor when under target (e.g. 2.0 = double)
   

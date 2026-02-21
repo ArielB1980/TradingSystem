@@ -130,6 +130,35 @@ class CandleManager:
         """Get cached candles."""
         return self.candles.get(timeframe, {}).get(symbol, [])
 
+    def receive_ws_candle(self, symbol: str, timeframe: str, candle: Candle) -> None:
+        """Ingest a single candle from the WebSocket feed.
+
+        If the candle's timestamp matches the latest cached bar, the bar is
+        *updated* in place (WS sends progressive updates for the current bar).
+        If it's newer, it's appended.  Older candles are ignored.
+
+        Does **not** enqueue into ``pending_candles`` -- persistence is handled
+        by the REST-based ``flush_pending`` path to avoid duplicate DB writes.
+        """
+        if timeframe not in self.candles:
+            return
+
+        buf = self.candles[timeframe]
+        existing = buf.get(symbol)
+
+        if not existing:
+            buf[symbol] = [candle]
+            return
+
+        last = existing[-1]
+        if candle.timestamp == last.timestamp:
+            existing[-1] = candle  # update current bar in place
+        elif candle.timestamp > last.timestamp:
+            existing.append(candle)
+            if len(existing) > 2000:
+                buf[symbol] = existing[-2000:]
+        # else: older than latest -- ignore
+
     def get_futures_fallback_count(self) -> int:
         """Return number of symbols that used futures OHLCV since last pop (no clear)."""
         return len(self._futures_fallback_symbols)
