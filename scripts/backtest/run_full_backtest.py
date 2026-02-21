@@ -55,18 +55,15 @@ async def run_full_backtest():
     print(f"Period: {start_date.date()} to {end_date.date()}")
     print(f"Max Concurrent Positions: {config.risk.max_concurrent_positions}")
     
-    # Get all coins from config
-    all_coins = []
+    # Get all coins from config (uses candidate_symbols or falls back to liquidity_tiers)
+    all_coins = config.coin_universe.get_all_candidates()
     tier_map = {}
-    for tier, coins in config.coin_universe.liquidity_tiers.items():
-        all_coins.extend(coins)
-        for coin in coins:
-            tier_map[coin] = tier
+    if config.coin_universe.liquidity_tiers:
+        for tier, coins in config.coin_universe.liquidity_tiers.items():
+            for coin in coins:
+                tier_map[coin] = tier
     
     print(f"Total Coins: {len(all_coins)}")
-    print(f"Tiers: A={len(config.coin_universe.liquidity_tiers['A'])}, "
-          f"B={len(config.coin_universe.liquidity_tiers['B'])}, "
-          f"C={len(config.coin_universe.liquidity_tiers['C'])}")
     print("\nRunning backtests (this will take several minutes)...")
     print("-"*80)
     
