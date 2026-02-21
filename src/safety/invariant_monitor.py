@@ -147,7 +147,7 @@ class SystemInvariants:
     max_margin_utilization_pct: Decimal = Decimal("0.92")  # 92%
     
     # Maximum single position as % of equity
-    max_single_position_pct_equity: Decimal = Decimal("0.25")  # 25%
+    max_single_position_pct_equity: Decimal = Decimal("0.35")  # 35%
     
     # ===== OPERATIONAL =====
     # Maximum rejected orders per cycle (indicates execution issues)

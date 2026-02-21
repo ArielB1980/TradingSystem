@@ -336,14 +336,21 @@ class ManagedPosition:
     
     @property
     def avg_entry_price(self) -> Optional[Decimal]:
-        """Volume-weighted average entry price."""
+        """Volume-weighted average entry price.
+        
+        Falls back to initial_entry_price when fills have zero prices
+        (common for orphaned/imported positions with synthetic fills).
+        """
         if not self.entry_fills:
-            return None
+            return self.initial_entry_price if self.initial_entry_price and self.initial_entry_price > 0 else None
         total_value = sum(f.qty * f.price for f in self.entry_fills)
         total_qty = self.filled_entry_qty
         if total_qty == 0:
-            return None
-        return total_value / total_qty
+            return self.initial_entry_price if self.initial_entry_price and self.initial_entry_price > 0 else None
+        vwap = total_value / total_qty
+        if vwap == 0 and self.initial_entry_price and self.initial_entry_price > 0:
+            return self.initial_entry_price
+        return vwap
     
     @property
     def avg_exit_price(self) -> Optional[Decimal]:
