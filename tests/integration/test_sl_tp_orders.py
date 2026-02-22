@@ -26,6 +26,8 @@ from typing import Optional, Dict, Any
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+pytestmark = pytest.mark.server
+
 from src.data.kraken_client import KrakenClient
 from src.domain.models import Side, OrderType
 

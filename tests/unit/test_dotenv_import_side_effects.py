@@ -12,7 +12,7 @@ def test_config_import_has_no_dotenv_side_effects():
     We enforce this by injecting a fake `dotenv` module whose `load_dotenv` would abort
     the process if called.
     """
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parent.parent.parent
 
     code = textwrap.dedent(
         """

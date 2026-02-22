@@ -19,6 +19,8 @@ from typing import List, Dict
 
 from sqlalchemy import create_engine, text
 
+pytestmark = pytest.mark.server
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

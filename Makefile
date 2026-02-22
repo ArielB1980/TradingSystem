@@ -3,8 +3,12 @@
 SHELL := /bin/bash
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
+DEPLOY_SERVER ?= root@207.154.193.121
+DEPLOY_SSH_KEY ?= $(HOME)/.ssh/trading_droplet
+DEPLOY_TRADING_USER ?= trading
+DEPLOY_TRADING_DIR ?= /home/trading/TradingSystem
 
-.PHONY: help venv install run smoke logs smoke-logs test lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full replay replay-episode replay-sweep audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals safety-reset safety-reset-soft safety-reset-hard clean clean-logs status validate
+.PHONY: help venv install run smoke logs smoke-logs test test-server lint format integration pre-deploy deploy deploy-quick deploy-live backfill backtest-quick backtest-full replay replay-episode replay-sweep audit audit-cancel audit-orphaned place-missing-stops place-missing-stops-live cancel-all-place-stops cancel-all-place-stops-live list-needing-protection check-signals safety-reset safety-reset-soft safety-reset-hard clean clean-logs status validate
 
 help:
 	@echo "Available commands:"
@@ -321,8 +325,14 @@ safety-reset-hard:
 	$(PYTHON) -m src.tools.safety_reset --mode hard --reset-peak-to-current --i-understand
 
 test:
-	@echo "Running unit tests..."
-	$(PYTHON) -m pytest tests/ -v
+	@echo "Running unit tests (server-dependent tests skipped)..."
+	$(PYTHON) -m pytest tests/ -v --tb=short
+
+test-server:
+	@echo "Running server-only tests (DB + exchange API)..."
+	ssh -i $(DEPLOY_SSH_KEY) $(DEPLOY_SERVER) "cd $(DEPLOY_TRADING_DIR) && \
+		sudo -u $(DEPLOY_TRADING_USER) bash -c 'set -a; source .env; set +a; \
+		venv/bin/python -m pytest tests/ -m server -v --tb=short -q' 2>&1"
 
 lint:
 	@echo "Running ruff linter..."

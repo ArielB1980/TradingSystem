@@ -145,10 +145,13 @@ class TestMinNotionalDynamicSizing:
             available_margin=Decimal("90"),
         )
 
-        # Notional should be capped by buying_power and equity % cap
-        max_from_equity = Decimal("90") * Decimal("0.25")  # $22.50
-        assert decision.position_notional <= max_from_equity + Decimal("1"), (
-            f"Notional {decision.position_notional} exceeds 25% equity cap ({max_from_equity})"
+        # Margin should be capped by max_single_position_margin_pct_equity (25%)
+        # With 5x leverage: max margin = $90 * 0.25 = $22.50 -> max notional = $22.50 * 5 = $112.50
+        max_margin = Decimal("90") * Decimal("0.25")
+        target_lev = Decimal("5")
+        max_notional_from_margin_cap = max_margin * target_lev
+        assert decision.position_notional <= max_notional_from_margin_cap + Decimal("1"), (
+            f"Notional {decision.position_notional} exceeds margin-derived cap ({max_notional_from_margin_cap})"
         )
 
 

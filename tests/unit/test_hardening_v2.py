@@ -41,6 +41,13 @@ class MockKillSwitch:
         self.emergency = emergency
         self.reason = reason
 
+    def is_active(self):
+        return self.activated
+
+    def acknowledge(self):
+        self.activated = False
+        self.reason = None
+
 
 class MockConfig:
     """Mock config object."""

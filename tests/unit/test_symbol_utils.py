@@ -55,6 +55,27 @@ class TestNormalizeSymbolForPositionMatch:
         assert normalize_symbol_for_position_match("PF_ROSEUSD") == "ROSEUSD"
         assert normalize_symbol_for_position_match("PI_ROSEUSD") == "ROSEUSD"
 
+    def test_cross_format_same_asset(self) -> None:
+        variants = ["ROSE/USD", "ROSE/USD:USD", "PF_ROSEUSD", "PI_ROSEUSD", "rose/usd", "Rose/USD:USD"]
+        canonical = normalize_symbol_for_position_match(variants[0])
+        for s in variants:
+            assert normalize_symbol_for_position_match(s) == canonical, f"Failed for {s!r}"
+
+    def test_different_assets_differ(self) -> None:
+        assert normalize_symbol_for_position_match("ROSE/USD") != normalize_symbol_for_position_match("BTC/USD")
+        assert normalize_symbol_for_position_match("PF_ROSEUSD") != normalize_symbol_for_position_match("PF_XBTUSD")
+        assert normalize_symbol_for_position_match("ETH/USD:USD") != normalize_symbol_for_position_match("ROSE/USD:USD")
+
+    def test_empty_returns_empty(self) -> None:
+        assert normalize_symbol_for_position_match("") == ""
+
+    def test_none_returns_empty(self) -> None:
+        assert normalize_symbol_for_position_match(None) == ""  # type: ignore[arg-type]
+
+    def test_xbt_btc_both_normalize_to_btc(self) -> None:
+        assert normalize_symbol_for_position_match("PF_XBTUSD") == "BTCUSD"
+        assert normalize_symbol_for_position_match("BTC/USD:USD") == "BTCUSD"
+
 
 class TestPfToUnified:
     def test_pf_ada_to_unified(self) -> None:

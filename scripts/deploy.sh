@@ -366,6 +366,16 @@ fi
 print_step "Recent logs (last 10 lines):"
 ssh -i "$SSH_KEY" "$SERVER" "sudo -u $TRADING_USER tail -n 10 $TRADING_DIR/logs/run.log 2>/dev/null || journalctl -u $SERVICE_NAME -n 10 --no-pager" || true
 
+# Step 6: Run server-only tests (DB + exchange API dependent)
+print_step "Running server-side test verification..."
+if ssh -i "$SSH_KEY" "$SERVER" "cd $TRADING_DIR && \
+    sudo -u $TRADING_USER bash -c 'set -a; source .env; set +a; \
+    venv/bin/python -m pytest tests/ -m server -v --tb=short -q' 2>&1"; then
+    print_success "Server-side tests passed"
+else
+    print_warning "Server-side tests failed (non-blocking). Review results above."
+fi
+
 # Final summary
 echo ""
 echo -e "${GREEN}════════════════════════════════════════${NC}"

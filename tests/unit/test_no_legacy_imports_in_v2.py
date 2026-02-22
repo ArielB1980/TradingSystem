@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def test_live_trading_module_does_not_import_legacy_position_manager_when_v2_enabled():
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parent.parent.parent
 
     code = textwrap.dedent(
         """

@@ -108,6 +108,7 @@ class ExitReason(str, Enum):
     ABANDON_SHIP = "abandon_ship"
     RECONCILIATION = "reconciliation"
     ORPHAN_FLATTEN = "orphan_flatten"
+    MANUAL_RESET = "manual_reset"
 
 
 class OrderEventType(str, Enum):

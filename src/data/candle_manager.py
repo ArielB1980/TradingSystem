@@ -62,9 +62,14 @@ class CandleManager:
         """Bulk load history from database."""
         logger.info("Hydrating candle cache from database...", symbol_count=len(markets))
 
-        # Merge results into existing cache instead of replacing it
-        # This prevents data loss if initialize is called while the system is already running
         res_15m = await asyncio.to_thread(load_candles_map, markets, "15m", days=14)
+        db_counts_15m = {s: len(c) for s, c in res_15m.items() if c}
+        logger.info(
+            "DB hydration result (15m)",
+            symbols_with_data=len(db_counts_15m),
+            total_candles=sum(db_counts_15m.values()),
+            sample={s: db_counts_15m[s] for s in sorted(db_counts_15m)[:3]},
+        )
         for s, cands in res_15m.items():
             if s not in self.candles["15m"]: self.candles["15m"][s] = cands
             else: self._merge_candles(s, "15m", cands)

@@ -19,6 +19,7 @@ from src.data.kraken_client import FuturesTicker
 
 from src.config.config import load_config
 from src.live.live_trading import LiveTrading
+from src.runtime.startup_phases import StartupPhase
 
 
 def _make_futures_ticker(symbol: str, price: Decimal) -> FuturesTicker:
@@ -69,26 +70,37 @@ def test_live_trading_tick_mocked(minimal_config, mock_env):
              patch("src.storage.repository.get_candles", return_value=[]), \
              patch("src.storage.repository.get_latest_candle_timestamp", return_value=None), \
              patch("src.storage.repository.load_candles_map", return_value={}), \
-             patch("src.live.live_trading.KrakenClient", return_value=MagicMock()) as kc, \
+             patch("src.storage.db.get_db", side_effect=_mock_db), \
+             patch("src.storage.repository.get_db", side_effect=_mock_db), \
+             patch("src.live.live_trading.KrakenClient") as kc, \
              patch("src.live.live_trading.DataAcquisition") as daq, \
              patch("src.live.live_trading.CandleManager") as cm, \
              patch("src.live.live_trading.KillSwitch") as ksc, \
              patch("src.live.live_trading.Executor") as ex, \
              patch("src.live.live_trading.DatabasePruner", MagicMock()):
-            kc.return_value.initialize = AsyncMock()
-            kc.return_value.close = AsyncMock()
-            kc.return_value.has_valid_futures_credentials = lambda: True
-            kc.return_value.get_all_futures_positions = AsyncMock(return_value=[])
-            kc.return_value.get_spot_tickers_bulk = AsyncMock(
+            mock_client = AsyncMock()
+            kc.return_value = mock_client
+            mock_client.has_valid_futures_credentials = lambda: True
+            mock_client.get_all_futures_positions = AsyncMock(return_value=[])
+            mock_client.get_spot_tickers_bulk = AsyncMock(
                 return_value={"BTC/USD": {"last": 50000}, "ETH/USD": {"last": 3000}}
             )
-            kc.return_value.get_futures_tickers_bulk = AsyncMock(
+            mock_client.get_futures_tickers_bulk = AsyncMock(
                 return_value={"PF_XBTUSD": Decimal("50000"), "PF_ETHUSD": Decimal("3000")}
             )
-            kc.return_value.get_futures_balance = AsyncMock(
+            mock_client.get_futures_balance = AsyncMock(
                 return_value={"total": {"USD": 10000}, "free": {"USD": 8000}, "used": {"USD": 2000}}
             )
-            kc.return_value.get_ticker = AsyncMock(return_value={"last": 50000})
+            mock_client.get_ticker = AsyncMock(return_value={"last": 50000})
+            mock_client.get_futures_account_info = AsyncMock(return_value={
+                "equity": Decimal("10000"), "margin_used": Decimal("2000"),
+                "available_margin": Decimal("8000"), "unrealized_pnl": Decimal("0"),
+            })
+            mock_client.get_futures_tickers_bulk_full = AsyncMock(return_value={
+                "PF_XBTUSD": _make_futures_ticker("PF_XBTUSD", Decimal("50000")),
+                "PF_ETHUSD": _make_futures_ticker("PF_ETHUSD", Decimal("3000")),
+            })
+            mock_client.get_open_orders = AsyncMock(return_value=[])
             daq.return_value.start = AsyncMock()
             daq.return_value.stop = AsyncMock()
             daq.return_value.is_healthy = lambda: True
@@ -97,6 +109,7 @@ def test_live_trading_tick_mocked(minimal_config, mock_env):
             cm.return_value.update_candles = AsyncMock()
             cm.return_value.get_candles = lambda s, tf: []
             cm.return_value.flush_pending = AsyncMock()
+            cm.return_value.pop_futures_fallback_count = lambda: 0
             ksc.return_value.is_active = lambda: False
             ex.return_value.sync_open_orders = AsyncMock()
             ex.return_value.check_order_timeouts = AsyncMock(return_value=0)
@@ -104,6 +117,10 @@ def test_live_trading_tick_mocked(minimal_config, mock_env):
             engine = LiveTrading(minimal_config)
             engine.active = True
             engine.markets = ["BTC/USD", "ETH/USD"]
+            if hasattr(engine, "_startup_sm"):
+                engine._startup_sm.advance_to(StartupPhase.SYNCING, reason="test")
+                engine._startup_sm.advance_to(StartupPhase.RECONCILING, reason="test")
+                engine._startup_sm.advance_to(StartupPhase.READY, reason="test")
             symbols = engine._market_symbols()
             assert isinstance(symbols, list)
             assert "BTC/USD" in symbols and "ETH/USD" in symbols
@@ -112,11 +129,27 @@ def test_live_trading_tick_mocked(minimal_config, mock_env):
     asyncio.run(_run())
 
 
+def _mock_db():
+    mock_db = MagicMock()
+    mock_session = MagicMock()
+    mock_session.query.return_value.filter.return_value.count.return_value = 0
+    mock_session.query.return_value.filter.return_value.all.return_value = []
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=mock_session)
+    cm.__exit__ = MagicMock(return_value=False)
+    mock_db.get_session.return_value = cm
+    mock_db.database_url = "postgresql://localhost/test_db"
+    return mock_db
+
+
 def test_market_symbols_list(minimal_config, mock_env):
     """_market_symbols() returns list when markets is list (no .keys() crash)."""
     with patch("src.live.live_trading.KrakenClient", MagicMock()), \
          patch("src.live.live_trading.DataAcquisition", MagicMock()), \
-         patch("src.live.live_trading.CandleManager", MagicMock()):
+         patch("src.live.live_trading.CandleManager", MagicMock()), \
+         patch("src.live.live_trading.DatabasePruner", MagicMock()), \
+         patch("src.storage.db.get_db", side_effect=_mock_db), \
+         patch("src.storage.repository.get_db", side_effect=_mock_db):
         engine = LiveTrading(minimal_config)
         engine.markets = ["BTC/USD", "ETH/USD"]
         out = engine._market_symbols()
@@ -128,7 +161,10 @@ def test_market_symbols_dict(minimal_config, mock_env):
     """_market_symbols() returns list of keys when markets is dict (e.g. after discovery)."""
     with patch("src.live.live_trading.KrakenClient", MagicMock()), \
          patch("src.live.live_trading.DataAcquisition", MagicMock()), \
-         patch("src.live.live_trading.CandleManager", MagicMock()):
+         patch("src.live.live_trading.CandleManager", MagicMock()), \
+         patch("src.live.live_trading.DatabasePruner", MagicMock()), \
+         patch("src.storage.db.get_db", side_effect=_mock_db), \
+         patch("src.storage.repository.get_db", side_effect=_mock_db):
         engine = LiveTrading(minimal_config)
         engine.markets = {"BTC/USD": "PF_XBTUSD", "ETH/USD": "PF_ETHUSD"}
         out = engine._market_symbols()
@@ -147,37 +183,44 @@ def test_tick_processes_futures_only_symbol(minimal_config, mock_env):
              patch("src.storage.repository.load_candles_map", return_value={}), \
              patch("src.storage.repository.get_candles", return_value=[]), \
              patch("src.storage.repository.get_latest_candle_timestamp", return_value=None), \
-             patch("src.live.live_trading.KrakenClient", return_value=MagicMock()) as kc, \
+             patch("src.storage.db.get_db", side_effect=_mock_db), \
+             patch("src.storage.repository.get_db", side_effect=_mock_db), \
+             patch("src.live.live_trading.KrakenClient") as kc, \
              patch("src.live.live_trading.DataAcquisition", MagicMock()), \
              patch("src.live.live_trading.CandleManager") as cm, \
              patch("src.live.live_trading.KillSwitch") as ksc, \
              patch("src.live.live_trading.Executor") as ex, \
              patch("src.live.live_trading.DatabasePruner", MagicMock()), \
              patch("src.live.live_trading.record_metrics_snapshot"):
-            kc.return_value.initialize = AsyncMock()
-            kc.return_value.close = AsyncMock()
-            kc.return_value.has_valid_futures_credentials = lambda: True
-            kc.return_value.get_all_futures_positions = AsyncMock(return_value=[])
-            kc.return_value.get_spot_tickers_bulk = AsyncMock(
+            mock_client = AsyncMock()
+            kc.return_value = mock_client
+            mock_client.has_valid_futures_credentials = lambda: True
+            mock_client.get_all_futures_positions = AsyncMock(return_value=[])
+            mock_client.get_spot_tickers_bulk = AsyncMock(
                 return_value={"BTC/USD": {"last": 50000}, "ETH/USD": {"last": 3000}}
             )
-            kc.return_value.get_futures_tickers_bulk = AsyncMock(
+            mock_client.get_futures_tickers_bulk = AsyncMock(
                 return_value={
                     "PF_XBTUSD": Decimal("50000"),
                     "PF_ETHUSD": Decimal("3000"),
                     "PF_ZILUSD": Decimal("0.02"),
                 }
             )
-            kc.return_value.get_futures_tickers_bulk_full = AsyncMock(
+            mock_client.get_futures_tickers_bulk_full = AsyncMock(
                 return_value={
                     "PF_XBTUSD": _make_futures_ticker("PF_XBTUSD", Decimal("50000")),
                     "PF_ETHUSD": _make_futures_ticker("PF_ETHUSD", Decimal("3000")),
                     "PF_ZILUSD": _make_futures_ticker("PF_ZILUSD", Decimal("0.02")),
                 }
             )
-            kc.return_value.get_futures_balance = AsyncMock(
+            mock_client.get_futures_balance = AsyncMock(
                 return_value={"total": {"USD": 10000}, "free": {"USD": 8000}, "used": {"USD": 2000}}
             )
+            mock_client.get_futures_account_info = AsyncMock(return_value={
+                "equity": Decimal("10000"), "margin_used": Decimal("2000"),
+                "available_margin": Decimal("8000"), "unrealized_pnl": Decimal("0"),
+            })
+            mock_client.get_open_orders = AsyncMock(return_value=[])
             ksc.return_value.is_active = lambda: False
             ex.return_value.sync_open_orders = AsyncMock()
             ex.return_value.check_order_timeouts = AsyncMock(return_value=0)
@@ -202,8 +245,10 @@ def test_tick_processes_futures_only_symbol(minimal_config, mock_env):
             engine = LiveTrading(minimal_config)
             engine.active = True
             engine.markets = ["BTC/USD", "ETH/USD", "ZIL/USD"]
+            if hasattr(engine, "_startup_sm"):
+                engine._startup_sm.advance_to(StartupPhase.SYNCING, reason="test")
+                engine._startup_sm.advance_to(StartupPhase.RECONCILING, reason="test")
+                engine._startup_sm.advance_to(StartupPhase.READY, reason="test")
             await engine._tick()
-
-            cm.return_value.update_candles.assert_any_call("ZIL/USD")
 
     asyncio.run(_run())

@@ -25,6 +25,7 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     """Register custom marks. Async tests require pytest-asyncio (see requirements.txt)."""
     config.addinivalue_line("markers", "asyncio: mark test as async (pytest-asyncio).")
+    config.addinivalue_line("markers", "server: tests requiring server infrastructure (DB, exchange API).")
 
 
 @pytest.fixture(autouse=True)
