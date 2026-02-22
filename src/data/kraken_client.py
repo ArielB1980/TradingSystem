@@ -1033,23 +1033,25 @@ class KrakenClient:
                 # Store with raw key
                 results[raw_symbol] = ft
                 
-                # Derive base and create normalized keys
+                # Derive base and create normalized keys.
+                # Only PF_ (perpetual futures) symbols create alias keys;
+                # PI_ (price index) and FI_ (fixed-income) have no order
+                # book and would poison aliases with bid=0/ask=0.
+                raw_upper = raw_symbol.upper()
+                is_tradeable_perp = raw_upper.startswith("PF_")
+                
                 base = derive_base(raw_symbol)
-                if base:
-                    # Add PF_{BASE}USD format
+                if base and is_tradeable_perp:
+                    # PF_ symbols always overwrite aliases to ensure
+                    # the tradeable perpetual's data wins.
                     pf_key = f"PF_{base}USD"
-                    if pf_key not in results:
-                        results[pf_key] = ft
+                    results[pf_key] = ft
                     
-                    # Add {BASE}/USD:USD (CCXT unified)
                     ccxt_unified = f"{base}/USD:USD"
-                    if ccxt_unified not in results:
-                        results[ccxt_unified] = ft
+                    results[ccxt_unified] = ft
                     
-                    # Add {BASE}/USD (helper format)
                     base_usd = f"{base}/USD"
-                    if base_usd not in results:
-                        results[base_usd] = ft
+                    results[base_usd] = ft
 
             # Also add CCXT unified keys from exchange markets
             if self.futures_exchange:
