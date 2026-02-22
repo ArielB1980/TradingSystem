@@ -1893,7 +1893,8 @@ class LiveTrading:
                         except (OperationalError, DataError, OSError) as e:
                             logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e), error_type=type(e).__name__)
 
-                    self.safety.record_coin_processed()
+                    if self.hardening:
+                        self.hardening.record_coin_processed()
 
                 except (OperationalError, DataError) as e:
                     logger.warning(f"Error processing {spot_symbol}", error=str(e), error_type=type(e).__name__)
