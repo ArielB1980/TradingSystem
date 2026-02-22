@@ -51,43 +51,61 @@ class BacktestMetrics:
     trade_symbols: List[str] = field(default_factory=list)  # Symbols for each trade
     loss_correlation: float = 0.0  # Correlation coefficient of consecutive losses
     
+    # Per-trade detail tracking
+    trade_entry_times: List[datetime] = field(default_factory=list)
+    trade_regimes: List[str] = field(default_factory=list)
+    trade_sides: List[str] = field(default_factory=list)
+    exit_reasons: List[str] = field(default_factory=list)
+    
+    # Computed aggregate metrics
+    max_consecutive_losses: int = 0
+    max_consecutive_wins: int = 0
+    avg_holding_hours: float = 0.0
+    median_holding_hours: float = 0.0
+    
     # Runner-specific metrics
-    tp1_fills: int = 0              # Number of TP1 partial fills
-    tp2_fills: int = 0              # Number of TP2 partial fills
-    tp1_pnl: Decimal = Decimal("0")  # Cumulative PnL from TP1 exits
-    tp2_pnl: Decimal = Decimal("0")  # Cumulative PnL from TP2 exits
-    runner_exits: int = 0           # Number of runner exits (trailing stop / SL after TPs)
-    runner_pnl: Decimal = Decimal("0")  # Cumulative PnL from runner portion
-    runner_r_multiples: List[float] = field(default_factory=list)  # R-multiple at runner exit
-    runner_avg_r: float = 0.0       # Average R-multiple of runner exits
-    runner_exits_beyond_3r: int = 0  # Count of runners that exceeded 3R
-    runner_max_r: float = 0.0       # Best single runner R-multiple
-    exit_reasons: List[str] = field(default_factory=list)  # Exit reason for each trade
+    tp1_fills: int = 0
+    tp2_fills: int = 0
+    tp1_pnl: Decimal = Decimal("0")
+    tp2_pnl: Decimal = Decimal("0")
+    runner_exits: int = 0
+    runner_pnl: Decimal = Decimal("0")
+    runner_r_multiples: List[float] = field(default_factory=list)
+    runner_avg_r: float = 0.0
+    runner_exits_beyond_3r: int = 0
+    runner_max_r: float = 0.0
     
     def update(self):
         """Update calculated metrics."""
         if self.total_trades > 0:
             self.win_rate = (self.winning_trades / self.total_trades) * 100
         
-        # Calculate Calmar ratio (PnL / Max Drawdown)
+        # Calmar ratio
         if self.max_drawdown > 0:
             self.calmar_ratio = float(self.total_pnl) / float(self.max_drawdown * Decimal("100"))
         elif float(self.total_pnl) > 0:
-            self.calmar_ratio = float("inf")  # Positive PnL with no drawdown
+            self.calmar_ratio = float("inf")
         
-        # Calculate loss correlation (are losses clustered?)
         self._calculate_loss_correlation()
         
-        if self.winning_trades > 0 and self.losing_trades > 0:
-            # Calculate avg win/loss
-            wins = [r for r in self.trade_results if r > 0]
-            losses = [r for r in self.trade_results if r < 0]
-            if wins:
-                self.avg_win = sum(wins) / len(wins)
-            if losses:
-                self.avg_loss = sum(losses) / len(losses)
-            if self.avg_loss != 0:
-                self.profit_factor = float(abs(self.avg_win * self.winning_trades) / abs(self.avg_loss * self.losing_trades))
+        # Avg win/loss and profit factor
+        wins = [r for r in self.trade_results if r > 0]
+        losses = [r for r in self.trade_results if r < 0]
+        if wins:
+            self.avg_win = sum(wins) / len(wins)
+        if losses:
+            self.avg_loss = sum(losses) / len(losses)
+        if losses and self.avg_loss != 0 and wins:
+            self.profit_factor = float(abs(sum(wins)) / abs(sum(losses)))
+        
+        # Sharpe ratio (annualized from daily equity curve returns)
+        self._calculate_sharpe_ratio()
+        
+        # Consecutive wins/losses
+        self._calculate_streaks()
+        
+        # Holding time
+        self._calculate_holding_times()
         
         # Runner metrics
         if self.runner_r_multiples:
@@ -125,6 +143,64 @@ class BacktestMetrics:
         
         covariance = sum((loss_sequence[i] - mean) * (loss_sequence[i+1] - mean) for i in range(n-1)) / (n-1)
         self.loss_correlation = covariance / variance 
+
+    def _calculate_sharpe_ratio(self):
+        """Annualized Sharpe from daily equity curve snapshots."""
+        if len(self.equity_curve) < 3:
+            self.sharpe_ratio = 0.0
+            return
+        daily_returns = []
+        for i in range(1, len(self.equity_curve)):
+            prev = float(self.equity_curve[i - 1])
+            if prev > 0:
+                daily_returns.append((float(self.equity_curve[i]) - prev) / prev)
+        if not daily_returns:
+            self.sharpe_ratio = 0.0
+            return
+        mean_ret = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+        std_ret = variance ** 0.5
+        if std_ret == 0:
+            self.sharpe_ratio = 0.0
+            return
+        self.sharpe_ratio = (mean_ret / std_ret) * (365 ** 0.5)
+
+    def _calculate_streaks(self):
+        """Max consecutive wins and losses."""
+        max_w = max_l = cur_w = cur_l = 0
+        for r in self.trade_results:
+            if r > 0:
+                cur_w += 1
+                cur_l = 0
+            elif r < 0:
+                cur_l += 1
+                cur_w = 0
+            else:
+                cur_w = cur_l = 0
+            max_w = max(max_w, cur_w)
+            max_l = max(max_l, cur_l)
+        self.max_consecutive_wins = max_w
+        self.max_consecutive_losses = max_l
+
+    def _calculate_holding_times(self):
+        """Average and median holding time in hours."""
+        if len(self.trade_timestamps) != len(self.trade_entry_times):
+            return
+        if not self.trade_timestamps:
+            return
+        hours = []
+        for entry_t, exit_t in zip(self.trade_entry_times, self.trade_timestamps):
+            h = (exit_t - entry_t).total_seconds() / 3600.0
+            if h >= 0:
+                hours.append(h)
+        if hours:
+            self.avg_holding_hours = sum(hours) / len(hours)
+            sorted_h = sorted(hours)
+            n = len(sorted_h)
+            if n % 2 == 0:
+                self.median_holding_hours = (sorted_h[n // 2 - 1] + sorted_h[n // 2]) / 2
+            else:
+                self.median_holding_hours = sorted_h[n // 2]
 
 
 class BacktestEngine:
@@ -577,8 +653,7 @@ class BacktestEngine:
         # Set runner tracking metadata
         self.position._tp_fills_count = 0
         self.position._initial_risk_per_unit = abs(fill_price - sl_price) if sl_price else None
-        
-        # logger.info("Position opened", side=self.position.side.value, size=str(decision.position_notional))
+        self.position._entry_time = current_candle.timestamp
     
     def _check_exit(self, position: Position, candle: Candle) -> bool:
         """Check if position hit stop-loss or take-profit."""
@@ -640,17 +715,19 @@ class BacktestEngine:
             position.tp_order_ids = remaining_tps
             # If size ~ 0, position is fully closed via TPs - record the trade
             if position.size <= Decimal("0.0001"):
-                # Record trade completion (trade count, win/loss)
                 self.metrics.total_trades += 1
                 if self.position_realized_pnl > 0:
                     self.metrics.winning_trades += 1
                 else:
                     self.metrics.losing_trades += 1
                 
-                # Record trade result for correlation analysis
                 self.metrics.trade_results.append(self.position_realized_pnl)
                 self.metrics.trade_timestamps.append(candle.timestamp)
                 self.metrics.trade_symbols.append(position.symbol)
+                self.metrics.exit_reasons.append("tp_full")
+                self.metrics.trade_entry_times.append(getattr(position, '_entry_time', candle.timestamp))
+                self.metrics.trade_regimes.append(getattr(position, 'regime', 'unknown') or 'unknown')
+                self.metrics.trade_sides.append(position.side.value)
                 
                 self.risk_manager.record_trade_result(
                     self.position_realized_pnl,
@@ -724,11 +801,14 @@ class BacktestEngine:
         else:
             self.metrics.losing_trades += 1
         
-        # Record trade result for correlation analysis
+        # Record trade result and metadata
         self.metrics.trade_results.append(self.position_realized_pnl)
         self.metrics.trade_timestamps.append(timestamp)
         self.metrics.trade_symbols.append(self.position.symbol)
         self.metrics.exit_reasons.append(reason)
+        self.metrics.trade_entry_times.append(getattr(self.position, '_entry_time', timestamp))
+        self.metrics.trade_regimes.append(getattr(self.position, 'regime', 'unknown') or 'unknown')
+        self.metrics.trade_sides.append(self.position.side.value)
         
         # Runner-specific metrics: if this is a runner exit (trailing stop / SL after TPs filled)
         # A runner exit = position closed after TP orders were already filled but position still had size
