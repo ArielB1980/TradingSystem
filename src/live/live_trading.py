@@ -243,6 +243,9 @@ class LiveTrading:
                 instrument_spec_registry=getattr(self, "instrument_spec_registry", None),
                 on_trade_recorded=self._on_trade_recorded,
                 startup_machine=self._startup_sm,
+                maker_fee_bps=config.risk.maker_fee_bps,
+                taker_fee_bps=config.risk.taker_fee_bps,
+                funding_rate_daily_bps=config.risk.funding_rate_daily_bps,
             )
             
             logger.critical("State Machine V2 running - all orders via gateway")
@@ -577,6 +580,15 @@ class LiveTrading:
             except (ValueError, TypeError, RuntimeError) as e:
                 logger.error("Failed to start WS candle feed task", error=str(e), error_type=type(e).__name__)
 
+            # 2.6c.4 Periodic instrument spec refresh (prevents stale cache from blocking new entries)
+            try:
+                self._spec_refresh_task = asyncio.create_task(
+                    self._run_spec_refresh(interval_seconds=4 * 3600)
+                )
+                logger.info("Instrument spec refresh task started (interval=4h)")
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start spec refresh task", error=str(e), error_type=type(e).__name__)
+
             # 2.6d Runtime regression monitors (trade starvation + winner churn)
             try:
                 self._starvation_monitor_task = asyncio.create_task(
@@ -895,6 +907,12 @@ class LiveTrading:
                     await self._spot_dca_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self, "_spec_refresh_task", None) and not self._spec_refresh_task.done():
+                self._spec_refresh_task.cancel()
+                try:
+                    await self._spec_refresh_task
+                except asyncio.CancelledError:
+                    pass
             if getattr(self, "_ws_candle_feed", None):
                 await self._ws_candle_feed.stop()
             if getattr(self, "_ws_candle_task", None) and not self._ws_candle_task.done():
@@ -959,6 +977,32 @@ class LiveTrading:
         """Daily spot DCA purchase -- delegates to spot_dca module."""
         from src.live.spot_dca import run_spot_dca
         await run_spot_dca(self)
+
+    async def _run_spec_refresh(self, interval_seconds: int = 4 * 3600) -> None:
+        """Periodically refresh instrument specs from the Kraken API.
+
+        Prevents the in-memory cache from going stale and falling back to a
+        potentially corrupted disk cache (e.g. overwritten by a cron job).
+        """
+        await asyncio.sleep(60)  # initial delay to let startup finish
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                registry = getattr(self, "instrument_spec_registry", None)
+                if registry:
+                    old_count = len(registry._by_raw)
+                    registry._loaded_at = 0  # force refresh
+                    await registry.refresh()
+                    new_count = len(registry._by_raw)
+                    logger.info(
+                        "Periodic instrument spec refresh completed",
+                        old_count=old_count,
+                        new_count=new_count,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Periodic spec refresh failed (will retry)", error=str(e), error_type=type(e).__name__)
 
     async def _run_ws_candle_feed(self) -> None:
         """Stream 15m OHLC candles from Kraken WebSocket v2 into CandleManager."""

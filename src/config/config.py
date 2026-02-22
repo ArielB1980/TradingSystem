@@ -15,6 +15,8 @@ CONFIG_SCHEMA_VERSION = "2026-02-01"
 
 class ExchangeConfig(BaseSettings):
     """Exchange configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     name: str = "kraken"
     
     # Market Discovery (for multi-asset expansion)
@@ -56,6 +58,8 @@ class ExchangeConfig(BaseSettings):
 
 class RiskConfig(BaseSettings):
     """Risk management configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Position sizing
     risk_per_trade_pct: float = Field(default=0.005, ge=0.0001, le=0.05)
     max_leverage: float = Field(default=10.0, ge=1.0, le=10.0)
@@ -186,6 +190,8 @@ class RiskConfig(BaseSettings):
 
 class StrategyConfig(BaseSettings):
     """Strategy parameters configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Timeframes - 4H DECISION AUTHORITY HIERARCHY
     # 1D: Regime filter only (EMA200 bias)
     # 4H: DECISION AUTHORITY - all SMC patterns (OB, FVG, BOS, ATR for stops)
@@ -296,6 +302,8 @@ class StrategyConfig(BaseSettings):
 
 class AssetConfig(BaseSettings):
     """Asset selection and filtering configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     mode: Literal["auto", "whitelist", "blacklist"] = Field(default="auto")
     whitelist: List[str] = Field(default_factory=list)  # e.g., ["BTC/USD", "ETH/USD"]
     blacklist: List[str] = Field(default_factory=list)  # e.g., ["DOGE/USD"]
@@ -316,6 +324,8 @@ class CoinUniverseConfig(BaseSettings):
     The tiers in liquidity_tiers are for UNIVERSE SELECTION only - actual tier
     classification is done dynamically by MarketRegistry based on futures metrics.
     """
+    model_config = SettingsConfigDict(extra="ignore")
+
     enabled: bool = True
     min_spot_volume_24h: Decimal = Field(default=Decimal("5000000"))
     
@@ -373,6 +383,8 @@ class CoinUniverseConfig(BaseSettings):
 
 class TierConfig(BaseSettings):
     """Per-tier risk limits for position sizing."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     max_leverage: float = Field(default=10.0)  # Maximum leverage for this tier
     max_position_size_usd: Decimal = Field(default=Decimal("100000"))  # Maximum position size in USD
     slippage_cap_pct: Decimal = Field(default=Decimal("0.001"))  # Maximum expected slippage
@@ -405,6 +417,8 @@ def _default_tier_configs() -> Dict[str, TierConfig]:
 
 class LiquidityFilters(BaseSettings):
     """Market eligibility filters with tier-based risk limits."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Spot filters
     min_spot_volume_usd_24h: Decimal = Field(default=Decimal("1000000"))  # $1M minimum (relaxed from $5M)
     max_spread_pct: Decimal = Field(default=Decimal("0.0020"))  # 0.20% spot spread (relaxed from 0.05%)
@@ -429,6 +443,8 @@ class LiquidityFilters(BaseSettings):
 
 class MultiTPConfig(BaseSettings):
     """Multi-TP configuration (YAML multi_tp section). When enabled, overrides execution TP splits and RR multiples."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     enabled: bool = False
     tp1_r_multiple: float = Field(default=1.0, ge=0.5, le=5.0)
     tp1_close_pct: float = Field(default=0.40, ge=0.1, le=0.6)
@@ -480,6 +496,8 @@ class MultiTPConfig(BaseSettings):
 
 class ExecutionConfig(BaseSettings):
     """Execution settings configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Price conversion
     use_mark_price: bool = True
     
@@ -541,6 +559,7 @@ class DataSanityConfig(BaseSettings):
     Stage B (post-I/O): candle count + freshness.
     Also controls the DataQualityTracker state machine thresholds.
     """
+    model_config = SettingsConfigDict(extra="ignore")
 
     max_spread_pct: float = Field(default=0.10, description="Max futures spread (10%)")
     min_volume_24h_usd: float = Field(default=10_000, description="Min 24h futures volume USD")
@@ -557,6 +576,8 @@ class DataSanityConfig(BaseSettings):
 
 class DataConfig(BaseSettings):
     """Data acquisition configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # WebSocket settings
     ws_reconnect_max_retries: int = Field(default=10, ge=3, le=50)
     ws_reconnect_backoff_seconds: int = Field(default=5, ge=1, le=30)
@@ -584,6 +605,8 @@ class DataConfig(BaseSettings):
 
 class ReconciliationConfig(BaseSettings):
     """Reconciliation configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     reconcile_enabled: bool = Field(default=True, description="Run position reconciliation at startup and periodically")
     periodic_interval_seconds: int = Field(default=120, ge=5, le=600, description="Reconcile every N seconds (default 2 min)")
     unmanaged_position_policy: Literal["adopt", "force_close"] = Field(
@@ -598,6 +621,8 @@ class ReconciliationConfig(BaseSettings):
 
 class MonitoringConfig(BaseSettings):
     """Monitoring and alerting configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
@@ -616,6 +641,8 @@ class MonitoringConfig(BaseSettings):
 
 class BacktestConfig(BaseSettings):
     """Backtesting configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     # Starting capital
     starting_equity: float = Field(default=10000.0, ge=1000.0, le=1000000.0)
     
@@ -634,12 +661,16 @@ class BacktestConfig(BaseSettings):
 
 class PaperConfig(BaseSettings):
     """Paper trading configuration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     simulate_realistic_slippage: bool = True
     simulate_fill_delays_ms: int = Field(default=100, ge=0, le=1000)
 
 
 class LiveConfig(BaseSettings):
     """Live trading configuration and safety gates."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     require_paper_success: bool = True
     min_paper_days: int = Field(default=30, ge=7, le=90)
     min_paper_trades: int = Field(default=50, ge=10, le=200)
@@ -648,6 +679,8 @@ class LiveConfig(BaseSettings):
 
 class SystemConfig(BaseSettings):
     """System metadata."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     name: str = "Trading System"
     version: str = "3.0.0"
     dry_run: bool = False  # If True, no real orders are placed
@@ -659,6 +692,8 @@ class SpotDCAConfig(BaseSettings):
     When enabled, the system uses the available USD balance on the spot account
     to purchase the configured asset at the scheduled time each day.
     """
+    model_config = SettingsConfigDict(extra="ignore")
+
     enabled: bool = False
     asset: str = "SOL"                    # Base asset to purchase (e.g. "SOL", "BTC", "ETH")
     quote_currency: str = "USD"           # Quote currency to spend

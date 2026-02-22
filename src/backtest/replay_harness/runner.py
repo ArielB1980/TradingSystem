@@ -258,6 +258,11 @@ class BacktestRunner:
         os.environ.setdefault("ENV", "local")
         os.environ.setdefault("DRY_RUN", "0")
 
+        # Isolate instrument spec cache so replay never overwrites the live bot's cache
+        import tempfile
+        _replay_cache = tempfile.mktemp(suffix="_replay_specs.json", prefix="instrument_specs_")
+        os.environ["INSTRUMENT_SPECS_CACHE_PATH"] = _replay_cache
+
         config = load_config()
 
         # Apply overrides

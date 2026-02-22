@@ -179,6 +179,9 @@ class ExecutionGateway:
         instrument_spec_registry=None,
         on_trade_recorded: Optional[Callable] = None,
         startup_machine=None,
+        maker_fee_bps: float = 2.0,
+        taker_fee_bps: float = 5.0,
+        funding_rate_daily_bps: float = 10.0,
     ):
         """
         Initialize the execution gateway.
@@ -236,10 +239,10 @@ class ExecutionGateway:
             max_per_10s=10,
         )
 
-        # Fee config for trade recorder (bps → fraction, loaded lazily)
-        self._maker_fee_rate: Optional[Decimal] = None
-        self._taker_fee_rate: Optional[Decimal] = None
-        self._funding_rate_daily_bps: Decimal = Decimal("10")
+        # Fee config for trade recorder (bps → fraction, set at construction)
+        self._maker_fee_rate: Optional[Decimal] = Decimal(str(maker_fee_bps)) / Decimal("10000")
+        self._taker_fee_rate: Optional[Decimal] = Decimal(str(taker_fee_bps)) / Decimal("10000")
+        self._funding_rate_daily_bps: Decimal = Decimal(str(funding_rate_daily_bps))
 
     def _wal_record_intent(
         self,
@@ -1131,23 +1134,11 @@ class ExecutionGateway:
     # ========== TRADE RECORDING ==========
     
     def _get_fee_rates(self) -> tuple:
-        """Lazily load fee rates from config (bps → fraction)."""
+        """Return fee rates (bps → fraction). Uses values set at construction time."""
         if self._maker_fee_rate is None:
-            try:
-                from src.config.config import load_config
-                cfg = load_config()
-                self._maker_fee_rate = Decimal(str(cfg.exchange.maker_fee_bps)) / Decimal("10000")
-                self._taker_fee_rate = Decimal(str(cfg.exchange.taker_fee_bps)) / Decimal("10000")
-                self._funding_rate_daily_bps = Decimal(str(cfg.exchange.funding_rate_daily_bps))
-            except (ImportError, AttributeError, KeyError, ValueError, TypeError) as e:
-                logger.warning(
-                    "Fee rate config load failed — using conservative defaults (maker=2bps, taker=5bps)",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-                self._maker_fee_rate = Decimal("0.0002")   # 2 bps
-                self._taker_fee_rate = Decimal("0.0005")   # 5 bps
-                self._funding_rate_daily_bps = Decimal("10")
+            self._maker_fee_rate = Decimal("0.0002")   # 2 bps default
+            self._taker_fee_rate = Decimal("0.0005")   # 5 bps default
+            self._funding_rate_daily_bps = Decimal("10")
         return self._maker_fee_rate, self._taker_fee_rate
     
     async def _maybe_record_trade(self, position: ManagedPosition) -> None:
@@ -1604,6 +1595,7 @@ class ExecutionGateway:
             OrderPurpose.STOP_INITIAL,
             OrderPurpose.STOP_UPDATE,
             OrderPurpose.EXIT_STOP,
+            OrderPurpose.EXIT_MARKET,
         }
 
         processed = 0
@@ -1702,6 +1694,28 @@ class ExecutionGateway:
             
             exchange_oid = result.get("id")
             self.metrics["orders_placed"] += 1
+
+            # Register in _pending_orders so poll_and_process_order_updates detects the fill.
+            # Without this, the position stays in the registry until reconciliation marks it
+            # orphaned -- losing the fill data and P&L for trade recording.
+            purpose = OrderPurpose.EXIT_STOP if reason in ("emergency_stop", "missing_stop", "shock_guard") else OrderPurpose.EXIT_MARKET
+            pending = PendingOrder(
+                client_order_id=client_oid,
+                position_id=symbol,
+                symbol=symbol,
+                purpose=purpose,
+                side=Side(side) if side in ("long", "short") else Side.SHORT,
+                size=Decimal(str(size)),
+                price=Decimal(str(stop_price)) if stop_price is not None else (Decimal(str(price)) if price is not None else None),
+                order_type=OrderType(order_type) if order_type in ("market", "limit", "stop") else OrderType.MARKET,
+                submitted_at=datetime.now(timezone.utc),
+                exchange_order_id=exchange_oid,
+                exchange_symbol=symbol,
+            )
+            self._pending_orders[client_oid] = pending
+            if exchange_oid:
+                self._order_id_map[exchange_oid] = client_oid
+
             logger.info(
                 "Emergency order placed",
                 symbol=symbol,
@@ -1710,6 +1724,7 @@ class ExecutionGateway:
                 size=str(size),
                 reason=reason,
                 exchange_order_id=exchange_oid,
+                registered_for_polling=True,
             )
             return ExecutionResult(
                 success=True,
@@ -1739,12 +1754,15 @@ class ExecutionGateway:
         if self._wal:
             try:
                 self._wal.record_intent(ActionIntent(
-                    client_order_id=client_oid,
+                    intent_id=client_oid,
                     position_id=kwargs.get("symbol", "unknown"),
                     action_type=reason,
-                    status=ActionIntentStatus.PENDING,
+                    symbol=kwargs.get("symbol", "unknown"),
+                    side=kwargs.get("side", "unknown"),
+                    size=str(kwargs.get("size", "0")),
+                    price=str(kwargs.get("price")) if kwargs.get("price") is not None else None,
                     created_at=datetime.now(timezone.utc),
-                    metadata=kwargs,
+                    status=ActionIntentStatus.PENDING,
                 ))
             except Exception as wal_err:
                 logger.warning(

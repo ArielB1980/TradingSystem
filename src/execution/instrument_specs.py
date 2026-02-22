@@ -38,6 +38,7 @@ def _instrument_specs_cache_path() -> Path:
 
 CACHE_PATH = _instrument_specs_cache_path()  # For backward compatibility
 CACHE_TTL_SECONDS = 12 * 3600  # 12 hours
+MIN_EXPECTED_SPECS = 50  # Reject disk cache if fewer specs than this (likely corrupted by another process)
 
 # Kraken min_size now parsed from contractValueTradePrecision at refresh. Overrides only for
 # edge cases where API is wrong or we discover post-deploy. Keys: normalized base+USD (e.g. UNIUSD)
@@ -442,9 +443,16 @@ class InstrumentSpecRegistry:
             with open(self._cache_path) as f:
                 data = json.load(f)
             specs = [InstrumentSpec.from_dict(d) for d in data.get("specs", [])]
+            if len(specs) < MIN_EXPECTED_SPECS and self._get_instruments_fn:
+                logger.warning(
+                    "Disk cache rejected: too few specs (likely corrupted by another process)",
+                    count=len(specs),
+                    min_expected=MIN_EXPECTED_SPECS,
+                    path=str(self._cache_path),
+                )
+                return False
             self._index(specs)
             self._loaded_at = data.get("loaded_at", time.time())
-            # Startup sanity check: fail fast if size_step >> min_size
             self._validate_specs_sanity()
             logger.debug("InstrumentSpecRegistry loaded from cache", count=len(specs), path=str(self._cache_path))
             return True
