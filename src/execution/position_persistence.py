@@ -251,7 +251,7 @@ class PositionPersistence:
                 self._save_fill(position.position_id, fill)
     
     def _save_fill(self, position_id: str, fill: FillRecord) -> None:
-        """Save a fill record."""
+        """Save a fill record, with post-write invariant check."""
         self._conn.execute("""
             INSERT OR IGNORE INTO position_fills (
                 fill_id, position_id, order_id, side, qty, price, timestamp, is_entry
@@ -266,6 +266,30 @@ class PositionPersistence:
             fill.timestamp.isoformat(),
             1 if fill.is_entry else 0
         ))
+
+        # Post-write invariant check: exit_qty must not exceed entry_qty
+        if not fill.is_entry:
+            try:
+                cursor = self._conn.execute(
+                    "SELECT SUM(CAST(qty AS REAL)) FROM position_fills WHERE position_id = ? AND is_entry = 1",
+                    (position_id,),
+                )
+                entry_total = cursor.fetchone()[0] or 0.0
+                cursor = self._conn.execute(
+                    "SELECT SUM(CAST(qty AS REAL)) FROM position_fills WHERE position_id = ? AND is_entry = 0",
+                    (position_id,),
+                )
+                exit_total = cursor.fetchone()[0] or 0.0
+                if exit_total > entry_total * 1.001:  # small tolerance for float precision
+                    logger.error(
+                        "FILL_INVARIANT_VIOLATION: exit_qty exceeds entry_qty",
+                        position_id=position_id,
+                        entry_total=entry_total,
+                        exit_total=exit_total,
+                        fill_id=fill.fill_id,
+                    )
+            except Exception as check_err:
+                logger.debug("Fill invariant check failed", error=str(check_err))
     
     def load_position(self, position_id: str) -> Optional[ManagedPosition]:
         """Load a position by ID."""
@@ -341,7 +365,18 @@ class PositionPersistence:
                 pos.tp1_qty_target = Decimal(row["tp1_qty_target"])
             if row.get("tp2_qty_target"):
                 pos.tp2_qty_target = Decimal(row["tp2_qty_target"])
-            pos.exit_reason = ExitReason(row["exit_reason"]) if row.get("exit_reason") else None
+            if row.get("exit_reason"):
+                try:
+                    pos.exit_reason = ExitReason(row["exit_reason"])
+                except ValueError:
+                    logger.warning(
+                        "Unknown exit_reason in DB, treating as RECONCILIATION",
+                        position_id=row.get("position_id"),
+                        raw_value=row["exit_reason"],
+                    )
+                    pos.exit_reason = ExitReason.RECONCILIATION
+            else:
+                pos.exit_reason = None
             pos.exit_time = datetime.fromisoformat(row["exit_time"]) if row.get("exit_time") else None
             pos.entry_order_id = row.get("entry_order_id")
             pos.stop_order_id = row.get("stop_order_id")

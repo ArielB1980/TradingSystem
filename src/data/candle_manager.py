@@ -55,6 +55,8 @@ class CandleManager:
         }
         # Last update tracking: symbol -> timeframe -> datetime
         self.last_candle_update: Dict[str, Dict[str, datetime]] = {}
+        # WS feed freshness tracking: "symbol:timeframe" -> datetime
+        self._ws_last_update: Dict[str, datetime] = {}
         # Persistence queue
         self.pending_candles: List[Candle] = []
 
@@ -152,6 +154,17 @@ class CandleManager:
         """Get cached candles."""
         return self.candles.get(timeframe, {}).get(symbol, [])
 
+    def has_fresh_ws_data(self, symbol: str, timeframe: str, max_age_seconds: float = 1800) -> bool:
+        """Check if the WS feed has delivered fresh data for this symbol/timeframe.
+        
+        Used to skip redundant REST fetches when the WS feed is active and current.
+        """
+        last_ws = self._ws_last_update.get(f"{symbol}:{timeframe}")
+        if last_ws is None:
+            return False
+        age = (datetime.now(timezone.utc) - last_ws).total_seconds()
+        return age < max_age_seconds
+
     def receive_ws_candle(self, symbol: str, timeframe: str, candle: Candle) -> None:
         """Ingest a single candle from the WebSocket feed.
 
@@ -175,10 +188,12 @@ class CandleManager:
         last = existing[-1]
         if candle.timestamp == last.timestamp:
             existing[-1] = candle  # update current bar in place
+            self._ws_last_update[f"{symbol}:{timeframe}"] = datetime.now(timezone.utc)
         elif candle.timestamp > last.timestamp:
             existing.append(candle)
             if len(existing) > 2000:
                 buf[symbol] = existing[-2000:]
+            self._ws_last_update[f"{symbol}:{timeframe}"] = datetime.now(timezone.utc)
         # else: older than latest -- ignore
 
     def get_futures_fallback_count(self) -> int:
@@ -200,11 +215,17 @@ class CandleManager:
         async def fetch_tf(tf: str, interval_min: int):
             last_update = self.last_candle_update[symbol].get(tf, datetime.min.replace(tzinfo=timezone.utc))
             elapsed = (now - last_update).total_seconds()
+
+            # WS-aware skip: if WS feed has fresh data for this symbol/tf,
+            # skip REST fetch (saves API calls and latency).
+            # WS only covers 15m; 1h/4h/1d still use REST exclusively.
+            if tf == "15m" and self.has_fresh_ws_data(symbol, tf, max_age_seconds=1800):
+                # WS is feeding us, but still do REST occasionally (every 30 min)
+                # to persist candles to DB and catch any WS gaps.
+                if elapsed < 1800:
+                    return
             
             # Smart candle-boundary caching: only refetch when a new bar has likely closed.
-            # For 15m: refetch only if we haven't fetched since the last 15m boundary.
-            # For 1h/4h/1d: use boundary-aware check too.
-            # First fetch always proceeds (last_update is datetime.min).
             if elapsed < 30:
                 return  # Hard floor: never refetch within 30 seconds
             

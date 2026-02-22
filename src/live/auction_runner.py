@@ -118,8 +118,29 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     error_type=type(e).__name__,
                 )
 
+        # Pre-filter: exclude signals for symbols that already have open positions
+        open_position_symbols: set = set()
+        for meta in open_positions_meta:
+            spot = getattr(meta, "spot_symbol", None)
+            if spot:
+                from src.data.symbol_utils import normalize_symbol_for_position_match
+                open_position_symbols.add(normalize_symbol_for_position_match(spot))
+
+        pre_filter_count = len(lt.auction_signals_this_tick)
+        lt.auction_signals_this_tick = [
+            (sig, sp, mp) for sig, sp, mp in lt.auction_signals_this_tick
+            if normalize_symbol_for_position_match(sig.symbol) not in open_position_symbols
+        ]
+        filtered_out = pre_filter_count - len(lt.auction_signals_this_tick)
+        if filtered_out > 0:
+            logger.debug(
+                "Auction: pre-filtered signals for existing positions",
+                filtered_out=filtered_out,
+                open_symbols=sorted(open_position_symbols),
+            )
+
         signals_count = len(lt.auction_signals_this_tick)
-        logger.info("Auction: Collecting candidate signals", signals_count=signals_count)
+        logger.info("Auction: Collecting candidate signals", signals_count=signals_count, pre_filtered=filtered_out)
 
         # Refresh instrument spec registry
         try:

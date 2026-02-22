@@ -872,6 +872,15 @@ async def run_daily_summary(lt: "LiveTrading") -> None:
 
                 lt.risk_manager.reset_daily_metrics(equity)
 
+                # Daily position DB cleanup: remove terminal positions older than 30 days
+                try:
+                    if hasattr(lt, "position_persistence") and lt.position_persistence:
+                        cleaned = lt.position_persistence.cleanup_old_positions(days=30)
+                        if cleaned > 0:
+                            logger.info("Daily position DB cleanup", removed=cleaned)
+                except Exception as cleanup_err:
+                    logger.warning("Position DB cleanup failed", error=str(cleanup_err))
+
             except (OperationalError, DataError) as e:
                 logger.warning(
                     "Failed to gather daily summary data", error=str(e)

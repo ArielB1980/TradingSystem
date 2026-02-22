@@ -42,6 +42,7 @@ DEFAULT_DEGRADED_SKIP_RATIO = 4           # analyze 1 in 4 cycles
 DEFAULT_PERSIST_INTERVAL_SECONDS = 5 * 60 # 5 minutes
 DEFAULT_STATE_FILE = ".local/data_quality_state.json"
 DEFAULT_TRUST_WINDOW_SECONDS = 7 * 24 * 3600  # 7 days
+MAX_SUSPENSION_HOURS = 72  # auto-reset symbols suspended longer than this on restart
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +326,13 @@ class DataQualityTracker:
         except Exception:
             logger.exception("data_quality_persist_failed")
 
-    def restore(self) -> None:
-        """Restore non-HEALTHY state from disk on boot."""
+    def restore(self, active_universe: Optional[List[str]] = None) -> None:
+        """Restore non-HEALTHY state from disk on boot.
+        
+        Args:
+            active_universe: Current market symbols. Symbols in persisted state
+                but NOT in this set are purged (stale symbol cleanup).
+        """
         if not self.state_file.exists():
             logger.info("data_quality_no_saved_state", path=str(self.state_file))
             return
@@ -338,8 +344,18 @@ class DataQualityTracker:
             return
 
         restored = 0
+        purged_stale: List[str] = []
+        auto_reset: List[str] = []
         now = self._clock()
+
+        active_set = set(active_universe) if active_universe else None
+
         for sym, info in raw.items():
+            # Purge symbols no longer in the active trading universe
+            if active_set is not None and sym not in active_set:
+                purged_stale.append(sym)
+                continue
+
             rec = self._get(sym)
             try:
                 rec.state = SymbolHealthState(info["state"])
@@ -348,6 +364,18 @@ class DataQualityTracker:
             rec.consecutive_failures = info.get("consecutive_failures", 0)
             rec.first_failure_ts = info.get("first_failure_ts", 0.0)
             rec.last_probe_ts = info.get("last_probe_ts", 0.0)
+
+            # Auto-reset symbols SUSPENDED for over 72 hours
+            if rec.state == SymbolHealthState.SUSPENDED and rec.first_failure_ts > 0:
+                suspended_hours = (now - rec.first_failure_ts) / 3600
+                if suspended_hours > MAX_SUSPENSION_HOURS:
+                    auto_reset.append(sym)
+                    rec.state = SymbolHealthState.HEALTHY
+                    rec.consecutive_failures = 0
+                    rec.consecutive_successes = 0
+                    rec.first_failure_ts = 0.0
+                    rec.last_probe_ts = 0.0
+
             # Restore trust history (prune stale entries)
             saved_history = info.get("trust_history", [])
             if saved_history:
@@ -356,6 +384,20 @@ class DataQualityTracker:
                 )
                 self._prune_trust_history(rec, now)
             restored += 1
+
+        if purged_stale:
+            logger.info(
+                "data_quality_purged_stale_symbols",
+                count=len(purged_stale),
+                symbols=purged_stale,
+            )
+        if auto_reset:
+            logger.info(
+                "data_quality_auto_reset_long_suspended",
+                count=len(auto_reset),
+                symbols=auto_reset,
+                threshold_hours=MAX_SUSPENSION_HOURS,
+            )
 
         logger.info(
             "data_quality_state_restored",

@@ -549,11 +549,39 @@ async def compute_tp_plan(
 
     side_sign = Decimal("1") if db_pos.side == Side.LONG else Decimal("-1")
 
-    tp1 = entry + side_sign * Decimal("1.0") * risk
-    tp2 = entry + side_sign * Decimal("2.0") * risk
-    tp3 = entry + side_sign * Decimal("3.0") * risk
+    # Determine TP count and R-multiples from config (runner-aware)
+    multi_tp = getattr(lt.config, "multi_tp", None)
+    runner_mode = (
+        multi_tp is not None
+        and getattr(multi_tp, "enabled", False)
+        and not getattr(multi_tp, "runner_has_fixed_tp", False)
+    )
 
-    tp_plan = [tp1, tp2, tp3]
+    # Check if the position itself was opened in runner mode (stored state > config)
+    registry = getattr(lt, "position_registry", None)
+    if registry:
+        v2_pos = registry.get_position(symbol)
+        if v2_pos is not None and hasattr(v2_pos, "runner_mode"):
+            runner_mode = bool(v2_pos.runner_mode)
+
+    if runner_mode and multi_tp:
+        tp1_r = Decimal(str(getattr(multi_tp, "tp1_r_multiple", 1.0)))
+        tp2_r = Decimal(str(getattr(multi_tp, "tp2_r_multiple", 2.0)))
+        tp1 = entry + side_sign * tp1_r * risk
+        tp2 = entry + side_sign * tp2_r * risk
+        tp_plan = [tp1, tp2]
+    else:
+        tp1_r = Decimal("1.0")
+        tp2_r = Decimal("2.0")
+        tp3_r = Decimal("3.0")
+        if multi_tp:
+            tp1_r = Decimal(str(getattr(multi_tp, "tp1_r_multiple", 1.0)))
+            tp2_r = Decimal(str(getattr(multi_tp, "tp2_r_multiple", 2.0)))
+            tp3_r = Decimal(str(getattr(multi_tp, "runner_tp_r_multiple", 3.0) or 3.0))
+        tp1 = entry + side_sign * tp1_r * risk
+        tp2 = entry + side_sign * tp2_r * risk
+        tp3 = entry + side_sign * tp3_r * risk
+        tp_plan = [tp1, tp2, tp3]
 
     from src.storage.repository import async_record_event
 
@@ -566,7 +594,8 @@ async def compute_tp_plan(
             "sl": str(sl),
             "risk": str(risk),
             "tp_plan": [str(tp) for tp in tp_plan],
-            "reason": "computed_from_r_multiples",
+            "runner_mode": runner_mode,
+            "reason": "computed_from_config_r_multiples",
         },
     )
 
@@ -826,7 +855,15 @@ async def place_tp_backfill(
         db_pos.tp_order_ids = new_tp_ids
         db_pos.tp1_price = tp_plan[0] if len(tp_plan) > 0 else None
         db_pos.tp2_price = tp_plan[1] if len(tp_plan) > 1 else None
+        # Only set final_target_price if a 3rd TP exists (legacy mode);
+        # in runner mode there are exactly 2 TPs and no final target.
         db_pos.final_target_price = tp_plan[2] if len(tp_plan) > 2 else None
+        logger.info(
+            "TP backfill plan applied",
+            symbol=symbol,
+            tp_count=len(tp_plan),
+            runner_mode=len(tp_plan) == 2,
+        )
 
         await asyncio.to_thread(save_position, db_pos)
 

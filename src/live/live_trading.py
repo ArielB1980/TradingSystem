@@ -339,7 +339,7 @@ class LiveTrading:
                     log_cooldown_seconds=ds.log_cooldown_seconds,
                     degraded_skip_ratio=ds.degraded_skip_ratio,
                 )
-                self.data_quality_tracker.restore()
+                self.data_quality_tracker.restore(active_universe=self._market_symbols())
                 logger.info(
                     "DataSanityGate initialized",
                     max_spread_pct=float(self.sanity_thresholds.max_spread_pct),
@@ -1892,6 +1892,8 @@ class LiveTrading:
                             self.last_trace_log[spot_symbol] = now
                         except (OperationalError, DataError, OSError) as e:
                             logger.error("Failed to record decision trace", symbol=spot_symbol, error=str(e), error_type=type(e).__name__)
+
+                    self.safety.record_coin_processed()
 
                 except (OperationalError, DataError) as e:
                     logger.warning(f"Error processing {spot_symbol}", error=str(e), error_type=type(e).__name__)
