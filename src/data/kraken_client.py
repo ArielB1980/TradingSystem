@@ -461,19 +461,20 @@ class KrakenClient:
                 perps = {}
                 for m in self.futures_exchange.markets.values():
                     if m.get("type") == "swap" and m.get("active", True):
-                        # CCXT unified futures symbols for Kraken can sometimes be weird (e.g. "ADA/USD:ADA").
-                        # For our system we prefer to store the market ID (Kraken raw, e.g. "PF_ADAUSD")
-                        # as the executable symbol, because KrakenClient.place_futures_order reliably
-                        # resolves ID -> unified symbol at order placement time.
                         ccxt_symbol = m.get("symbol", "") or ""
                         market_id = m.get("id") or ccxt_symbol
+
+                        # Skip inverse perpetuals (PI_): they have no USD
+                        # order book and would overwrite the linear PF_ entry
+                        # when both map to the same base_quote key.
+                        if str(market_id).upper().startswith("PI_"):
+                            continue
+
                         base = m.get("base")
                         quote = m.get("quote")
-                        # Exclude fiat + stablecoin BASE perpetuals (e.g., GBP/USD perps, USDT/USD perps).
                         if is_disallowed_trading_base(base):
                             continue
 
-                        # Build a stable spot-style key like "ADA/USD" (used by MarketRegistry to pair spot×futures).
                         if base and quote:
                             base_quote = f"{base}/{quote}"
                         elif ":" in ccxt_symbol:
