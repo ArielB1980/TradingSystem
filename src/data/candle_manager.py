@@ -73,6 +73,17 @@ class CandleManager:
         for s, cands in res_15m.items():
             if s not in self.candles["15m"]: self.candles["15m"][s] = cands
             else: self._merge_candles(s, "15m", cands)
+        
+        post_merge_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) >= 50)
+        candles_dict_id = id(self.candles)
+        candles_15m_id = id(self.candles["15m"])
+        logger.info(
+            "Post-merge check (15m)",
+            sufficient=post_merge_15m,
+            candles_dict_id=candles_dict_id,
+            candles_15m_dict_id=candles_15m_id,
+            sample_counts={s: len(self.candles["15m"].get(s, [])) for s in sorted(markets)[:3]},
+        )
 
         res_1h = await asyncio.to_thread(load_candles_map, markets, "1h", days=60)
         for s, cands in res_1h.items():
@@ -88,6 +99,16 @@ class CandleManager:
         for s, cands in res_1d.items():
             if s not in self.candles["1d"]: self.candles["1d"][s] = cands
             else: self._merge_candles(s, "1d", cands)
+        
+        pre_summary_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) >= 50)
+        pre_summary_id = id(self.candles["15m"])
+        logger.info(
+            "Pre-summary check (15m)",
+            sufficient=pre_summary_15m,
+            candles_15m_dict_id=pre_summary_id,
+            same_dict=(pre_summary_id == candles_15m_id),
+            sample_counts={s: len(self.candles["15m"].get(s, [])) for s in sorted(markets)[:3]},
+        )
         
         # Initialize update trackers
         now = datetime.now(timezone.utc)
