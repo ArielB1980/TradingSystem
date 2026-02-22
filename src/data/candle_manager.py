@@ -62,28 +62,18 @@ class CandleManager:
         """Bulk load history from database."""
         logger.info("Hydrating candle cache from database...", symbol_count=len(markets))
 
+        pre_existing_15m = sum(1 for s in markets if self.candles["15m"].get(s))
+        if pre_existing_15m:
+            logger.warning(
+                "Cache already populated before DB hydration",
+                symbols_with_data=pre_existing_15m,
+                sample={s: len(self.candles["15m"].get(s, [])) for s in sorted(markets)[:3]},
+            )
+
         res_15m = await asyncio.to_thread(load_candles_map, markets, "15m", days=14)
-        db_counts_15m = {s: len(c) for s, c in res_15m.items() if c}
-        logger.info(
-            "DB hydration result (15m)",
-            symbols_with_data=len(db_counts_15m),
-            total_candles=sum(db_counts_15m.values()),
-            sample={s: db_counts_15m[s] for s in sorted(db_counts_15m)[:3]},
-        )
         for s, cands in res_15m.items():
             if s not in self.candles["15m"]: self.candles["15m"][s] = cands
             else: self._merge_candles(s, "15m", cands)
-        
-        post_merge_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) >= 50)
-        candles_dict_id = id(self.candles)
-        candles_15m_id = id(self.candles["15m"])
-        logger.info(
-            "Post-merge check (15m)",
-            sufficient=post_merge_15m,
-            candles_dict_id=candles_dict_id,
-            candles_15m_dict_id=candles_15m_id,
-            sample_counts={s: len(self.candles["15m"].get(s, [])) for s in sorted(markets)[:3]},
-        )
 
         res_1h = await asyncio.to_thread(load_candles_map, markets, "1h", days=60)
         for s, cands in res_1h.items():
@@ -99,16 +89,6 @@ class CandleManager:
         for s, cands in res_1d.items():
             if s not in self.candles["1d"]: self.candles["1d"][s] = cands
             else: self._merge_candles(s, "1d", cands)
-        
-        pre_summary_15m = sum(1 for s in markets if len(self.candles["15m"].get(s, [])) >= 50)
-        pre_summary_id = id(self.candles["15m"])
-        logger.info(
-            "Pre-summary check (15m)",
-            sufficient=pre_summary_15m,
-            candles_15m_dict_id=pre_summary_id,
-            same_dict=(pre_summary_id == candles_15m_id),
-            sample_counts={s: len(self.candles["15m"].get(s, [])) for s in sorted(markets)[:3]},
-        )
         
         # Initialize update trackers
         now = datetime.now(timezone.utc)
@@ -132,7 +112,12 @@ class CandleManager:
         )
 
     def _merge_candles(self, symbol: str, timeframe: str, new_candles: List[Candle]):
-        """Helper to merge candles into cache, avoiding duplicates."""
+        """Merge candles into cache, keeping the larger historical window.
+
+        When the incoming set is significantly larger than the existing cache
+        (e.g. DB hydration vs a handful of WS-streamed bars), use the incoming
+        set as the base and append any newer existing candles on top.
+        """
         buffer = self.candles[timeframe]
         if symbol not in buffer:
             buffer[symbol] = new_candles
@@ -142,13 +127,24 @@ class CandleManager:
         if not existing:
             buffer[symbol] = new_candles
             return
+        
+        if not new_candles:
+            return
+
+        if len(new_candles) > len(existing) * 2:
+            last_new_ts = new_candles[-1].timestamp
+            tail = [c for c in existing if c.timestamp > last_new_ts]
+            merged = list(new_candles)
+            if tail:
+                merged.extend(tail)
+            buffer[symbol] = merged[-2000:]
+            return
             
         last_ts = existing[-1].timestamp
         to_append = [c for c in new_candles if c.timestamp > last_ts]
         if to_append:
             existing.extend(to_append)
         
-        # Prune if over limit (2,000 for HTF context)
         if len(existing) > 2000:
             buffer[symbol] = existing[-2000:]
 

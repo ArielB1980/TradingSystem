@@ -571,14 +571,8 @@ class LiveTrading:
             except (ValueError, TypeError, RuntimeError) as e:
                 logger.error("Failed to start spot DCA task", error=str(e), error_type=type(e).__name__)
 
-            # 2.6c.3 WebSocket candle feed (real-time 15m OHLC from Kraken)
-            try:
-                self._ws_candle_task = asyncio.create_task(
-                    self._run_ws_candle_feed()
-                )
-                logger.info("WebSocket candle feed task started")
-            except (ValueError, TypeError, RuntimeError) as e:
-                logger.error("Failed to start WS candle feed task", error=str(e), error_type=type(e).__name__)
+            # 2.6c.3 WebSocket candle feed — deferred to AFTER DB hydration (step 3)
+            # to prevent WS candles from poisoning the merge logic.
 
             # 2.6c.4 Periodic instrument spec refresh (prevents stale cache from blocking new entries)
             try:
@@ -634,6 +628,15 @@ class LiveTrading:
                 await self.candle_manager.initialize(self._market_symbols())
             except (OperationalError, DataError) as e:
                 logger.error("Failed to hydrate candles", error=str(e), error_type=type(e).__name__)
+
+            # 3.5 Start WebSocket candle feed AFTER DB hydration
+            try:
+                self._ws_candle_task = asyncio.create_task(
+                    self._run_ws_candle_feed()
+                )
+                logger.info("WebSocket candle feed task started (post-hydration)")
+            except (ValueError, TypeError, RuntimeError) as e:
+                logger.error("Failed to start WS candle feed task", error=str(e), error_type=type(e).__name__)
 
             # 4. Start Data Acquisition
             await self.data_acq.start()
