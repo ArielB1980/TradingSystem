@@ -13,6 +13,7 @@ import ccxt.async_support as ccxt_async
 import hashlib
 import hmac
 import base64
+import os
 import time
 import asyncio
 import json
