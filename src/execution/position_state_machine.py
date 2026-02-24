@@ -1615,6 +1615,22 @@ class PositionRegistry:
         """Get closed position history."""
         with self._lock:
             return self._closed_positions[-limit:]
+
+    def get_closed_position(
+        self,
+        symbol: str,
+        states: Optional[Tuple[PositionState, ...]] = None,
+    ) -> Optional[ManagedPosition]:
+        """Get most recent closed/history position by canonical symbol match."""
+        target = _normalize_symbol(symbol)
+        with self._lock:
+            for pos in reversed(self._closed_positions):
+                if _normalize_symbol(pos.symbol) != target:
+                    continue
+                if states and pos.state not in states:
+                    continue
+                return pos
+        return None
     
     def cleanup_stale(self, max_age_hours: int = 24) -> int:
         """Remove very old closed positions from memory."""

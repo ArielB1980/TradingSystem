@@ -1045,6 +1045,29 @@ class TestReconciliation:
         orphaned = [p for p in registry._closed_positions if p.symbol == "ADA/USD"]
         assert len(orphaned) == 1
 
+    def test_get_closed_position_normalized_lookup(self):
+        registry = get_position_registry()
+        registry._positions.clear()
+        registry._closed_positions.clear()
+
+        pos = ManagedPosition(
+            symbol="PF_SOLUSD",
+            side=Side.LONG,
+            position_id="closed-sol-1",
+            initial_size=Decimal("5"),
+            initial_entry_price=Decimal("100"),
+            initial_stop_price=Decimal("95"),
+            initial_tp1_price=Decimal("110"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.CLOSED
+        registry._closed_positions.append(pos)
+
+        found = registry.get_closed_position("SOL/USD:USD", states=(PositionState.CLOSED,))
+        assert found is not None
+        assert found.position_id == "closed-sol-1"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

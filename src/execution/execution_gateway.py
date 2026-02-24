@@ -1924,17 +1924,16 @@ class ExecutionGateway:
                     qty_synced_count += 1
                 else:
                     # Reconciliation may close/move the position to history.
-                    for closed_pos in self.registry._closed_positions:
-                        if closed_pos.symbol == symbol:
-                            self.persistence.save_position(closed_pos)
-                            self.persistence.log_state_adjustment(
-                                position_id=closed_pos.position_id,
-                                symbol=symbol,
-                                adjustment_type="QTY_SYNCED",
-                                detail=issue,
-                            )
-                            qty_synced_count += 1
-                            break
+                    closed_pos = self.registry.get_closed_position(symbol)
+                    if closed_pos:
+                        self.persistence.save_position(closed_pos)
+                        self.persistence.log_state_adjustment(
+                            position_id=closed_pos.position_id,
+                            symbol=symbol,
+                            adjustment_type="QTY_SYNCED",
+                            detail=issue,
+                        )
+                        qty_synced_count += 1
         
         if orphaned_count > 0:
             logger.info("Persisted orphaned positions", count=orphaned_count)
@@ -1945,12 +1944,12 @@ class ExecutionGateway:
         recordable_issues = ("STALE", "QTY_SYNCED", "ORPHANED")
         for symbol, issue in issues:
             if any(tag in issue for tag in recordable_issues):
-                for closed_pos in self.registry._closed_positions:
-                    if closed_pos.symbol == symbol and closed_pos.state in (
-                        PositionState.CLOSED, PositionState.ORPHANED
-                    ):
-                        await self._maybe_record_trade(closed_pos)
-                        break
+                closed_pos = self.registry.get_closed_position(
+                    symbol,
+                    states=(PositionState.CLOSED, PositionState.ORPHANED),
+                )
+                if closed_pos:
+                    await self._maybe_record_trade(closed_pos)
         
         # Auto-import phantom positions at runtime (not just startup).
         # Without this, a symbol-normalization miss or race condition can
