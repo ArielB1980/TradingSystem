@@ -171,3 +171,58 @@ async def test_sync_with_exchange_persists_qty_synced_positions():
     assert result["issues"] == [
         ("ENA/USD", "QTY_SYNCED: exit+39 local=111 exchange=72 price=0.1546")
     ]
+
+
+def test_summarize_reconcile_issues_counts_classes():
+    issues = [
+        ("A", "ORPHANED: x"),
+        ("B", "STALE_ZERO_QTY: y"),
+        ("C", "QTY_SYNCED: z"),
+        ("D", "QTY_MISMATCH: q"),
+        ("E", "PENDING_ADOPTED: w"),
+        ("F", "PHANTOM: p"),
+    ]
+    report = ExecutionGateway._summarize_reconcile_issues(issues)
+    assert report["issues_total"] == 6
+    assert report["orphaned"] == 1
+    assert report["stale"] == 1
+    assert report["qty_synced"] == 1
+    assert report["qty_mismatch"] == 1
+    assert report["pending_adopted"] == 1
+    assert report["phantom"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_with_exchange_returns_reconciliation_report_and_adjustment_metrics():
+    gateway = _build_gateway()
+    gateway.client.get_all_futures_positions.return_value = [
+        {"symbol": "PF_ENAUSD", "side": "short", "contracts": 72, "entryPrice": "0.1546"}
+    ]
+    gateway.client.get_futures_open_orders.return_value = []
+    gateway.registry.reconcile_with_exchange.return_value = [
+        ("ENA/USD", "QTY_SYNCED: exit+39 local=111 exchange=72 price=0.1546"),
+        ("SOL/USD", "PHANTOM: Exchange has position, registry does not"),
+        ("XRP/USD", "PENDING_ADOPTED: Registry adopted 10 from exchange (was PENDING)"),
+        ("ADA/USD", "QTY_MISMATCH: Registry 10 vs Exchange 12"),
+    ]
+    synced_pos = MagicMock()
+    gateway.registry.get_position.side_effect = (
+        lambda symbol: synced_pos if symbol == "ENA/USD" else None
+    )
+    gateway.registry.get_closed_position.return_value = None
+    gateway.persistence.log_state_adjustment.return_value = True
+    gateway.position_manager.reconcile.return_value = []
+    gateway.registry.get_all_active.return_value = [synced_pos]
+    gateway._import_phantom_positions = AsyncMock()
+
+    result = await gateway.sync_with_exchange()
+
+    report = result["reconciliation_report"]
+    assert report["issues_total"] == 4
+    assert report["qty_synced"] == 1
+    assert report["phantom"] == 1
+    assert report["pending_adopted"] == 1
+    assert report["qty_mismatch"] == 1
+    assert report["state_adjustments_logged"] == 1
+    assert report["state_adjustments_deduped"] == 0
+    assert report["actions_taken"] == 0
