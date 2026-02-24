@@ -252,7 +252,7 @@ class PositionPersistence:
     
     def _save_fill(self, position_id: str, fill: FillRecord) -> None:
         """Save a fill record, with post-write invariant check."""
-        self._conn.execute("""
+        cursor = self._conn.execute("""
             INSERT OR IGNORE INTO position_fills (
                 fill_id, position_id, order_id, side, qty, price, timestamp, is_entry
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -266,6 +266,22 @@ class PositionPersistence:
             fill.timestamp.isoformat(),
             1 if fill.is_entry else 0
         ))
+
+        if cursor.rowcount == 0:
+            # Fill IDs must be globally unique. If this trips, we silently lose
+            # fill history for the current position and can violate invariants on restart.
+            existing = self._conn.execute(
+                "SELECT position_id FROM position_fills WHERE fill_id = ?",
+                (fill.fill_id,),
+            ).fetchone()
+            logger.error(
+                "FILL_ID_COLLISION: fill insert ignored",
+                fill_id=fill.fill_id,
+                current_position_id=position_id,
+                existing_position_id=existing["position_id"] if existing else None,
+                is_entry=fill.is_entry,
+                qty=str(fill.qty),
+            )
 
         # Post-write invariant check: exit_qty must not exceed entry_qty
         if not fill.is_entry:
@@ -527,6 +543,7 @@ class PositionPersistence:
                 registry._closed_positions.append(pos)
                 terminal_symbols.append(symbol)
                 continue
+            self._repair_missing_entry_fill(pos)
             try:
                 rem_qty = pos.remaining_qty
             except Exception as inv_err:
@@ -584,6 +601,36 @@ class PositionPersistence:
         )
         
         return registry
+
+    def _repair_missing_entry_fill(self, pos: ManagedPosition) -> None:
+        """Best-effort startup repair for legacy rows missing entry fills.
+
+        If exits exist but entries are zero, synthesize a single entry fill so
+        remaining_qty invariant can be evaluated and reconciled safely.
+        """
+        if pos.filled_entry_qty > 0 or pos.filled_exit_qty <= 0:
+            return
+        repaired_entry_qty = max(pos.initial_size, pos.filled_exit_qty)
+        now = datetime.now(timezone.utc)
+        repair_fill = FillRecord(
+            fill_id=f"startup-repair-entry-{pos.position_id}-{int(now.timestamp() * 1000)}",
+            order_id="startup-repair",
+            side=pos.side,
+            qty=repaired_entry_qty,
+            price=pos.initial_entry_price,
+            timestamp=now,
+            is_entry=True,
+        )
+        pos.entry_fills.append(repair_fill)
+        pos.entry_acknowledged = True
+        pos.ensure_snapshot_targets()
+        logger.warning(
+            "Repaired missing entry fills for position",
+            symbol=pos.symbol,
+            position_id=pos.position_id,
+            repaired_entry_qty=str(repaired_entry_qty),
+            existing_exit_qty=str(pos.filled_exit_qty),
+        )
     
     # ========== CLEANUP ==========
     

@@ -190,3 +190,26 @@ async def test_emergency_quarantine_on_failure(takeover, mock_gateway):
     
     # Emergency flatten attempt happened
     assert mock_gateway.client.place_futures_order.call_count >= 1 # Stop fail + Flatten attempt
+
+
+@pytest.mark.asyncio
+async def test_takeover_entry_fill_ids_are_unique_per_position(takeover, mock_gateway):
+    """Each imported position must get a globally unique fill_id."""
+    btc = "BTC/USD:USD"
+    eth = "ETH/USD:USD"
+    mock_gateway.client.get_futures_open_orders.return_value = [
+        {"id": "stop-btc", "symbol": btc, "type": "stop", "side": "sell", "amount": "1.0", "stopPrice": "49000", "status": "open"},
+        {"id": "stop-eth", "symbol": eth, "type": "stop", "side": "sell", "amount": "2.0", "stopPrice": "2900", "status": "open"},
+    ]
+    mock_gateway.client.get_all_futures_positions.return_value = [
+        {"symbol": btc, "side": "long", "size": 1.0, "entry_price": 50000},
+        {"symbol": eth, "side": "long", "size": 2.0, "entry_price": 3000},
+    ]
+
+    stats = await takeover.execute_takeover()
+    assert stats["imported"] == 2
+
+    saved_positions = [call.args[0] for call in mock_gateway.persistence.save_position.call_args_list]
+    fill_ids = [p.entry_fills[0].fill_id for p in saved_positions]
+    assert len(fill_ids) == 2
+    assert len(set(fill_ids)) == 2

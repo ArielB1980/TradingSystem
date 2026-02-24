@@ -61,3 +61,44 @@ def test_load_registry_archives_stale_zero_qty_non_terminal_positions(tmp_path):
     assert len(stale) == 1
     assert stale[0].state == PositionState.CLOSED
     assert stale[0].exit_reason == ExitReason.RECONCILIATION
+
+
+def test_load_registry_repairs_missing_entry_fills_when_exit_exists(tmp_path):
+    db_path = tmp_path / "positions.db"
+    persistence = PositionPersistence(db_path=str(db_path))
+    registry = PositionRegistry()
+
+    pos = ManagedPosition(
+        symbol="XLM/USD",
+        side=Side.SHORT,
+        position_id="pos-repair-test",
+        initial_size=Decimal("683"),
+        initial_entry_price=Decimal("0.1542"),
+        initial_stop_price=Decimal("0.1592"),
+        initial_tp1_price=None,
+        initial_tp2_price=None,
+        initial_final_target=None,
+    )
+    pos.state = PositionState.OPEN
+    # Simulate legacy-corrupt state: no entry fills, only synthetic exit.
+    pos.exit_fills.append(
+        FillRecord(
+            fill_id="legacy-exit-only",
+            order_id="reconcile-sync",
+            side=Side.LONG,
+            qty=Decimal("273"),
+            price=Decimal("0.1542"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=False,
+        )
+    )
+    registry.register_position(pos)
+    persistence.save_registry(registry)
+
+    loaded = persistence.load_registry()
+    repaired = loaded.get_position("XLM/USD")
+
+    assert repaired is not None
+    assert repaired.filled_entry_qty == Decimal("683")
+    assert repaired.filled_exit_qty == Decimal("273")
+    assert repaired.remaining_qty == Decimal("410")

@@ -493,7 +493,9 @@ class ProductionTakeover:
         
         # Synthesize Fill Record to make stats work
         dummy_fill = FillRecord(
-            fill_id=f"takeover-fill-{self.snapshot_id}",
+            # Must be globally unique across ALL positions; persistence uses
+            # fill_id as PRIMARY KEY and duplicate IDs are ignored.
+            fill_id=f"takeover-fill-{pid}",
             order_id="UNKNOWN_ORIGIN",
             side=pos_data["side"],
             qty=pos_data["qty"],
