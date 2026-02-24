@@ -1153,6 +1153,33 @@ class ExecutionGateway:
             self._taker_fee_rate = Decimal("0.0005")   # 5 bps default
             self._funding_rate_daily_bps = Decimal("10")
         return self._maker_fee_rate, self._taker_fee_rate
+
+    @staticmethod
+    def _summarize_reconcile_issues(issues: list[tuple[str, str]]) -> Dict[str, int]:
+        """Build deterministic reconciliation counters for startup/runtime reports."""
+        report = {
+            "issues_total": len(issues),
+            "orphaned": 0,
+            "stale": 0,
+            "qty_synced": 0,
+            "qty_mismatch": 0,
+            "pending_adopted": 0,
+            "phantom": 0,
+        }
+        for _, issue in issues:
+            if issue.startswith("ORPHANED"):
+                report["orphaned"] += 1
+            elif issue.startswith("STALE"):
+                report["stale"] += 1
+            elif issue.startswith("QTY_SYNCED"):
+                report["qty_synced"] += 1
+            elif issue.startswith("QTY_MISMATCH"):
+                report["qty_mismatch"] += 1
+            elif issue.startswith("PENDING_ADOPTED"):
+                report["pending_adopted"] += 1
+            elif issue.startswith("PHANTOM"):
+                report["phantom"] += 1
+        return report
     
     async def _maybe_record_trade(self, position: ManagedPosition) -> None:
         """
@@ -1903,6 +1930,8 @@ class ExecutionGateway:
         # This ensures they're saved as ORPHANED and won't be reloaded as ACTIVE
         orphaned_count = 0
         qty_synced_count = 0
+        adjustments_logged = 0
+        adjustments_deduped = 0
         for symbol, issue in issues:
             if "ORPHANED" in issue:
                 # Find in closed positions (just moved there by reconcile)
@@ -1915,24 +1944,32 @@ class ExecutionGateway:
                 pos = self.registry.get_position(symbol)
                 if pos:
                     self.persistence.save_position(pos)
-                    self.persistence.log_state_adjustment(
+                    inserted = self.persistence.log_state_adjustment(
                         position_id=pos.position_id,
                         symbol=symbol,
                         adjustment_type="QTY_SYNCED",
                         detail=issue,
                     )
+                    if inserted:
+                        adjustments_logged += 1
+                    else:
+                        adjustments_deduped += 1
                     qty_synced_count += 1
                 else:
                     # Reconciliation may close/move the position to history.
                     closed_pos = self.registry.get_closed_position(symbol)
                     if closed_pos:
                         self.persistence.save_position(closed_pos)
-                        self.persistence.log_state_adjustment(
+                        inserted = self.persistence.log_state_adjustment(
                             position_id=closed_pos.position_id,
                             symbol=symbol,
                             adjustment_type="QTY_SYNCED",
                             detail=issue,
                         )
+                        if inserted:
+                            adjustments_logged += 1
+                        else:
+                            adjustments_deduped += 1
                         qty_synced_count += 1
         
         if orphaned_count > 0:
@@ -1973,12 +2010,21 @@ class ExecutionGateway:
         # Execute corrective actions
         for action in actions:
             await self.execute_action(action)
+
+        reconcile_report = self._summarize_reconcile_issues(issues)
+        reconcile_report["state_adjustments_logged"] = adjustments_logged
+        reconcile_report["state_adjustments_deduped"] = adjustments_deduped
+        reconcile_report["actions_taken"] = len(actions)
+        reconcile_report["exchange_positions"] = len(exchange_positions)
+        reconcile_report["registry_positions"] = len(self.registry.get_all_active())
+        logger.info("RECONCILIATION_REPORT", **reconcile_report)
         
         return {
             "issues": issues,
             "actions_taken": len(actions),
             "exchange_positions": len(exchange_positions),
-            "registry_positions": len(self.registry.get_all_active())
+            "registry_positions": len(self.registry.get_all_active()),
+            "reconciliation_report": reconcile_report,
         }
     
     # ========== STARTUP / RECOVERY ==========
@@ -2057,6 +2103,7 @@ class ExecutionGateway:
             positions=len(self.registry.get_all_active()),
             issues=len(sync_result.get("issues", [])),
             pg_enriched=enriched,
+            reconciliation_report=sync_result.get("reconciliation_report"),
         )
     
     def _enrich_from_postgres(self) -> int:

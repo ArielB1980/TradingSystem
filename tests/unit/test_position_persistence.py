@@ -114,8 +114,11 @@ def test_log_state_adjustment_is_idempotent_for_same_payload(tmp_path):
         "adjustment_type": "QTY_SYNCED",
         "detail": "QTY_SYNCED: exit+2 local=10 exchange=8 price=101",
     }
-    persistence.log_state_adjustment(**payload)
-    persistence.log_state_adjustment(**payload)
+    inserted_first = persistence.log_state_adjustment(**payload)
+    inserted_second = persistence.log_state_adjustment(**payload)
+
+    assert inserted_first is True
+    assert inserted_second is False
 
     row = persistence._conn.execute(
         "SELECT COUNT(*) AS c FROM position_state_adjustments"

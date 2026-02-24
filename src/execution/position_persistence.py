@@ -518,13 +518,17 @@ class PositionPersistence:
         symbol: str,
         adjustment_type: str,
         detail: Optional[str] = None,
-    ) -> None:
-        """Persist non-economic reconciliation adjustments for auditability."""
+    ) -> bool:
+        """Persist non-economic reconciliation adjustments for auditability.
+
+        Returns True when a new adjustment row was inserted, False when it was
+        deduplicated by adjustment_key.
+        """
         detail_text = detail or ""
         normalized = f"{position_id}|{symbol.upper()}|{adjustment_type}|{detail_text}"
         adjustment_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
         with self._conn:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 """
                 INSERT INTO position_state_adjustments (
                     position_id, symbol, adjustment_type, adjustment_key, detail, timestamp
@@ -540,6 +544,7 @@ class PositionPersistence:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+        return bool(cursor.rowcount)
     
     # ========== PENDING REVERSALS ==========
     
