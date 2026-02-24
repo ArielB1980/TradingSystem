@@ -14,6 +14,7 @@ Recovery algorithm:
 import sqlite3
 import json
 import threading
+import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional, List, Dict
@@ -147,6 +148,7 @@ class PositionPersistence:
                     position_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     adjustment_type TEXT NOT NULL,
+                    adjustment_key TEXT,
                     detail TEXT,
                     timestamp TEXT NOT NULL
                 );
@@ -154,6 +156,8 @@ class PositionPersistence:
                     ON position_state_adjustments(position_id);
                 CREATE INDEX IF NOT EXISTS idx_state_adjustments_timestamp
                     ON position_state_adjustments(timestamp);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_state_adjustments_key
+                    ON position_state_adjustments(adjustment_key);
                 
                 -- Pending reversals
                 CREATE TABLE IF NOT EXISTS pending_reversals (
@@ -193,6 +197,17 @@ class PositionPersistence:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+            try:
+                self._conn.execute(
+                    "ALTER TABLE position_state_adjustments ADD COLUMN adjustment_key TEXT"
+                )
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_state_adjustments_key "
+                "ON position_state_adjustments(adjustment_key)"
+            )
             for col in ("entry_size_initial", "tp1_qty_target", "tp2_qty_target"):
                 try:
                     self._conn.execute(
@@ -505,17 +520,22 @@ class PositionPersistence:
         detail: Optional[str] = None,
     ) -> None:
         """Persist non-economic reconciliation adjustments for auditability."""
+        detail_text = detail or ""
+        normalized = f"{position_id}|{symbol.upper()}|{adjustment_type}|{detail_text}"
+        adjustment_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO position_state_adjustments (
-                    position_id, symbol, adjustment_type, detail, timestamp
-                ) VALUES (?, ?, ?, ?, ?)
+                    position_id, symbol, adjustment_type, adjustment_key, detail, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(adjustment_key) DO NOTHING
                 """,
                 (
                     position_id,
                     symbol,
                     adjustment_type,
+                    adjustment_key,
                     detail,
                     datetime.now(timezone.utc).isoformat(),
                 ),

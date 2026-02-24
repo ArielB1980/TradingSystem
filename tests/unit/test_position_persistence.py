@@ -102,3 +102,22 @@ def test_load_registry_repairs_missing_entry_fills_when_exit_exists(tmp_path):
     assert repaired.filled_entry_qty == Decimal("683")
     assert repaired.filled_exit_qty == Decimal("273")
     assert repaired.remaining_qty == Decimal("410")
+
+
+def test_log_state_adjustment_is_idempotent_for_same_payload(tmp_path):
+    db_path = tmp_path / "positions.db"
+    persistence = PositionPersistence(db_path=str(db_path))
+
+    payload = {
+        "position_id": "pos-1",
+        "symbol": "PF_SOLUSD",
+        "adjustment_type": "QTY_SYNCED",
+        "detail": "QTY_SYNCED: exit+2 local=10 exchange=8 price=101",
+    }
+    persistence.log_state_adjustment(**payload)
+    persistence.log_state_adjustment(**payload)
+
+    row = persistence._conn.execute(
+        "SELECT COUNT(*) AS c FROM position_state_adjustments"
+    ).fetchone()
+    assert int(row["c"]) == 1

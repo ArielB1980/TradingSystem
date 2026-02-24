@@ -432,6 +432,47 @@ class TestIdempotentEventHandling:
         assert pos.entry_acknowledged is True
         # Still in OPEN state (fill already processed)
 
+    def test_duplicate_fill_id_with_new_event_seq_is_ignored(self):
+        """Exchange can replay same fill with a different event_seq; keep qty idempotent."""
+        pos = ManagedPosition(
+            symbol="BTC/USD:USD",
+            side=Side.LONG,
+            position_id="test-dup-fill",
+            initial_size=Decimal("0.1"),
+            initial_entry_price=Decimal("50000"),
+            initial_stop_price=Decimal("49000"),
+            initial_tp1_price=Decimal("52000"),
+            initial_tp2_price=None,
+            initial_final_target=None
+        )
+        pos.entry_order_id = "entry-1"
+
+        first = OrderEvent(
+            order_id="entry-1",
+            client_order_id="client-1",
+            event_type=OrderEventType.FILLED,
+            event_seq=1,
+            timestamp=datetime.now(timezone.utc),
+            fill_qty=Decimal("0.1"),
+            fill_price=Decimal("50000"),
+            fill_id="kraken-fill-123",
+        )
+        replay = OrderEvent(
+            order_id="entry-1",
+            client_order_id="client-1",
+            event_type=OrderEventType.FILLED,
+            event_seq=2,  # Different seq, same fill
+            timestamp=datetime.now(timezone.utc),
+            fill_qty=Decimal("0.1"),
+            fill_price=Decimal("50000"),
+            fill_id="kraken-fill-123",
+        )
+
+        assert pos.apply_order_event(first) is True
+        assert pos.filled_entry_qty == Decimal("0.1")
+        assert pos.apply_order_event(replay) is False
+        assert pos.filled_entry_qty == Decimal("0.1")
+
 
 class TestPartialFills:
     """Test partial fill handling."""

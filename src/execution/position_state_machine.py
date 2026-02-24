@@ -509,6 +509,19 @@ class ManagedPosition:
     
     def _record_fill(self, event: OrderEvent) -> bool:
         """Record a fill and update state."""
+        if event.fill_id and any(
+            f.fill_id == event.fill_id for f in (self.entry_fills + self.exit_fills)
+        ):
+            logger.debug(
+                "Duplicate fill_id ignored",
+                symbol=self.symbol,
+                position_id=self.position_id,
+                fill_id=event.fill_id,
+                order_id=event.order_id,
+                event_seq=event.event_seq,
+            )
+            return False
+
         is_entry = self._matches_entry_event(event)
         is_tp1 = self._matches_tp1_event(event)
         is_tp2 = self._matches_tp2_event(event)
