@@ -188,6 +188,7 @@ class ManagedPosition:
     """
     # Identity
     symbol: str
+    symbol_key: str = field(init=False)
     side: Side
     position_id: str  # Unique identifier for this position instance
     
@@ -275,6 +276,7 @@ class ManagedPosition:
     
     def __post_init__(self):
         """Validate position parameters."""
+        self.symbol_key = _normalize_symbol(self.symbol)
         check_invariant(
             self.initial_size > 0,
             f"Invalid position size: {self.initial_size}"
@@ -983,6 +985,7 @@ class ManagedPosition:
         return {
             "position_id": self.position_id,
             "symbol": self.symbol,
+            "symbol_key": self.symbol_key,
             "side": self.side.value,
             "state": self.state.value,
             "initial_size": str(self.initial_size),
@@ -1009,11 +1012,27 @@ class ManagedPosition:
             "pending_exit_order_id": self.pending_exit_order_id,
             "pending_exit_client_order_id": self.pending_exit_client_order_id,
             "entry_fills": [
-                {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
+                {
+                    "fill_id": f.fill_id,
+                    "order_id": f.order_id,
+                    "side": f.side.value,
+                    "qty": str(f.qty),
+                    "price": str(f.price),
+                    "ts": f.timestamp.isoformat(),
+                    "is_entry": f.is_entry,
+                }
                 for f in self.entry_fills
             ],
             "exit_fills": [
-                {"fill_id": f.fill_id, "qty": str(f.qty), "price": str(f.price), "ts": f.timestamp.isoformat()}
+                {
+                    "fill_id": f.fill_id,
+                    "order_id": f.order_id,
+                    "side": f.side.value,
+                    "qty": str(f.qty),
+                    "price": str(f.price),
+                    "ts": f.timestamp.isoformat(),
+                    "is_entry": f.is_entry,
+                }
                 for f in self.exit_fills
             ],
             "processed_event_hashes": list(self.processed_event_hashes),
@@ -1035,6 +1054,7 @@ class ManagedPosition:
             initial_tp2_price=Decimal(data["initial_tp2_price"]) if data.get("initial_tp2_price") else None,
             initial_final_target=Decimal(data["initial_final_target"]) if data.get("initial_final_target") else None,
         )
+        pos.symbol_key = data.get("symbol_key") or _normalize_symbol(pos.symbol)
         
         pos.state = PositionState(data["state"])
         pos.current_stop_price = Decimal(data["current_stop_price"]) if data.get("current_stop_price") else None
@@ -1059,23 +1079,23 @@ class ManagedPosition:
         for f_data in data.get("entry_fills", []):
             pos.entry_fills.append(FillRecord(
                 fill_id=f_data["fill_id"],
-                order_id=pos.entry_order_id or "",
-                side=pos.side,
+                order_id=f_data.get("order_id") or pos.entry_order_id or "",
+                side=Side(f_data.get("side")) if f_data.get("side") else pos.side,
                 qty=Decimal(f_data["qty"]),
                 price=Decimal(f_data["price"]),
                 timestamp=datetime.fromisoformat(f_data["ts"]),
-                is_entry=True
+                is_entry=bool(f_data.get("is_entry", True))
             ))
         
         for f_data in data.get("exit_fills", []):
             pos.exit_fills.append(FillRecord(
                 fill_id=f_data["fill_id"],
-                order_id="",
-                side=Side.SHORT if pos.side == Side.LONG else Side.LONG,
+                order_id=f_data.get("order_id", ""),
+                side=Side(f_data.get("side")) if f_data.get("side") else (Side.SHORT if pos.side == Side.LONG else Side.LONG),
                 qty=Decimal(f_data["qty"]),
                 price=Decimal(f_data["price"]),
                 timestamp=datetime.fromisoformat(f_data["ts"]),
-                is_entry=False
+                is_entry=bool(f_data.get("is_entry", False))
             ))
         
         pos.processed_event_hashes = set(data.get("processed_event_hashes", []))

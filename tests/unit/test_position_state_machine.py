@@ -75,6 +75,16 @@ class TestInvariants:
         
         with pytest.raises(InvariantViolation, match="Cannot register position"):
             registry.register_position(pos2)
+
+    def test_symbol_key_normalizes_format_variants(self):
+        """Canonical symbol key should be stable across PF/unified/spot formats."""
+        pos_spot = self._create_position("ADA/USD", Side.LONG)
+        pos_pf = self._create_position("PF_ADAUSD", Side.LONG)
+        pos_unified = self._create_position("ADA/USD:USD", Side.LONG)
+
+        assert pos_spot.symbol_key == "ADAUSD"
+        assert pos_pf.symbol_key == "ADAUSD"
+        assert pos_unified.symbol_key == "ADAUSD"
     
     def test_invariant_b_remaining_qty_never_negative(self):
         """Invariant B: remaining_qty = entry_qty - exit_qty >= 0."""
@@ -587,6 +597,15 @@ class TestPersistence:
             timestamp=datetime.now(timezone.utc),
             is_entry=True
         ))
+        pos.exit_fills.append(FillRecord(
+            fill_id="fill-2",
+            order_id="stop-1",
+            side=Side.SHORT,
+            qty=Decimal("0.05"),
+            price=Decimal("49500"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=False,
+        ))
         
         # Serialize
         data = pos.to_dict()
@@ -596,12 +615,16 @@ class TestPersistence:
         
         assert restored.position_id == pos.position_id
         assert restored.symbol == pos.symbol
+        assert restored.symbol_key == pos.symbol_key
         assert restored.side == pos.side
         assert restored.initial_size == pos.initial_size
         assert restored.current_stop_price == pos.current_stop_price
         assert restored.entry_acknowledged == pos.entry_acknowledged
         assert restored.tp1_filled == pos.tp1_filled
         assert len(restored.entry_fills) == 1
+        assert len(restored.exit_fills) == 1
+        assert restored.entry_fills[0].order_id == "entry-1"
+        assert restored.exit_fills[0].order_id == "stop-1"
     
     def test_registry_serialization(self):
         """Test registry to_dict/from_dict."""

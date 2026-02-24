@@ -65,6 +65,7 @@ class PositionPersistence:
                 CREATE TABLE IF NOT EXISTS positions (
                     position_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
+                    symbol_key TEXT,
                     side TEXT NOT NULL,
                     state TEXT NOT NULL,
                     
@@ -106,6 +107,7 @@ class PositionPersistence:
                 );
                 
                 CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);
+                CREATE INDEX IF NOT EXISTS idx_positions_symbol_key ON positions(symbol_key);
                 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
                 
                 -- Position fills table
@@ -186,6 +188,11 @@ class PositionPersistence:
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
+            try:
+                self._conn.execute("ALTER TABLE positions ADD COLUMN symbol_key TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
             for col in ("entry_size_initial", "tp1_qty_target", "tp2_qty_target"):
                 try:
                     self._conn.execute(
@@ -210,7 +217,7 @@ class PositionPersistence:
         with self._conn:
             self._conn.execute("""
                 INSERT OR REPLACE INTO positions (
-                    position_id, symbol, side, state,
+                    position_id, symbol, symbol_key, side, state,
                     initial_size, initial_entry_price, initial_stop_price,
                     initial_tp1_price, initial_tp2_price, initial_final_target,
                     current_stop_price, entry_acknowledged,
@@ -222,10 +229,11 @@ class PositionPersistence:
                     created_at, updated_at,
                     processed_event_hashes,
                     trade_recorded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 position.position_id,
                 position.symbol,
+                getattr(position, "symbol_key", None),
                 position.side.value,
                 position.state.value,
                 str(position.initial_size),
@@ -381,6 +389,8 @@ class PositionPersistence:
                 initial_tp2_price=Decimal(row["initial_tp2_price"]) if row.get("initial_tp2_price") else None,
                 initial_final_target=Decimal(row["initial_final_target"]) if row.get("initial_final_target") else None,
             )
+            if row.get("symbol_key"):
+                pos.symbol_key = row["symbol_key"]
             
             pos.state = PositionState(row["state"])
             pos.current_stop_price = Decimal(row["current_stop_price"]) if row.get("current_stop_price") else None
