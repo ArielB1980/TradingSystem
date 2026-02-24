@@ -1238,6 +1238,40 @@ class PositionRegistry:
         with self._lock:
             return list(self._positions.values())
 
+    @staticmethod
+    def _terminalize_for_archive(
+        position: ManagedPosition,
+        reason: ExitReason = ExitReason.RECONCILIATION,
+    ) -> None:
+        """Ensure archived history entries are terminal lifecycle states."""
+        if not position.is_terminal:
+            position.state = PositionState.CLOSED
+        if position.exit_reason is None:
+            position.exit_reason = reason
+        if position.exit_time is None:
+            position.exit_time = datetime.now(timezone.utc)
+        position.updated_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _is_non_terminal_preferred(a: ManagedPosition, b: ManagedPosition) -> Optional[ManagedPosition]:
+        """Return preferred position when one is terminal and the other is active."""
+        if a.is_terminal and not b.is_terminal:
+            return b
+        if b.is_terminal and not a.is_terminal:
+            return a
+        return None
+
+    @staticmethod
+    def _is_larger_exposure_preferred(a: ManagedPosition, b: ManagedPosition) -> Optional[ManagedPosition]:
+        """Prefer larger filled-entry exposure when both are non-terminal."""
+        if a.is_terminal or b.is_terminal:
+            return None
+        if a.filled_entry_qty > b.filled_entry_qty:
+            return a
+        if b.filled_entry_qty > a.filled_entry_qty:
+            return b
+        return None
+
     def merge_recovered_position(self, position: ManagedPosition) -> bool:
         """
         Merge a recovered position from persistence/startup into registry.
@@ -1263,14 +1297,42 @@ class PositionRegistry:
                     return True
                 return False
 
-            if position.updated_at > existing.updated_at:
-                self._closed_positions.append(existing)
+            preferred = (
+                self._is_non_terminal_preferred(existing, position)
+                or self._is_larger_exposure_preferred(existing, position)
+            )
+            if preferred is None:
+                preferred = position if position.updated_at > existing.updated_at else existing
+
+            kept = preferred
+            dropped = existing if kept is position else position
+            reason = (
+                "non_terminal_preferred"
+                if self._is_non_terminal_preferred(existing, position) is kept
+                else "larger_exposure_preferred"
+                if self._is_larger_exposure_preferred(existing, position) is kept
+                else "newer_updated_at"
+            )
+
+            self._terminalize_for_archive(dropped)
+            self._closed_positions.append(dropped)
+            logger.warning(
+                "RECOVERY_MERGE_COLLISION",
+                symbol_key=position.symbol_key,
+                kept_position_id=kept.position_id,
+                kept_state=kept.state.value,
+                kept_symbol=kept.symbol,
+                dropped_position_id=dropped.position_id,
+                dropped_state=dropped.state.value,
+                dropped_symbol=dropped.symbol,
+                reason=reason,
+            )
+            if kept is position:
                 self._positions.pop(existing.symbol, None)
                 self._positions[position.symbol] = position
                 return True
 
-            # Keep existing newer record; preserve recovered in history.
-            self._closed_positions.append(position)
+            # Existing kept in place; recovered row archived.
             return False
 
     def remove_position(self, symbol: str, archive: bool = True) -> Optional[ManagedPosition]:
@@ -1285,6 +1347,7 @@ class PositionRegistry:
                 return None
             removed = self._positions.pop(existing.symbol, None)
             if removed and archive:
+                self._terminalize_for_archive(removed)
                 self._closed_positions.append(removed)
             return removed
     
@@ -1679,11 +1742,17 @@ class PositionRegistry:
     ) -> Optional[ManagedPosition]:
         """Get most recent closed/history position by canonical symbol match."""
         target = _normalize_symbol(symbol)
+        allowed_states = states or (
+            PositionState.CLOSED,
+            PositionState.ORPHANED,
+            PositionState.CANCELLED,
+            PositionState.ERROR,
+        )
         with self._lock:
             for pos in reversed(self._closed_positions):
                 if _normalize_symbol(pos.symbol) != target:
                     continue
-                if states and pos.state not in states:
+                if pos.state not in allowed_states:
                     continue
                 return pos
         return None

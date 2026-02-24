@@ -105,15 +105,83 @@ class TestInvariants:
         assert current is not None
         assert current.position_id == "new-pos"
 
+    def test_merge_recovered_position_prefers_non_terminal_over_newer_terminal(self):
+        registry = get_position_registry()
+        active = self._create_position("ADA/USD", Side.LONG)
+        active.position_id = "active-pos"
+        active.state = PositionState.OPEN
+        active.updated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        active.entry_fills.append(FillRecord(
+            fill_id="entry-a",
+            order_id="entry-a",
+            side=Side.LONG,
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+
+        terminal = self._create_position("PF_ADAUSD", Side.LONG)
+        terminal.position_id = "terminal-pos"
+        terminal.state = PositionState.CLOSED
+        terminal.exit_reason = ExitReason.RECONCILIATION
+        terminal.updated_at = datetime(2026, 1, 2, tzinfo=timezone.utc)  # newer
+
+        assert registry.merge_recovered_position(active) is True
+        assert registry.merge_recovered_position(terminal) is False
+        current = registry.get_position("ADA/USD:USD")
+        assert current is not None
+        assert current.position_id == "active-pos"
+
+    def test_merge_recovered_position_prefers_larger_exposure_when_both_active(self):
+        registry = get_position_registry()
+        smaller = self._create_position("ADA/USD", Side.LONG)
+        smaller.position_id = "small-pos"
+        smaller.state = PositionState.OPEN
+        smaller.updated_at = datetime(2026, 1, 2, tzinfo=timezone.utc)  # newer
+        smaller.entry_fills.append(FillRecord(
+            fill_id="entry-small",
+            order_id="entry-small",
+            side=Side.LONG,
+            qty=Decimal("1"),
+            price=Decimal("100"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+
+        larger = self._create_position("PF_ADAUSD", Side.LONG)
+        larger.position_id = "large-pos"
+        larger.state = PositionState.OPEN
+        larger.updated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)  # older
+        larger.entry_fills.append(FillRecord(
+            fill_id="entry-large",
+            order_id="entry-large",
+            side=Side.LONG,
+            qty=Decimal("2"),
+            price=Decimal("100"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+
+        assert registry.merge_recovered_position(smaller) is True
+        assert registry.merge_recovered_position(larger) is True
+        current = registry.get_position("ADA/USD:USD")
+        assert current is not None
+        assert current.position_id == "large-pos"
+
     def test_remove_position_uses_normalized_symbol(self):
         registry = get_position_registry()
         pos = self._create_position("PF_XBTUSD", Side.LONG)
+        pos.state = PositionState.OPEN
         registry.register_position(pos)
 
         removed = registry.remove_position("BTC/USD:USD", archive=True)
         assert removed is not None
         assert removed.position_id == pos.position_id
         assert registry.get_position("PF_XBTUSD") is None
+        assert removed.is_terminal is True
+        assert removed.exit_reason == ExitReason.RECONCILIATION
+        assert removed.exit_time is not None
     
     def test_invariant_b_remaining_qty_never_negative(self):
         """Invariant B: remaining_qty = entry_qty - exit_qty >= 0."""

@@ -1935,11 +1935,13 @@ class ExecutionGateway:
         for symbol, issue in issues:
             if "ORPHANED" in issue:
                 # Find in closed positions (just moved there by reconcile)
-                for pos in self.registry._closed_positions:
-                    if pos.symbol == symbol and pos.state.value == "orphaned":
-                        self.persistence.save_position(pos)
-                        orphaned_count += 1
-                        break
+                pos = self.registry.get_closed_position(
+                    symbol,
+                    states=(PositionState.ORPHANED,),
+                )
+                if pos:
+                    self.persistence.save_position(pos)
+                    orphaned_count += 1
             elif "QTY_SYNCED" in issue:
                 pos = self.registry.get_position(symbol)
                 if pos:
@@ -1957,7 +1959,10 @@ class ExecutionGateway:
                     qty_synced_count += 1
                 else:
                     # Reconciliation may close/move the position to history.
-                    closed_pos = self.registry.get_closed_position(symbol)
+                    closed_pos = self.registry.get_closed_position(
+                        symbol,
+                        states=(PositionState.CLOSED, PositionState.ORPHANED),
+                    )
                     if closed_pos:
                         self.persistence.save_position(closed_pos)
                         inserted = self.persistence.log_state_adjustment(
