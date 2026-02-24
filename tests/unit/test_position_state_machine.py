@@ -85,6 +85,35 @@ class TestInvariants:
         assert pos_spot.symbol_key == "ADAUSD"
         assert pos_pf.symbol_key == "ADAUSD"
         assert pos_unified.symbol_key == "ADAUSD"
+
+    def test_merge_recovered_position_prefers_newer_by_symbol_key(self):
+        registry = get_position_registry()
+        old_pos = self._create_position("ADA/USD", Side.LONG)
+        old_pos.position_id = "old-pos"
+        old_pos.updated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        new_pos = self._create_position("PF_ADAUSD", Side.LONG)
+        new_pos.position_id = "new-pos"
+        new_pos.updated_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+        inserted_old = registry.merge_recovered_position(old_pos)
+        inserted_new = registry.merge_recovered_position(new_pos)
+
+        assert inserted_old is True
+        assert inserted_new is True
+        current = registry.get_position("ADA/USD:USD")
+        assert current is not None
+        assert current.position_id == "new-pos"
+
+    def test_remove_position_uses_normalized_symbol(self):
+        registry = get_position_registry()
+        pos = self._create_position("PF_XBTUSD", Side.LONG)
+        registry.register_position(pos)
+
+        removed = registry.remove_position("BTC/USD:USD", archive=True)
+        assert removed is not None
+        assert removed.position_id == pos.position_id
+        assert registry.get_position("PF_XBTUSD") is None
     
     def test_invariant_b_remaining_qty_never_negative(self):
         """Invariant B: remaining_qty = entry_qty - exit_qty >= 0."""

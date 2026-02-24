@@ -576,7 +576,7 @@ class PositionPersistence:
         
         # Load all positions
         for pos in self.load_all_positions():
-            registry._positions[pos.symbol] = pos
+            registry.merge_recovered_position(pos)
         
         # Load pending reversals
         registry._pending_reversals = self.get_pending_reversals()
@@ -586,7 +586,7 @@ class PositionPersistence:
         stale_zero_symbols: List[str] = []
         corrupted_symbols: List[str] = []
         qty_epsilon = Decimal("0.0001")
-        for symbol, pos in registry._positions.items():
+        for symbol, pos in list(registry._positions.items()):
             if pos.is_terminal:
                 registry._closed_positions.append(pos)
                 terminal_symbols.append(symbol)

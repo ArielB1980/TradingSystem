@@ -1188,6 +1188,56 @@ class PositionRegistry:
         """Get all positions including terminal."""
         with self._lock:
             return list(self._positions.values())
+
+    def merge_recovered_position(self, position: ManagedPosition) -> bool:
+        """
+        Merge a recovered position from persistence/startup into registry.
+
+        Canonical-key semantics:
+        - No existing position for symbol_key -> insert.
+        - Existing position present -> keep the newer one by updated_at.
+        - If replacing, archive the old position for audit continuity.
+
+        Returns True if the recovered position became active in registry.
+        """
+        with self._lock:
+            existing = self._find_position_by_normalized(position.symbol)
+            if existing is None:
+                self._positions[position.symbol] = position
+                return True
+
+            if existing.position_id == position.position_id:
+                if position.updated_at >= existing.updated_at:
+                    if existing.symbol != position.symbol:
+                        self._positions.pop(existing.symbol, None)
+                    self._positions[position.symbol] = position
+                    return True
+                return False
+
+            if position.updated_at > existing.updated_at:
+                self._closed_positions.append(existing)
+                self._positions.pop(existing.symbol, None)
+                self._positions[position.symbol] = position
+                return True
+
+            # Keep existing newer record; preserve recovered in history.
+            self._closed_positions.append(position)
+            return False
+
+    def remove_position(self, symbol: str, archive: bool = True) -> Optional[ManagedPosition]:
+        """
+        Remove a position by exact or normalized symbol key.
+
+        If archive=True, append removed position to closed history for traceability.
+        """
+        with self._lock:
+            existing = self._find_position_by_normalized(symbol)
+            if existing is None:
+                return None
+            removed = self._positions.pop(existing.symbol, None)
+            if removed and archive:
+                self._closed_positions.append(removed)
+            return removed
     
     # ========== HARD RESET (startup hygiene) ==========
 

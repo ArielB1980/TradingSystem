@@ -2002,8 +2002,7 @@ class ExecutionGateway:
         
         # Merge into current registry
         for pos in persisted_registry.get_all():
-            if pos.symbol not in self.registry._positions:
-                self.registry._positions[pos.symbol] = pos
+            self.registry.merge_recovered_position(pos)
         
         # 0. REGISTRY HYGIENE: if exchange is provably flat, wipe stale registry.
         # Exchange is always source of truth. If the exchange has zero
@@ -2200,14 +2199,14 @@ class ExecutionGateway:
             stale_symbols_to_remove = []
             
             # Also check for normalized matches across all registry positions
-            for reg_symbol in list(self.registry._positions.keys()):
+            for reg_pos in self.registry.get_all():
+                reg_symbol = reg_pos.symbol
                 if normalize_symbol_for_position_match(reg_symbol) == normalized_key:
-                    reg_pos = self.registry._positions.get(reg_symbol)
-                    if reg_pos and reg_pos.remaining_qty > 0:
+                    if reg_pos.remaining_qty > 0 and not reg_pos.is_terminal:
                         # Found a valid existing position, skip import
                         existing = reg_pos
                         break
-                    elif reg_pos and reg_pos.remaining_qty <= 0:
+                    if reg_pos.remaining_qty <= 0:
                         # Stale position, mark for removal
                         stale_symbols_to_remove.append(reg_symbol)
             
@@ -2218,10 +2217,7 @@ class ExecutionGateway:
             for stale_symbol in stale_symbols_to_remove:
                 logger.warning("Removing stale position before phantom import", 
                               stale_symbol=stale_symbol, new_symbol=symbol)
-                with self.registry._lock:
-                    stale_pos = self.registry._positions.pop(stale_symbol, None)
-                    if stale_pos:
-                        self.registry._closed_positions.append(stale_pos)
+                self.registry.remove_position(stale_symbol, archive=True)
             
             # Need to import
             logger.warning("Importing phantom position from exchange", symbol=symbol, size=size)

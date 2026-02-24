@@ -197,8 +197,8 @@ class ProductionTakeover:
                 # Root cause fix: registry keys by position.symbol (e.g. PF_TONUSD); exchange may
                 # return a different format (e.g. TON/USD:USD). Must remove by existing.symbol.
                 logger.warning(f"Case D: Purging local state for {symbol} (no stop in registry)")
-                if existing and existing.symbol in self.registry._positions:
-                    del self.registry._positions[existing.symbol]
+                if existing:
+                    self.registry.remove_position(existing.symbol, archive=True)
         
         valid_stop: Optional[Dict] = None
         
