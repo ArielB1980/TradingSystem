@@ -75,6 +75,68 @@ python -m src.tools.check_tp_coverage  # identify gaps
 | `ORDER_REJECTED_BY_VENUE` | Exchange rejected order |
 | `API circuit breaker OPENED` | Circuit breaker tripped (API outage) |
 | `THRESHOLD_MISMATCH` | Config/safety limit inconsistency |
+| `REGISTRY_AUDIT_REPORT` | Startup/runtime lifecycle integrity report |
+| `RECONCILIATION_REPORT` | Reconciliation issue classes and convergence counters |
+| `RECOVERY_MERGE_COLLISION` | Canonical symbol-key collision resolved during startup merge |
+
+## Registry and Reconciliation Runbook
+
+These two logs are the primary health signals for orphan prevention and replay stability:
+
+- `REGISTRY_AUDIT_REPORT`
+- `RECONCILIATION_REPORT`
+
+### REGISTRY_AUDIT_REPORT fields and actions
+
+| Field | Expected | Action if non-zero |
+|------|----------|--------------------|
+| `violations_total` | `0` | Treat as **critical**. Startup should fail-fast; do not override. |
+| `duplicate_active_symbol_keys` | `0` | Investigate duplicate lifecycle rows by symbol key. Run sync tools only after root cause is identified. |
+| `non_terminal_in_closed_history` | `0` | Indicates lifecycle corruption. Review recent takeover/import/reconcile logs. |
+| `remaining_qty_violations` | `0` | Potential fill-ledger corruption. Inspect fill IDs and position snapshots before restart. |
+
+### RECONCILIATION_REPORT fields and thresholds
+
+| Field | Target | Warning threshold | Critical threshold |
+|------|--------|-------------------|--------------------|
+| `orphaned` | `0` | `>= 1` in a cycle | `>= 3` in 15 minutes |
+| `phantom` | `0` | `>= 1` in a cycle | `>= 3` in 15 minutes |
+| `qty_mismatch` | `0` | `>= 1` in a cycle | persistent for 3+ cycles |
+| `qty_synced` | low/occasional | `>= 3` in a cycle | sustained increase over 30 minutes |
+| `pending_adopted` | rare | `>= 1` in a cycle | repeated every restart |
+| `state_adjustments_deduped` | low | rising trend | dominates `state_adjustments_logged` for >30 minutes |
+
+### Incident playbook
+
+1. **Audit failure (`violations_total > 0`)**
+   - Keep service stopped.
+   - Capture latest `REGISTRY_AUDIT_REPORT`, `RECOVERY_MERGE_COLLISION`, and `CORRUPTED_POSITION` logs.
+   - Run local smoke (`make smoke`) before any redeploy.
+
+2. **Orphan/phantom spike**
+   - Check exchange connectivity and order stream lag (`API circuit breaker OPENED`, websocket health).
+   - Run:
+     - `python -m src.tools.check_live_readiness`
+     - `python -m src.tools.sync_positions --execute`
+   - Verify next 3 `RECONCILIATION_REPORT` cycles trend down.
+
+3. **Persistent qty_mismatch**
+   - Inspect recent fill IDs and `QTY_SYNCED` issues.
+   - Confirm no repeated symbol format drift (`PF_*` vs unified symbols).
+   - If unresolved after 3 cycles, halt and investigate replay/persistence state.
+
+4. **High dedupe with low new adjustments**
+   - Usually benign after restart/replay.
+   - If sustained, review whether same mismatch issue is emitted repeatedly (possible stale exchange snapshot or event feed lag).
+
+### Escalation criteria
+
+Escalate immediately (page + pause trading) when any of the below occur:
+
+- `REGISTRY_AUDIT_REPORT.violations_total > 0`
+- `orphaned` or `phantom` hits critical threshold
+- `qty_mismatch` persists for 3+ consecutive cycles
+- repeated `CORRUPTED_POSITION` alerts
 
 ## Common Troubleshooting
 
