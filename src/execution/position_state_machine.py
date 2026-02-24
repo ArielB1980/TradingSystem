@@ -855,6 +855,10 @@ class ManagedPosition:
     def mark_orphaned(self) -> None:
         """Mark position as ORPHANED (exchange mismatch)."""
         self.state = PositionState.ORPHANED
+        if self.exit_reason is None:
+            self.exit_reason = ExitReason.RECONCILIATION
+        if self.exit_time is None:
+            self.exit_time = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
         logger.critical(f"Position marked ORPHANED: {self.symbol}")
 

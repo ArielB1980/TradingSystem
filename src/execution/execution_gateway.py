@@ -1184,9 +1184,48 @@ class ExecutionGateway:
                 pass
             return
         
-        # If no exit fills, try to backfill from exchange before recording
-        if not position.exit_fills and position.filled_entry_qty > 0:
+        # If exit fills are missing or incomplete, try to backfill from exchange
+        # before recording. This is common for orphaned positions where the
+        # exchange closed exposure but local fill events were partially missed.
+        if position.filled_entry_qty > 0 and (
+            not position.exit_fills or position.filled_exit_qty < position.filled_entry_qty
+        ):
             await self._backfill_exit_fills(position)
+
+        # Do not fabricate precise trade stats for orphaned positions when we
+        # still lack complete exit fills after backfill. Emit a clear alert
+        # without P&L instead of a misleading "entry == exit" summary.
+        if (
+            position.state == PositionState.ORPHANED
+            and position.filled_entry_qty > 0
+            and position.filled_exit_qty < position.filled_entry_qty
+        ):
+            missing_qty = position.filled_entry_qty - position.filled_exit_qty
+            logger.warning(
+                "ORPHANED_CLOSE_UNPRICED: skipping precise trade record",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                entry_qty=str(position.filled_entry_qty),
+                exit_qty=str(position.filled_exit_qty),
+                missing_qty=str(missing_qty),
+            )
+            try:
+                from src.monitoring.alerting import send_alert, fmt_size
+                await send_alert(
+                    "POSITION_CLOSED_UNPRICED",
+                    f"⚠️ Position reconciled closed: {position.symbol}\n"
+                    f"Side: {position.side.value.upper()}\n"
+                    f"Entry size: {fmt_size(position.filled_entry_qty)}\n"
+                    f"Known exited: {fmt_size(position.filled_exit_qty)}\n"
+                    f"Unpriced remainder: {fmt_size(missing_qty)}\n"
+                    "Reason: orphaned_exchange_reconcile (exact exit fills unavailable)",
+                    urgent=True,
+                )
+            except Exception:
+                pass
+            position.trade_recorded = True
+            self.persistence.save_position(position)
+            return
         
         maker_rate, taker_rate = self._get_fee_rates()
         
@@ -1224,6 +1263,7 @@ class ExecutionGateway:
                         f"Entry: ${fmt_price(trade.entry_price)} \u2192 Exit: ${fmt_price(trade.exit_price)}\n"
                         f"Gross P&L: {pnl_sign}${float(trade.gross_pnl):.2f}\n"
                         f"Fees: ${float(trade.fees):.2f}\n"
+                        f"Funding: ${float(trade.funding):.2f}\n"
                         f"Net P&L: {pnl_sign}${float(trade.net_pnl):.2f}\n"
                         f"Reason: {exit_reason}\n"
                         f"Duration: {holding_str}",
