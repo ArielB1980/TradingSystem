@@ -182,6 +182,16 @@ class TestInvariants:
         assert removed.is_terminal is True
         assert removed.exit_reason == ExitReason.RECONCILIATION
         assert removed.exit_time is not None
+
+    def test_audit_integrity_detects_non_terminal_in_closed_history(self):
+        registry = get_position_registry()
+        pos = self._create_position("ADA/USD", Side.LONG)
+        pos.state = PositionState.OPEN
+        registry._closed_positions.append(pos)
+
+        report = registry.audit_integrity(phase="test")
+        assert report["violations_total"] >= 1
+        assert report["non_terminal_in_closed_history"] == 1
     
     def test_invariant_b_remaining_qty_never_negative(self):
         """Invariant B: remaining_qty = entry_qty - exit_qty >= 0."""

@@ -1154,6 +1154,19 @@ class ExecutionGateway:
             self._funding_rate_daily_bps = Decimal("10")
         return self._maker_fee_rate, self._taker_fee_rate
 
+    def _run_registry_audit(self, phase: str) -> Dict[str, object]:
+        report = self.registry.audit_integrity(phase=phase)
+        logger.info("REGISTRY_AUDIT_REPORT", **report)
+        return report
+
+    def _assert_registry_integrity(self, phase: str) -> Dict[str, object]:
+        report = self._run_registry_audit(phase)
+        if int(report.get("violations_total", 0)) > 0:
+            raise InvariantError(
+                f"Registry audit failed at {phase}: {report.get('violations_total')} violations"
+            )
+        return report
+
     @staticmethod
     def _summarize_reconcile_issues(issues: list[tuple[str, str]]) -> Dict[str, int]:
         """Build deterministic reconciliation counters for startup/runtime reports."""
@@ -2053,6 +2066,9 @@ class ExecutionGateway:
         # Merge into current registry
         for pos in persisted_registry.get_all():
             self.registry.merge_recovered_position(pos)
+
+        # Audit immediately after state restoration/merge.
+        self._assert_registry_integrity("startup_post_load_merge")
         
         # 0. REGISTRY HYGIENE: if exchange is provably flat, wipe stale registry.
         # Exchange is always source of truth. If the exchange has zero
@@ -2099,6 +2115,9 @@ class ExecutionGateway:
         
         # 4. Cross-validate with Postgres and enrich SQLite positions
         enriched = self._enrich_from_postgres()
+
+        # Final startup integrity gate before persistence and live trading.
+        self._assert_registry_integrity("startup_pre_persist")
         
         # 5. Persist fully reconciled state to SQLite
         self.persistence.save_registry(self.registry)

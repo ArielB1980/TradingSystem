@@ -1756,6 +1756,58 @@ class PositionRegistry:
                     continue
                 return pos
         return None
+
+    def audit_integrity(self, phase: str = "runtime") -> Dict[str, object]:
+        """
+        Deterministic registry audit for startup/runtime safety checks.
+
+        Reports violations instead of mutating state so callers can fail fast or
+        alert without hidden side-effects.
+        """
+        report: Dict[str, object] = {
+            "phase": phase,
+            "active_positions": 0,
+            "closed_positions": 0,
+            "duplicate_active_symbol_keys": 0,
+            "non_terminal_in_closed_history": 0,
+            "remaining_qty_violations": 0,
+            "violations": [],
+        }
+        with self._lock:
+            report["active_positions"] = len(self.get_all_active())
+            report["closed_positions"] = len(self._closed_positions)
+
+            # 1) no duplicate active positions by canonical symbol key
+            active_by_key: Dict[str, int] = {}
+            for pos in self._positions.values():
+                if pos.is_terminal:
+                    continue
+                active_by_key[pos.symbol_key] = active_by_key.get(pos.symbol_key, 0) + 1
+            for key, count in active_by_key.items():
+                if count > 1:
+                    report["duplicate_active_symbol_keys"] = int(report["duplicate_active_symbol_keys"]) + 1
+                    report["violations"].append(f"duplicate_active_symbol_key:{key}:{count}")
+
+            # 2) closed history should only contain terminal positions
+            for pos in self._closed_positions:
+                if not pos.is_terminal:
+                    report["non_terminal_in_closed_history"] = int(report["non_terminal_in_closed_history"]) + 1
+                    report["violations"].append(
+                        f"non_terminal_in_closed_history:{pos.position_id}:{pos.symbol}:{pos.state.value}"
+                    )
+
+            # 3) invariant B check across all tracked positions
+            for pos in list(self._positions.values()) + list(self._closed_positions):
+                try:
+                    _ = pos.remaining_qty
+                except Exception as e:
+                    report["remaining_qty_violations"] = int(report["remaining_qty_violations"]) + 1
+                    report["violations"].append(
+                        f"remaining_qty_violation:{pos.position_id}:{pos.symbol}:{type(e).__name__}:{e}"
+                    )
+
+        report["violations_total"] = len(report["violations"])
+        return report
     
     def cleanup_stale(self, max_age_hours: int = 24) -> int:
         """Remove very old closed positions from memory."""

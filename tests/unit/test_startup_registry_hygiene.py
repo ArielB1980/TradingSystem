@@ -20,6 +20,7 @@ from src.execution.position_state_machine import (
     PositionRegistry,
     PositionState,
 )
+from src.exceptions import InvariantError
 
 
 def _make_position(symbol: str, state: PositionState = PositionState.OPEN) -> ManagedPosition:
@@ -239,3 +240,19 @@ async def test_wiped_positions_are_persisted():
     ]
     assert len(saved) >= 1
     assert saved[0].state == PositionState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_startup_fails_fast_on_registry_audit_violation():
+    """Startup must fail if closed history contains non-terminal states."""
+    registry = PositionRegistry()
+    bad = _make_position("PF_BADUSD")
+    bad.state = PositionState.OPEN
+    registry._closed_positions.append(bad)
+
+    gw = _build_gateway(registry)
+    gw.client.get_all_futures_positions.return_value = []
+    gw.client.get_futures_open_orders.return_value = []
+
+    with pytest.raises(InvariantError, match="Registry audit failed"):
+        await gw.startup()
