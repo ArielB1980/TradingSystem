@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 
 from src.monitoring.logger import get_logger
+from src.exceptions import CircuitOpenError, OperationalError, RateLimitError
 
 logger = get_logger(__name__)
 
@@ -66,7 +67,32 @@ async def run_spot_dca(lt: "LiveTrading") -> None:
             if not lt.active:
                 break
 
-            await _execute_dca_purchase(lt, dca_cfg, symbol)
+            completed, retryable = await _execute_dca_purchase(lt, dca_cfg, symbol)
+
+            # If the midnight run failed for a transient API reason
+            # (e.g., circuit breaker open), retry for a short window
+            # instead of skipping the whole day.
+            if lt.active and not completed and retryable:
+                retry_deadline = datetime.now(timezone.utc) + timedelta(minutes=15)
+                retry_attempt = 0
+                while lt.active and datetime.now(timezone.utc) < retry_deadline:
+                    retry_attempt += 1
+                    wait_seconds = 65  # breaker cooldown is 60s
+                    logger.warning(
+                        "Spot DCA transient failure, retrying",
+                        attempt=retry_attempt,
+                        wait_seconds=wait_seconds,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    completed, retryable = await _execute_dca_purchase(lt, dca_cfg, symbol)
+                    if completed or not retryable:
+                        break
+
+                if not completed and retryable:
+                    logger.error(
+                        "Spot DCA retry window exhausted",
+                        window_minutes=15,
+                    )
 
         except asyncio.CancelledError:
             logger.info("Spot DCA task cancelled")
@@ -80,8 +106,28 @@ async def run_spot_dca(lt: "LiveTrading") -> None:
             await asyncio.sleep(60)
 
 
-async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
-    """Execute one DCA purchase cycle."""
+def _is_retryable_dca_error(exc: Exception) -> bool:
+    """Return True for transient failures worth retrying soon."""
+    if isinstance(exc, (CircuitOpenError, RateLimitError)):
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    # Some operational wrappers carry only message text.
+    msg = str(exc).lower()
+    if "circuit breaker" in msg or "timeout" in msg or "temporar" in msg:
+        return True
+    # Keep OperationalError last (broader type).
+    return isinstance(exc, OperationalError)
+
+
+async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> tuple[bool, bool]:
+    """Execute one DCA purchase cycle.
+
+    Returns:
+        (completed, retryable_error)
+        - completed=True means no retry needed (success or intentional skip)
+        - completed=False and retryable_error=True means retry is recommended
+    """
     try:
         from src.monitoring.alerting import send_alert
     except ImportError:
@@ -99,7 +145,7 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
         logger.error("Spot DCA: failed to fetch spot balance", error=str(e))
         if send_alert:
             await send_alert("SPOT_DCA", f"Balance fetch failed – {e}")
-        return
+        return False, _is_retryable_dca_error(e)
 
     # Extract available quote currency (USD)
     free_quote = Decimal(str(balance.get("free", {}).get(quote, 0)))
@@ -118,7 +164,7 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
             free=str(free_quote),
             reserve=str(dca_cfg.reserve_usd),
         )
-        return
+        return True, False
 
     if dca_cfg.fixed_amount_usd is not None:
         spend_usd = min(Decimal(str(dca_cfg.fixed_amount_usd)), available)
@@ -126,7 +172,7 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
         spend_usd = available
     else:
         logger.warning("Spot DCA: no amount strategy configured, skipping")
-        return
+        return True, False
 
     if dca_cfg.max_purchase_usd is not None:
         spend_usd = min(spend_usd, Decimal(str(dca_cfg.max_purchase_usd)))
@@ -137,7 +183,7 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
             spend_usd=str(spend_usd),
             min_required=str(dca_cfg.min_purchase_usd),
         )
-        return
+        return True, False
 
     # 3. Get spot price to compute quantity
     try:
@@ -146,20 +192,20 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
         logger.error("Spot DCA: failed to fetch ticker", error=str(e), symbol=symbol)
         if send_alert:
             await send_alert("SPOT_DCA", f"Ticker fetch failed for {symbol} – {e}")
-        return
+        return False, _is_retryable_dca_error(e)
 
     ask_price = Decimal(str(ticker.get("ask", 0)))
     if ask_price <= 0:
         last_price = Decimal(str(ticker.get("last", 0)))
         if last_price <= 0:
             logger.error("Spot DCA: invalid ticker price", ticker=ticker)
-            return
+            return True, False
         ask_price = last_price
 
     quantity = (spend_usd / ask_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
     if quantity <= 0:
         logger.info("Spot DCA: computed quantity too small", spend_usd=str(spend_usd), price=str(ask_price))
-        return
+        return True, False
 
     logger.info(
         "Spot DCA: placing market buy",
@@ -197,17 +243,21 @@ async def _execute_dca_purchase(lt, dca_cfg, symbol: str) -> None:
                 "SPOT_DCA",
                 f"Bought {filled} {asset} @ ${avg_price} (${spend_usd:.2f} spent)",
             )
+        return True, False
 
     except Exception as e:
+        retryable = _is_retryable_dca_error(e)
         logger.error(
             "Spot DCA: order placement FAILED",
             error=str(e),
             error_type=type(e).__name__,
             symbol=symbol,
             quantity=str(quantity),
+            retryable=retryable,
         )
         if send_alert:
             await send_alert("SPOT_DCA", f"Order FAILED for {symbol} – {e}", urgent=True)
+        return False, retryable
 
 
 def _seconds_until_next_run(hour_utc: int, minute_utc: int) -> float:
