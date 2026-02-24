@@ -243,6 +243,114 @@ class TestDeadlockRegression:
             "New signal should open in a free slot"
         )
 
+    def test_rebalancer_plans_reduce_only_trims_for_oversized_positions(self):
+        """Oversized positions should produce planned reductions."""
+        from src.domain.models import Position
+
+        allocator = AuctionAllocator(
+            PortfolioLimits(max_positions=5, max_margin_util=0.90, max_per_cluster=3, max_per_symbol=1),
+            rebalancer_enabled=True,
+            rebalancer_trigger_pct_equity=0.32,
+            rebalancer_clear_pct_equity=0.24,
+            rebalancer_max_reductions_per_cycle=2,
+            rebalancer_max_total_margin_reduced_per_cycle=0.50,
+        )
+        oversized = OpenPositionMetadata(
+            position=Position(
+                symbol="PF_SOLUSD",
+                side=Side.LONG,
+                size=Decimal("100"),
+                size_notional=Decimal("5000"),  # 50% of equity
+                entry_price=Decimal("50"),
+                current_mark_price=Decimal("50"),
+                leverage=Decimal("5"),
+                margin_used=Decimal("1000"),
+                unrealized_pnl=Decimal("0"),
+                liquidation_price=Decimal("10"),
+                is_protected=True,
+                stop_loss_order_id="sl-sol",
+            ),
+            entry_time=datetime.now(timezone.utc) - timedelta(hours=2),
+            entry_score=80.0,
+            current_pnl_R=Decimal("0.2"),
+            margin_used=Decimal("1000"),
+            cluster="tight_smc_ob",
+            direction=Side.LONG,
+            age_seconds=7200,
+            is_protective_orders_live=True,
+            locked=False,
+        )
+
+        plan = allocator.allocate(
+            open_positions=[oversized],
+            candidate_signals=[],
+            portfolio_state={
+                "account_equity": Decimal("10000"),
+                "available_margin": Decimal("10000"),
+                "current_cycle": 10,
+                "last_trim_cycle_by_symbol": {},
+            },
+        )
+
+        assert len(plan.reductions) == 1
+        symbol, qty = plan.reductions[0]
+        assert symbol == "PF_SOLUSD"
+        assert qty > Decimal("0")
+        assert plan.reasons["reductions_planned"] == 1
+
+    def test_rebalancer_respects_per_symbol_cooldown(self):
+        """Recently trimmed symbols should be skipped by cooldown."""
+        from src.domain.models import Position
+
+        allocator = AuctionAllocator(
+            PortfolioLimits(max_positions=5, max_margin_util=0.90, max_per_cluster=3, max_per_symbol=1),
+            rebalancer_enabled=True,
+            rebalancer_trigger_pct_equity=0.32,
+            rebalancer_clear_pct_equity=0.24,
+            rebalancer_per_symbol_trim_cooldown_cycles=3,
+            rebalancer_max_reductions_per_cycle=2,
+            rebalancer_max_total_margin_reduced_per_cycle=0.50,
+        )
+        oversized = OpenPositionMetadata(
+            position=Position(
+                symbol="PF_ETHUSD",
+                side=Side.LONG,
+                size=Decimal("20"),
+                size_notional=Decimal("4000"),  # 40% of equity
+                entry_price=Decimal("200"),
+                current_mark_price=Decimal("200"),
+                leverage=Decimal("5"),
+                margin_used=Decimal("800"),
+                unrealized_pnl=Decimal("0"),
+                liquidation_price=Decimal("100"),
+                is_protected=True,
+                stop_loss_order_id="sl-eth",
+            ),
+            entry_time=datetime.now(timezone.utc) - timedelta(hours=2),
+            entry_score=70.0,
+            current_pnl_R=Decimal("0"),
+            margin_used=Decimal("800"),
+            cluster="tight_smc_ob",
+            direction=Side.LONG,
+            age_seconds=7200,
+            is_protective_orders_live=True,
+            locked=False,
+        )
+
+        plan = allocator.allocate(
+            open_positions=[oversized],
+            candidate_signals=[],
+            portfolio_state={
+                "account_equity": Decimal("10000"),
+                "available_margin": Decimal("10000"),
+                "current_cycle": 10,
+                "last_trim_cycle_by_symbol": {"PF_ETHUSD": 9},
+            },
+        )
+
+        assert plan.reductions == []
+        assert plan.reasons["reduction_reasons"].get("cooldown_active", 0) >= 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

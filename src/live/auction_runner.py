@@ -272,6 +272,10 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             "partial_close_cooldown_seconds": getattr(
                 lt.config.risk, "auction_partial_close_cooldown_seconds", 0
             ),
+            "current_cycle": int(getattr(lt, "_last_cycle_count", 0) or 0),
+            "last_trim_cycle_by_symbol": dict(
+                getattr(lt, "_last_trim_cycle_by_symbol", {}) or {}
+            ),
         }
 
         plan = lt.auction_allocator.allocate(
@@ -286,6 +290,8 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             closes_symbols=plan.closes,
             opens_count=len(plan.opens),
             opens_symbols=[s.symbol for s in plan.opens],
+            reductions_count=len(plan.reductions),
+            reductions=[(sym, str(qty)) for sym, qty in plan.reductions],
             reasons=plan.reasons,
         )
 
@@ -294,7 +300,84 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         for sig in plan.opens:
             lt._auction_win_log.setdefault(sig.symbol, []).append(now_utc)
 
-        # Execute closes first
+        # Execute concentration reductions first (reduceOnly partial closes only).
+        reductions_executed = 0
+        reductions_failed = 0
+        rebalancer_shadow = bool(
+            getattr(lt.config.risk, "auction_rebalancer_shadow_mode", True)
+        )
+        if plan.reductions:
+            if rebalancer_shadow:
+                logger.info(
+                    "Auction rebalancer shadow mode: reductions not executed",
+                    reductions=[(sym, str(qty)) for sym, qty in plan.reductions],
+                )
+            elif not (lt.use_state_machine_v2 and lt.execution_gateway and lt.position_registry):
+                logger.warning(
+                    "Auction rebalancer skipped: state machine gateway unavailable",
+                    reductions=len(plan.reductions),
+                )
+            else:
+                from src.execution.position_manager_v2 import ManagementAction, ActionType
+
+                for symbol, trim_qty in plan.reductions:
+                    if trim_qty <= 0:
+                        reductions_failed += 1
+                        logger.warning(
+                            "Auction rebalancer skipped non-positive trim",
+                            symbol=symbol,
+                            trim_qty=str(trim_qty),
+                        )
+                        continue
+                    position = lt.position_registry.get_position(symbol)
+                    if not position:
+                        reductions_failed += 1
+                        logger.warning(
+                            "Auction rebalancer skipped missing registry position",
+                            symbol=symbol,
+                        )
+                        continue
+                    if trim_qty >= position.remaining_qty:
+                        trim_qty = position.remaining_qty * Decimal("0.95")
+                    if trim_qty <= 0:
+                        reductions_failed += 1
+                        logger.warning(
+                            "Auction rebalancer skipped zero trim after clamp",
+                            symbol=symbol,
+                            remaining_qty=str(position.remaining_qty),
+                        )
+                        continue
+
+                    action = ManagementAction(
+                        type=ActionType.CLOSE_PARTIAL,
+                        symbol=symbol,
+                        reason="AUTONOMOUS_REBALANCER_TRIM",
+                        side=position.side,
+                        size=trim_qty,
+                    )
+                    result = await lt.execution_gateway.execute_action(action)
+                    if result.success:
+                        reductions_executed += 1
+                        lt._last_trim_cycle_by_symbol[symbol] = int(
+                            getattr(lt, "_last_cycle_count", 0) or 0
+                        )
+                        logger.info(
+                            "Auction rebalancer trim executed",
+                            symbol=symbol,
+                            trim_qty=str(trim_qty),
+                            client_order_id=action.client_order_id,
+                            exchange_order_id=result.exchange_order_id,
+                        )
+                    else:
+                        reductions_failed += 1
+                        logger.error(
+                            "Auction rebalancer trim failed",
+                            symbol=symbol,
+                            trim_qty=str(trim_qty),
+                            error=result.error,
+                        )
+
+        # Execute closes next
         for symbol in plan.closes:
             try:
                 await lt.client.close_position(symbol)
@@ -302,17 +385,81 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             except (OperationalError, DataError) as e:
                 logger.error("Auction: Failed to close position", symbol=symbol, error=str(e), error_type=type(e).__name__)
 
-        # Refresh margin after closes
-        balance_after_closes = await lt.client.get_futures_balance()
-        equity_after, refreshed_available_margin, _ = await calculate_effective_equity(
-            balance_after_closes, base_currency=base, kraken_client=lt.client
-        )
-        logger.info(
-            "Auction: Margin refreshed after closes",
-            equity=str(equity_after),
-            refreshed_available_margin=str(refreshed_available_margin),
-            previous_available_margin=str(available_margin),
-        )
+        # Refresh protective orders after trims, then reconcile + refresh margin before opens.
+        fresh_snapshot_ok = False
+        reconcile_blocking_issues = False
+        refreshed_available_margin = available_margin
+        if reductions_executed > 0:
+            try:
+                refreshed_positions = await lt.client.get_all_futures_positions()
+                current_prices_map = {}
+                for pos_data in refreshed_positions:
+                    symbol = pos_data.get("symbol")
+                    if not symbol:
+                        continue
+                    mark_price = None
+                    if lt.latest_futures_tickers:
+                        mark_price = lt.latest_futures_tickers.get(symbol)
+                    if mark_price is None:
+                        mark_price = Decimal(
+                            str(
+                                pos_data.get("markPrice")
+                                or pos_data.get("mark_price")
+                                or pos_data.get("entryPrice")
+                                or 0
+                            )
+                        )
+                    current_prices_map[symbol] = mark_price
+                await lt._reconcile_stop_loss_order_ids(refreshed_positions)
+                await lt._reconcile_protective_orders(refreshed_positions, current_prices_map)
+                logger.info(
+                    "Auction rebalancer protective refresh complete",
+                    refreshed_positions=len(refreshed_positions),
+                )
+            except (OperationalError, DataError, ValueError, TypeError) as e:
+                logger.warning(
+                    "Auction rebalancer protective refresh failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
+        if lt.use_state_machine_v2 and lt.execution_gateway:
+            try:
+                sync_result = await lt.execution_gateway.sync_with_exchange()
+                reconcile_blocking_issues = bool(sync_result.get("issues"))
+                logger.info(
+                    "Auction rebalancer pre-open reconcile",
+                    actions_taken=sync_result.get("actions_taken", 0),
+                    issues=sync_result.get("issues", []),
+                )
+            except (OperationalError, DataError) as e:
+                reconcile_blocking_issues = True
+                logger.warning(
+                    "Auction rebalancer pre-open reconcile failed",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
+        try:
+            balance_after_actions = await lt.client.get_futures_balance()
+            equity_after, refreshed_available_margin, _ = await calculate_effective_equity(
+                balance_after_actions, base_currency=base, kraken_client=lt.client
+            )
+            fresh_snapshot_ok = True
+            logger.info(
+                "Auction: Margin refreshed after management actions",
+                equity=str(equity_after),
+                refreshed_available_margin=str(refreshed_available_margin),
+                previous_available_margin=str(available_margin),
+                reductions_executed=reductions_executed,
+                closes_executed=len(plan.closes),
+            )
+        except (OperationalError, DataError) as e:
+            logger.warning(
+                "Auction: Failed to refresh margin after management actions",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
 
         # Execute opens (deduplicated)
         seen_opens: set = set()
@@ -320,7 +467,26 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         opens_failed = 0
         rejection_counts: Dict[str, int] = {}
 
+        # Gate opens: degraded/halted state, stale snapshot, or unresolved reconcile issues
+        open_gate_reason = None
+        if lt.hardening and not lt.hardening.is_trading_allowed():
+            open_gate_reason = "TRADING_GATE_CLOSED"
+        elif not fresh_snapshot_ok:
+            open_gate_reason = "FRESH_SNAPSHOT_UNAVAILABLE"
+        elif reconcile_blocking_issues:
+            open_gate_reason = "RECONCILE_BLOCKING_ISSUES"
+        if open_gate_reason:
+            logger.warning(
+                "Auction opens suppressed by pre-open gate",
+                reason=open_gate_reason,
+                planned_opens=len(plan.opens),
+            )
+
         for signal in plan.opens:
+            if open_gate_reason:
+                opens_failed += 1
+                rejection_counts[open_gate_reason] = rejection_counts.get(open_gate_reason, 0) + 1
+                continue
             if signal.symbol in seen_opens:
                 logger.warning(
                     "Auction: Skipping duplicate open for same symbol",
@@ -441,13 +607,16 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         logger.info(
             "Auction allocation executed",
             closes=len(plan.closes),
+            reductions_planned=len(plan.reductions),
+            reductions_executed=reductions_executed,
+            reductions_failed=reductions_failed,
             opens_planned=len(plan.opens),
             opens_executed=opens_executed,
             opens_failed=opens_failed,
             rejection_counts=rejection_counts if rejection_counts else None,
             reasons=plan.reasons,
         )
-        if opens_executed > 0 or len(plan.closes) > 0:
+        if opens_executed > 0 or len(plan.closes) > 0 or reductions_executed > 0:
             lt._reconcile_requested = True
 
     except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:

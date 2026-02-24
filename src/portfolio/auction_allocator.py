@@ -110,6 +110,12 @@ class AuctionAllocator:
         max_closes_per_cycle: int = 5,
         entry_cost: float = 2.0,
         exit_cost: float = 2.0,
+        rebalancer_enabled: bool = False,
+        rebalancer_trigger_pct_equity: float = 0.32,
+        rebalancer_clear_pct_equity: float = 0.24,
+        rebalancer_per_symbol_trim_cooldown_cycles: int = 2,
+        rebalancer_max_reductions_per_cycle: int = 1,
+        rebalancer_max_total_margin_reduced_per_cycle: float = 0.25,
     ):
         """
         Initialize auction allocator.
@@ -132,12 +138,21 @@ class AuctionAllocator:
         self.max_closes_per_cycle = max_closes_per_cycle
         self.entry_cost = entry_cost
         self.exit_cost = exit_cost
+        self.rebalancer_enabled = rebalancer_enabled
+        self.rebalancer_trigger_pct_equity = Decimal(str(rebalancer_trigger_pct_equity))
+        self.rebalancer_clear_pct_equity = Decimal(str(rebalancer_clear_pct_equity))
+        self.rebalancer_per_symbol_trim_cooldown_cycles = rebalancer_per_symbol_trim_cooldown_cycles
+        self.rebalancer_max_reductions_per_cycle = rebalancer_max_reductions_per_cycle
+        self.rebalancer_max_total_margin_reduced_per_cycle = Decimal(
+            str(rebalancer_max_total_margin_reduced_per_cycle)
+        )
         
         logger.info(
             "AuctionAllocator initialized",
             max_positions=limits.max_positions,
             swap_threshold=swap_threshold,
             min_hold_minutes=min_hold_minutes,
+            rebalancer_enabled=rebalancer_enabled,
         )
     
     def allocate(
@@ -235,6 +250,12 @@ class AuctionAllocator:
         allowed_opens = closes_count + free_slots
         opens = all_opens[:allowed_opens]  # Enforce net position limit
         
+        reductions, reduction_reasons = self._plan_concentration_reductions(
+            open_positions=open_positions,
+            close_symbols=set(closes),
+            portfolio_state=portfolio_state,
+        )
+
         reasons = {
             "total_contenders": len(contenders),
             "winners_selected": len(winners),
@@ -242,6 +263,8 @@ class AuctionAllocator:
             "closes_after_hysteresis": len(final_closes),
             "opens_after_limits": len(opens),
             "closes_after_limits": len(closes),
+            "reductions_planned": len(reductions),
+            "reduction_reasons": reduction_reasons,
         }
         
         logger.info(
@@ -252,8 +275,137 @@ class AuctionAllocator:
         return AllocationPlan(
             opens=opens,
             closes=closes,
+            reductions=reductions,
             reasons=reasons,
         )
+
+    def _plan_concentration_reductions(
+        self,
+        open_positions: List[OpenPositionMetadata],
+        close_symbols: Set[str],
+        portfolio_state: Dict[str, any],
+    ) -> Tuple[List[Tuple[str, Decimal]], Dict[str, int]]:
+        """
+        Plan partial reductions for oversized positions using the same metric as invariants:
+        position size_notional / account_equity.
+        """
+        reasons: Dict[str, int] = {}
+        reductions: List[Tuple[str, Decimal]] = []
+        if not self.rebalancer_enabled:
+            reasons["rebalancer_disabled"] = 1
+            return reductions, reasons
+        if self.rebalancer_max_reductions_per_cycle <= 0:
+            reasons["max_reductions_zero"] = 1
+            return reductions, reasons
+
+        account_equity = Decimal(str(portfolio_state.get("account_equity", 0) or 0))
+        if account_equity <= 0:
+            reasons["invalid_equity"] = 1
+            return reductions, reasons
+
+        trigger_pct = self.rebalancer_trigger_pct_equity
+        clear_pct = self.rebalancer_clear_pct_equity
+        if clear_pct >= trigger_pct:
+            reasons["invalid_hysteresis"] = 1
+            return reductions, reasons
+
+        current_cycle = int(portfolio_state.get("current_cycle", 0) or 0)
+        cooldown_cycles = int(self.rebalancer_per_symbol_trim_cooldown_cycles or 0)
+        last_trim_cycle_by_symbol = dict(
+            portfolio_state.get("last_trim_cycle_by_symbol", {}) or {}
+        )
+        max_total_margin_reduction = (
+            account_equity * self.rebalancer_max_total_margin_reduced_per_cycle
+        )
+
+        # Prioritize largest concentration offenders first
+        ranked = sorted(
+            open_positions,
+            key=lambda op: (
+                -(
+                    (getattr(op.position, "size_notional", Decimal("0")) or Decimal("0"))
+                    / account_equity
+                ) if account_equity > 0 else Decimal("0")
+            ),
+        )
+
+        total_margin_reduction = Decimal("0")
+        for op_meta in ranked:
+            if len(reductions) >= self.rebalancer_max_reductions_per_cycle:
+                reasons["max_reductions_reached"] = reasons.get("max_reductions_reached", 0) + 1
+                break
+            symbol = op_meta.position.symbol
+            if symbol in close_symbols:
+                reasons["skip_symbol_closing"] = reasons.get("skip_symbol_closing", 0) + 1
+                continue
+            if op_meta.locked:
+                reasons["skip_locked"] = reasons.get("skip_locked", 0) + 1
+                continue
+
+            size_notional = getattr(op_meta.position, "size_notional", Decimal("0")) or Decimal("0")
+            size_qty = getattr(op_meta.position, "size", Decimal("0")) or Decimal("0")
+            margin_used = getattr(op_meta.position, "margin_used", Decimal("0")) or Decimal("0")
+            if size_notional <= 0 or size_qty <= 0:
+                reasons["skip_invalid_size"] = reasons.get("skip_invalid_size", 0) + 1
+                continue
+
+            concentration_pct = size_notional / account_equity
+            if concentration_pct <= trigger_pct:
+                reasons["below_trigger"] = reasons.get("below_trigger", 0) + 1
+                continue
+
+            last_trim_cycle = last_trim_cycle_by_symbol.get(symbol)
+            if (
+                cooldown_cycles > 0
+                and last_trim_cycle is not None
+                and current_cycle > 0
+                and (current_cycle - int(last_trim_cycle)) < cooldown_cycles
+            ):
+                reasons["cooldown_active"] = reasons.get("cooldown_active", 0) + 1
+                continue
+
+            target_notional = account_equity * clear_pct
+            trim_notional = max(Decimal("0"), size_notional - target_notional)
+            if trim_notional <= 0:
+                reasons["already_below_clear"] = reasons.get("already_below_clear", 0) + 1
+                continue
+
+            trim_fraction = trim_notional / size_notional
+            est_margin_reduction = margin_used * trim_fraction if margin_used > 0 else Decimal("0")
+
+            # Clamp by max total margin reduced per cycle
+            remaining_margin_budget = max_total_margin_reduction - total_margin_reduction
+            if remaining_margin_budget <= 0:
+                reasons["margin_reduction_budget_reached"] = reasons.get(
+                    "margin_reduction_budget_reached", 0
+                ) + 1
+                break
+            if est_margin_reduction > remaining_margin_budget and est_margin_reduction > 0:
+                scale = remaining_margin_budget / est_margin_reduction
+                trim_fraction *= scale
+                est_margin_reduction = remaining_margin_budget
+
+            trim_qty = size_qty * trim_fraction
+            if trim_qty <= 0:
+                reasons["skip_zero_trim_qty"] = reasons.get("skip_zero_trim_qty", 0) + 1
+                continue
+
+            reductions.append((symbol, trim_qty))
+            total_margin_reduction += est_margin_reduction
+            reasons["planned"] = reasons.get("planned", 0) + 1
+
+            logger.info(
+                "Auction rebalancer reduction planned",
+                symbol=symbol,
+                concentration_pct=f"{concentration_pct:.2%}",
+                trigger_pct=f"{trigger_pct:.2%}",
+                clear_pct=f"{clear_pct:.2%}",
+                trim_qty=str(trim_qty),
+                trim_fraction=f"{trim_fraction:.4f}",
+                est_margin_reduction=str(est_margin_reduction),
+            )
+
+        return reductions, reasons
     
     def _build_contender_list(
         self,

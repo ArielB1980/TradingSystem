@@ -183,6 +183,8 @@ class LiveTrading:
         self._auction_win_log: Dict[str, list] = {}
         # Dict[symbol, datetime] — timestamp of last successful entry per symbol
         self._auction_entry_log: Dict[str, datetime] = {}
+        # Rebalancer cooldown tracking: symbol -> last cycle where a trim executed
+        self._last_trim_cycle_by_symbol: Dict[str, int] = {}
 
         # Signal cooldown: prevent the same signal from firing repeatedly for the same symbol.
         # Key: symbol, Value: (signal_type, structure_timestamp, cooldown_until)
@@ -213,6 +215,12 @@ class LiveTrading:
                 max_closes_per_cycle=config.risk.auction_max_closes_per_cycle,
                 entry_cost=config.risk.auction_entry_cost,
                 exit_cost=config.risk.auction_exit_cost,
+                rebalancer_enabled=config.risk.auction_rebalancer_enabled,
+                rebalancer_trigger_pct_equity=config.risk.auction_rebalancer_trigger_pct_equity,
+                rebalancer_clear_pct_equity=config.risk.auction_rebalancer_clear_pct_equity,
+                rebalancer_per_symbol_trim_cooldown_cycles=config.risk.auction_rebalancer_per_symbol_trim_cooldown_cycles,
+                rebalancer_max_reductions_per_cycle=config.risk.auction_rebalancer_max_reductions_per_cycle,
+                rebalancer_max_total_margin_reduced_per_cycle=config.risk.auction_rebalancer_max_total_margin_reduced_per_cycle,
             )
             logger.info("Auction mode enabled", max_positions=limits.max_positions)
         

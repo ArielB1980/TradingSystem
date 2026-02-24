@@ -125,6 +125,29 @@ class RiskConfig(BaseSettings):
     auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_direction_concentration_penalty: float = Field(default=10.0, ge=0.0, le=50.0, description="Score penalty at max directional imbalance (all positions same side)")
+    # Autonomous concentration rebalancer (auction path)
+    auction_rebalancer_enabled: bool = Field(default=False, description="Enable autonomous concentration trims before opens")
+    auction_rebalancer_shadow_mode: bool = Field(default=True, description="Log would-trim decisions without executing reductions")
+    auction_rebalancer_trigger_pct_equity: float = Field(
+        default=0.32, ge=0.10, le=0.80,
+        description="Trim trigger when single-position concentration exceeds this % of equity"
+    )
+    auction_rebalancer_clear_pct_equity: float = Field(
+        default=0.24, ge=0.05, le=0.70,
+        description="Stop trimming once concentration is below this % of equity"
+    )
+    auction_rebalancer_per_symbol_trim_cooldown_cycles: int = Field(
+        default=2, ge=0, le=50,
+        description="Minimum cycles between trims for the same symbol"
+    )
+    auction_rebalancer_max_reductions_per_cycle: int = Field(
+        default=1, ge=0, le=20,
+        description="Maximum number of partial trims submitted per cycle"
+    )
+    auction_rebalancer_max_total_margin_reduced_per_cycle: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description="Cap on aggregate estimated margin reduction per cycle as % of equity"
+    )
 
     # Target margin utilisation band: when below target_min, boost notional (bounded) to deploy more capital.
     # Only applied when sizing_method is leverage_based (risk sanity: stop-distance-based sizing would violate risk-per-trade if we boosted).
@@ -186,6 +209,14 @@ class RiskConfig(BaseSettings):
         if v > 10.0:
             raise ValueError("Leverage cap is 10× (hard limit, non-negotiable)")
         return v
+
+    @model_validator(mode="after")
+    def validate_rebalancer_hysteresis(self):
+        if self.auction_rebalancer_clear_pct_equity >= self.auction_rebalancer_trigger_pct_equity:
+            raise ValueError(
+                "auction_rebalancer_clear_pct_equity must be below auction_rebalancer_trigger_pct_equity"
+            )
+        return self
 
 
 class StrategyConfig(BaseSettings):

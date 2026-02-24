@@ -56,6 +56,15 @@ async def handle_signal(
             "rejection_reasons": ["trade_paused"],
         }
 
+    # Hardening gate: in DEGRADED/HALTED/EMERGENCY, block new entries.
+    # Management actions remain handled elsewhere in the loop.
+    if getattr(lt, "hardening", None) and not lt.hardening.is_trading_allowed():
+        return {
+            "order_placed": False,
+            "reason": "TRADING_GATE_CLOSED: new entries suppressed by hardening state",
+            "rejection_reasons": ["hardening_gate_closed"],
+        }
+
     return await handle_signal_v2(lt, signal, spot_price, mark_price, notional_override=notional_override)
 
 

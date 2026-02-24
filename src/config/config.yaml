@@ -79,6 +79,14 @@ risk:
   auction_entry_cost: 2.0  # Entry cost penalty in score points
   auction_exit_cost: 2.0  # Exit cost penalty in score points
   auction_direction_concentration_penalty: 10.0  # Score penalty at max directional imbalance (all positions same side)
+  # Autonomous concentration rebalancer
+  auction_rebalancer_enabled: true
+  auction_rebalancer_shadow_mode: true
+  auction_rebalancer_trigger_pct_equity: 0.32  # Trim trigger (>32%)
+  auction_rebalancer_clear_pct_equity: 0.24  # Stop trimming once below 24%
+  auction_rebalancer_per_symbol_trim_cooldown_cycles: 2
+  auction_rebalancer_max_reductions_per_cycle: 1
+  auction_rebalancer_max_total_margin_reduced_per_cycle: 0.25  # As % of equity
   target_margin_util_min: 0.70  # Below this, utilisation boost may scale notional (clamped to caps)
   utilisation_boost_max_factor: 2.0  # Max factor when under target (e.g. 2.0 = double)
   
