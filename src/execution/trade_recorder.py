@@ -26,6 +26,7 @@ from src.execution.position_state_machine import (
     ManagedPosition,
     PositionState,
     FillRecord,
+    ExitReason,
 )
 from src.monitoring.logger import get_logger
 
@@ -82,6 +83,43 @@ def _infer_fill_type(fill: FillRecord, position: ManagedPosition) -> str:
 
     # Unknown — conservative
     return _TAKER
+
+
+def _resolve_exit_reason(position: ManagedPosition) -> str:
+    """
+    Return a deterministic exit reason for persisted trade rows.
+
+    If a close path forgot to set ``position.exit_reason``, infer a conservative
+    fallback from observed exit order IDs and persist it back onto the position.
+    """
+    if position.exit_reason is not None:
+        return position.exit_reason.value
+
+    exit_order_ids = {f.order_id for f in position.exit_fills if f.order_id}
+    resolved = ExitReason.RECONCILIATION
+
+    # Prefer concrete order-driven reasons when we can infer them.
+    if position.stop_order_id and position.stop_order_id in exit_order_ids:
+        resolved = ExitReason.TRAILING_STOP if position.trailing_active else ExitReason.STOP_LOSS
+    elif (
+        (position.tp1_order_id and position.tp1_order_id in exit_order_ids)
+        or (position.tp2_order_id and position.tp2_order_id in exit_order_ids)
+    ):
+        resolved = ExitReason.TAKE_PROFIT_FINAL
+    elif position.pending_exit_order_id and position.pending_exit_order_id in exit_order_ids:
+        resolved = ExitReason.MANUAL
+    elif position.state == PositionState.ORPHANED:
+        resolved = ExitReason.RECONCILIATION
+
+    position.exit_reason = resolved
+    logger.warning(
+        "Missing exit_reason on closed position, applying deterministic fallback",
+        position_id=position.position_id,
+        symbol=position.symbol,
+        resolved_exit_reason=resolved.value,
+        state=position.state.value,
+    )
+    return resolved.value
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +196,16 @@ def record_closed_trade(
         return None
 
     size_notional = qty * entry_vwap
+    if size_notional <= 0:
+        logger.critical(
+            "TRADE_RECORD_BLOCKED_INVALID_NOTIONAL",
+            position_id=position.position_id,
+            symbol=position.symbol,
+            qty=str(qty),
+            entry_vwap=str(entry_vwap),
+            size_notional=str(size_notional),
+        )
+        return None
 
     # ---- Gross PnL ----
     if position.side == Side.LONG:
@@ -200,7 +248,7 @@ def record_closed_trade(
         leverage = Decimal(str(leverage))
 
     # ---- Exit reason ----
-    exit_reason = position.exit_reason.value if position.exit_reason else "unknown"
+    exit_reason = _resolve_exit_reason(position)
 
     # ---- Timing: use final fill timestamp, not datetime.now() ----
     # Priority: exchange fill time > state-machine exit_time > fallback now()

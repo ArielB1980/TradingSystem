@@ -182,10 +182,10 @@ strategy:
   min_score_tight_smc_neutral: 75.0
   min_score_wide_structure_aligned: 60.0  # Was 65.0
   min_score_wide_structure_neutral: 70.0
-  fib_proximity_bps: 20.0
+  fib_proximity_bps: 60.0
   
   # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
-  entry_zone_tolerance_pct: 0.02  # 2% buffer
+  entry_zone_tolerance_pct: 0.05  # 5% buffer (aggressive widening)
   entry_zone_tolerance_adaptive: true  # Scale with ATR
   entry_zone_tolerance_atr_mult: 0.3  # ATR multiplier
   entry_zone_tolerance_score_penalty: -5  # Penalty for tolerance entries

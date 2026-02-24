@@ -480,6 +480,12 @@ def load_candles_map(
 
 def save_trade(trade: Trade) -> None:
     """Save a completed trade to the database."""
+    if trade.entry_price <= 0 or trade.size_notional <= 0:
+        raise DataError(
+            f"Refusing to persist malformed trade: trade_id={trade.trade_id} "
+            f"entry_price={trade.entry_price} size_notional={trade.size_notional}"
+        )
+
     db = get_db()
     with db.get_session() as session:
         trade_model = TradeModel(

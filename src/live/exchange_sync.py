@@ -242,6 +242,25 @@ async def save_trade_history(
 
         net_pnl = gross_pnl - fees - funding
 
+        if position.entry_price <= 0 or position.size_notional <= 0:
+            logger.critical(
+                "TRADE_SAVE_BLOCKED_INVALID_INPUT",
+                symbol=position.symbol,
+                entry_price=str(position.entry_price),
+                size_notional=str(position.size_notional),
+                exit_reason=exit_reason,
+            )
+            return
+
+        if not exit_reason or exit_reason == "unknown":
+            resolved_reason = "reconciliation"
+            logger.warning(
+                "Missing exit reason in legacy trade saver; applying fallback",
+                symbol=position.symbol,
+                resolved_exit_reason=resolved_reason,
+            )
+            exit_reason = resolved_reason
+
         trade = Trade(
             trade_id=str(uuid.uuid4()),
             symbol=position.symbol,

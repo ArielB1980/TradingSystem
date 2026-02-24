@@ -552,3 +552,43 @@ class TestSkipNonEligible:
         assert result is None
         assert pos.trade_recorded is False  # Stays False for backfill retry
         mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 12. Integrity and deterministic exit-reason safeguards
+# ---------------------------------------------------------------------------
+
+
+class TestTradeIntegrityAndReasonFallback:
+    @patch("src.storage.repository.save_trade")
+    def test_missing_exit_reason_falls_back_deterministically(self, mock_save):
+        pos = _make_position()
+        pos.stop_order_id = "stop-001"
+        _add_entry_fill(pos, qty=Decimal("10"), price=Decimal("100"))
+        _add_exit_fill(pos, qty=Decimal("10"), price=Decimal("95"), order_id="stop-001")
+        pos._mark_closed(ExitReason.STOP_LOSS)
+        pos.exit_reason = None  # Simulate buggy close path
+
+        trade = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
+
+        assert trade is not None
+        assert trade.exit_reason == "stop_loss"
+        assert pos.exit_reason == ExitReason.STOP_LOSS
+        mock_save.assert_called_once()
+
+    @patch("src.storage.repository.save_trade")
+    def test_zero_entry_price_blocks_trade_recording(self, mock_save):
+        pos = _make_position(
+            side=Side.SHORT,
+            entry_price=Decimal("0"),
+            stop_price=Decimal("110"),
+        )
+        _add_entry_fill(pos, qty=Decimal("10"), price=Decimal("0"))
+        _add_exit_fill(pos, qty=Decimal("10"), price=Decimal("95"), order_id="exit-001")
+        pos._mark_closed(ExitReason.MANUAL)
+
+        trade = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
+
+        assert trade is None
+        assert pos.trade_recorded is False
+        mock_save.assert_not_called()
