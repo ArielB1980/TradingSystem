@@ -21,6 +21,32 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _split_reconcile_issues(issues: List) -> tuple[List, List]:
+    """
+    Split reconcile issues into (blocking, non_blocking).
+
+    Rationale:
+    - ORPHANED issues are often transient right after stop/TP-driven closes.
+      They indicate registry/exchange convergence in progress and are
+      persisted/handled by gateway reconciliation.
+    - Other issue classes (PHANTOM, QTY_MISMATCH, etc.) remain blocking.
+    """
+    blocking = []
+    non_blocking = []
+    for issue in issues or []:
+        # Issue format is typically (symbol, "TYPE: details"), but keep robust.
+        if (
+            isinstance(issue, (list, tuple))
+            and len(issue) >= 2
+            and isinstance(issue[1], str)
+            and issue[1].startswith("ORPHANED:")
+        ):
+            non_blocking.append(issue)
+        else:
+            blocking.append(issue)
+    return blocking, non_blocking
+
+
 async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -> None:
     """
     Run auction-based portfolio allocation if auction mode is enabled.
@@ -426,11 +452,15 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         if lt.use_state_machine_v2 and lt.execution_gateway:
             try:
                 sync_result = await lt.execution_gateway.sync_with_exchange()
-                reconcile_blocking_issues = bool(sync_result.get("issues"))
+                all_issues = sync_result.get("issues", []) or []
+                blocking_issues, non_blocking_issues = _split_reconcile_issues(all_issues)
+                reconcile_blocking_issues = bool(blocking_issues)
                 logger.info(
                     "Auction rebalancer pre-open reconcile",
                     actions_taken=sync_result.get("actions_taken", 0),
-                    issues=sync_result.get("issues", []),
+                    issues=all_issues,
+                    blocking_issues=blocking_issues,
+                    non_blocking_issues=non_blocking_issues,
                 )
             except (OperationalError, DataError) as e:
                 reconcile_blocking_issues = True
