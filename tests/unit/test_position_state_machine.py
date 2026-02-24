@@ -1044,6 +1044,84 @@ class TestReconciliation:
             [],
         )
         assert issues_again == []
+
+    def test_reconcile_fill_ids_are_deterministic_for_same_pre_state(self):
+        """Same pre-adjustment state should generate the same synthetic reconcile fill_id."""
+        def _make_pos() -> ManagedPosition:
+            p = ManagedPosition(
+                symbol="ENA/USD",
+                side=Side.SHORT,
+                position_id="test-ena-deterministic",
+                initial_size=Decimal("111"),
+                initial_entry_price=Decimal("0.1546"),
+                initial_stop_price=Decimal("0.1596"),
+                initial_tp1_price=Decimal("0.1490"),
+                initial_tp2_price=None,
+                initial_final_target=None,
+            )
+            p.state = PositionState.OPEN
+            p.entry_fills.append(FillRecord(
+                fill_id="entry-1",
+                order_id="entry-order-1",
+                side=Side.SHORT,
+                qty=Decimal("111"),
+                price=Decimal("0.1546"),
+                timestamp=datetime.now(timezone.utc),
+                is_entry=True,
+            ))
+            return p
+
+        pos_a = _make_pos()
+        pos_b = _make_pos()
+
+        summary_a = pos_a.reconcile_quantity_to_exchange(
+            exchange_qty=Decimal("72"),
+            exchange_entry_price=Decimal("0.1546"),
+            qty_epsilon=Decimal("0.0001"),
+        )
+        summary_b = pos_b.reconcile_quantity_to_exchange(
+            exchange_qty=Decimal("72"),
+            exchange_entry_price=Decimal("0.1546"),
+            qty_epsilon=Decimal("0.0001"),
+        )
+
+        assert summary_a is not None
+        assert summary_b is not None
+        assert len(pos_a.exit_fills) == 1
+        assert len(pos_b.exit_fills) == 1
+        assert pos_a.exit_fills[0].fill_id == pos_b.exit_fills[0].fill_id
+
+    def test_pending_adopt_fill_id_is_deterministic_for_same_pre_state(self):
+        """PENDING_ADOPTED synthetic fills should be replay-stable."""
+        def _run_once() -> str:
+            registry = PositionRegistry()
+            pos = ManagedPosition(
+                symbol="PF_ADAUSD",
+                side=Side.LONG,
+                position_id="pending-adopt-1",
+                initial_size=Decimal("100"),
+                initial_entry_price=Decimal("0.50"),
+                initial_stop_price=Decimal("0.45"),
+                initial_tp1_price=Decimal("0.60"),
+                initial_tp2_price=None,
+                initial_final_target=None,
+            )
+            pos.state = PositionState.PENDING
+            pos.entry_order_id = "entry-order-xyz"
+            registry.register_position(pos)
+            issues = registry.reconcile_with_exchange(
+                {"ADA/USD:USD": {"side": "long", "qty": "100", "entry_price": "0.50"}},
+                [],
+            )
+            assert any("PENDING_ADOPTED" in issue for _, issue in issues)
+            current = registry.get_position("PF_ADAUSD")
+            assert current is not None
+            assert len(current.entry_fills) == 1
+            return current.entry_fills[0].fill_id
+
+        id_a = _run_once()
+        id_b = _run_once()
+        assert id_a == id_b
     
     def test_orphaned_with_symbol_normalization(self):
         """Registry has spot format position, exchange has nothing - should orphan."""

@@ -382,6 +382,26 @@ class ManagedPosition:
         return self.remaining_qty > 0 and not self.is_terminal
     
     # ========== IDEMPOTENT EVENT HANDLING ==========
+
+    def _synthetic_fill_id(self, namespace: str, *parts: object) -> str:
+        """
+        Build deterministic synthetic fill IDs for replay stability.
+
+        If the same reconciliation/sync operation is replayed against the same
+        pre-adjustment position state, this returns the same fill_id so duplicate
+        inserts become harmless no-ops.
+        """
+        raw = "|".join(
+            [
+                namespace,
+                self.position_id,
+                self.symbol_key,
+                self.side.value,
+                *[str(p) for p in parts],
+            ]
+        )
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+        return f"{namespace}-{digest}"
     
     def _is_duplicate_event(self, event: OrderEvent) -> bool:
         """Check if event was already processed."""
@@ -907,8 +927,16 @@ class ManagedPosition:
         if delta > 0:
             # Exchange has larger exposure than local registry: add synthetic entry fill.
             fill_qty = delta
+            fill_id = self._synthetic_fill_id(
+                "reconcile-entry",
+                local_qty,
+                exchange_qty,
+                fill_qty,
+                len(self.entry_fills),
+                len(self.exit_fills),
+            )
             fill = FillRecord(
-                fill_id=f"reconcile-entry-{int(now.timestamp() * 1000)}-{len(self.entry_fills) + 1}",
+                fill_id=fill_id,
                 order_id="reconcile-sync",
                 side=self.side,
                 qty=fill_qty,
@@ -929,8 +957,16 @@ class ManagedPosition:
         fill_qty = min(abs(delta), local_qty)
         if fill_qty <= 0:
             return None
+        fill_id = self._synthetic_fill_id(
+            "reconcile-exit",
+            local_qty,
+            exchange_qty,
+            fill_qty,
+            len(self.entry_fills),
+            len(self.exit_fills),
+        )
         fill = FillRecord(
-            fill_id=f"reconcile-exit-{int(now.timestamp() * 1000)}-{len(self.exit_fills) + 1}",
+            fill_id=fill_id,
             order_id="reconcile-sync",
             side=Side.SHORT if self.side == Side.LONG else Side.LONG,
             qty=fill_qty,
@@ -1547,8 +1583,15 @@ class PositionRegistry:
                                 except (ValueError, TypeError, ArithmeticError):
                                     pass
                             now = datetime.now(timezone.utc)
+                            fill_id = pos._synthetic_fill_id(
+                                "sync-adopt",
+                                exchange_qty,
+                                ref_price,
+                                len(pos.entry_fills),
+                                len(pos.exit_fills),
+                            )
                             fill = FillRecord(
-                                fill_id=f"sync-adopt-{int(now.timestamp() * 1000)}-{len(pos.entry_fills) + 1}",
+                                fill_id=fill_id,
                                 order_id=pos.entry_order_id or "sync-adopted",
                                 side=pos.side,
                                 qty=exchange_qty,
