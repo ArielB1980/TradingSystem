@@ -17,7 +17,7 @@ Design decisions:
 import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Iterable
 
 from src.domain.models import Trade, Side
 from sqlalchemy.exc import IntegrityError as _IntegrityError
@@ -37,6 +37,12 @@ logger = get_logger(__name__)
 
 _TAKER = "taker"
 _MAKER = "maker"
+_SYNTHETIC_ORDER_PREFIXES = (
+    "reconcile-",
+    "sync-",
+    "startup-repair",
+    "auto_import",
+)
 
 
 def _infer_fill_type(fill: FillRecord, position: ManagedPosition) -> str:
@@ -84,6 +90,25 @@ def _infer_fill_type(fill: FillRecord, position: ManagedPosition) -> str:
     return _TAKER
 
 
+def _is_synthetic_state_fill(fill: FillRecord) -> bool:
+    """True when this fill is a state-sync adjustment, not an exchange economic fill."""
+    order_id = (fill.order_id or "").strip().lower()
+    if not order_id:
+        return True
+    return order_id.startswith(_SYNTHETIC_ORDER_PREFIXES)
+
+
+def _qty_vwap(fills: Iterable[FillRecord]) -> tuple[Decimal, Optional[Decimal]]:
+    total_qty = Decimal("0")
+    weighted = Decimal("0")
+    for fill in fills:
+        total_qty += fill.qty
+        weighted += fill.qty * fill.price
+    if total_qty <= 0:
+        return Decimal("0"), None
+    return total_qty, (weighted / total_qty)
+
+
 # ---------------------------------------------------------------------------
 # Core recorder
 # ---------------------------------------------------------------------------
@@ -119,41 +144,51 @@ def record_closed_trade(
         )
         return None
 
-    # ---- VWAPs ----
-    entry_vwap = position.avg_entry_price
-    exit_vwap = position.avg_exit_price
+    economic_entry_fills = [f for f in position.entry_fills if not _is_synthetic_state_fill(f)]
+    economic_exit_fills = [f for f in position.exit_fills if not _is_synthetic_state_fill(f)]
+    entry_qty, entry_vwap = _qty_vwap(economic_entry_fills)
+    exit_qty, exit_vwap = _qty_vwap(economic_exit_fills)
 
-    # Fallback: if entry VWAP is zero/None but initial_entry_price is set
-    # (common for orphaned/imported positions with synthetic fills)
-    if (entry_vwap is None or entry_vwap == 0) and position.initial_entry_price and position.initial_entry_price > 0:
-        logger.info(
-            "Using initial_entry_price as fallback for missing/zero avg_entry_price",
-            position_id=position.position_id,
-            symbol=position.symbol,
-            initial_entry_price=str(position.initial_entry_price),
-            avg_entry_price=str(entry_vwap),
-        )
-        entry_vwap = position.initial_entry_price
-
-    if entry_vwap is None or entry_vwap == 0 or exit_vwap is None or exit_vwap == 0:
+    if exit_vwap is None or exit_vwap == 0:
         logger.warning(
-            "Cannot record trade yet: missing/zero VWAP — will retry after backfill",
+            "Cannot record trade: missing economic exit fills",
             position_id=position.position_id,
             symbol=position.symbol,
-            entry_vwap=str(entry_vwap),
-            exit_vwap=str(exit_vwap),
-            has_entry_fills=len(position.entry_fills),
-            has_exit_fills=len(position.exit_fills),
+            entry_fills_total=len(position.entry_fills),
+            exit_fills_total=len(position.exit_fills),
+            economic_entry_fills=len(economic_entry_fills),
+            economic_exit_fills=len(economic_exit_fills),
         )
         return None
 
+    if entry_vwap is None or entry_vwap == 0:
+        if position.initial_entry_price and position.initial_entry_price > 0:
+            entry_vwap = position.initial_entry_price
+        else:
+            logger.warning(
+                "Cannot record trade: missing economic entry price",
+                position_id=position.position_id,
+                symbol=position.symbol,
+            )
+            return None
+
     # ---- Size ----
-    qty = position.filled_entry_qty
+    expected_qty = entry_qty if entry_qty > 0 else position.filled_entry_qty
+    qty = min(expected_qty, exit_qty)
     if qty <= 0:
         logger.warning(
-            "Cannot record trade yet: zero filled qty — will retry after backfill",
+            "Cannot record trade: zero economic filled qty",
             position_id=position.position_id,
             symbol=position.symbol,
+        )
+        return None
+    if expected_qty > 0 and exit_qty < expected_qty:
+        logger.warning(
+            "Cannot record trade: incomplete economic exit coverage",
+            position_id=position.position_id,
+            symbol=position.symbol,
+            expected_qty=str(expected_qty),
+            exit_qty=str(exit_qty),
         )
         return None
 
@@ -170,7 +205,7 @@ def record_closed_trade(
     maker_count = 0
     taker_count = 0
 
-    for fill in position.entry_fills + position.exit_fills:
+    for fill in economic_entry_fills + economic_exit_fills:
         fill_notional = fill.qty * fill.price
         fill_type = _infer_fill_type(fill, position)
         if fill_type == _MAKER:
@@ -205,8 +240,8 @@ def record_closed_trade(
     # ---- Timing: use final fill timestamp, not datetime.now() ----
     # Priority: exchange fill time > state-machine exit_time > fallback now()
     exit_time_source = "fill_timestamp"
-    if position.exit_fills:
-        exited_at = max(f.timestamp for f in position.exit_fills)
+    if economic_exit_fills:
+        exited_at = max(f.timestamp for f in economic_exit_fills)
     elif position.exit_time:
         exited_at = position.exit_time
         exit_time_source = "state_machine_exit_time"
@@ -220,8 +255,8 @@ def record_closed_trade(
         )
 
     entered_at = opened_at
-    if position.entry_fills:
-        entered_at = min(f.timestamp for f in position.entry_fills)
+    if economic_entry_fills:
+        entered_at = min(f.timestamp for f in economic_entry_fills)
 
     trade = Trade(
         trade_id=position.position_id,

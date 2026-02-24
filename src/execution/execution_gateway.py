@@ -50,6 +50,19 @@ from src.exceptions import (
 )
 
 logger = get_logger(__name__)
+_SYNTHETIC_ORDER_PREFIXES = (
+    "reconcile-",
+    "sync-",
+    "startup-repair",
+    "auto_import",
+)
+
+
+def _is_synthetic_fill_order(order_id: Optional[str]) -> bool:
+    normalized = (order_id or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized.startswith(_SYNTHETIC_ORDER_PREFIXES)
 
 
 class OrderPurpose(str, Enum):
@@ -1240,6 +1253,42 @@ class ExecutionGateway:
             if trade is None and position.trade_recorded:
                 self.persistence.save_position(position)
                 return
+            if trade is None:
+                # Some reconciliation paths only have synthetic state-sync fills.
+                # Do not keep retrying forever when no economic exits exist.
+                has_economic_exit = any(
+                    not _is_synthetic_fill_order(fill.order_id)
+                    for fill in position.exit_fills
+                )
+                if position.state == PositionState.ORPHANED or (
+                    position.state == PositionState.CLOSED and position.exit_fills and not has_economic_exit
+                ):
+                    logger.warning(
+                        "POSITION_CLOSED_UNPRICED: no economic exit fills available",
+                        position_id=position.position_id,
+                        symbol=position.symbol,
+                        state=position.state.value,
+                        entry_fills=len(position.entry_fills),
+                        exit_fills=len(position.exit_fills),
+                    )
+                    try:
+                        from src.monitoring.alerting import send_alert, fmt_size
+                        missing_qty = max(position.filled_entry_qty - position.filled_exit_qty, Decimal("0"))
+                        await send_alert(
+                            "POSITION_CLOSED_UNPRICED",
+                            f"⚠️ Position closed without exchange-priced fills: {position.symbol}\n"
+                            f"Side: {position.side.value.upper()}\n"
+                            f"Entry size: {fmt_size(position.filled_entry_qty)}\n"
+                            f"Known exited: {fmt_size(position.filled_exit_qty)}\n"
+                            f"Unpriced remainder: {fmt_size(missing_qty)}\n"
+                            f"Reason: {position.exit_reason.value if position.exit_reason else 'unknown'}",
+                            urgent=True,
+                        )
+                    except Exception:
+                        pass
+                    position.trade_recorded = True
+                    self.persistence.save_position(position)
+                return
             if trade:
                 self.metrics["trades_recorded_total"] += 1
                 # Re-persist to save trade_recorded=True
@@ -1866,12 +1915,24 @@ class ExecutionGateway:
                 pos = self.registry.get_position(symbol)
                 if pos:
                     self.persistence.save_position(pos)
+                    self.persistence.log_state_adjustment(
+                        position_id=pos.position_id,
+                        symbol=symbol,
+                        adjustment_type="QTY_SYNCED",
+                        detail=issue,
+                    )
                     qty_synced_count += 1
                 else:
                     # Reconciliation may close/move the position to history.
                     for closed_pos in self.registry._closed_positions:
                         if closed_pos.symbol == symbol:
                             self.persistence.save_position(closed_pos)
+                            self.persistence.log_state_adjustment(
+                                position_id=closed_pos.position_id,
+                                symbol=symbol,
+                                adjustment_type="QTY_SYNCED",
+                                detail=issue,
+                            )
                             qty_synced_count += 1
                             break
         

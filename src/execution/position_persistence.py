@@ -138,6 +138,20 @@ class PositionPersistence:
                 
                 CREATE INDEX IF NOT EXISTS idx_actions_position ON position_actions(position_id);
                 CREATE INDEX IF NOT EXISTS idx_actions_timestamp ON position_actions(timestamp);
+
+                -- Reconciliation / state-sync adjustments (non-economic)
+                CREATE TABLE IF NOT EXISTS position_state_adjustments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    adjustment_type TEXT NOT NULL,
+                    detail TEXT,
+                    timestamp TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_state_adjustments_position
+                    ON position_state_adjustments(position_id);
+                CREATE INDEX IF NOT EXISTS idx_state_adjustments_timestamp
+                    ON position_state_adjustments(timestamp);
                 
                 -- Pending reversals
                 CREATE TABLE IF NOT EXISTS pending_reversals (
@@ -472,6 +486,30 @@ class PositionPersistence:
         )
         
         return [dict(row) for row in cursor]
+
+    def log_state_adjustment(
+        self,
+        position_id: str,
+        symbol: str,
+        adjustment_type: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Persist non-economic reconciliation adjustments for auditability."""
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO position_state_adjustments (
+                    position_id, symbol, adjustment_type, detail, timestamp
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    position_id,
+                    symbol,
+                    adjustment_type,
+                    detail,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
     
     # ========== PENDING REVERSALS ==========
     

@@ -220,13 +220,13 @@ class TestIdempotency:
 
 
 # ---------------------------------------------------------------------------
-# 4. Reconciliation close records trade
+# 4. Reconciliation-only close stays unpriced
 # ---------------------------------------------------------------------------
 
 
 class TestReconciliationClose:
     @patch("src.storage.repository.save_trade")
-    def test_recon_close_records_trade(self, mock_save):
+    def test_recon_close_with_only_synthetic_exit_not_recorded(self, mock_save):
         pos = _make_position()
         _add_entry_fill(pos, qty=Decimal("10"), price=Decimal("100"))
 
@@ -239,10 +239,29 @@ class TestReconciliationClose:
 
         trade = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
 
+        assert trade is None
+        assert pos.trade_recorded is False
+        mock_save.assert_not_called()
+
+    @patch("src.storage.repository.save_trade")
+    def test_recon_close_uses_economic_exit_fill_when_present(self, mock_save):
+        pos = _make_position()
+        _add_entry_fill(pos, qty=Decimal("10"), price=Decimal("100"))
+        _add_exit_fill(
+            pos, qty=Decimal("10"), price=Decimal("98"),
+            order_id="reconcile-sync", fill_id="fill-recon-synth",
+        )
+        _add_exit_fill(
+            pos, qty=Decimal("10"), price=Decimal("97"),
+            order_id="stop-001", fill_id="fill-recon-real",
+        )
+        pos._mark_closed(ExitReason.RECONCILIATION)
+
+        trade = record_closed_trade(pos, MAKER_RATE, TAKER_RATE)
+
         assert trade is not None
+        assert trade.exit_price == Decimal("97")
         assert trade.exit_reason == "reconciliation"
-        # Recon fills are always taker (conservative)
-        assert trade.taker_fills_count >= 1
         mock_save.assert_called_once()
 
 
