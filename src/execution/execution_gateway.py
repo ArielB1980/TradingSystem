@@ -93,6 +93,18 @@ class ExecutionResult:
     filled_price: Optional[Decimal] = None
 
 
+def _normalize_pending_order_type(raw_order_type: str) -> OrderType:
+    """Normalize exchange/raw order type strings to domain enum values."""
+    order_type = (raw_order_type or "").strip().lower()
+    if order_type in ("stop", "stop_loss", "stop-loss", "stp"):
+        return OrderType.STOP_LOSS
+    if order_type in ("take_profit", "take-profit", "tp"):
+        return OrderType.TAKE_PROFIT
+    if order_type == "limit":
+        return OrderType.LIMIT
+    return OrderType.MARKET
+
+
 class _OrderRateLimiter:
     """Sliding-window token bucket for order rate limiting.
 
@@ -1739,6 +1751,8 @@ class ExecutionGateway:
             # Without this, the position stays in the registry until reconciliation marks it
             # orphaned -- losing the fill data and P&L for trade recording.
             purpose = OrderPurpose.EXIT_STOP if reason in ("emergency_stop", "missing_stop", "shock_guard") else OrderPurpose.EXIT_MARKET
+            pending_order_type = _normalize_pending_order_type(order_type)
+
             pending = PendingOrder(
                 client_order_id=client_oid,
                 position_id=symbol,
@@ -1747,7 +1761,7 @@ class ExecutionGateway:
                 side=Side(side) if side in ("long", "short") else Side.SHORT,
                 size=Decimal(str(size)),
                 price=Decimal(str(stop_price)) if stop_price is not None else (Decimal(str(price)) if price is not None else None),
-                order_type=OrderType(order_type) if order_type in ("market", "limit", "stop") else OrderType.MARKET,
+                order_type=pending_order_type,
                 submitted_at=datetime.now(timezone.utc),
                 exchange_order_id=exchange_oid,
                 exchange_symbol=symbol,

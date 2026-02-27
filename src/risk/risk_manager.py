@@ -785,6 +785,69 @@ class RiskManager:
                 rejection_reasons.append(
                     f"Fees+funding distort R:R by {rr_distortion:.1%} > max {max_distortion:.1%} (Stop: {stop_distance_pct:.2%})"
                 )
+            # Hard funding gate for prolonged contango burden in wide-structure regime.
+            daily_funding_bps = Decimal(str(self.config.funding_rate_daily_bps))
+            wide_hold_hours = Decimal(str(self.config.wide_structure_avg_hold_hours))
+            projected_funding_bps = daily_funding_bps * (wide_hold_hours / Decimal("24"))
+            funding_cap_bps = Decimal(str(getattr(self.config, "wide_structure_funding_hard_cap_bps", 0.0)))
+            if funding_cap_bps > 0 and projected_funding_bps > funding_cap_bps:
+                rejection_reasons.append("REJECT_WIDE_FUNDING_CONTANGO")
+                logger.info(
+                    "Risk funding hard gate rejected",
+                    symbol=signal.symbol,
+                    regime=regime,
+                    projected_funding_bps=float(projected_funding_bps),
+                    funding_cap_bps=float(funding_cap_bps),
+                )
+
+        fee_edge_metrics = None
+        if bool(getattr(self.config, "fee_edge_guard_enabled", False)):
+            fee_edge_metrics = self._compute_fee_edge_metrics(
+                signal=signal,
+                entry_price=entry_for_risk,
+                regime=regime,
+            )
+            edge_bps = fee_edge_metrics["edge_bps"]
+            required_bps = fee_edge_metrics["required_bps"]
+            fee_bps_rt = fee_edge_metrics["fee_bps_rt"]
+
+            if edge_bps is None:
+                rejection_reasons.append("REJECT_EDGE_BELOW_FEES_PLUS_FUNDING")
+                logger.info(
+                    "Risk fee-edge gate rejected (missing TP1 proxy)",
+                    symbol=signal.symbol,
+                    regime=regime,
+                    fee_bps_rt=float(fee_bps_rt),
+                    required_bps=float(required_bps),
+                )
+            elif edge_bps < required_bps:
+                reason_code = (
+                    "REJECT_EDGE_BELOW_FEES_PLUS_FUNDING"
+                    if fee_edge_metrics["funding_bps_est"] > 0
+                    else "REJECT_EDGE_BELOW_FEES"
+                )
+                rejection_reasons.append(reason_code)
+                logger.info(
+                    "Risk fee-edge gate rejected",
+                    symbol=signal.symbol,
+                    regime=regime,
+                    edge_bps=float(edge_bps),
+                    required_bps=float(required_bps),
+                    fee_bps_rt=float(fee_bps_rt),
+                    fees_bps_rt=float(fee_edge_metrics["fees_bps_rt"]),
+                    slippage_bps_rt=float(fee_edge_metrics["slippage_bps_rt"]),
+                    funding_bps_est=float(fee_edge_metrics["funding_bps_est"]),
+                    edge_multiple_k=float(fee_edge_metrics["edge_multiple_k"]),
+                )
+            else:
+                logger.debug(
+                    "Risk fee-edge gate passed",
+                    symbol=signal.symbol,
+                    regime=regime,
+                    edge_bps=float(edge_bps),
+                    required_bps=float(required_bps),
+                    fee_bps_rt=float(fee_bps_rt),
+                )
         
         # Approve or reject
         approved = len(rejection_reasons) == 0
@@ -834,6 +897,8 @@ class RiskManager:
                 "Trade rejected",
                 symbol=signal.symbol,
                 reasons=rejection_reasons,
+                signal_score=float(signal.score) if getattr(signal, "score", None) is not None else None,
+                signal_score_breakdown=getattr(signal, "score_breakdown", None) or {},
             )
             
         # --- EXPLAINABILITY INSTRUMENTATION ---
@@ -860,6 +925,12 @@ class RiskManager:
                 "strictness_tier": strictness_tier
             }
         }
+        if fee_edge_metrics:
+            validation_data["metrics"]["fee_edge_bps_rt"] = float(fee_edge_metrics["fee_bps_rt"])
+            validation_data["metrics"]["fee_edge_required_bps"] = float(fee_edge_metrics["required_bps"])
+            validation_data["metrics"]["fee_edge_observed_bps"] = (
+                float(fee_edge_metrics["edge_bps"]) if fee_edge_metrics["edge_bps"] is not None else None
+            )
         
         self._record_event("RISK_VALIDATION", signal.symbol, validation_data)
         
@@ -905,6 +976,64 @@ class RiskManager:
         total = entry_fee + exit_fee + expected_funding
         
         return total
+
+    def _resolve_tp1_proxy(self, signal: Signal) -> Optional[Decimal]:
+        """Resolve first-profit edge proxy deterministically from signal."""
+        if signal.take_profit and signal.take_profit > 0:
+            return signal.take_profit
+        for candidate in (signal.tp_candidates or []):
+            if candidate and candidate > 0:
+                return candidate
+        return None
+
+    def _compute_fee_edge_metrics(self, signal: Signal, entry_price: Decimal, regime: str) -> dict:
+        """
+        Compute deterministic edge-vs-cost gate metrics in bps.
+
+        edge_bps uses TP1 proxy; fee_bps_rt uses conservative fee + slippage + funding
+        with a configurable cost buffer multiplier.
+        """
+        tp1_proxy = self._resolve_tp1_proxy(signal)
+        edge_bps: Optional[Decimal] = None
+        if tp1_proxy and entry_price > 0:
+            edge_bps = abs(tp1_proxy - entry_price) / entry_price * Decimal("10000")
+
+        taker_fee_bps = Decimal(str(self.config.taker_fee_bps))
+        maker_fee_bps = Decimal(str(self.config.maker_fee_bps))
+        conservative_taker = bool(getattr(self.config, "fee_edge_use_conservative_taker", True))
+        fees_bps_rt = (
+            taker_fee_bps * Decimal("2")
+            if conservative_taker
+            else (maker_fee_bps + taker_fee_bps)
+        )
+        slippage_bps_rt = Decimal(str(getattr(self.config, "fee_edge_slippage_bps_est", 4.0)))
+        avg_hold_hours = Decimal(
+            str(
+                self.config.tight_smc_avg_hold_hours
+                if regime == "tight_smc"
+                else self.config.wide_structure_avg_hold_hours
+            )
+        )
+        funding_bps_from_hold = Decimal(str(self.config.funding_rate_daily_bps)) * (
+            avg_hold_hours / Decimal("24")
+        )
+        funding_floor_bps = Decimal(str(getattr(self.config, "fee_edge_funding_floor_bps", 2.0)))
+        funding_bps_est = max(funding_bps_from_hold, funding_floor_bps)
+
+        buffer_mult = Decimal(str(getattr(self.config, "fee_edge_cost_buffer_multiplier", 1.2)))
+        fee_bps_rt = (fees_bps_rt + slippage_bps_rt + funding_bps_est) * buffer_mult
+        edge_multiple_k = Decimal(str(getattr(self.config, "fee_edge_multiple_k", 5.0)))
+        required_bps = fee_bps_rt * edge_multiple_k
+
+        return {
+            "edge_bps": edge_bps,
+            "fee_bps_rt": fee_bps_rt,
+            "required_bps": required_bps,
+            "fees_bps_rt": fees_bps_rt,
+            "slippage_bps_rt": slippage_bps_rt,
+            "funding_bps_est": funding_bps_est,
+            "edge_multiple_k": edge_multiple_k,
+        }
     
     def _estimate_costs_wide_structure(self, position_notional: Decimal, stop_distance_pct: Decimal) -> Decimal:
         """

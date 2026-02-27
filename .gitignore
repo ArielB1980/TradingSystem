@@ -76,7 +76,6 @@ results/
 .watchdog_live_trading.pid
 .env.local
 .local/
-logs/
 .venv/
 
 # Ad-hoc logs and output (run-specific)
@@ -89,3 +88,11 @@ trace_output.txt
 recent_signals.json
 signal_output.json
 trades_today.txt
+
+# Root ad-hoc artifacts
+/COMMIT_MESSAGE.txt
+/rejection_reasons.json
+
+# Optional generalized local outputs at repo root
+/*_output.json
+/*.trace

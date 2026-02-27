@@ -136,7 +136,7 @@ async def reconcile_protective_orders(
             await place_tp_backfill(lt, symbol, pos_data, db_pos, tp_plan, symbol_orders, current_price)
 
         except (OperationalError, DataError, ValueError) as e:
-            logger.error("TP backfill failed", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            logger.exception("TP backfill failed", symbol=symbol, error=str(e), error_type=type(e).__name__)
             await async_record_event(
                 "TP_BACKFILL_SKIPPED", symbol, {"reason": f"error: {str(e)}"}
             )
@@ -385,7 +385,7 @@ async def place_missing_stops_for_unprotected(
             result = await lt.execution_gateway.place_emergency_order(
                 symbol=unified,
                 side=close_side,
-                order_type="stop",
+                order_type="stop_loss",
                 size=size,
                 stop_price=stop_price,
                 reduce_only=True,
@@ -896,7 +896,7 @@ async def place_tp_backfill(
         )
 
     except (OperationalError, DataError, ValueError) as e:
-        logger.error("Failed to place TP backfill", symbol=symbol, error=str(e), error_type=type(e).__name__)
+        logger.exception("Failed to place TP backfill", symbol=symbol, error=str(e), error_type=type(e).__name__)
         await async_record_event(
             "TP_BACKFILL_SKIPPED", symbol, {"reason": f"placement_failed: {str(e)}"}
         )

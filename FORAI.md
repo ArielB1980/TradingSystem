@@ -7,6 +7,12 @@ This file captures everything learned about this trading system across debugging
 
 ---
 
+## Active Profitability Roadmap
+
+- Current optimization roadmap: `docs/PHASE2_PROFITABILITY_PLAN.md`
+
+---
+
 ## 1. Production Infrastructure
 
 ### SSH Access

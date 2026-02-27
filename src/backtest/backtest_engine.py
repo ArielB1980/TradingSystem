@@ -284,6 +284,9 @@ class BacktestEngine:
         end_date: datetime,
     ) -> BacktestMetrics:
         """Run backtest for given date range."""
+        if start_date >= end_date:
+            raise DataError(f"Invalid backtest window: start_date ({start_date}) must be < end_date ({end_date})")
+
         # Initialize Kraken client (lazy init for CCXT)
         await self.client.initialize()
         
@@ -298,11 +301,33 @@ class BacktestEngine:
         candles_4h = await self._fetch_historical(self.symbol, "4h", data_start, end_date)
         candles_1h = await self._fetch_historical(self.symbol, "1h", data_start, end_date)
         candles_15m = await self._fetch_historical(self.symbol, "15m", data_start, end_date)
-        
-        logger.info("Data fetched", symbol=self.symbol)
-        
+
+        # Enforce strict bounds on all fetched candles. If upstream provider
+        # ignores `since`, we fail closed instead of leaking out-of-window data.
+        candles_1d = self._normalize_candles(candles_1d, data_start, end_date)
+        candles_4h = self._normalize_candles(candles_4h, data_start, end_date)
+        candles_1h = self._normalize_candles(candles_1h, data_start, end_date)
+        candles_15m = self._normalize_candles(candles_15m, data_start, end_date)
+        timeline_1h = self._normalize_candles(candles_1h, start_date, end_date)
+
+        logger.info(
+            "Data fetched",
+            symbol=self.symbol,
+            count_1d=len(candles_1d),
+            count_4h=len(candles_4h),
+            count_1h=len(candles_1h),
+            count_15m=len(candles_15m),
+            timeline_1h=len(timeline_1h),
+        )
+
+        if not timeline_1h:
+            raise DataError(
+                f"No 1h candles in requested range for {self.symbol}: "
+                f"{start_date.isoformat()} to {end_date.isoformat()}"
+            )
+
         # Replay chronologically (use 1h as main timeline)
-        for i, current_candle in enumerate(candles_1h):
+        for i, current_candle in enumerate(timeline_1h):
             cutoff_time = current_candle.timestamp
             
             # Historical candles for signal generation
@@ -315,10 +340,6 @@ class BacktestEngine:
             if len(hist_1d) < 200 or len(hist_1h) < 200:
                 continue 
                 
-            # Wait until requested simulation start
-            if current_candle.timestamp < start_date:
-                continue
-            
             # Check existing position
             if self.position:
                 # Accrue funding costs (simulated every hour, applied 3x daily in reality)
@@ -449,7 +470,7 @@ class BacktestEngine:
         
         # Close any remaining open position at end of backtest
         if self.position:
-            final_candle = candles_1h[-1] if candles_1h else None
+            final_candle = timeline_1h[-1] if timeline_1h else None
             if final_candle:
                 logger.info(
                     "Closing open position at backtest end",
@@ -523,7 +544,7 @@ class BacktestEngine:
         expected_count = total_seconds / interval_seconds
         
         if len(db_candles) >= expected_count * 0.95:
-            return db_candles
+            return self._normalize_candles(db_candles, start_date, end_date)
             
         logger.info("Cache miss - fetching from API", found=len(db_candles), timeframe=timeframe)
 
@@ -543,12 +564,43 @@ class BacktestEngine:
 
             if not batch:
                 break
-            
-            candles.extend(batch)
+
+            # Guard against providers returning out-of-window data.
+            in_window_batch = [
+                c for c in batch if start_date <= c.timestamp <= end_date
+            ]
+            candles.extend(in_window_batch)
             since = int(batch[-1].timestamp.timestamp() * 1000) + 1
-            save_candles_bulk(batch)
-        
-        return candles
+            if in_window_batch:
+                save_candles_bulk(in_window_batch)
+
+        return self._normalize_candles(candles, start_date, end_date)
+
+    def _normalize_candles(
+        self,
+        candles: List[Candle],
+        start_date: datetime,
+        end_date: datetime,
+    ) -> List[Candle]:
+        """Sort, de-dup, and strictly bound candles to requested window."""
+        if not candles:
+            return []
+
+        filtered = [
+            c for c in candles
+            if c and c.timestamp and start_date <= c.timestamp <= end_date
+        ]
+        filtered.sort(key=lambda c: c.timestamp)
+
+        deduped: List[Candle] = []
+        seen_ts = set()
+        for candle in filtered:
+            ts = candle.timestamp
+            if ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            deduped.append(candle)
+        return deduped
 
     def _timeframe_to_seconds(self, tf: str) -> int:
         """Helper to estimate candle count."""

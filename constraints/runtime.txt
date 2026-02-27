@@ -1,0 +1,5 @@
+# Pinned runtime-critical libraries for deterministic deploy resolution.
+ccxt==4.5.31
+sqlalchemy==2.0.45
+pydantic==2.12.5
+pydantic-settings==2.12.0

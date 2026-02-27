@@ -1,7 +1,9 @@
 import sys
 import os
 import argparse
+import statistics
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -75,6 +77,89 @@ def main():
         print(f"Trades Executed: {trade_count}")
         print(f"Total PnL: ${total_pnl:.2f}")
         print(f"Win Rate: {win_rate:.1f}%")
+
+        # Fee/churn observability
+        if trade_count > 0:
+            total_fees = sum(float(t.fees or 0) for t in trades)
+            total_gross = sum(float(t.gross_pnl or 0) for t in trades)
+            winners = [t for t in trades if float(t.gross_pnl or 0) > 0]
+            winner_fees = sum(float(t.fees or 0) for t in winners)
+            winner_gross = sum(float(t.gross_pnl or 0) for t in winners)
+            fee_drag_abs_gross = (total_fees / abs(total_gross) * 100.0) if total_gross else 0.0
+            fee_drag_winners = (winner_fees / winner_gross * 100.0) if winner_gross else 0.0
+            holds_h = [float(t.holding_period_hours or 0) for t in trades]
+            fees_bps = []
+            gross_edge_abs_bps = []
+            maker_count = 0
+            taker_count = 0
+            for t in trades:
+                notional = float(t.size_notional or 0)
+                if notional > 0:
+                    fees_bps.append(float(t.fees or 0) / notional * 10000.0)
+                    gross_edge_abs_bps.append(abs(float(t.gross_pnl or 0)) / notional * 10000.0)
+                maker_count += int(getattr(t, "maker_fills_count", 0) or 0)
+                taker_count += int(getattr(t, "taker_fills_count", 0) or 0)
+
+            def pct(values, p):
+                if not values:
+                    return 0.0
+                vals = sorted(values)
+                idx = max(int(len(vals) * p) - 1, 0)
+                return vals[idx]
+
+            lt_30m = sum(1 for h in holds_h if h < 0.5)
+            lt_1h = sum(1 for h in holds_h if h < 1.0)
+            h_1_4 = sum(1 for h in holds_h if 1.0 <= h < 4.0)
+            ge_4h = sum(1 for h in holds_h if h >= 4.0)
+
+            print("\nFee & Churn KPIs:")
+            print(f"  Fee Drag (abs gross): {fee_drag_abs_gross:.1f}%")
+            print(f"  Fee Drag (winners):   {fee_drag_winners:.1f}%")
+            print(f"  Fees bps p50/p90:     {statistics.median(fees_bps) if fees_bps else 0.0:.2f}/{pct(fees_bps, 0.9):.2f}")
+            print(f"  Edge bps p50/p90:     {statistics.median(gross_edge_abs_bps) if gross_edge_abs_bps else 0.0:.2f}/{pct(gross_edge_abs_bps, 0.9):.2f}")
+            print(f"  Median hold:          {statistics.median(holds_h) if holds_h else 0.0:.2f}h")
+            print(f"  Hold bins:            <30m={lt_30m}, <1h={lt_1h}, 1-4h={h_1_4}, >=4h={ge_4h}")
+            print(f"  Maker/Taker fills:    {maker_count}/{taker_count}")
+
+            # Per-symbol fee drag and churn counts
+            by_symbol = defaultdict(list)
+            for t in sorted(trades, key=lambda x: x.entered_at):
+                by_symbol[t.symbol].append(t)
+
+            per_symbol_rows = []
+            for sym, ts in by_symbol.items():
+                sym_fees = sum(float(t.fees or 0) for t in ts)
+                sym_gross = sum(float(t.gross_pnl or 0) for t in ts)
+                sym_net = sum(float(t.net_pnl or 0) for t in ts)
+                churn_events = 0
+                for i in range(len(ts) - 1):
+                    cur = ts[i]
+                    nxt = ts[i + 1]
+                    hold_min = float(cur.holding_period_hours or 0) * 60.0
+                    reopen_gap_min = (nxt.entered_at - cur.exited_at).total_seconds() / 60.0
+                    if hold_min <= 60.0 and 0 <= reopen_gap_min <= 120.0:
+                        churn_events += 1
+                per_symbol_rows.append(
+                    (
+                        sym,
+                        len(ts),
+                        churn_events,
+                        sym_fees,
+                        (sym_fees / abs(sym_gross) * 100.0) if sym_gross else 0.0,
+                        sym_net,
+                    )
+                )
+
+            per_symbol_rows.sort(key=lambda r: (r[2], r[3]), reverse=True)
+            print("\nTop Symbols (churn/fees):")
+            for row in per_symbol_rows[:8]:
+                sym, ntr, ch, sf, sfd, sn = row
+                print(f"  {sym:12s} trades={ntr:2d} churn={ch:2d} fees=${sf:5.2f} fee_drag={sfd:5.1f}% net=${sn:6.2f}")
+
+            print(
+                f"\nROLLUP|hours={args.hours}|trades={trade_count}|fee_drag_winners_pct={fee_drag_winners:.1f}|"
+                f"lt1h_pct={(lt_1h/trade_count*100.0):.1f}|maker_fills={maker_count}|taker_fills={taker_count}"
+            )
         
         if trade_count > 0:
             print("\nRecent Trades:")

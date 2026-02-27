@@ -41,6 +41,17 @@ class ExecutionEngine:
             self._runner_has_fixed_tp = runner_has_fixed_tp
             self._regime_sizing_enabled = getattr(mtp, "regime_runner_sizing_enabled", False)
             self._regime_overrides = getattr(mtp, "regime_runner_overrides", {})
+            self._hybrid_exit_mode_enabled = bool(getattr(mtp, "hybrid_exit_mode_enabled", False))
+            self._hybrid_exit_canary_symbols = {
+                str(s).strip().upper() for s in (getattr(mtp, "hybrid_exit_canary_symbols", []) or [])
+            }
+            self._hybrid_exit_regime_mode_overrides = {
+                str(k).strip().lower(): str(v).strip().lower()
+                for k, v in (getattr(mtp, "hybrid_exit_regime_mode_overrides", {}) or {}).items()
+            }
+            self._hybrid_unknown_regime_fallback = str(
+                getattr(mtp, "hybrid_exit_unknown_regime_fallback_mode", "global_default")
+            ).strip().lower()
             logger.info(
                 "ExecutionEngine using multi_tp config",
                 tp_splits=self._tp_splits,
@@ -48,6 +59,7 @@ class ExecutionEngine:
                 runner_pct=self._runner_pct,
                 runner_has_fixed_tp=self._runner_has_fixed_tp,
                 regime_sizing=self._regime_sizing_enabled,
+                hybrid_exit_mode_enabled=self._hybrid_exit_mode_enabled,
             )
         else:
             self._tp_splits = list(self.config.tp_splits)
@@ -56,9 +68,81 @@ class ExecutionEngine:
             self._runner_has_fixed_tp = True  # legacy: all TPs have orders
             self._regime_sizing_enabled = False
             self._regime_overrides = {}
+            self._hybrid_exit_mode_enabled = False
+            self._hybrid_exit_canary_symbols = set()
+            self._hybrid_exit_regime_mode_overrides = {}
+            self._hybrid_unknown_regime_fallback = "global_default"
 
         self.price_precision = Decimal("0.1")
         self.qty_precision = Decimal("0.001")
+
+    @staticmethod
+    def _normalize_regime_key(raw_regime: Optional[str]) -> str:
+        if not raw_regime:
+            return ""
+        key = str(raw_regime).strip().lower()
+        aliases = {
+            "tight": "tight_smc",
+            "tightsmc": "tight_smc",
+            "wide": "wide_structure",
+            "widestructure": "wide_structure",
+            "range": "consolidation",
+        }
+        return aliases.get(key, key)
+
+    @staticmethod
+    def _normalize_symbol_key(raw_symbol: Optional[str]) -> str:
+        if not raw_symbol:
+            return ""
+        return str(raw_symbol).strip().upper().split(":")[0]
+
+    def _hybrid_canary_allows_symbol(self, symbol: Optional[str]) -> bool:
+        if not self._hybrid_exit_canary_symbols:
+            return True
+        return self._normalize_symbol_key(symbol) in self._hybrid_exit_canary_symbols
+
+    def _resolve_effective_runner_mode(
+        self,
+        signal: Signal,
+    ) -> Tuple[bool, str, bool, str]:
+        """
+        Returns:
+            (effective_runner_has_fixed_tp, effective_exit_mode, fallback_used, normalized_regime)
+        """
+        effective_runner_has_fixed_tp = self._runner_has_fixed_tp
+        normalized_regime = self._normalize_regime_key(getattr(signal, "regime", ""))
+        fallback_used = False
+
+        if not self._hybrid_exit_mode_enabled:
+            mode = "fixed_tp3" if effective_runner_has_fixed_tp else "runner"
+            return effective_runner_has_fixed_tp, mode, fallback_used, normalized_regime
+        if not self._hybrid_canary_allows_symbol(getattr(signal, "symbol", None)):
+            mode = "fixed_tp3" if effective_runner_has_fixed_tp else "runner"
+            return effective_runner_has_fixed_tp, mode, fallback_used, normalized_regime
+
+        regime_mode = self._hybrid_exit_regime_mode_overrides.get(normalized_regime)
+        if regime_mode == "fixed_tp3":
+            effective_runner_has_fixed_tp = True
+        elif regime_mode == "runner":
+            effective_runner_has_fixed_tp = False
+        else:
+            fallback_used = True
+            if self._hybrid_unknown_regime_fallback == "fixed_tp3":
+                effective_runner_has_fixed_tp = True
+            elif self._hybrid_unknown_regime_fallback == "runner":
+                effective_runner_has_fixed_tp = False
+            else:
+                effective_runner_has_fixed_tp = self._runner_has_fixed_tp
+            logger.warning(
+                "Hybrid exit regime fallback used",
+                symbol=getattr(signal, "symbol", None),
+                regime=getattr(signal, "regime", None),
+                normalized_regime=normalized_regime or None,
+                fallback_mode=self._hybrid_unknown_regime_fallback,
+            )
+
+        mode = "fixed_tp3" if effective_runner_has_fixed_tp else "runner"
+        return effective_runner_has_fixed_tp, mode, fallback_used, normalized_regime
         
     def generate_entry_plan(
         self, 
@@ -90,18 +174,48 @@ class ExecutionEngine:
         else:
             fut_sl = fut_entry * (Decimal("1") + sl_pct)
             
+        (
+            effective_runner_has_fixed_tp,
+            effective_exit_mode,
+            fallback_used,
+            normalized_regime,
+        ) = self._resolve_effective_runner_mode(signal)
+        logger.info(
+            "Execution exit mode resolved",
+            symbol=signal.symbol,
+            regime=getattr(signal, "regime", None),
+            normalized_regime=normalized_regime or None,
+            effective_exit_mode=effective_exit_mode,
+            fallback_used=fallback_used,
+        )
+
+        # Build per-trade RR ladder from effective mode.
+        if effective_runner_has_fixed_tp:
+            if len(self._rr_fallback_multiples) >= 3:
+                effective_rr_multiples = list(self._rr_fallback_multiples[:3])
+            else:
+                runner_r = getattr(self._multi_tp_config, "runner_tp_r_multiple", 3.0) if self._multi_tp_config else 3.0
+                effective_rr_multiples = list(self._rr_fallback_multiples[:2]) + [float(runner_r or 3.0)]
+        else:
+            effective_rr_multiples = list(self._rr_fallback_multiples[:2])
+
         # 2. Regime-aware sizing: override tp_splits and runner_pct based on signal's regime
         effective_tp_splits = list(self._tp_splits)
+        if effective_runner_has_fixed_tp and len(effective_tp_splits) > 3:
+            effective_tp_splits = effective_tp_splits[:3]
+        if not effective_runner_has_fixed_tp and len(effective_tp_splits) > 2:
+            effective_tp_splits = effective_tp_splits[:2]
         effective_runner_pct = self._runner_pct
         regime_used = getattr(signal, 'regime', None)
+        regime_override_key = normalized_regime or regime_used
         
         if (
             self._regime_sizing_enabled
-            and not self._runner_has_fixed_tp
-            and regime_used
-            and regime_used in self._regime_overrides
+            and not effective_runner_has_fixed_tp
+            and regime_override_key
+            and regime_override_key in self._regime_overrides
         ):
-            override = self._regime_overrides[regime_used]
+            override = self._regime_overrides[regime_override_key]
             effective_runner_pct = override.get("runner_pct", self._runner_pct)
             regime_tp1 = override.get("tp1_close_pct", effective_tp_splits[0] if effective_tp_splits else 0.4)
             regime_tp2 = override.get("tp2_close_pct", effective_tp_splits[1] if len(effective_tp_splits) > 1 else 0.4)
@@ -115,10 +229,13 @@ class ExecutionEngine:
             )
         
         # 2b. Generate TP Ladder (Futures prices)
-        tps = self._generate_tp_ladder(signal, fut_entry, fut_sl, signal.signal_type)
-        if not self._runner_has_fixed_tp and len(tps) > 2:
-            tps = tps[:2]
-            logger.warning("Runner mode: capped TP ladder to 2 levels (no fixed TP3)")
+        tps = self._generate_tp_ladder(
+            signal,
+            fut_entry,
+            fut_sl,
+            signal.signal_type,
+            rr_multiples=effective_rr_multiples,
+        )
         
         # 3. Calculate Quantities (using effective regime-adjusted splits)
         size_qty = size_notional / fut_entry
@@ -165,7 +282,7 @@ class ExecutionEngine:
         # In runner mode (no TP3 order), this is the RR level at 3.0R (or last TP if 3 TPs).
         # This price is used as a management signal, not an order.
         risk = abs(fut_entry - fut_sl)
-        if not self._runner_has_fixed_tp and len(tps) == 2:
+        if not effective_runner_has_fixed_tp and len(tps) == 2:
             # Runner mode: compute final target at 3.0R as aspiration level
             final_target_r = Decimal("3.0")
             if signal.signal_type == SignalType.LONG:
@@ -185,9 +302,12 @@ class ExecutionEngine:
                 "fut_sl": fut_sl,
                 "sl_pct": sl_pct,
                 "runner_pct": effective_runner_pct,
-                "runner_has_fixed_tp": self._runner_has_fixed_tp,
+                "runner_has_fixed_tp": effective_runner_has_fixed_tp,
                 "final_target_price": final_target_price,
                 "regime": regime_used,
+                "normalized_regime": normalized_regime,
+                "effective_exit_mode": effective_exit_mode,
+                "fallback_used": fallback_used,
                 "effective_tp_splits": effective_tp_splits,
             }
         }
@@ -281,7 +401,8 @@ class ExecutionEngine:
         signal: Signal, 
         fut_entry: Decimal, 
         fut_sl: Decimal, 
-        side: SignalType
+        side: SignalType,
+        rr_multiples: Optional[List[float]] = None,
     ) -> List[Decimal]:
         """
         Generate TP levels (2 in runner mode, 3 in legacy/fixed-TP mode).
@@ -294,7 +415,7 @@ class ExecutionEngine:
         risk = abs(fut_entry - fut_sl)
         if risk == 0: risk = Decimal("1") # Edge case protection or config error
         
-        multiples = self._rr_fallback_multiples
+        multiples = rr_multiples if rr_multiples is not None else self._rr_fallback_multiples
         fallbacks = []
         for m in multiples:
             m = Decimal(str(m))
@@ -310,7 +431,7 @@ class ExecutionEngine:
         final_tps = []
         
         # Dynamic slot count: 2 in runner mode (no fixed TP for runner), 3 in legacy
-        num_slots = len(self._rr_fallback_multiples)
+        num_slots = len(multiples)
         
         structure_idx = 0
         fallback_idx = 0

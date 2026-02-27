@@ -38,6 +38,55 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _parse_opened_at(data: Dict) -> datetime:
+    """
+    Best-effort parse of exchange-provided open timestamp.
+
+    Falls back to current UTC time when timestamp is unavailable/invalid.
+    """
+    raw = (
+        data.get("openedAt")
+        or data.get("opened_at")
+        or data.get("openTime")
+        or data.get("open_time")
+        or data.get("timestamp")
+    )
+    if raw is None:
+        return datetime.now(timezone.utc)
+
+    # Numeric epoch (seconds or milliseconds)
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        if ts > 10_000_000_000:  # likely ms
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now(timezone.utc)
+
+    # Numeric string epoch
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.isdigit():
+            ts = float(s)
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            try:
+                return datetime.fromtimestamp(ts, tz=timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                return datetime.now(timezone.utc)
+        # ISO string
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return datetime.now(timezone.utc)
+
+    return datetime.now(timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Position conversion
 # ---------------------------------------------------------------------------
@@ -81,7 +130,7 @@ def convert_to_position(lt: "LiveTrading", data: Dict) -> Position:
         unrealized_pnl=unrealized_pnl,
         leverage=leverage,
         margin_used=margin_used,
-        opened_at=datetime.now(timezone.utc),  # Approximate if missing
+        opened_at=_parse_opened_at(data),
     )
 
 

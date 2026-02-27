@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from src.exceptions import OperationalError, DataError
 from src.monitoring.logger import get_logger
+from src.cli_output import print_critical_error
 
 app = typer.Typer(
     name="kraken-futures-smc",
@@ -152,29 +153,14 @@ def live(
     try:
         config = _load_config(config_path)
     except (OperationalError, DataError, OSError, ValueError, TypeError, KeyError) as e:
-        import sys
-        import traceback
-        print("=" * 80, file=sys.stderr)
-        print("CRITICAL ERROR - Failed to load configuration", file=sys.stderr)
-        print("=" * 80, file=sys.stderr)
-        print(f"Error: {e}", file=sys.stderr)
-        print(f"Type: {type(e).__name__}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print("=" * 80, file=sys.stderr)
+        print_critical_error("Failed to load configuration", e)
         raise typer.Exit(1)
     
     # Setup logging (may fail if config is invalid)
     try:
         _setup_logging_from_config(config, log_file=log_file)
     except (ValueError, TypeError, KeyError, ImportError, OSError) as e:
-        import sys
-        import traceback
-        print("=" * 80, file=sys.stderr)
-        print("CRITICAL ERROR - Failed to setup logging", file=sys.stderr)
-        print("=" * 80, file=sys.stderr)
-        print(f"Error: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print("=" * 80, file=sys.stderr)
+        print_critical_error("Failed to setup logging", e, include_type=False)
         raise typer.Exit(1)
     
     # Validate environment

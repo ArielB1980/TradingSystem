@@ -160,6 +160,7 @@ risk:
   tight_smc_avg_hold_hours: 6.0
   wide_structure_max_distortion_pct: 0.15
   wide_structure_avg_hold_hours: 36.0
+  wide_structure_funding_hard_cap_bps: 15.0
   
   loss_streak_cooldown_tight: 3
   loss_streak_cooldown_wide: 5

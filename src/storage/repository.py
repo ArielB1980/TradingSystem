@@ -840,6 +840,29 @@ def get_trades_since(since: datetime) -> List[Trade]:
         ]
 
 
+def count_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
+    """
+    Count recent stop-loss exits for a symbol (spot or futures symbol form).
+    """
+    if not symbol:
+        return 0
+    cutoff = _to_naive_utc(datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours)))
+    base_symbol = symbol.replace("PF_", "").replace("USD", "/USD").replace("//", "/")
+    futures_symbol = "PF_" + symbol.replace("/", "").replace("PF_", "")
+
+    db = get_db()
+    with db.get_session() as session:
+        return (
+            session.query(TradeModel)
+            .filter(
+                (TradeModel.symbol.ilike(f"%{base_symbol}%")) | (TradeModel.symbol.ilike(f"%{futures_symbol}%")),
+                TradeModel.exit_reason.ilike("Stop Loss%"),
+                TradeModel.exited_at >= cutoff,
+            )
+            .count()
+        )
+
+
 def _to_naive_utc(dt: datetime) -> datetime:
     """
     Convert a datetime to naive-UTC for DB comparison.

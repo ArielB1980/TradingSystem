@@ -351,6 +351,113 @@ class TestDeadlockRegression:
         assert plan.reductions == []
         assert plan.reasons["reduction_reasons"].get("cooldown_active", 0) >= 1
 
+    def test_rebalancer_can_trim_locked_positions_when_gate_closed(self):
+        """When trading gate is closed, locked positions can still be reduceOnly trimmed."""
+        from src.domain.models import Position
+
+        allocator = AuctionAllocator(
+            PortfolioLimits(max_positions=5, max_margin_util=0.90, max_per_cluster=3, max_per_symbol=1),
+            rebalancer_enabled=True,
+            rebalancer_trigger_pct_equity=0.32,
+            rebalancer_clear_pct_equity=0.24,
+            rebalancer_max_reductions_per_cycle=2,
+            rebalancer_max_total_margin_reduced_per_cycle=0.50,
+        )
+        locked_oversized = OpenPositionMetadata(
+            position=Position(
+                symbol="PF_ADAUSD",
+                side=Side.LONG,
+                size=Decimal("1000"),
+                size_notional=Decimal("4200"),  # 42% of equity
+                entry_price=Decimal("4.2"),
+                current_mark_price=Decimal("4.2"),
+                leverage=Decimal("5"),
+                margin_used=Decimal("900"),
+                unrealized_pnl=Decimal("0"),
+                liquidation_price=Decimal("1.0"),
+                is_protected=True,
+                stop_loss_order_id="sl-ada",
+            ),
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=2),
+            entry_score=70.0,
+            current_pnl_R=Decimal("0"),
+            margin_used=Decimal("900"),
+            cluster="tight_smc_ob",
+            direction=Side.LONG,
+            age_seconds=120,
+            is_protective_orders_live=True,
+            locked=True,
+        )
+
+        plan = allocator.allocate(
+            open_positions=[locked_oversized],
+            candidate_signals=[],
+            portfolio_state={
+                "account_equity": Decimal("10000"),
+                "available_margin": Decimal("10000"),
+                "current_cycle": 11,
+                "last_trim_cycle_by_symbol": {},
+                "allow_locked_rebalancer_trims": True,
+            },
+        )
+
+        assert len(plan.reductions) == 1
+        assert plan.reductions[0][0] == "PF_ADAUSD"
+        assert plan.reasons["reductions_planned"] == 1
+
+    def test_rebalancer_ignores_planned_close_symbols_in_gate_closed_recovery(self):
+        """In recovery mode, planned strategic closes should not block concentration trims."""
+        from src.domain.models import Position
+
+        allocator = AuctionAllocator(
+            PortfolioLimits(max_positions=5, max_margin_util=0.90, max_per_cluster=3, max_per_symbol=1),
+            rebalancer_enabled=True,
+            rebalancer_trigger_pct_equity=0.32,
+            rebalancer_clear_pct_equity=0.24,
+            rebalancer_max_reductions_per_cycle=1,
+            rebalancer_max_total_margin_reduced_per_cycle=0.50,
+        )
+        pos = OpenPositionMetadata(
+            position=Position(
+                symbol="PF_SOLUSD",
+                side=Side.LONG,
+                size=Decimal("100"),
+                size_notional=Decimal("4200"),
+                entry_price=Decimal("42"),
+                current_mark_price=Decimal("42"),
+                leverage=Decimal("5"),
+                margin_used=Decimal("840"),
+                unrealized_pnl=Decimal("0"),
+                liquidation_price=Decimal("10"),
+                is_protected=True,
+                stop_loss_order_id="sl-sol",
+            ),
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=3),
+            entry_score=70.0,
+            current_pnl_R=Decimal("0"),
+            margin_used=Decimal("840"),
+            cluster="tight_smc_ob",
+            direction=Side.LONG,
+            age_seconds=180,
+            is_protective_orders_live=True,
+            locked=True,
+        )
+
+        plan = allocator.allocate(
+            open_positions=[pos],
+            candidate_signals=[],
+            portfolio_state={
+                "account_equity": Decimal("10000"),
+                "available_margin": Decimal("10000"),
+                "current_cycle": 12,
+                "last_trim_cycle_by_symbol": {},
+                "allow_locked_rebalancer_trims": True,
+            },
+        )
+
+        assert len(plan.reductions) == 1
+        assert plan.reductions[0][0] == "PF_SOLUSD"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

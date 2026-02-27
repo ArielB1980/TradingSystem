@@ -81,6 +81,10 @@ def _make_config(
     runner_pct: float = 0.20,
     final_target_behavior: str = "tighten_trail",
     tighten_trail_at_final_target_atr_mult: float = 1.2,
+    hybrid_exit_mode_enabled: bool = False,
+    hybrid_exit_canary_symbols=None,
+    hybrid_exit_regime_mode_overrides=None,
+    hybrid_exit_unknown_regime_fallback_mode: str = "global_default",
 ) -> MagicMock:
     """Build a minimal Config mock with multi_tp settings."""
     mtp = MultiTPConfig(
@@ -98,6 +102,13 @@ def _make_config(
         final_target_behavior=final_target_behavior,
         tighten_trail_at_final_target_atr_mult=tighten_trail_at_final_target_atr_mult,
         regime_runner_sizing_enabled=False,  # Disable in base tests; tested separately
+        hybrid_exit_mode_enabled=hybrid_exit_mode_enabled,
+        hybrid_exit_canary_symbols=hybrid_exit_canary_symbols or [],
+        hybrid_exit_regime_mode_overrides=hybrid_exit_regime_mode_overrides or {
+            "tight_smc": "fixed_tp3",
+            "wide_structure": "runner",
+        },
+        hybrid_exit_unknown_regime_fallback_mode=hybrid_exit_unknown_regime_fallback_mode,
     )
 
     config = MagicMock()
@@ -333,6 +344,94 @@ class TestExecutionEngineLegacyMode:
         assert tp3_price == expected_tp3, (
             f"TP3 price {tp3_price} != expected 5.0R ({expected_tp3})"
         )
+
+
+class TestHybridExitMode:
+
+    def test_tight_smc_maps_to_fixed_tp3(self):
+        config = _make_config(
+            runner_has_fixed_tp=False,  # global default is runner
+            hybrid_exit_mode_enabled=True,
+        )
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)
+        signal.regime = "tight_smc"
+
+        plan = engine.generate_entry_plan(
+            signal=signal,
+            size_notional=Decimal("1000"),
+            spot_price=Decimal("100"),
+            mark_price=Decimal("100"),
+            leverage=Decimal("5"),
+        )
+
+        assert len(plan["take_profits"]) == 3
+        assert plan["metadata"]["effective_exit_mode"] == "fixed_tp3"
+        assert plan["metadata"]["fallback_used"] is False
+
+    def test_wide_structure_maps_to_runner(self):
+        config = _make_config(
+            runner_has_fixed_tp=True,  # global default is fixed tp3
+            hybrid_exit_mode_enabled=True,
+        )
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)
+        signal.regime = "wide_structure"
+
+        plan = engine.generate_entry_plan(
+            signal=signal,
+            size_notional=Decimal("1000"),
+            spot_price=Decimal("100"),
+            mark_price=Decimal("100"),
+            leverage=Decimal("5"),
+        )
+
+        assert len(plan["take_profits"]) == 2
+        assert plan["metadata"]["effective_exit_mode"] == "runner"
+        assert plan["metadata"]["runner_has_fixed_tp"] is False
+
+    def test_unknown_regime_uses_fallback_and_telemetry(self):
+        config = _make_config(
+            runner_has_fixed_tp=False,
+            hybrid_exit_mode_enabled=True,
+            hybrid_exit_unknown_regime_fallback_mode="fixed_tp3",
+        )
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)
+        signal.regime = "mystery_regime"
+
+        plan = engine.generate_entry_plan(
+            signal=signal,
+            size_notional=Decimal("1000"),
+            spot_price=Decimal("100"),
+            mark_price=Decimal("100"),
+            leverage=Decimal("5"),
+        )
+
+        assert plan["metadata"]["fallback_used"] is True
+        assert plan["metadata"]["effective_exit_mode"] == "fixed_tp3"
+
+    def test_hybrid_canary_excludes_non_canary_symbol(self):
+        config = _make_config(
+            runner_has_fixed_tp=False,
+            hybrid_exit_mode_enabled=True,
+            hybrid_exit_canary_symbols=["ETH/USD"],
+        )
+        engine = ExecutionEngine(config)
+        signal = _make_signal(SignalType.LONG)  # BTC/USD
+        signal.regime = "tight_smc"  # would map to fixed_tp3 if canary applied
+
+        plan = engine.generate_entry_plan(
+            signal=signal,
+            size_notional=Decimal("1000"),
+            spot_price=Decimal("100"),
+            mark_price=Decimal("100"),
+            leverage=Decimal("5"),
+        )
+
+        # Should remain global runner mode (2 TPs) for non-canary symbol.
+        assert len(plan["take_profits"]) == 2
+        assert plan["metadata"]["effective_exit_mode"] == "runner"
 
 
 # ============================================================

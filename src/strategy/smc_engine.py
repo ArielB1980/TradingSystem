@@ -18,6 +18,7 @@ from src.config.config import StrategyConfig
 from src.monitoring.logger import get_logger
 from src.domain.protocols import EventRecorder, _noop_event_recorder
 from src.exceptions import OperationalError, DataError
+from src.storage.repository import count_recent_stopouts
 import uuid
 
 logger = get_logger(__name__)
@@ -49,11 +50,6 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
     try:
         if not os.getenv("DATABASE_URL"):
             return 0
-        try:
-            from src.storage.repository import count_recent_stopouts
-        except ImportError:
-            logger.warning("count_recent_stopouts unavailable; skip stopout query", symbol=symbol)
-            return 0
 
         count = count_recent_stopouts(symbol, lookback_hours)
         _stopout_cache[cache_key] = (count, _time.monotonic() + _STOPOUT_CACHE_TTL)
@@ -64,7 +60,13 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
         return count
         
     except (OperationalError, DataError, OSError) as e:
-        logger.warning("Failed to query stop-outs", symbol=symbol, error=str(e), error_type=type(e).__name__)
+        logger.error(
+            "Failed to query stop-outs",
+            symbol=symbol,
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True,
+        )
         return 0
 
 
@@ -696,14 +698,13 @@ class SMCEngine:
                     
                     if not passed:
                         score_breakdown = {
-                            "smc": score_obj.smc_quality,
-                            "fib": score_obj.fib_confluence,
-                            "htf": score_obj.htf_alignment,
-                            "adx": score_obj.adx_strength,
-                            "cost": score_obj.cost_efficiency,
-                            "total": score_obj.total_score,
-                            "threshold": threshold,
-                            "grade": score_obj.get_grade(),
+                            "smc": float(score_obj.smc_quality),
+                            "fib": float(score_obj.fib_confluence),
+                            "htf": float(score_obj.htf_alignment),
+                            "adx": float(score_obj.adx_strength),
+                            "cost": float(score_obj.cost_efficiency),
+                            "total": float(score_obj.total_score),
+                            "threshold": float(threshold),
                         }
                         reasoning_parts.append(f"❌ Score {score_obj.total_score:.1f} < Threshold {threshold} (Grade: {score_obj.get_grade()})")
                         signal = self._no_signal(

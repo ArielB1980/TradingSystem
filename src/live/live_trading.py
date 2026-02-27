@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import os
 import time
 from pathlib import Path
@@ -62,6 +63,7 @@ from src.safety.integration import (
 from src.data.symbol_utils import exchange_position_side as _exchange_position_side
 from src.data.data_sanity import SanityThresholds, check_ticker_sanity, check_candle_sanity
 from src.data.data_quality_tracker import DataQualityTracker
+from src.live.policy_fingerprint import build_policy_hash
 
 logger = get_logger(__name__)
 
@@ -185,6 +187,8 @@ class LiveTrading:
         self._auction_entry_log: Dict[str, datetime] = {}
         # Rebalancer cooldown tracking: symbol -> last cycle where a trim executed
         self._last_trim_cycle_by_symbol: Dict[str, int] = {}
+        # Strategic no-signal persistence tracking (auction strategic closes only)
+        self._auction_no_signal_cycles: int = 0
 
         # Signal cooldown: prevent the same signal from firing repeatedly for the same symbol.
         # Key: symbol, Value: (signal_type, structure_timestamp, cooldown_until)
@@ -206,23 +210,43 @@ class LiveTrading:
                 max_per_symbol=config.risk.auction_max_per_symbol,
                 direction_concentration_penalty=config.risk.auction_direction_concentration_penalty,
             )
-            self.auction_allocator = AuctionAllocator(
-                limits=limits,
-                swap_threshold=config.risk.auction_swap_threshold,
-                min_hold_minutes=config.risk.auction_min_hold_minutes,
-                max_trades_per_cycle=config.risk.auction_max_trades_per_cycle,
-                max_new_opens_per_cycle=config.risk.auction_max_new_opens_per_cycle,
-                max_closes_per_cycle=config.risk.auction_max_closes_per_cycle,
-                entry_cost=config.risk.auction_entry_cost,
-                exit_cost=config.risk.auction_exit_cost,
-                rebalancer_enabled=config.risk.auction_rebalancer_enabled,
-                rebalancer_trigger_pct_equity=config.risk.auction_rebalancer_trigger_pct_equity,
-                rebalancer_clear_pct_equity=config.risk.auction_rebalancer_clear_pct_equity,
-                rebalancer_per_symbol_trim_cooldown_cycles=config.risk.auction_rebalancer_per_symbol_trim_cooldown_cycles,
-                rebalancer_max_reductions_per_cycle=config.risk.auction_rebalancer_max_reductions_per_cycle,
-                rebalancer_max_total_margin_reduced_per_cycle=config.risk.auction_rebalancer_max_total_margin_reduced_per_cycle,
-            )
+            allocator_kwargs = {
+                "limits": limits,
+                "swap_threshold": config.risk.auction_swap_threshold,
+                "min_hold_minutes": config.risk.auction_min_hold_minutes,
+                "max_trades_per_cycle": config.risk.auction_max_trades_per_cycle,
+                "max_new_opens_per_cycle": config.risk.auction_max_new_opens_per_cycle,
+                "max_closes_per_cycle": config.risk.auction_max_closes_per_cycle,
+                "entry_cost": config.risk.auction_entry_cost,
+                "exit_cost": config.risk.auction_exit_cost,
+                "rebalancer_enabled": config.risk.auction_rebalancer_enabled,
+                "rebalancer_trigger_pct_equity": config.risk.auction_rebalancer_trigger_pct_equity,
+                "rebalancer_clear_pct_equity": config.risk.auction_rebalancer_clear_pct_equity,
+                "rebalancer_per_symbol_trim_cooldown_cycles": config.risk.auction_rebalancer_per_symbol_trim_cooldown_cycles,
+                "rebalancer_max_reductions_per_cycle": config.risk.auction_rebalancer_max_reductions_per_cycle,
+                "rebalancer_max_total_margin_reduced_per_cycle": config.risk.auction_rebalancer_max_total_margin_reduced_per_cycle,
+                "no_signal_persistence_enabled": config.risk.auction_no_signal_persistence_enabled,
+                "no_signal_close_persistence_cycles": config.risk.auction_no_signal_close_persistence_cycles,
+                "no_signal_persistence_canary_symbols": config.risk.auction_no_signal_persistence_canary_symbols,
+            }
+            accepted_params = set(inspect.signature(AuctionAllocator.__init__).parameters.keys())
+            filtered_kwargs = {k: v for k, v in allocator_kwargs.items() if k in accepted_params}
+            dropped_kwargs = sorted(set(allocator_kwargs.keys()) - set(filtered_kwargs.keys()))
+            if dropped_kwargs:
+                logger.warning(
+                    "AuctionAllocator does not support some config args; using compatible subset",
+                    dropped_kwargs=dropped_kwargs,
+                )
+            self.auction_allocator = AuctionAllocator(**filtered_kwargs)
+            policy_snapshot, policy_hash = build_policy_hash(config)
+            self._policy_snapshot = policy_snapshot
+            self._policy_hash = policy_hash
             logger.info("Auction mode enabled", max_positions=limits.max_positions)
+            logger.info(
+                "STARTUP_POLICY_FINGERPRINT",
+                policy_hash=policy_hash,
+                policy_snapshot=policy_snapshot,
+            )
         
         self._last_partial_close_at: Optional[datetime] = None
         if self.use_state_machine_v2:
@@ -1564,7 +1588,7 @@ class LiveTrading:
                 # Auto-place missing stops for unprotected positions (rate-limited per tick)
                 await self._place_missing_stops_for_unprotected(all_raw_positions, max_per_tick=3)
             except (OperationalError, DataError, ValueError) as e:
-                logger.error("TP backfill reconciliation failed", error=str(e), error_type=type(e).__name__)
+                logger.exception("TP backfill reconciliation failed", error=str(e), error_type=type(e).__name__)
                 # Don't return - continue with trading loop
             symbols_with_spot = len([s for s in market_symbols if s in map_spot_tickers])
             # Use futures_tickers for accurate coverage counting
@@ -1865,7 +1889,11 @@ class LiveTrading:
                                 "atr": float(signal.atr) if signal.atr else 0.0,
                                 "ema200_slope": signal.ema200_slope,
                                 "spot_price": float(spot_price),
-                                "setup_quality": sum(float(v) for v in (signal.score_breakdown or {}).values()),
+                                "setup_quality": sum(
+                                    float(v)
+                                    for v in (signal.score_breakdown or {}).values()
+                                    if isinstance(v, (int, float, Decimal))
+                                ),
                                 "score_breakdown": signal.score_breakdown or {},
                                 "status": "active",
                                 "candle_count": candle_count,

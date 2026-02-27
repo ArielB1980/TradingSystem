@@ -75,6 +75,7 @@ make pre-deploy    # Full pre-deployment validation
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Runbooks: deploy, recovery, tools, log patterns |
 | [FORAI.md](FORAI.md) | Institutional memory: lessons learned, bugs fixed |
 | [docs/PRODUCTION_RUNTIME.md](docs/PRODUCTION_RUNTIME.md) | Canonical entrypoints and safety requirements |
+| [docs/PHASE2_PROFITABILITY_PLAN.md](docs/PHASE2_PROFITABILITY_PLAN.md) | Post-deploy profitability optimization roadmap and experiment cadence |
 
 ## Safety
 

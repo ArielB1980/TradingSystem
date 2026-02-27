@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import os
 
 from src.exceptions import OperationalError, DataError
+from src.health_checks import check_required_secrets_and_db, quick_connectivity_snapshot
 import time
 import subprocess
 import sys
@@ -101,44 +102,20 @@ def get_worker_health_app(enable_debug: bool = False) -> FastAPI:
     @w.get("/api/health")
     async def api_health():
         """Quick health: DB ping, environment, secrets availability."""
-        from src.utils.secret_manager import check_secret_availability, get_environment
-        
+        database, secrets, environment = check_required_secrets_and_db()
         out = {
             "status": "healthy",
-            "database": "unknown",
-            "environment": get_environment(),
-            "secrets": {}
+            "database": database,
+            "environment": environment,
+            "secrets": secrets,
         }
-        
-        # Check secrets availability
-        required_secrets = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
-        for secret in required_secrets:
-            is_available, error_msg = check_secret_availability(secret)
-            out["secrets"][secret] = {
-                "available": is_available,
-                "error": error_msg if not is_available else None
-            }
-        
-        # Check database connection
-        db_available, db_error = check_secret_availability("DATABASE_URL")
-        if db_available:
-            out["database"] = "configured"
-            try:
-                from src.storage.db import get_db
-                from sqlalchemy import text
-                db = get_db()
-                with db.get_session() as session:
-                    session.execute(text("SELECT 1;"))
-                out["database"] = "connected"
-            except (OperationalError, DataError, OSError) as e:
-                out["database"] = f"error: {str(e)[:80]}"
-                out["status"] = "unhealthy"
-        else:
-            out["database"] = "missing"
+
+        if database != "connected":
             out["status"] = "unhealthy"
-        
+
         # Overall status: unhealthy if any required secret is missing
-        if not all(out["secrets"][s]["available"] for s in required_secrets):
+        required_secrets = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
+        if not all(out["secrets"].get(s, {}).get("available") for s in required_secrets):
             out["status"] = "degraded"  # Degraded, not unhealthy, since secrets may be injected later
         
         status_code = 200 if out["status"] == "healthy" else (503 if out["status"] == "unhealthy" else 200)
@@ -186,43 +163,18 @@ async def root():
 @app.get("/api/health")
 async def health():
     """Health check. Pings DB; reports kill switch and worker liveness from metrics."""
-    from src.utils.secret_manager import check_secret_availability, get_environment
-    
+    database, secrets, environment = check_required_secrets_and_db()
     checks = {
         "status": "healthy",
-        "database": "unknown",
-        "environment": get_environment(),
+        "database": database,
+        "environment": environment,
         "kill_switch_active": False,
         "worker_last_tick_at": None,
         "worker_stale": None,
-        "secrets": {}
+        "secrets": secrets,
     }
-    
-    # Check secrets availability
-    required_secrets = ["DATABASE_URL", "KRAKEN_FUTURES_API_KEY", "KRAKEN_FUTURES_API_SECRET"]
-    for secret in required_secrets:
-        is_available, error_msg = check_secret_availability(secret)
-        checks["secrets"][secret] = {
-            "available": is_available,
-            "error": error_msg if not is_available else None
-        }
-    
-    db_available, db_error = check_secret_availability("DATABASE_URL")
-    if not db_available:
-        checks["database"] = "missing"
+    if database != "connected":
         checks["status"] = "unhealthy"
-    else:
-        checks["database"] = "configured"
-        try:
-            from src.storage.db import get_db
-            from sqlalchemy import text
-            db = get_db()
-            with db.get_session() as session:
-                session.execute(text("SELECT 1;"))
-            checks["database"] = "connected"
-        except (OperationalError, DataError, OSError) as e:
-            checks["database"] = f"error: {str(e)[:80]}"
-            checks["status"] = "unhealthy"
 
     try:
         from src.utils.kill_switch import read_kill_switch_state
@@ -276,45 +228,7 @@ async def metrics_prometheus():
 @app.get("/api/quick-test")
 async def quick_test():
     """Quick system connectivity test."""
-    results = {
-        "database": "unknown",
-        "api_keys": "unknown",
-        "environment": os.getenv("ENVIRONMENT", "unknown")
-    }
-    
-    # Check database URL
-    database_url = os.getenv("DATABASE_URL", "")
-    if database_url:
-        results["database"] = "configured"
-        # Try to connect
-        try:
-            from src.storage.db import get_db
-            from sqlalchemy import text
-            db = get_db()
-            with db.get_session() as session:
-                session.execute(text("SELECT 1;"))
-            results["database"] = "connected"
-        except (OperationalError, DataError, OSError) as e:
-            results["database"] = f"error: {str(e)[:50]}"
-    else:
-        results["database"] = "not_configured"
-    
-    # Check API keys
-    has_spot_key = bool(os.getenv("KRAKEN_API_KEY"))
-    has_spot_secret = bool(os.getenv("KRAKEN_API_SECRET"))
-    has_futures_key = bool(os.getenv("KRAKEN_FUTURES_API_KEY"))
-    has_futures_secret = bool(os.getenv("KRAKEN_FUTURES_API_SECRET"))
-    
-    if has_spot_key and has_spot_secret:
-        results["api_keys"] = "spot_configured"
-    if has_futures_key and has_futures_secret:
-        results["api_keys"] = "futures_configured" if results["api_keys"] == "spot_configured" else "futures_only"
-    if not has_spot_key and not has_futures_key:
-        results["api_keys"] = "not_configured"
-    
-    results["status"] = "ok" if results["database"] == "connected" else "issues"
-    
-    return JSONResponse(content=results)
+    return JSONResponse(content=quick_connectivity_snapshot())
 
 
 @app.get("/api/test")

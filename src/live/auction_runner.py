@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List
 
 from src.exceptions import OperationalError, DataError
 from src.execution.equity import calculate_effective_equity
+from src.live.policy_fingerprint import build_policy_hash
 from src.monitoring.logger import get_logger
 from src.storage.repository import get_active_position, get_trades_since
 
@@ -682,8 +683,10 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             reductions=[(sym, str(qty)) for sym, qty in plan.reductions],
             reasons=plan.reasons,
         )
+        _, policy_hash = build_policy_hash(lt.config)
         logger.info(
             "AUCTION_CHOP_SUMMARY",
+            policy_hash=policy_hash,
             global_chop=global_chop,
             chop_guard_enabled=chop_guard_enabled,
             chop_telemetry_only=chop_telemetry_only,
@@ -1129,6 +1132,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             "would_block_flip": anti_flip_would_block,
             "blocked_flip_enforced": anti_flip_enforced_blocks,
             "rejection_buckets": dict(funnel_rejections) if funnel_rejections else None,
+            "policy_hash": policy_hash,
         }
         logger.info("ENTRY_FUNNEL_SUMMARY", **funnel_payload)
         if opens_executed > 0 or closes_executed_count > 0 or reductions_executed > 0:
