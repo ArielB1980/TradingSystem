@@ -293,3 +293,53 @@ class TelegramCommandHandler:
         )
         
         await self._send_message("\n".join(lines))
+
+
+def _resolve_telegram_config() -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve bot token + chat id from the same env contract used by command polling.
+    """
+    webhook_url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+    chat_id = os.environ.get("ALERT_CHAT_ID", "").strip()
+    if not webhook_url or "api.telegram.org" not in webhook_url or not chat_id:
+        return None, None
+    token = _extract_bot_token(webhook_url)
+    if not token:
+        return None, None
+    return token, chat_id
+
+
+async def send_telegram_message(text: str) -> None:
+    """
+    Fire-and-forget outbound Telegram message using ALERT_* credentials.
+    """
+    token, chat_id = _resolve_telegram_config()
+    if not token or not chat_id:
+        logger.info("Telegram outbound message skipped (not configured)")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Telegram outbound message failed", status=resp.status, body=body[:200])
+    except (OperationalError, OSError) as e:
+        logger.warning("Telegram outbound message error", error=str(e), error_type=type(e).__name__)
+
+
+def send_telegram_message_sync(text: str) -> None:
+    """
+    Sync wrapper for send_telegram_message for non-async call sites.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(send_telegram_message(text))
+    except RuntimeError:
+        asyncio.run(send_telegram_message(text))

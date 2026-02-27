@@ -11,9 +11,13 @@ import os
 import pandas as pd
 from src.domain.models import Candle, Signal, SignalType, SetupType
 from src.strategy.indicators import Indicators
+from src.strategy.fibonacci_engine import FibonacciEngine
+from src.strategy.signal_scorer import SignalScorer
+from src.strategy.market_structure_tracker import MarketStructureTracker
 from src.config.config import StrategyConfig
 from src.monitoring.logger import get_logger
 from src.domain.protocols import EventRecorder, _noop_event_recorder
+from src.exceptions import OperationalError, DataError
 import uuid
 
 logger = get_logger(__name__)
@@ -43,31 +47,11 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
         return cached[0]
 
     try:
-        from sqlalchemy import text
-        from src.storage.db import get_db
-        
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
+        if not os.getenv("DATABASE_URL"):
             return 0
-        
-        db = get_db()
-        
-        # Normalize symbol for matching (handle both WIF/USD and PF_WIFUSD formats)
-        base_symbol = symbol.replace("PF_", "").replace("USD", "/USD").replace("//", "/")
-        futures_symbol = "PF_" + symbol.replace("/", "").replace("PF_", "")
-        
-        with db.get_session() as session:
-            result = session.execute(
-                text("""
-                    SELECT COUNT(*) FROM trades 
-                    WHERE (symbol LIKE :base OR symbol LIKE :futures)
-                    AND exit_reason LIKE 'Stop Loss%%'
-                    AND exited_at >= NOW() - INTERVAL :hours
-                """),
-                {"base": f"%{base_symbol}%", "futures": f"%{futures_symbol}%", "hours": f"{lookback_hours} hours"},
-            )
-            count = result.scalar() or 0
-        
+        from src.storage.repository import count_recent_stopouts
+
+        count = count_recent_stopouts(symbol, lookback_hours)
         _stopout_cache[cache_key] = (count, _time.monotonic() + _STOPOUT_CACHE_TTL)
         
         if count > 0:
@@ -109,15 +93,12 @@ class SMCEngine:
         self.cache_max_age = timedelta(hours=2)  # Configurable
 
         # Fibonacci engine for confluence scoring
-        from src.strategy.fibonacci_engine import FibonacciEngine
         self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
 
         # Signal quality scoring
-        from src.strategy.signal_scorer import SignalScorer
         self.signal_scorer = SignalScorer(config)
         
         # Market Structure Tracker (confirmation + reconfirmation)
-        from src.strategy.market_structure_tracker import MarketStructureTracker
         self.ms_tracker = MarketStructureTracker(
             confirmation_candles=getattr(config, 'ms_confirmation_candles', 3),
             reconfirmation_candles=getattr(config, 'ms_reconfirmation_candles', 2),
@@ -710,18 +691,22 @@ class SMCEngine:
                     passed, threshold = self.signal_scorer.check_score_gate(score_obj.total_score, setup_type, bias)
                     
                     if not passed:
+                        score_breakdown = {
+                            "smc": score_obj.smc_quality,
+                            "fib": score_obj.fib_confluence,
+                            "htf": score_obj.htf_alignment,
+                            "adx": score_obj.adx_strength,
+                            "cost": score_obj.cost_efficiency,
+                            "total": score_obj.total_score,
+                            "threshold": threshold,
+                            "grade": score_obj.get_grade(),
+                        }
                         reasoning_parts.append(f"❌ Score {score_obj.total_score:.1f} < Threshold {threshold} (Grade: {score_obj.get_grade()})")
                         signal = self._no_signal(
                             symbol, 
                             reasoning_parts, 
                             current_candle, 
-                            score_breakdown={
-                                "smc": score_obj.smc_quality,
-                                "fib": score_obj.fib_confluence,
-                                "htf": score_obj.htf_alignment,
-                                "adx": score_obj.adx_strength,
-                                "cost": score_obj.cost_efficiency
-                            },
+                            score_breakdown=score_breakdown,
                             adx=adx_value,
                             atr=atr_value,
                             regime=regime
@@ -735,7 +720,8 @@ class SMCEngine:
                             setup=setup_type.value,
                             bias=bias,
                             adx=adx_value,
-                            fib_confluence=fib_valid
+                            fib_confluence=fib_valid,
+                            score_breakdown=score_breakdown,
                         )
                     else:
                         reasoning_parts.append(f"✓ Score Passed: {score_obj.total_score:.1f} >= {threshold}")
@@ -829,6 +815,7 @@ class SMCEngine:
                 entry=str(signal.entry_price),
                 stop=str(signal.stop_loss),
             )
+            self._maybe_emit_dca_suggestion(signal)
             # Record explicit signal event (design choice: signal source records its own generation)
             self._record_event(
                 "SIGNAL_GENERATED", 
@@ -847,6 +834,35 @@ class SMCEngine:
             )
         
         return signal
+
+    def _maybe_emit_dca_suggestion(self, signal: Signal) -> None:
+        """
+        Telemetry-only spot DCA suggestion channel via Telegram alerting.
+        """
+        if os.getenv("DCA_SUGGESTIONS_TELEGRAM_ENABLED", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        if signal.signal_type == SignalType.NO_SIGNAL:
+            return
+        min_score = float(os.getenv("DCA_SUGGESTIONS_MIN_SCORE", "70"))
+        score = float(signal.score or 0.0)
+        if score < min_score:
+            return
+        try:
+            from src.monitoring.telegram_bot import send_telegram_message_sync
+
+            entry = float(signal.entry_price) if signal.entry_price else None
+            stop = float(signal.stop_loss) if signal.stop_loss else None
+            tp1 = float(signal.take_profit) if signal.take_profit else None
+            send_telegram_message_sync(
+                (
+                    f"Spot DCA suggestion (telemetry-only)\n"
+                    f"symbol={signal.symbol} side={signal.signal_type.value} setup={signal.setup_type.value} regime={signal.regime}\n"
+                    f"score={score:.1f} entry={entry} stop={stop} tp1={tp1}\n"
+                    f"breakdown={signal.score_breakdown or {}}"
+                )
+            )
+        except (OperationalError, DataError, OSError, ImportError, RuntimeError):
+            logger.debug("DCA suggestion telemetry send failed (non-fatal)", symbol=signal.symbol)
     
     def _classify_setup(
         self,
