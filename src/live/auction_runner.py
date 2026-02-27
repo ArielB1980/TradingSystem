@@ -854,10 +854,50 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 )
                 break
             try:
-                await lt.client.close_position(symbol)
-                closes_executed_count += 1
-                logger.info("Auction: Closed position", symbol=symbol)
+                # Route strategic closes through the gateway/state machine when available.
+                # This preserves fill tracking and prevents ORPHANED close artifacts.
+                if lt.use_state_machine_v2 and lt.execution_gateway and lt.position_registry:
+                    from src.execution.position_manager_v2 import ManagementAction, ActionType
+
+                    normalized_symbol = _normalize_symbol_key(symbol)
+                    position = lt.position_registry.get_position(normalized_symbol)
+                    if not position:
+                        logger.warning(
+                            "Auction close fallback: position missing in registry",
+                            requested_symbol=symbol,
+                            normalized_symbol=normalized_symbol,
+                        )
+                        await lt.client.close_position(symbol)
+                        closes_executed_count += 1
+                        logger.info("Auction: Closed position (direct fallback)", symbol=symbol)
+                        continue
+
+                    action = ManagementAction(
+                        type=ActionType.CLOSE_FULL,
+                        symbol=position.symbol,
+                        reason="AUCTION_STRATEGIC_CLOSE",
+                        side=position.side,
+                        size=position.remaining_qty,
+                        position_id=position.position_id,
+                    )
+                    result = await lt.execution_gateway.execute_action(action)
+                    if not result.success:
+                        raise RuntimeError(result.error or "gateway close failed")
+
+                    closes_executed_count += 1
+                    logger.info(
+                        "Auction: Closed position via gateway",
+                        symbol=position.symbol,
+                        requested_symbol=symbol,
+                        exchange_order_id=result.exchange_order_id,
+                    )
+                else:
+                    await lt.client.close_position(symbol)
+                    closes_executed_count += 1
+                    logger.info("Auction: Closed position", symbol=symbol)
             except (OperationalError, DataError) as e:
+                logger.error("Auction: Failed to close position", symbol=symbol, error=str(e), error_type=type(e).__name__)
+            except RuntimeError as e:
                 logger.error("Auction: Failed to close position", symbol=symbol, error=str(e), error_type=type(e).__name__)
 
         # Refresh protective orders after trims, then reconcile + refresh margin before opens.

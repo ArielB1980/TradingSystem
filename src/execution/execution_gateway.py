@@ -1401,12 +1401,17 @@ class ExecutionGateway:
         # Fallback: if no fills found via order IDs, try fetch_my_trades
         if fills_added == 0:
             try:
-                # Fetch recent trades for this symbol
-                ccxt_symbol = symbol
-                if not ccxt_symbol.endswith(":USD"):
-                    # Convert PF_XBTUSD -> BTC/USD:USD format for CCXT
-                    base = symbol.replace("PF_", "").replace("USD", "")
+                # Fetch recent trades for this symbol.
+                # Accepts position symbols as either spot (e.g. AVAX/USD),
+                # unified futures (AVAX/USD:USD), or venue ids (PF_AVAXUSD).
+                ccxt_symbol = str(symbol or "").strip()
+                if ccxt_symbol.startswith("PF_") and "/" not in ccxt_symbol:
+                    base = ccxt_symbol.replace("PF_", "")
+                    if base.endswith("USD"):
+                        base = base[:-3]
                     ccxt_symbol = f"{base}/USD:USD"
+                elif "/" in ccxt_symbol and not ccxt_symbol.endswith(":USD"):
+                    ccxt_symbol = f"{ccxt_symbol}:USD"
                 
                 since_ms = None
                 if position.entry_fills:
