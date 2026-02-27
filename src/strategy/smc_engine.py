@@ -49,7 +49,11 @@ def get_recent_stopouts(symbol: str, lookback_hours: int = 24) -> int:
     try:
         if not os.getenv("DATABASE_URL"):
             return 0
-        from src.storage.repository import count_recent_stopouts
+        try:
+            from src.storage.repository import count_recent_stopouts
+        except ImportError:
+            logger.warning("count_recent_stopouts unavailable; skip stopout query", symbol=symbol)
+            return 0
 
         count = count_recent_stopouts(symbol, lookback_hours)
         _stopout_cache[cache_key] = (count, _time.monotonic() + _STOPOUT_CACHE_TTL)
