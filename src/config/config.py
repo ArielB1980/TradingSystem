@@ -125,6 +125,68 @@ class RiskConfig(BaseSettings):
     auction_entry_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_exit_cost: float = Field(default=2.0, ge=0.0, le=10.0)
     auction_direction_concentration_penalty: float = Field(default=10.0, ge=0.0, le=50.0, description="Score penalty at max directional imbalance (all positions same side)")
+    auction_no_signal_persistence_enabled: bool = Field(
+        default=False,
+        description="When enabled, suppress strategic auction closes until no-signal streak reaches threshold",
+    )
+    auction_no_signal_close_persistence_cycles: int = Field(
+        default=3,
+        ge=1,
+        le=50,
+        description="Minimum consecutive no-signal cycles before strategic go-flat closes are allowed",
+    )
+    auction_no_signal_persistence_canary_symbols: List[str] = Field(
+        default_factory=list,
+        description="Optional symbol allowlist for no-signal persistence behavior (empty = all symbols)",
+    )
+    # Auction churn guard (DB-backed open->close->reopen loop protection)
+    auction_churn_guard_enabled: bool = Field(
+        default=False,
+        description="Enable DB-backed churn cooldown guard for repeated fast round-trips per symbol",
+    )
+    auction_churn_window_hours: int = Field(default=6, ge=1, le=48)
+    auction_churn_hold_max_minutes: int = Field(default=60, ge=5, le=240)
+    auction_churn_reopen_max_minutes: int = Field(default=120, ge=5, le=360)
+    auction_churn_max_events: int = Field(default=2, ge=1, le=10)
+    auction_churn_cooldown_tier1_minutes: int = Field(default=30, ge=5, le=720)
+    auction_churn_cooldown_tier2_minutes: int = Field(default=120, ge=5, le=1440)
+    auction_churn_cooldown_tier3_minutes: int = Field(default=360, ge=5, le=2880)
+    # Choppy-market reversal controls (telemetry-first rollout)
+    auction_chop_guard_enabled: bool = Field(
+        default=False,
+        description="Enable CHOP/TREND-aware auction policy overrides",
+    )
+    auction_chop_telemetry_only: bool = Field(
+        default=True,
+        description="Log would-block decisions for chop controls without enforcement",
+    )
+    auction_chop_canary_symbols: List[str] = Field(
+        default_factory=list,
+        description="Optional symbol allowlist for chop enforcement (empty = all symbols)",
+    )
+    auction_chop_adx_threshold: float = Field(default=18.0, ge=5.0, le=50.0)
+    auction_chop_score_std_threshold: float = Field(default=6.0, ge=0.1, le=50.0)
+    auction_chop_reversal_window_hours: int = Field(default=12, ge=1, le=72)
+    auction_chop_quick_reversal_hold_minutes: int = Field(default=60, ge=5, le=360)
+    auction_chop_opposite_reentry_minutes: int = Field(default=120, ge=5, le=360)
+    auction_chop_global_symbol_pct: float = Field(default=0.50, ge=0.10, le=1.0)
+    auction_chop_swap_threshold_delta: float = Field(default=2.0, ge=0.0, le=20.0)
+    auction_chop_min_hold_multiplier: float = Field(default=2.0, ge=1.0, le=5.0)
+    auction_chop_max_new_opens_delta: int = Field(default=-1, ge=-10, le=10)
+    auction_chop_no_signal_persistence_delta: int = Field(default=1, ge=0, le=10)
+    auction_anti_flip_lock_enabled: bool = Field(
+        default=False,
+        description="Block strategic auction closes/reversals shortly after entry",
+    )
+    auction_anti_flip_lock_telemetry_only: bool = Field(
+        default=True,
+        description="Log anti-flip lock would-block counters without enforcement",
+    )
+    auction_anti_flip_lock_minutes: int = Field(default=45, ge=1, le=360)
+    auction_anti_flip_canary_symbols: List[str] = Field(
+        default_factory=list,
+        description="Optional symbol allowlist for anti-flip lock enforcement (empty = all symbols)",
+    )
     # Autonomous concentration rebalancer (auction path)
     auction_rebalancer_enabled: bool = Field(default=False, description="Enable autonomous concentration trims before opens")
     auction_rebalancer_shadow_mode: bool = Field(default=True, description="Log would-trim decisions without executing reductions")
@@ -174,6 +236,13 @@ class RiskConfig(BaseSettings):
     rr_distortion_strict_limit_pct: float = Field(default=0.10, ge=0.05, le=0.30)
     tight_stop_threshold_pct: float = Field(default=0.015, ge=0.005, le=0.05)
     funding_cost_threshold_pct: float | None = Field(default=0.02, ge=0.0, le=0.10)
+    # Deterministic edge-vs-cost gate (TP1 proxy)
+    fee_edge_guard_enabled: bool = Field(default=False)
+    fee_edge_multiple_k: float = Field(default=5.0, ge=1.0, le=20.0)
+    fee_edge_use_conservative_taker: bool = Field(default=True)
+    fee_edge_slippage_bps_est: float = Field(default=4.0, ge=0.0, le=50.0)
+    fee_edge_funding_floor_bps: float = Field(default=2.0, ge=0.0, le=50.0)
+    fee_edge_cost_buffer_multiplier: float = Field(default=1.2, ge=1.0, le=3.0)
     
     # Regime-specific settings (NEW for dual-regime strategy)
     # Tight-stop SMC regime (OB/FVG): 0.4-1.0% stops
@@ -267,6 +336,13 @@ class StrategyConfig(BaseSettings):
     symbol_loss_threshold: int = Field(default=3, ge=2, le=10, description="Consecutive losses before cooldown")
     symbol_loss_cooldown_hours: int = Field(default=12, ge=4, le=48, description="Hours to pause trading after threshold")
     symbol_loss_min_pnl_pct: float = Field(default=-0.5, ge=-5.0, le=0.0, description="Min loss % to count as a loss (-0.5 = -0.5%)")
+    # Canary overrides for symbol-loss cooldown (disabled by default; scoped by symbol allowlist).
+    symbol_loss_cooldown_canary_enabled: bool = Field(default=False)
+    symbol_loss_cooldown_canary_symbols: List[str] = Field(default_factory=list)
+    symbol_loss_cooldown_canary_lookback_hours: Optional[int] = Field(default=None, ge=6, le=72)
+    symbol_loss_cooldown_canary_threshold: Optional[int] = Field(default=None, ge=2, le=10)
+    symbol_loss_cooldown_canary_hours: Optional[int] = Field(default=None, ge=1, le=48)
+    symbol_loss_cooldown_canary_min_pnl_pct: Optional[float] = Field(default=None, ge=-5.0, le=0.0)
     
     rsi_period: int = Field(default=14, ge=7, le=30)
 
@@ -523,6 +599,21 @@ class MultiTPConfig(BaseSettings):
             "consolidation": {"runner_pct": 0.10, "tp1_close_pct": 0.50, "tp2_close_pct": 0.40},
         }
     )
+    # Hybrid exit mode: regime-specific choice of runner vs fixed TP3.
+    # When disabled, runner_has_fixed_tp remains the global behavior.
+    hybrid_exit_mode_enabled: bool = Field(default=False)
+    hybrid_exit_canary_symbols: List[str] = Field(
+        default_factory=list,
+        description="Optional allowlist of symbols where hybrid exit mode is applied (empty = all symbols)",
+    )
+    hybrid_exit_regime_mode_overrides: Dict[str, Literal["runner", "fixed_tp3"]] = Field(
+        default_factory=lambda: {
+            "tight_smc": "fixed_tp3",
+            "wide_structure": "runner",
+            "consolidation": "fixed_tp3",
+        }
+    )
+    hybrid_exit_unknown_regime_fallback_mode: Literal["global_default", "runner", "fixed_tp3"] = "global_default"
 
 
 class ExecutionConfig(BaseSettings):

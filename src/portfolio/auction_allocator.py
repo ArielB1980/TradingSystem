@@ -116,6 +116,9 @@ class AuctionAllocator:
         rebalancer_per_symbol_trim_cooldown_cycles: int = 2,
         rebalancer_max_reductions_per_cycle: int = 1,
         rebalancer_max_total_margin_reduced_per_cycle: float = 0.25,
+        no_signal_persistence_enabled: bool = False,
+        no_signal_close_persistence_cycles: int = 3,
+        no_signal_persistence_canary_symbols: Optional[List[str]] = None,
     ):
         """
         Initialize auction allocator.
@@ -146,6 +149,11 @@ class AuctionAllocator:
         self.rebalancer_max_total_margin_reduced_per_cycle = Decimal(
             str(rebalancer_max_total_margin_reduced_per_cycle)
         )
+        self.no_signal_persistence_enabled = bool(no_signal_persistence_enabled)
+        self.no_signal_close_persistence_cycles = max(int(no_signal_close_persistence_cycles or 1), 1)
+        self.no_signal_persistence_canary_symbols = {
+            str(s).strip().upper() for s in (no_signal_persistence_canary_symbols or [])
+        }
         
         logger.info(
             "AuctionAllocator initialized",
@@ -153,7 +161,15 @@ class AuctionAllocator:
             swap_threshold=swap_threshold,
             min_hold_minutes=min_hold_minutes,
             rebalancer_enabled=rebalancer_enabled,
+            no_signal_persistence_enabled=self.no_signal_persistence_enabled,
+            no_signal_close_persistence_cycles=self.no_signal_close_persistence_cycles,
         )
+
+    def _symbol_in_persistence_canary(self, symbol: str) -> bool:
+        if not self.no_signal_persistence_canary_symbols:
+            return True
+        normalized = str(symbol).strip().upper().split(":")[0]
+        return normalized in self.no_signal_persistence_canary_symbols
     
     def allocate(
         self,
@@ -199,7 +215,7 @@ class AuctionAllocator:
         to_open_candidates = [c for c in winners if c.kind == ContenderKind.NEW]
         
         # Step E: Apply hysteresis swap rule
-        final_closes, final_opens = self._apply_hysteresis(
+        final_closes, final_opens, hysteresis_stats = self._apply_hysteresis(
             to_close_candidates,
             to_open_candidates,
             to_keep,
@@ -208,7 +224,37 @@ class AuctionAllocator:
         
         # Apply per-cycle limits as paired swaps to preserve "best 50"
         # Limit swaps (paired closes+opens) to maintain portfolio quality
-        max_swaps = min(self.max_new_opens_per_cycle, self.max_closes_per_cycle, self.max_trades_per_cycle)
+        max_new_opens_per_cycle = max(
+            int(
+                portfolio_state.get(
+                    "auction_max_new_opens_per_cycle",
+                    self.max_new_opens_per_cycle,
+                )
+                or self.max_new_opens_per_cycle
+            ),
+            1,
+        )
+        max_closes_per_cycle = max(
+            int(
+                portfolio_state.get(
+                    "auction_max_closes_per_cycle",
+                    self.max_closes_per_cycle,
+                )
+                or self.max_closes_per_cycle
+            ),
+            1,
+        )
+        max_trades_per_cycle = max(
+            int(
+                portfolio_state.get(
+                    "auction_max_trades_per_cycle",
+                    self.max_trades_per_cycle,
+                )
+                or self.max_trades_per_cycle
+            ),
+            1,
+        )
+        max_swaps = min(max_new_opens_per_cycle, max_closes_per_cycle, max_trades_per_cycle)
         
         # Match closes to opens for swaps
         swap_pairs = []
@@ -234,10 +280,10 @@ class AuctionAllocator:
         # Remaining closes (not part of swaps) - limit independently
         paired_close_symbols = {p[0] for p in swap_pairs}
         remaining_closes = [op for op in final_closes if op.position.symbol not in paired_close_symbols]
-        remaining_closes = remaining_closes[:max(self.max_closes_per_cycle - len(swap_pairs), 0)]
+        remaining_closes = remaining_closes[:max(max_closes_per_cycle - len(swap_pairs), 0)]
         
         # Remaining opens (not part of swaps) - limit independently
-        remaining_opens = remaining_opens[:max(self.max_new_opens_per_cycle - len(swap_pairs), 0)]
+        remaining_opens = remaining_opens[:max(max_new_opens_per_cycle - len(swap_pairs), 0)]
         
         # Build result
         all_opens = [c.candidate.signal for _, c in swap_pairs if c.candidate] + [c.candidate.signal for c in remaining_opens if c.candidate]
@@ -265,6 +311,13 @@ class AuctionAllocator:
             "closes_after_limits": len(closes),
             "reductions_planned": len(reductions),
             "reduction_reasons": reduction_reasons,
+            "hysteresis_swap_rejected": int(hysteresis_stats.get("swap_rejected_hysteresis", 0)),
+            "hysteresis_swap_rejected_chop": int(
+                hysteresis_stats.get("swap_rejected_hysteresis_chop", 0)
+            ),
+            "hysteresis_close_suppressed_no_signal": int(
+                hysteresis_stats.get("close_suppressed_no_signal_persistence", 0)
+            ),
         }
         
         logger.info(
@@ -317,6 +370,9 @@ class AuctionAllocator:
         max_total_margin_reduction = (
             account_equity * self.rebalancer_max_total_margin_reduced_per_cycle
         )
+        allow_locked_rebalancer_trims = bool(
+            portfolio_state.get("allow_locked_rebalancer_trims", False)
+        )
 
         # Prioritize largest concentration offenders first
         ranked = sorted(
@@ -335,10 +391,10 @@ class AuctionAllocator:
                 reasons["max_reductions_reached"] = reasons.get("max_reductions_reached", 0) + 1
                 break
             symbol = op_meta.position.symbol
-            if symbol in close_symbols:
+            if symbol in close_symbols and not allow_locked_rebalancer_trims:
                 reasons["skip_symbol_closing"] = reasons.get("skip_symbol_closing", 0) + 1
                 continue
-            if op_meta.locked:
+            if op_meta.locked and not allow_locked_rebalancer_trims:
                 reasons["skip_locked"] = reasons.get("skip_locked", 0) + 1
                 continue
 
@@ -415,14 +471,39 @@ class AuctionAllocator:
     ) -> List[Contender]:
         """Build and filter the contender list."""
         contenders = []
+        chop_active_symbols = {
+            _normalize_symbol_for_matching(str(s))
+            for s in (portfolio_state.get("auction_chop_active_symbols", []) or [])
+            if str(s).strip()
+        }
+        chop_min_hold_minutes = max(
+            int(
+                portfolio_state.get(
+                    "auction_chop_min_hold_minutes",
+                    int(self.min_hold_seconds / 60),
+                )
+                or int(self.min_hold_seconds / 60)
+            ),
+            0,
+        )
+        chop_min_hold_seconds = chop_min_hold_minutes * 60
         
         # Add open positions
         now = datetime.now(timezone.utc)
         for op_meta in open_positions:
+            # CRITICAL: Use spot symbol for matching if available, otherwise use futures symbol
+            # This ensures proper symbol matching between open positions (futures) and candidates (spot)
+            contender_symbol = op_meta.spot_symbol if op_meta.spot_symbol else op_meta.position.symbol
+            contender_normalized = _normalize_symbol_for_matching(contender_symbol)
+            min_hold_seconds_effective = (
+                chop_min_hold_seconds
+                if contender_normalized in chop_active_symbols
+                else self.min_hold_seconds
+            )
             # Mark as locked if within MIN_HOLD, protective orders not live, or UNPROTECTED
             is_unprotected = not getattr(op_meta.position, 'is_protected', True)
             locked = (
-                op_meta.age_seconds < self.min_hold_seconds or
+                op_meta.age_seconds < min_hold_seconds_effective or
                 not op_meta.is_protective_orders_live or
                 is_unprotected
             )
@@ -438,10 +519,6 @@ class AuctionAllocator:
             
             # Compute value for open position
             value = self._compute_open_value(op_meta, portfolio_state)
-            
-            # CRITICAL: Use spot symbol for matching if available, otherwise use futures symbol
-            # This ensures proper symbol matching between open positions (futures) and candidates (spot)
-            contender_symbol = op_meta.spot_symbol if op_meta.spot_symbol else op_meta.position.symbol
             
             contender = Contender(
                 kind=ContenderKind.OPEN,
@@ -680,7 +757,7 @@ class AuctionAllocator:
         to_open: List[Contender],
         to_keep: List[OpenPositionMetadata],
         portfolio_state: Dict[str, any],
-    ) -> Tuple[List[OpenPositionMetadata], List[Contender]]:
+    ) -> Tuple[List[OpenPositionMetadata], List[Contender], Dict[str, int]]:
         """
         Apply hysteresis swap rule to prevent churn.
         
@@ -690,6 +767,41 @@ class AuctionAllocator:
         """
         final_closes = []
         final_opens = []
+        stats = {
+            "swap_rejected_hysteresis": 0,
+            "swap_rejected_hysteresis_chop": 0,
+            "close_suppressed_no_signal_persistence": 0,
+        }
+        swap_threshold_base = float(
+            portfolio_state.get("auction_swap_threshold", self.swap_threshold) or self.swap_threshold
+        )
+        swap_threshold_chop = float(
+            portfolio_state.get("auction_chop_swap_threshold", swap_threshold_base) or swap_threshold_base
+        )
+        chop_active_symbols = {
+            _normalize_symbol_for_matching(str(s))
+            for s in (portfolio_state.get("auction_chop_active_symbols", []) or [])
+            if str(s).strip()
+        }
+        no_signal_cycles = int(portfolio_state.get("auction_no_signal_cycles", 0) or 0)
+        no_signal_enabled = bool(
+            portfolio_state.get("auction_no_signal_persistence_enabled", self.no_signal_persistence_enabled)
+        )
+        no_signal_threshold = int(
+            portfolio_state.get(
+                "auction_no_signal_close_persistence_cycles",
+                self.no_signal_close_persistence_cycles,
+            ) or self.no_signal_close_persistence_cycles
+        )
+        no_signal_canary = {
+            str(s).strip().upper()
+            for s in (
+                portfolio_state.get(
+                    "auction_no_signal_persistence_canary_symbols",
+                    list(self.no_signal_persistence_canary_symbols),
+                ) or []
+            )
+        }
         
         # Build lookup maps
         close_by_symbol = {op.position.symbol: op for op in to_close}
@@ -723,8 +835,15 @@ class AuctionAllocator:
                 close_value = self._compute_open_value(close_op, portfolio_state)
                 # For new, we already computed value, but ensure we're comparing apples to apples
                 new_value = matching_new.value
+                close_norm = _normalize_symbol_for_matching(close_op.position.symbol)
+                new_norm = _normalize_symbol_for_matching(matching_new.symbol)
+                is_chop_pair = (
+                    close_norm in chop_active_symbols
+                    or new_norm in chop_active_symbols
+                )
+                swap_threshold_effective = swap_threshold_chop if is_chop_pair else swap_threshold_base
                 
-                if new_value >= close_value + self.swap_threshold:
+                if new_value >= close_value + swap_threshold_effective:
                     # Swap approved
                     final_closes.append(close_op)
                     if matching_new not in final_opens:
@@ -735,29 +854,63 @@ class AuctionAllocator:
                         open_symbol=matching_new.symbol,
                         close_value=close_value,
                         new_value=new_value,
-                        threshold=self.swap_threshold,
+                        threshold=swap_threshold_effective,
+                        threshold_mode="chop" if is_chop_pair else "base",
                     )
                 else:
                     # Swap rejected - keep the open
+                    stats["swap_rejected_hysteresis"] += 1
+                    if is_chop_pair:
+                        stats["swap_rejected_hysteresis_chop"] += 1
+                    gap = new_value - close_value
                     logger.debug(
                         "Swap rejected (hysteresis)",
                         close_symbol=close_op.position.symbol,
                         open_symbol=matching_new.symbol if matching_new else None,
                         close_value=close_value,
                         new_value=new_value if matching_new else None,
-                        threshold=self.swap_threshold,
-                        gap=new_value - close_value if matching_new else None,
+                        threshold=swap_threshold_effective,
+                        threshold_mode="chop" if is_chop_pair else "base",
+                        gap=gap,
+                    )
+                    logger.info(
+                        "Swap rejection diagnostics",
+                        close_symbol=close_op.position.symbol,
+                        open_symbol=matching_new.symbol,
+                        close_value=close_value,
+                        new_value=new_value,
+                        gap=gap,
+                        threshold=swap_threshold_effective,
+                        threshold_mode="chop" if is_chop_pair else "base",
                     )
             else:
-                # No replacement candidate - close is fine (position not in winners)
-                final_closes.append(close_op)
+                # No replacement candidate: strategic close can be suppressed during no-signal persistence.
+                canary_allows = True
+                if no_signal_canary:
+                    normalized = str(close_op.position.symbol).strip().upper().split(":")[0]
+                    canary_allows = normalized in no_signal_canary
+                should_suppress_close = (
+                    no_signal_enabled
+                    and canary_allows
+                    and no_signal_cycles < no_signal_threshold
+                )
+                if should_suppress_close:
+                    stats["close_suppressed_no_signal_persistence"] += 1
+                    logger.info(
+                        "Strategic close suppressed by no-signal persistence",
+                        symbol=close_op.position.symbol,
+                        no_signal_cycles=no_signal_cycles,
+                        threshold=no_signal_threshold,
+                    )
+                else:
+                    final_closes.append(close_op)
         
         # Add remaining opens that weren't matched to closes
         for new_contender in to_open:
             if new_contender not in final_opens:
                 final_opens.append(new_contender)
         
-        return final_closes, final_opens
+        return final_closes, final_opens, stats
 
 
 def derive_cluster(signal: Signal) -> str:

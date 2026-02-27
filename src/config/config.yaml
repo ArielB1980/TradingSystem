@@ -54,7 +54,7 @@ risk:
   max_single_position_margin_pct_equity: 0.25  # 25% margin per position = 1.75x notional at 7x
   max_aggregate_margin_pct_equity: 2.0  # 200% total margin = 14x notional at 7x
   # Binding constraints for "tiny stakes" are usually: risk_per_trade_pct, max_single_position_margin_pct_equity, min notional, auction_max_positions — not aggregate. To increase utilisation: more slots (auction_max_positions) or bigger per-ticket margin (max_single_*) or target margin band (future).
-  auction_partial_close_cooldown_seconds: 0  # 0=disabled; >0 skips new opens for N sec after TP1/TP2 partial
+  auction_partial_close_cooldown_seconds: 300  # 5m cooldown after partial close to prevent immediate churny re-open
   
   # Liquidation safety
   min_liquidation_buffer_pct: 0.35  # 35% minimum distance from liquidation price
@@ -71,17 +71,46 @@ risk:
   auction_max_margin_util: 0.90  # Maximum margin utilization (90%)
   auction_max_per_cluster: 8  # Maximum positions per cluster (balanced for 25 positions)
   auction_max_per_symbol: 1  # Maximum positions per symbol
-  auction_swap_threshold: 10.0  # Minimum score advantage to replace position
-  auction_min_hold_minutes: 15  # Minimum hold time before position can be kicked
+  auction_swap_threshold: 17.0  # Modest bump: require stronger replacement edge before swapping incumbents
+  auction_min_hold_minutes: 45  # Balanced increase to reduce fast round-trip turnover
   auction_max_trades_per_cycle: 5  # Maximum total trades per cycle (anti-churn)
-  auction_max_new_opens_per_cycle: 5  # Maximum new positions per cycle
-  auction_max_closes_per_cycle: 5  # Maximum closes per cycle
+  auction_max_new_opens_per_cycle: 1  # Tighter cap to prevent bursty open churn
+  auction_max_closes_per_cycle: 1  # Tighter cap to prevent bursty close/reopen churn
   auction_entry_cost: 2.0  # Entry cost penalty in score points
   auction_exit_cost: 2.0  # Exit cost penalty in score points
   auction_direction_concentration_penalty: 10.0  # Score penalty at max directional imbalance (all positions same side)
+  auction_no_signal_persistence_enabled: true  # Suppress strategic closes during brief no-signal streaks
+  auction_no_signal_close_persistence_cycles: 8  # Further suppress strategic close/reopen whipsaws in brief no-signal windows
+  auction_no_signal_persistence_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]  # Phase-B canary scope
+  auction_churn_guard_enabled: true  # Block repeated fast round-trip symbols via DB-backed churn cooldown
+  auction_churn_window_hours: 6
+  auction_churn_hold_max_minutes: 60
+  auction_churn_reopen_max_minutes: 120
+  auction_churn_max_events: 2
+  auction_churn_cooldown_tier1_minutes: 30
+  auction_churn_cooldown_tier2_minutes: 120
+  auction_churn_cooldown_tier3_minutes: 360
+  # Choppy-market reversal controls (telemetry-first)
+  auction_chop_guard_enabled: true
+  auction_chop_telemetry_only: false
+  auction_chop_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]
+  auction_chop_adx_threshold: 18.0
+  auction_chop_score_std_threshold: 6.0
+  auction_chop_reversal_window_hours: 12
+  auction_chop_quick_reversal_hold_minutes: 60
+  auction_chop_opposite_reentry_minutes: 120
+  auction_chop_global_symbol_pct: 0.50
+  auction_chop_swap_threshold_delta: 2.0
+  auction_chop_min_hold_multiplier: 2.0
+  auction_chop_max_new_opens_delta: -1
+  auction_chop_no_signal_persistence_delta: 1
+  auction_anti_flip_lock_enabled: true
+  auction_anti_flip_lock_telemetry_only: false
+  auction_anti_flip_lock_minutes: 45
+  auction_anti_flip_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]
   # Autonomous concentration rebalancer
   auction_rebalancer_enabled: true
-  auction_rebalancer_shadow_mode: true
+  auction_rebalancer_shadow_mode: false
   auction_rebalancer_trigger_pct_equity: 0.32  # Trim trigger (>32%)
   auction_rebalancer_clear_pct_equity: 0.24  # Stop trimming once below 24%
   auction_rebalancer_per_symbol_trim_cooldown_cycles: 2
@@ -100,6 +129,12 @@ risk:
   rr_distortion_strict_limit_pct: 0.10  # Strict cap for normal stops (>1.5%)
   tight_stop_threshold_pct: 0.015  # Definition of "tight stop" (1.5%)
   funding_cost_threshold_pct: 0.02  # Optional: block entries if projected funding > 2%
+  fee_edge_guard_enabled: true  # Deterministic TP1 edge-vs-cost gate to prevent fee-dominated entries
+  fee_edge_multiple_k: 5.0  # Require edge_bps >= fee_bps_rt * k
+  fee_edge_use_conservative_taker: true  # Assume taker-like roundtrip cost for conservative gating
+  fee_edge_slippage_bps_est: 4.0
+  fee_edge_funding_floor_bps: 2.0
+  fee_edge_cost_buffer_multiplier: 1.2
 
   # Kelly Criterion Settings (for kelly and kelly_volatility sizing)
   kelly_win_prob: 0.55  # 55% win rate assumption
@@ -197,6 +232,13 @@ strategy:
   entry_zone_tolerance_adaptive: true  # Scale with ATR
   entry_zone_tolerance_atr_mult: 0.3  # ATR multiplier
   entry_zone_tolerance_score_penalty: -5  # Penalty for tolerance entries
+  # Symbol-loss cooldown canary overrides (disabled by default; only applied to listed symbols).
+  symbol_loss_cooldown_canary_enabled: true
+  symbol_loss_cooldown_canary_symbols: ["SOL/USD", "ETH/USD", "BTC/USD"]
+  symbol_loss_cooldown_canary_lookback_hours: 12
+  symbol_loss_cooldown_canary_threshold: 3
+  symbol_loss_cooldown_canary_hours: 6
+  symbol_loss_cooldown_canary_min_pnl_pct: -0.8
   
   # Regime-specific stops (adjusted for 4H ATR - roughly halved since 4H ATR is ~2-3x larger)
   # tight_smc: Order Block / FVG entries with precise zones
@@ -279,6 +321,14 @@ multi_tp:
       runner_pct: 0.10
       tp1_close_pct: 0.50
       tp2_close_pct: 0.40
+  # Hybrid exit mode (feature-flagged): choose runner vs fixed TP3 by regime
+  hybrid_exit_mode_enabled: false
+  hybrid_exit_canary_symbols: []  # Empty = all symbols when enabled
+  hybrid_exit_regime_mode_overrides:
+    tight_smc: fixed_tp3
+    wide_structure: runner
+    consolidation: fixed_tp3
+  hybrid_exit_unknown_regime_fallback_mode: global_default
 
 ## Spot DCA (Daily accumulation of spot assets)
 spot_dca:

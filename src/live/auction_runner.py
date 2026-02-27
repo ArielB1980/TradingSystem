@@ -6,14 +6,15 @@ Extracted from live_trading.py to reduce god-object size.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, List
 
 from src.exceptions import OperationalError, DataError
 from src.execution.equity import calculate_effective_equity
 from src.monitoring.logger import get_logger
-from src.storage.repository import get_active_position
+from src.storage.repository import get_active_position, get_trades_since
 
 if TYPE_CHECKING:
     from src.live.live_trading import LiveTrading
@@ -47,6 +48,215 @@ def _split_reconcile_issues(issues: List) -> tuple[List, List]:
     return blocking, non_blocking
 
 
+def _filter_strategic_closes_for_gate(
+    closes: List[str],
+    trading_allowed: bool,
+) -> List[str]:
+    """
+    Suppress allocator-driven rotation closes when hardening gate is closed.
+
+    In DEGRADED/HALTED/EMERGENCY, we still allow management reductions
+    (rebalancer reduceOnly trims), but we avoid one-way churn where swap closes
+    execute and matching opens are later blocked by the pre-open gate.
+    """
+    if trading_allowed:
+        return closes
+    return []
+
+
+def _normalize_symbol_key(symbol: str) -> str:
+    key = (symbol or "").strip().upper()
+    key = key.split(":")[0]
+    if key.startswith("PF_"):
+        base = key.replace("PF_", "").replace("USD", "")
+        if base:
+            return f"{base}/USD"
+    return key
+
+
+def _resolve_symbol_cooldown_params(strategy_config, symbol: str) -> Dict[str, float]:
+    """
+    Resolve cooldown parameters for a symbol, with optional canary overrides.
+    """
+    params = {
+        "lookback_hours": int(getattr(strategy_config, "symbol_loss_lookback_hours", 24)),
+        "loss_threshold": int(getattr(strategy_config, "symbol_loss_threshold", 3)),
+        "cooldown_hours": int(getattr(strategy_config, "symbol_loss_cooldown_hours", 12)),
+        "min_pnl_pct": float(getattr(strategy_config, "symbol_loss_min_pnl_pct", -0.5)),
+        "canary_applied": False,
+    }
+    if not bool(getattr(strategy_config, "symbol_loss_cooldown_canary_enabled", False)):
+        return params
+    canary_symbols = {
+        _normalize_symbol_key(s) for s in (getattr(strategy_config, "symbol_loss_cooldown_canary_symbols", []) or [])
+    }
+    if canary_symbols and _normalize_symbol_key(symbol) not in canary_symbols:
+        return params
+
+    for field_name, key_name in (
+        ("symbol_loss_cooldown_canary_lookback_hours", "lookback_hours"),
+        ("symbol_loss_cooldown_canary_threshold", "loss_threshold"),
+        ("symbol_loss_cooldown_canary_hours", "cooldown_hours"),
+        ("symbol_loss_cooldown_canary_min_pnl_pct", "min_pnl_pct"),
+    ):
+        override_value = getattr(strategy_config, field_name, None)
+        if override_value is not None:
+            params[key_name] = override_value
+    params["canary_applied"] = True
+    return params
+
+
+def _symbol_in_canary(symbol: str, canary_symbols: List[str]) -> bool:
+    if not canary_symbols:
+        return True
+    return _normalize_symbol_key(symbol) in {
+        _normalize_symbol_key(s) for s in canary_symbols
+    }
+
+
+def _score_std(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return variance ** 0.5
+
+
+async def _compute_quick_reversal_metrics(lt: "LiveTrading") -> Dict[str, object]:
+    risk_cfg = lt.config.risk
+    window_hours = int(getattr(risk_cfg, "auction_chop_reversal_window_hours", 12) or 12)
+    hold_minutes_threshold = int(getattr(risk_cfg, "auction_chop_quick_reversal_hold_minutes", 60) or 60)
+    opposite_reentry_minutes = int(getattr(risk_cfg, "auction_chop_opposite_reentry_minutes", 120) or 120)
+    now_utc = datetime.now(timezone.utc)
+    trades = await asyncio.to_thread(get_trades_since, now_utc - timedelta(hours=window_hours))
+
+    by_symbol: Dict[str, List] = {}
+    for trade in trades:
+        key = _normalize_symbol_key(getattr(trade, "symbol", ""))
+        if key:
+            by_symbol.setdefault(key, []).append(trade)
+
+    quick_reversal_reasons = {
+        "STOP",
+        "STOP_LOSS",
+        "TRAILING_STOP",
+        "PREMISE_INVALIDATION",
+        "NO_SIGNAL_CLOSE",
+    }
+    quick_reversal = 0
+    opposite_reentry_fast = 0
+    quick_profit_close = 0
+    quick_loss_close = 0
+    per_symbol_quick_reversal: Dict[str, int] = {}
+
+    for symbol_key, symbol_trades in by_symbol.items():
+        ordered = sorted(symbol_trades, key=lambda t: t.entered_at)
+        for idx, trade in enumerate(ordered):
+            hold_minutes = float((trade.holding_period_hours or Decimal("0")) * Decimal("60"))
+            if hold_minutes >= hold_minutes_threshold:
+                continue
+
+            if trade.net_pnl > 0:
+                quick_profit_close += 1
+            elif trade.net_pnl < 0:
+                quick_loss_close += 1
+
+            exit_reason = str(getattr(trade, "exit_reason", "") or "").upper()
+            is_quick_reversal = exit_reason in quick_reversal_reasons
+            if not is_quick_reversal:
+                continue
+
+            quick_reversal += 1
+            per_symbol_quick_reversal[symbol_key] = per_symbol_quick_reversal.get(symbol_key, 0) + 1
+            if idx + 1 >= len(ordered):
+                continue
+            next_trade = ordered[idx + 1]
+            gap_minutes = (next_trade.entered_at - trade.exited_at).total_seconds() / 60.0
+            if gap_minutes < 0 or gap_minutes > opposite_reentry_minutes:
+                continue
+            if next_trade.side != trade.side:
+                opposite_reentry_fast += 1
+
+    return {
+        "window_hours": window_hours,
+        "quick_reversal": quick_reversal,
+        "opposite_reentry_fast": opposite_reentry_fast,
+        "quick_profit_close": quick_profit_close,
+        "quick_loss_close": quick_loss_close,
+        "per_symbol_quick_reversal": per_symbol_quick_reversal,
+    }
+
+
+async def _compute_symbol_churn_cooldowns(lt: "LiveTrading") -> Dict[str, datetime]:
+    """
+    Build per-symbol churn cooldown expiries from DB trades.
+
+    Churn event definition:
+    - A trade closes quickly (holding <= hold_max_minutes), and
+    - next trade in same symbol reopens within reopen_max_minutes.
+    """
+    risk_cfg = lt.config.risk
+    if not bool(getattr(risk_cfg, "auction_churn_guard_enabled", False)):
+        return {}
+
+    window_hours = int(getattr(risk_cfg, "auction_churn_window_hours", 6) or 6)
+    hold_max_minutes = int(getattr(risk_cfg, "auction_churn_hold_max_minutes", 60) or 60)
+    reopen_max_minutes = int(getattr(risk_cfg, "auction_churn_reopen_max_minutes", 120) or 120)
+    max_events = int(getattr(risk_cfg, "auction_churn_max_events", 2) or 2)
+    tier_cooldowns = [
+        int(getattr(risk_cfg, "auction_churn_cooldown_tier1_minutes", 30) or 30),
+        int(getattr(risk_cfg, "auction_churn_cooldown_tier2_minutes", 120) or 120),
+        int(getattr(risk_cfg, "auction_churn_cooldown_tier3_minutes", 360) or 360),
+    ]
+
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc - timedelta(hours=window_hours)
+    trades = await asyncio.to_thread(get_trades_since, window_start)
+
+    by_symbol: Dict[str, List] = {}
+    for trade in trades:
+        key = _normalize_symbol_key(getattr(trade, "symbol", ""))
+        if not key:
+            continue
+        by_symbol.setdefault(key, []).append(trade)
+
+    cooldowns: Dict[str, datetime] = {}
+    for key, symbol_trades in by_symbol.items():
+        ordered = sorted(symbol_trades, key=lambda t: t.entered_at)
+        event_times: List[datetime] = []
+        for idx in range(len(ordered) - 1):
+            current = ordered[idx]
+            nxt = ordered[idx + 1]
+            hold_minutes = float((current.holding_period_hours or Decimal("0")) * Decimal("60"))
+            reopen_gap_minutes = (nxt.entered_at - current.exited_at).total_seconds() / 60.0
+            if hold_minutes <= hold_max_minutes and 0 <= reopen_gap_minutes <= reopen_max_minutes:
+                event_times.append(nxt.entered_at)
+
+        if len(event_times) < max_events:
+            continue
+
+        over = len(event_times) - max_events + 1
+        if over <= 1:
+            cooldown_minutes = tier_cooldowns[0]
+        elif over == 2:
+            cooldown_minutes = tier_cooldowns[1]
+        else:
+            cooldown_minutes = tier_cooldowns[2]
+
+        expiry = event_times[-1] + timedelta(minutes=cooldown_minutes)
+        if now_utc < expiry:
+            cooldowns[key] = expiry
+
+    if cooldowns:
+        logger.info(
+            "Auction churn cooldowns active",
+            count=len(cooldowns),
+            symbols=sorted(cooldowns.keys())[:15],
+            window_hours=window_hours,
+        )
+    return cooldowns
+
+
 async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -> None:
     """
     Run auction-based portfolio allocation if auction mode is enabled.
@@ -58,6 +268,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
         "Auction: _run_auction_allocation called",
         signals_count=len(lt.auction_signals_this_tick),
     )
+    funnel_rejections: Counter = Counter()
     try:
         from src.portfolio.auction_allocator import (
             position_to_open_metadata,
@@ -100,6 +311,9 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     if db_pos:
                         pos.is_protected = db_pos.is_protected
                         pos.protection_reason = db_pos.protection_reason
+                        # Preserve true position age from DB so allocator lock checks
+                        # don't treat long-lived positions as newly opened.
+                        pos.opened_at = db_pos.opened_at
                         pos.stop_loss_order_id = db_pos.stop_loss_order_id
                         pos.initial_stop_price = db_pos.initial_stop_price
                         if hasattr(db_pos, "tp_order_ids"):
@@ -145,11 +359,12 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 )
 
         # Pre-filter: exclude signals for symbols that already have open positions
+        from src.data.symbol_utils import normalize_symbol_for_position_match
+
         open_position_symbols: set = set()
         for meta in open_positions_meta:
             spot = getattr(meta, "spot_symbol", None)
             if spot:
-                from src.data.symbol_utils import normalize_symbol_for_position_match
                 open_position_symbols.add(normalize_symbol_for_position_match(spot))
 
         pre_filter_count = len(lt.auction_signals_this_tick)
@@ -167,6 +382,20 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
 
         signals_count = len(lt.auction_signals_this_tick)
         logger.info("Auction: Collecting candidate signals", signals_count=signals_count, pre_filtered=filtered_out)
+        signals_after_cooldown = 0
+        risk_approved_count = 0
+        risk_rejected_count = 0
+        canary_overrides_applied = 0
+        now_utc = datetime.now(timezone.utc)
+        churn_cooldowns = await _compute_symbol_churn_cooldowns(lt)
+        quick_reversal_metrics = await _compute_quick_reversal_metrics(lt)
+        signal_scores = [float(sig.score) for sig, _, _ in lt.auction_signals_this_tick]
+        cycle_score_std = _score_std(signal_scores)
+        per_symbol_quick_reversal = dict(
+            quick_reversal_metrics.get("per_symbol_quick_reversal", {}) or {}
+        )
+        chop_per_symbol: Dict[str, bool] = {}
+        chop_signals = 0
 
         # Refresh instrument spec registry
         try:
@@ -184,15 +413,46 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
 
         for signal, spot_price, mark_price in lt.auction_signals_this_tick:
             try:
+                normalized_signal_symbol = _normalize_symbol_key(signal.symbol)
+                adx_value = float(getattr(signal, "adx", 0) or 0)
+                adx_threshold = float(getattr(lt.config.risk, "auction_chop_adx_threshold", 18.0) or 18.0)
+                score_std_threshold = float(
+                    getattr(lt.config.risk, "auction_chop_score_std_threshold", 6.0) or 6.0
+                )
+                symbol_quick_reversals = int(per_symbol_quick_reversal.get(normalized_signal_symbol, 0) or 0)
+                symbol_is_chop = (
+                    adx_value < adx_threshold
+                    and cycle_score_std < score_std_threshold
+                    and symbol_quick_reversals > 0
+                )
+                chop_per_symbol[normalized_signal_symbol] = bool(symbol_is_chop)
+                if symbol_is_chop:
+                    chop_signals += 1
+                churn_cooldown_until = churn_cooldowns.get(normalized_signal_symbol)
+                if churn_cooldown_until and now_utc < churn_cooldown_until:
+                    funnel_rejections["REJECT_CHURN_COOLDOWN"] += 1
+                    remaining_minutes = int((churn_cooldown_until - now_utc).total_seconds() / 60)
+                    logger.warning(
+                        "AUCTION_OPEN_REJECTED",
+                        symbol=signal.symbol,
+                        reason="REJECT_CHURN_COOLDOWN",
+                        details=f"remaining={remaining_minutes}m",
+                    )
+                    continue
+
                 if getattr(lt.config.strategy, "symbol_loss_cooldown_enabled", True):
+                    cooldown_params = _resolve_symbol_cooldown_params(lt.config.strategy, signal.symbol)
+                    if cooldown_params["canary_applied"]:
+                        canary_overrides_applied += 1
                     is_on_cooldown, cooldown_reason = check_symbol_cooldown(
                         symbol=signal.symbol,
-                        lookback_hours=getattr(lt.config.strategy, "symbol_loss_lookback_hours", 24),
-                        loss_threshold=getattr(lt.config.strategy, "symbol_loss_threshold", 3),
-                        cooldown_hours=getattr(lt.config.strategy, "symbol_loss_cooldown_hours", 12),
-                        min_pnl_pct=getattr(lt.config.strategy, "symbol_loss_min_pnl_pct", -0.5),
+                        lookback_hours=int(cooldown_params["lookback_hours"]),
+                        loss_threshold=int(cooldown_params["loss_threshold"]),
+                        cooldown_hours=int(cooldown_params["cooldown_hours"]),
+                        min_pnl_pct=float(cooldown_params["min_pnl_pct"]),
                     )
                     if is_on_cooldown:
+                        funnel_rejections["SYMBOL_COOLDOWN"] += 1
                         logger.warning(
                             "AUCTION_OPEN_REJECTED",
                             symbol=signal.symbol,
@@ -200,12 +460,14 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                             details=cooldown_reason,
                         )
                         continue
+                signals_after_cooldown += 1
 
                 futures_symbol = lt.futures_adapter.map_spot_to_futures(
                     signal.symbol, futures_tickers=lt.latest_futures_tickers
                 )
                 spec = lt.instrument_spec_registry.get_spec(futures_symbol)
                 if not spec:
+                    funnel_rejections["NO_SPEC"] += 1
                     logger.warning(
                         "AUCTION_OPEN_REJECTED",
                         symbol=signal.symbol,
@@ -240,6 +502,9 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                     symbol_tier=symbol_tier,
                 )
                 if not decision.approved:
+                    risk_rejected_count += 1
+                    for reason in (decision.rejection_reasons or []):
+                        funnel_rejections[f"RISK_{reason}"] += 1
                     logger.info(
                         "Auction candidate rejected by risk manager",
                         symbol=signal.symbol,
@@ -248,6 +513,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         position_notional=str(decision.position_notional),
                     )
                 elif decision.position_notional > 0 and decision.margin_required > 0:
+                    risk_approved_count += 1
                     stop_distance = (
                         abs(signal.entry_price - signal.stop_loss) / signal.entry_price
                         if signal.stop_loss
@@ -272,8 +538,12 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         score=signal.score,
                         notional=str(decision.position_notional),
                         margin=str(decision.margin_required),
+                        regime="CHOP" if symbol_is_chop else "TREND",
+                        score_std=round(cycle_score_std, 3),
+                        symbol_quick_reversals=symbol_quick_reversals,
                     )
                 else:
+                    funnel_rejections["APPROVED_BUT_NON_TRADABLE_SIZE"] += 1
                     logger.warning(
                         "Signal not added to auction candidates",
                         symbol=signal.symbol,
@@ -284,12 +554,81 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         rejection_reasons=decision.rejection_reasons,
                     )
             except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:
+                funnel_rejections[f"CANDIDATE_BUILD_{type(e).__name__}"] += 1
                 logger.error(
                     "Failed to create candidate signal for auction",
                     symbol=signal.symbol,
                     error=str(e),
                     error_type=type(e).__name__,
                 )
+
+        if candidate_signals:
+            lt._auction_no_signal_cycles = 0
+        else:
+            lt._auction_no_signal_cycles = int(getattr(lt, "_auction_no_signal_cycles", 0) or 0) + 1
+        logger.info(
+            "Auction no-signal cycle state updated",
+            no_signal_cycles=lt._auction_no_signal_cycles,
+            candidate_count=len(candidate_signals),
+        )
+
+        unique_scanned_symbols = {
+            _normalize_symbol_key(sig.symbol) for sig, _, _ in lt.auction_signals_this_tick
+        }
+        choppy_symbols = {sym for sym, is_chop in chop_per_symbol.items() if is_chop}
+        chop_symbol_ratio = (
+            (len(choppy_symbols) / len(unique_scanned_symbols)) if unique_scanned_symbols else 0.0
+        )
+        global_chop = chop_symbol_ratio >= float(
+            getattr(lt.config.risk, "auction_chop_global_symbol_pct", 0.50) or 0.50
+        )
+
+        trading_allowed_now = bool(
+            not lt.hardening or lt.hardening.is_trading_allowed()
+        )
+        base_swap_threshold = float(getattr(lt.config.risk, "auction_swap_threshold", 10.0) or 10.0)
+        base_min_hold_minutes = int(getattr(lt.config.risk, "auction_min_hold_minutes", 15) or 15)
+        base_max_new_opens = int(getattr(lt.config.risk, "auction_max_new_opens_per_cycle", 1) or 1)
+        base_no_signal_cycles = int(
+            getattr(lt.config.risk, "auction_no_signal_close_persistence_cycles", 3) or 3
+        )
+
+        chop_guard_enabled = bool(getattr(lt.config.risk, "auction_chop_guard_enabled", False))
+        chop_telemetry_only = bool(getattr(lt.config.risk, "auction_chop_telemetry_only", True))
+        chop_canary_symbols = list(getattr(lt.config.risk, "auction_chop_canary_symbols", []) or [])
+        canary_set = {_normalize_symbol_key(s) for s in chop_canary_symbols}
+        chop_active_symbols = (
+            {s for s in choppy_symbols if not canary_set or s in canary_set}
+            if global_chop
+            else set()
+        )
+        chop_policy_active = chop_guard_enabled and bool(chop_active_symbols)
+        canary_scoped_mode = bool(canary_set)
+        chop_swap_threshold = base_swap_threshold + float(
+            getattr(lt.config.risk, "auction_chop_swap_threshold_delta", 2.0) or 2.0
+        )
+        chop_min_hold_minutes = int(
+            round(
+                base_min_hold_minutes
+                * float(getattr(lt.config.risk, "auction_chop_min_hold_multiplier", 2.0) or 2.0)
+            )
+        )
+        chop_max_new_opens = max(
+            base_max_new_opens + int(getattr(lt.config.risk, "auction_chop_max_new_opens_delta", -1) or -1),
+            1,
+        )
+        chop_no_signal_cycles = max(
+            base_no_signal_cycles + int(getattr(lt.config.risk, "auction_chop_no_signal_persistence_delta", 1) or 1),
+            1,
+        )
+        would_block_replace = 0
+        if chop_policy_active:
+            active_candidate_count = sum(
+                1
+                for c in candidate_signals
+                if _normalize_symbol_key(getattr(c, "symbol", "")) in chop_active_symbols
+            )
+            would_block_replace = max(active_candidate_count - chop_max_new_opens, 0)
 
         portfolio_state = {
             "available_margin": auction_budget_margin,
@@ -301,6 +640,29 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             "current_cycle": int(getattr(lt, "_last_cycle_count", 0) or 0),
             "last_trim_cycle_by_symbol": dict(
                 getattr(lt, "_last_trim_cycle_by_symbol", {}) or {}
+            ),
+            # In degraded/halted/emergency, allow reduceOnly concentration trims
+            # even for lock-flagged positions to unblock safety recovery.
+            "allow_locked_rebalancer_trims": not trading_allowed_now,
+            "auction_no_signal_cycles": int(getattr(lt, "_auction_no_signal_cycles", 0) or 0),
+            "auction_no_signal_persistence_enabled": bool(
+                getattr(lt.config.risk, "auction_no_signal_persistence_enabled", False)
+            ),
+            "auction_no_signal_persistence_canary_symbols": list(
+                getattr(lt.config.risk, "auction_no_signal_persistence_canary_symbols", []) or []
+            ),
+            "auction_chop_active_symbols": sorted(chop_active_symbols),
+            "auction_chop_swap_threshold": chop_swap_threshold,
+            "auction_chop_min_hold_minutes": chop_min_hold_minutes,
+            "auction_swap_threshold": chop_swap_threshold if (chop_policy_active and not chop_telemetry_only) else base_swap_threshold,
+            "auction_min_hold_minutes": base_min_hold_minutes,
+            "auction_max_new_opens_per_cycle": (
+                chop_max_new_opens
+                if (chop_policy_active and not chop_telemetry_only and not canary_scoped_mode)
+                else base_max_new_opens
+            ),
+            "auction_no_signal_close_persistence_cycles": (
+                chop_no_signal_cycles if (chop_policy_active and not chop_telemetry_only) else base_no_signal_cycles
             ),
         }
 
@@ -319,6 +681,28 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             reductions_count=len(plan.reductions),
             reductions=[(sym, str(qty)) for sym, qty in plan.reductions],
             reasons=plan.reasons,
+        )
+        logger.info(
+            "AUCTION_CHOP_SUMMARY",
+            global_chop=global_chop,
+            chop_guard_enabled=chop_guard_enabled,
+            chop_telemetry_only=chop_telemetry_only,
+            chop_canary_mode=canary_scoped_mode,
+            chop_canary_symbols=sorted(list(canary_set))[:10] if canary_set else None,
+            chop_signals=chop_signals,
+            unique_symbols=len(unique_scanned_symbols),
+            choppy_symbols=len(choppy_symbols),
+            active_chop_symbols=len(chop_active_symbols),
+            chop_symbol_ratio=round(chop_symbol_ratio, 3),
+            cycle_score_std=round(cycle_score_std, 3),
+            quick_reversal=int(quick_reversal_metrics.get("quick_reversal", 0) or 0),
+            opposite_reentry_fast=int(quick_reversal_metrics.get("opposite_reentry_fast", 0) or 0),
+            quick_profit_close=int(quick_reversal_metrics.get("quick_profit_close", 0) or 0),
+            quick_loss_close=int(quick_reversal_metrics.get("quick_loss_close", 0) or 0),
+            would_block_replace=would_block_replace,
+            would_block_close_no_signal=int(
+                (plan.reasons or {}).get("hysteresis_close_suppressed_no_signal", 0) or 0
+            ),
         )
 
         # Record auction wins for churn tracking
@@ -403,10 +787,72 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                             error=result.error,
                         )
 
-        # Execute closes next
-        for symbol in plan.closes:
+        closes_to_execute = _filter_strategic_closes_for_gate(
+            plan.closes,
+            trading_allowed_now,
+        )
+        anti_flip_would_block = 0
+        anti_flip_enforced_blocks = 0
+        anti_flip_lock_enabled = bool(getattr(lt.config.risk, "auction_anti_flip_lock_enabled", False))
+        anti_flip_telemetry_only = bool(
+            getattr(lt.config.risk, "auction_anti_flip_lock_telemetry_only", True)
+        )
+        anti_flip_lock_minutes = int(getattr(lt.config.risk, "auction_anti_flip_lock_minutes", 45) or 45)
+        anti_flip_canary_symbols = list(
+            getattr(lt.config.risk, "auction_anti_flip_canary_symbols", []) or []
+        )
+        open_age_minutes_by_symbol: Dict[str, float] = {}
+        for op_meta in open_positions_meta:
+            age_minutes = max(float(op_meta.age_seconds) / 60.0, 0.0)
+            open_age_minutes_by_symbol[_normalize_symbol_key(op_meta.position.symbol)] = age_minutes
+            if op_meta.spot_symbol:
+                open_age_minutes_by_symbol[_normalize_symbol_key(op_meta.spot_symbol)] = age_minutes
+        if anti_flip_lock_enabled and closes_to_execute:
+            filtered_closes: List[str] = []
+            for close_symbol in closes_to_execute:
+                normalized_close = _normalize_symbol_key(close_symbol)
+                age_minutes = open_age_minutes_by_symbol.get(normalized_close)
+                in_lock_window = age_minutes is not None and age_minutes < anti_flip_lock_minutes
+                canary_match = _symbol_in_canary(close_symbol, anti_flip_canary_symbols)
+                if in_lock_window and canary_match:
+                    anti_flip_would_block += 1
+                    if anti_flip_telemetry_only:
+                        filtered_closes.append(close_symbol)
+                    else:
+                        anti_flip_enforced_blocks += 1
+                        funnel_rejections["REJECT_ANTI_FLIP_LOCK"] += 1
+                        logger.warning(
+                            "AUCTION_CLOSE_REJECTED",
+                            symbol=close_symbol,
+                            reason="REJECT_ANTI_FLIP_LOCK",
+                            details=f"age_minutes={age_minutes:.1f}, lock_minutes={anti_flip_lock_minutes}",
+                        )
+                else:
+                    filtered_closes.append(close_symbol)
+            closes_to_execute = filtered_closes
+        if plan.closes and not closes_to_execute:
+            logger.warning(
+                "Auction closes suppressed by hardening gate",
+                planned_closes=len(plan.closes),
+                system_state="gate_closed",
+            )
+
+        # Execute closes next.
+        # Guardrail: if this is a swap cycle (planned opens present), stop closing
+        # as soon as hardening gate closes to avoid close-without-open cascades.
+        closes_executed_count = 0
+        for symbol in closes_to_execute:
+            if plan.opens and lt.hardening and not lt.hardening.is_trading_allowed():
+                logger.warning(
+                    "Auction close loop stopped: hardening gate closed mid-swap",
+                    closes_executed=closes_executed_count,
+                    closes_remaining=max(len(closes_to_execute) - closes_executed_count, 0),
+                    planned_opens=len(plan.opens),
+                )
+                break
             try:
                 await lt.client.close_position(symbol)
+                closes_executed_count += 1
                 logger.info("Auction: Closed position", symbol=symbol)
             except (OperationalError, DataError) as e:
                 logger.error("Auction: Failed to close position", symbol=symbol, error=str(e), error_type=type(e).__name__)
@@ -482,7 +928,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 refreshed_available_margin=str(refreshed_available_margin),
                 previous_available_margin=str(available_margin),
                 reductions_executed=reductions_executed,
-                closes_executed=len(plan.closes),
+                closes_executed=closes_executed_count,
             )
         except (OperationalError, DataError) as e:
             logger.warning(
@@ -516,6 +962,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             if open_gate_reason:
                 opens_failed += 1
                 rejection_counts[open_gate_reason] = rejection_counts.get(open_gate_reason, 0) + 1
+                funnel_rejections[f"OPEN_{open_gate_reason}"] += 1
                 continue
             if signal.symbol in seen_opens:
                 logger.warning(
@@ -585,6 +1032,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         rejection_reasons = result.get("rejection_reasons", [])
                         for r in rejection_reasons:
                             rejection_counts[r] = rejection_counts.get(r, 0) + 1
+                            funnel_rejections[f"OPEN_{r}"] += 1
                         logger.warning(
                             "Auction: Open rejected/failed",
                             symbol=signal.symbol,
@@ -600,6 +1048,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         missing.append("candidate")
                     reason = "missing_data:" + ",".join(missing)
                     rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                    funnel_rejections[f"OPEN_{reason}"] += 1
                     logger.warning(
                         "Auction: Missing data for signal",
                         symbol=signal.symbol,
@@ -617,6 +1066,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 else:
                     reason = "ValueError"
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                funnel_rejections[f"OPEN_{reason}"] += 1
                 logger.error(
                     "Auction: Failed to open position (size/validation)",
                     symbol=signal.symbol,
@@ -626,6 +1076,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 opens_failed += 1
                 reason = type(e).__name__
                 rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                funnel_rejections[f"OPEN_{reason}"] += 1
                 logger.error(
                     "Auction: Failed to open position",
                     symbol=signal.symbol,
@@ -636,7 +1087,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
 
         logger.info(
             "Auction allocation executed",
-            closes=len(plan.closes),
+            closes=closes_executed_count,
             reductions_planned=len(plan.reductions),
             reductions_executed=reductions_executed,
             reductions_failed=reductions_failed,
@@ -646,7 +1097,41 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             rejection_counts=rejection_counts if rejection_counts else None,
             reasons=plan.reasons,
         )
-        if opens_executed > 0 or len(plan.closes) > 0 or reductions_executed > 0:
+        cycle_num = int(getattr(lt, "_last_cycle_count", 0) or 0)
+        funnel_payload = {
+            "cycle": cycle_num if cycle_num > 0 else None,
+            "cycle_phase": "main_loop" if cycle_num > 0 else "startup_hydration",
+            "symbols_scanned": len(lt._market_symbols()) if hasattr(lt, "_market_symbols") else None,
+            "signals_raw": pre_filter_count,
+            "signals_after_position_prefilter": signals_count,
+            "signals_after_cooldown": signals_after_cooldown,
+            "risk_approved": risk_approved_count,
+            "risk_rejected": risk_rejected_count,
+            "auction_candidates_created": len(candidate_signals),
+            "auction_opens_planned": len(plan.opens),
+            "auction_opens_executed": opens_executed,
+            "auction_opens_failed": opens_failed,
+            "cooldowns_active": len(getattr(lt, "_signal_cooldown", {}) or {}),
+            "canary_cooldown_overrides_applied": canary_overrides_applied,
+            "global_chop": global_chop,
+            "chop_signals": chop_signals,
+            "active_chop_symbols": len(chop_active_symbols),
+            "chop_canary_mode": canary_scoped_mode,
+            "chop_symbol_ratio": round(chop_symbol_ratio, 3),
+            "quick_reversal": int(quick_reversal_metrics.get("quick_reversal", 0) or 0),
+            "opposite_reentry_fast": int(quick_reversal_metrics.get("opposite_reentry_fast", 0) or 0),
+            "quick_profit_close": int(quick_reversal_metrics.get("quick_profit_close", 0) or 0),
+            "quick_loss_close": int(quick_reversal_metrics.get("quick_loss_close", 0) or 0),
+            "would_block_replace": would_block_replace,
+            "would_block_close_no_signal": int(
+                (plan.reasons or {}).get("hysteresis_close_suppressed_no_signal", 0) or 0
+            ),
+            "would_block_flip": anti_flip_would_block,
+            "blocked_flip_enforced": anti_flip_enforced_blocks,
+            "rejection_buckets": dict(funnel_rejections) if funnel_rejections else None,
+        }
+        logger.info("ENTRY_FUNNEL_SUMMARY", **funnel_payload)
+        if opens_executed > 0 or closes_executed_count > 0 or reductions_executed > 0:
             lt._reconcile_requested = True
 
     except (OperationalError, DataError, ValueError, TypeError, KeyError) as e:
