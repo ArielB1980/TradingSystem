@@ -24,6 +24,7 @@ from src.execution.position_state_machine import (
     OrderEvent,
     OrderEventType,
     ExitReason,
+    normalize_exit_reason,
     get_position_registry
 )
 from src.execution.position_manager_v2 import (
@@ -618,6 +619,19 @@ class ExecutionGateway:
     
     async def _execute_close(self, action: ManagementAction) -> ExecutionResult:
         """Execute full position close."""
+        normalized_exit_reason, was_normalized = normalize_exit_reason(action.exit_reason)
+        if was_normalized:
+            logger.warning(
+                "EXIT_REASON_NORMALIZED",
+                symbol=action.symbol,
+                position_id=action.position_id,
+                input_reason=str(action.exit_reason),
+                normalized_reason=normalized_exit_reason.value,
+                caller="_execute_close",
+                action_type=action.type.value,
+            )
+        action.exit_reason = normalized_exit_reason
+
         self.metrics["orders_submitted"] += 1
         
         # Track pending order
@@ -676,7 +690,7 @@ class ExecutionGateway:
             logger.info(
                 "Close order submitted",
                 symbol=exchange_symbol,
-                reason=action.exit_reason.value if action.exit_reason else "unknown"
+            reason=action.exit_reason.value if action.exit_reason else "unknown"
             )
             
             return ExecutionResult(

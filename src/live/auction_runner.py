@@ -123,6 +123,24 @@ def _score_std(values: List[float]) -> float:
     return variance ** 0.5
 
 
+def _build_strategic_close_action(position):
+    """
+    Build allocator-driven close action with explicit non-null exit reason.
+    """
+    from src.execution.position_manager_v2 import ManagementAction, ActionType
+    from src.execution.position_state_machine import ExitReason
+
+    return ManagementAction(
+        type=ActionType.CLOSE_FULL,
+        symbol=position.symbol,
+        reason="AUCTION_STRATEGIC_CLOSE",
+        side=position.side,
+        size=position.remaining_qty,
+        position_id=position.position_id,
+        exit_reason=ExitReason.TIME_BASED,
+    )
+
+
 async def _compute_quick_reversal_metrics(lt: "LiveTrading") -> Dict[str, object]:
     risk_cfg = lt.config.risk
     window_hours = int(getattr(risk_cfg, "auction_chop_reversal_window_hours", 12) or 12)
@@ -857,8 +875,6 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                 # Route strategic closes through the gateway/state machine when available.
                 # This preserves fill tracking and prevents ORPHANED close artifacts.
                 if lt.use_state_machine_v2 and lt.execution_gateway and lt.position_registry:
-                    from src.execution.position_manager_v2 import ManagementAction, ActionType
-
                     normalized_symbol = _normalize_symbol_key(symbol)
                     position = lt.position_registry.get_position(normalized_symbol)
                     if not position:
@@ -872,14 +888,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
                         logger.info("Auction: Closed position (direct fallback)", symbol=symbol)
                         continue
 
-                    action = ManagementAction(
-                        type=ActionType.CLOSE_FULL,
-                        symbol=position.symbol,
-                        reason="AUCTION_STRATEGIC_CLOSE",
-                        side=position.side,
-                        size=position.remaining_qty,
-                        position_id=position.position_id,
-                    )
+                    action = _build_strategic_close_action(position)
                     result = await lt.execution_gateway.execute_action(action)
                     if not result.success:
                         raise RuntimeError(result.error or "gateway close failed")

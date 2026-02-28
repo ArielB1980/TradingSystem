@@ -111,6 +111,41 @@ class ExitReason(str, Enum):
     MANUAL_RESET = "manual_reset"
 
 
+def normalize_exit_reason(
+    reason: Optional[object],
+    *,
+    default: ExitReason = ExitReason.TIME_BASED,
+) -> tuple[ExitReason, bool]:
+    """
+    Normalize potentially invalid exit reason input to a valid ExitReason enum.
+
+    Returns (normalized_reason, was_normalized).
+    """
+    if isinstance(reason, ExitReason):
+        return reason, False
+
+    if isinstance(reason, str):
+        raw = reason.strip()
+        if raw:
+            normalized = raw.lower().replace("-", "_").replace(" ", "_")
+            aliases = {
+                "strategic": ExitReason.TIME_BASED,
+                "strategic_close": ExitReason.TIME_BASED,
+                "auction_strategic_close": ExitReason.TIME_BASED,
+                "unknown": ExitReason.MANUAL,
+            }
+            if normalized in aliases:
+                return aliases[normalized], True
+            try:
+                return ExitReason(normalized), True
+            except ValueError:
+                enum_name = normalized.upper()
+                if enum_name in ExitReason.__members__:
+                    return ExitReason.__members__[enum_name], True
+
+    return default, True
+
+
 class OrderEventType(str, Enum):
     """Order event types for idempotent processing."""
     SUBMITTED = "submitted"
@@ -794,7 +829,7 @@ class ManagedPosition:
     
     def initiate_exit(
         self,
-        reason: ExitReason,
+        reason: ExitReason | str | None,
         order_id: str,
         client_order_id: Optional[str] = None,
     ) -> bool:
@@ -804,7 +839,17 @@ class ManagedPosition:
         if self.is_terminal or self.state == PositionState.EXIT_PENDING:
             return False
         
-        self.exit_reason = reason
+        normalized_reason, was_normalized = normalize_exit_reason(reason)
+        if was_normalized:
+            logger.warning(
+                "EXIT_REASON_INVALID_FALLBACK",
+                symbol=self.symbol,
+                position_id=self.position_id,
+                input_reason=str(reason),
+                normalized_reason=normalized_reason.value,
+            )
+
+        self.exit_reason = normalized_reason
         self.pending_exit_order_id = order_id
         self.pending_exit_client_order_id = client_order_id or order_id
         self.state = PositionState.EXIT_PENDING
@@ -813,7 +858,7 @@ class ManagedPosition:
         logger.info(
             "Exit initiated",
             symbol=self.symbol,
-            reason=reason.value,
+            reason=normalized_reason.value,
             order_id=order_id
         )
         return True
