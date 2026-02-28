@@ -96,3 +96,9 @@ trades_today.txt
 # Optional generalized local outputs at repo root
 /*_output.json
 /*.trace
+
+# Track runtime directory scaffold, keep contents ignored
+!data/
+!data/runtime/
+data/runtime/*
+!data/runtime/.gitkeep
