@@ -99,6 +99,7 @@ trades_today.txt
 
 # Track runtime directory scaffold, keep contents ignored
 !data/
+data/*
 !data/runtime/
 data/runtime/*
 !data/runtime/.gitkeep
