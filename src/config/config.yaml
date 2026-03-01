@@ -238,7 +238,7 @@ strategy:
   signal_cooldown_hours_canary: 1.0
   signal_post_close_cooldown_enabled: true
   signal_post_close_lookback_hours: 24
-  signal_post_close_cooldown_win_minutes: 30
+  signal_post_close_cooldown_win_minutes: 15
   signal_post_close_cooldown_loss_minutes: 120
   
   # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
