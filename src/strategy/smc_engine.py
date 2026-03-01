@@ -115,8 +115,35 @@ class SMCEngine:
         
         # Store score penalty for tolerance entries
         self.entry_zone_tolerance_score_penalty = getattr(config, 'entry_zone_tolerance_score_penalty', -5)
+        self._fvg_min_size_pct_default = Decimal(str(getattr(config, "fvg_min_size_pct", 0.001)))
+        self._fvg_min_size_pct_canary_enabled = bool(
+            getattr(config, "fvg_min_size_pct_canary_enabled", False)
+        )
+        self._fvg_min_size_pct_canary_symbols = {
+            self._normalize_symbol_key(s)
+            for s in (getattr(config, "fvg_min_size_pct_canary_symbols", []) or [])
+        }
+        canary_override = getattr(config, "fvg_min_size_pct_canary", None)
+        if canary_override is None:
+            canary_override = self._fvg_min_size_pct_default
+        self._fvg_min_size_pct_canary = Decimal(str(canary_override))
         
         logger.info("SMC Engine initialized", config=config.model_dump())
+
+    @staticmethod
+    def _normalize_symbol_key(raw_symbol: Optional[str]) -> str:
+        if not raw_symbol:
+            return ""
+        return str(raw_symbol).strip().upper().split(":")[0]
+
+    def _resolve_fvg_min_size_pct(self, symbol: Optional[str]) -> Decimal:
+        if not self._fvg_min_size_pct_canary_enabled:
+            return self._fvg_min_size_pct_default
+        if not self._fvg_min_size_pct_canary_symbols:
+            return self._fvg_min_size_pct_canary
+        if self._normalize_symbol_key(symbol) in self._fvg_min_size_pct_canary_symbols:
+            return self._fvg_min_size_pct_canary
+        return self._fvg_min_size_pct_default
     
     def _get_cache_key(self, symbol: str, candles: List[Candle]) -> Tuple[str, datetime]:
         """Generate cache key from symbol and last candle timestamp."""
@@ -322,6 +349,7 @@ class SMCEngine:
                 effective_decision_candles,
                 bias,
                 reasoning_parts,
+                symbol=symbol,
             )
             
             # HARD GATE: No decision TF structure = NO TRADE
@@ -983,6 +1011,7 @@ class SMCEngine:
         candles_1h: List[Candle],
         bias: str,
         reasoning: List[str],
+        symbol: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Detect SMC structure (order blocks, FVGs, break of structure).
@@ -1006,7 +1035,7 @@ class SMCEngine:
         )
         
         # Detect fair value gaps
-        fvg = self._find_fair_value_gap(candles_1h, bias)
+        fvg = self._find_fair_value_gap(candles_1h, bias, symbol=symbol)
         
         if fvg:
             reasoning.append(f"✓ Fair value gap detected at ${fvg['price']}")
@@ -1110,7 +1139,12 @@ class SMCEngine:
                         }
         return None
     
-    def _find_fair_value_gap(self, candles: List[Candle], bias: str) -> Optional[dict]:
+    def _find_fair_value_gap(
+        self,
+        candles: List[Candle],
+        bias: str,
+        symbol: Optional[str] = None,
+    ) -> Optional[dict]:
         """
         Find most recent UNMITIGATED FVG.
         """
@@ -1129,6 +1163,15 @@ class SMCEngine:
                 gap_zone = (c3.high, c1.low)
                 
             if gap_zone:
+                gap_size = gap_zone[1] - gap_zone[0]
+                reference_price = abs(c2.close) if c2.close else abs(gap_zone[1])
+                if reference_price <= 0:
+                    continue
+                gap_size_pct = gap_size / reference_price
+                min_gap_size_pct = self._resolve_fvg_min_size_pct(symbol)
+                if gap_size_pct < min_gap_size_pct:
+                    continue
+
                 # Check for mitigation by any candle AFTER the gap formation (from i+3 to end)
                 # If any candle's wick enters the gap, it is mitigated.
                 mitigated = False

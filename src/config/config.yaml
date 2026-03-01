@@ -227,6 +227,10 @@ strategy:
   min_score_wide_structure_aligned: 60.0  # Was 65.0
   min_score_wide_structure_neutral: 70.0
   fib_proximity_bps: 60.0
+  # FVG threshold canary override: canary symbols use 0.07% min gap vs global 0.10%.
+  fvg_min_size_pct_canary_enabled: true
+  fvg_min_size_pct_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]
+  fvg_min_size_pct_canary: 0.0007
   
   # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
   entry_zone_tolerance_pct: 0.05  # 5% buffer (aggressive widening)

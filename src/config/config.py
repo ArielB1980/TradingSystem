@@ -356,6 +356,12 @@ class StrategyConfig(BaseSettings):
     ob_entry_mode: Literal["high_low", "mid", "open", "discount"] = Field(default="mid")
     ob_discount_pct: float = Field(default=0.25, ge=0.1, le=0.5)
     fvg_min_size_pct: float = Field(default=0.001, ge=0.0001, le=0.01)
+    # Canary-scoped override for FVG minimum size threshold.
+    # When enabled, applies fvg_min_size_pct_canary to symbols in fvg_min_size_pct_canary_symbols.
+    # If symbol list is empty, override applies to all symbols.
+    fvg_min_size_pct_canary_enabled: bool = Field(default=False)
+    fvg_min_size_pct_canary_symbols: List[str] = Field(default_factory=list)
+    fvg_min_size_pct_canary: Optional[float] = Field(default=None, ge=0.0001, le=0.01)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"

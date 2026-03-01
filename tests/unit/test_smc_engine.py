@@ -97,3 +97,51 @@ def test_smc_engine_no_4h_structure_returns_no_signal():
     assert signal.signal_type == SignalType.NO_SIGNAL
     # Should mention 4H in reasoning
     assert "4H" in signal.reasoning or "no_4h_structure" in signal.regime
+
+
+def test_fvg_min_size_canary_override_applies_only_to_canary_symbols():
+    config = StrategyConfig(
+        fvg_min_size_pct=0.001,  # 0.10%
+        fvg_min_size_pct_canary_enabled=True,
+        fvg_min_size_pct_canary_symbols=["BTC/USD"],
+        fvg_min_size_pct_canary=0.0007,  # 0.07%
+    )
+    engine = SMCEngine(config)
+    base_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    candles = [
+        Candle(
+            timestamp=base_time,
+            symbol="BTC/USD",
+            timeframe="4h",
+            open=Decimal("0.9995"),
+            high=Decimal("1.0000"),
+            low=Decimal("0.9985"),
+            close=Decimal("0.9998"),
+            volume=Decimal("100"),
+        ),
+        Candle(
+            timestamp=base_time + timedelta(hours=4),
+            symbol="BTC/USD",
+            timeframe="4h",
+            open=Decimal("0.9999"),
+            high=Decimal("1.0002"),
+            low=Decimal("0.9992"),
+            close=Decimal("1.0000"),
+            volume=Decimal("100"),
+        ),
+        Candle(
+            timestamp=base_time + timedelta(hours=8),
+            symbol="BTC/USD",
+            timeframe="4h",
+            open=Decimal("1.0010"),
+            high=Decimal("1.0014"),
+            low=Decimal("1.0008"),
+            close=Decimal("1.0012"),
+            volume=Decimal("100"),
+        ),
+    ]
+
+    # Gap size is 0.0008 (0.08%): should pass canary threshold (0.07%).
+    assert engine._find_fair_value_gap(candles, "bullish", symbol="BTC/USD") is not None
+    # Same setup should fail default threshold (0.10%) for non-canary symbols.
+    assert engine._find_fair_value_gap(candles, "bullish", symbol="LINK/USD") is None
