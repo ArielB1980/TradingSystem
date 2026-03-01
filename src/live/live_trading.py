@@ -68,6 +68,40 @@ from src.live.policy_fingerprint import build_policy_hash
 logger = get_logger(__name__)
 
 
+def _normalize_symbol_key(symbol: str) -> str:
+    key = (symbol or "").strip().upper()
+    key = key.split(":")[0]
+    if key.startswith("PF_"):
+        base = key.replace("PF_", "").replace("USD", "")
+        if base:
+            return f"{base}/USD"
+    return key
+
+
+def _resolve_signal_cooldown_params(strategy_config, symbol: str) -> Dict[str, Any]:
+    """
+    Resolve signal cooldown hours for a symbol, with optional canary overrides.
+    """
+    base_hours = float(getattr(strategy_config, "signal_cooldown_hours", 4.0))
+    params: Dict[str, Any] = {
+        "cooldown_hours": base_hours,
+        "canary_applied": False,
+    }
+    if not bool(getattr(strategy_config, "signal_cooldown_canary_enabled", False)):
+        return params
+    canary_symbols = {
+        _normalize_symbol_key(s)
+        for s in (getattr(strategy_config, "signal_cooldown_canary_symbols", []) or [])
+    }
+    if canary_symbols and _normalize_symbol_key(symbol) not in canary_symbols:
+        return params
+    override_hours = getattr(strategy_config, "signal_cooldown_hours_canary", None)
+    if override_hours is not None:
+        params["cooldown_hours"] = float(override_hours)
+    params["canary_applied"] = True
+    return params
+
+
 class LiveTrading:
     """
     Live trading runtime.
@@ -194,7 +228,7 @@ class LiveTrading:
         # Key: symbol, Value: (signal_type, structure_timestamp, cooldown_until)
         # A signal is considered "same" if it has the same symbol + signal_type + structure_timestamp.
         self._signal_cooldown: Dict[str, datetime] = {}  # symbol -> cooldown expiry
-        self._signal_cooldown_hours: int = 4  # hours before same symbol can signal again
+        self._signal_cooldown_hours: float = float(getattr(config.strategy, "signal_cooldown_hours", 4.0))
         
         # Auto halt recovery tracking (instance-level, not class-level)
         self._auto_recovery_attempts: list = []
@@ -1813,11 +1847,25 @@ class LiveTrading:
                     if signal.signal_type != SignalType.NO_SIGNAL:
                         # Signal cooldown: prevent the same symbol from re-signalling
                         # every cycle (which caused the SPX compounding bug).
-                        # Once a signal fires for a symbol, suppress re-signals for 4 hours.
+                        # Once a signal fires for a symbol, suppress re-signals for configured cooldown.
+                        cooldown_params = _resolve_signal_cooldown_params(self.config.strategy, spot_symbol)
+                        cooldown_hours = float(cooldown_params["cooldown_hours"])
+                        cooldown_canary_applied = bool(cooldown_params["canary_applied"])
                         cooldown_until = self._signal_cooldown.get(spot_symbol)
                         now_cd = datetime.now(timezone.utc)
                         if cooldown_until and now_cd < cooldown_until:
-                            pass  # Signal suppressed by cooldown — skip silently
+                            logger.info(
+                                "SIGNAL_SUPPRESSED_COOLDOWN",
+                                symbol=spot_symbol,
+                                cooldown_hours=cooldown_hours,
+                                cooldown_until=cooldown_until.isoformat(),
+                                cooldown_remaining_seconds=max(
+                                    0,
+                                    int((cooldown_until - now_cd).total_seconds()),
+                                ),
+                                canary_applied=cooldown_canary_applied,
+                                reason="pre_auction_cooldown_active",
+                            )
                         else:
                             # Pre-entry spread check (fail-open: if anything fails, allow the trade).
                             # Uses already-fetched spot ticker bid/ask — zero new API calls.
@@ -1853,7 +1901,7 @@ class LiveTrading:
 
                             # Record cooldown for this symbol
                             self._signal_cooldown[spot_symbol] = now_cd + timedelta(
-                                hours=self._signal_cooldown_hours
+                                hours=cooldown_hours
                             )
                         
                             # Collect signal for auction mode (if enabled)

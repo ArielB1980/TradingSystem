@@ -362,6 +362,11 @@ class StrategyConfig(BaseSettings):
     fvg_min_size_pct_canary_enabled: bool = Field(default=False)
     fvg_min_size_pct_canary_symbols: List[str] = Field(default_factory=list)
     fvg_min_size_pct_canary: Optional[float] = Field(default=None, ge=0.0001, le=0.01)
+    # Signal cooldown gate to prevent repeated re-signals from the same symbol.
+    signal_cooldown_hours: float = Field(default=4.0, ge=0.0, le=24.0)
+    signal_cooldown_canary_enabled: bool = Field(default=False)
+    signal_cooldown_canary_symbols: List[str] = Field(default_factory=list)
+    signal_cooldown_hours_canary: Optional[float] = Field(default=None, ge=0.0, le=24.0)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"
