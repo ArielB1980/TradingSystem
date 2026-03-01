@@ -232,10 +232,14 @@ strategy:
   fvg_min_size_pct_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]
   fvg_min_size_pct_canary: 0.0007
   # Signal cooldown canary override: reduce silent pre-auction suppression on canary symbols.
-  signal_cooldown_hours: 4.0
+  signal_cooldown_hours: 1.0
   signal_cooldown_canary_enabled: true
   signal_cooldown_canary_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD"]
   signal_cooldown_hours_canary: 1.0
+  signal_post_close_cooldown_enabled: true
+  signal_post_close_lookback_hours: 24
+  signal_post_close_cooldown_win_minutes: 30
+  signal_post_close_cooldown_loss_minutes: 120
   
   # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
   entry_zone_tolerance_pct: 0.05  # 5% buffer (aggressive widening)

@@ -367,6 +367,10 @@ class StrategyConfig(BaseSettings):
     signal_cooldown_canary_enabled: bool = Field(default=False)
     signal_cooldown_canary_symbols: List[str] = Field(default_factory=list)
     signal_cooldown_hours_canary: Optional[float] = Field(default=None, ge=0.0, le=24.0)
+    signal_post_close_cooldown_enabled: bool = Field(default=True)
+    signal_post_close_lookback_hours: int = Field(default=24, ge=1, le=168)
+    signal_post_close_cooldown_win_minutes: int = Field(default=30, ge=0, le=720)
+    signal_post_close_cooldown_loss_minutes: int = Field(default=120, ge=0, le=1440)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"

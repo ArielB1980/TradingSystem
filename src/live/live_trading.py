@@ -47,7 +47,7 @@ from src.utils.kill_switch import KillSwitch, KillSwitchReason
 from src.exceptions import CircuitOpenError, OperationalError, DataError, InvariantError
 from src.runtime.startup_phases import StartupStateMachine, StartupPhase
 from src.domain.models import Candle, Signal, SignalType, Position, Side
-from src.storage.repository import record_event, record_metrics_snapshot
+from src.storage.repository import record_event, record_metrics_snapshot, get_trades_since
 from src.storage.maintenance import DatabasePruner
 from src.live.startup_validator import ensure_all_coins_have_traces
 from src.live.maintenance import periodic_data_maintenance
@@ -100,6 +100,22 @@ def _resolve_signal_cooldown_params(strategy_config, symbol: str) -> Dict[str, A
         params["cooldown_hours"] = float(override_hours)
     params["canary_applied"] = True
     return params
+
+
+def _resolve_post_close_cooldown_kind_and_minutes(
+    exit_reason: str,
+    strategy_config,
+) -> tuple[str, int]:
+    """
+    Classify post-close cooldown bucket from exit reason.
+    """
+    reason = (exit_reason or "").strip().lower()
+    loss_markers = ("stop", "invalidation", "loss", "liquidation")
+    if any(marker in reason for marker in loss_markers):
+        minutes = int(getattr(strategy_config, "signal_post_close_cooldown_loss_minutes", 120))
+        return "POST_CLOSE_LOSS", max(0, minutes)
+    minutes = int(getattr(strategy_config, "signal_post_close_cooldown_win_minutes", 30))
+    return "POST_CLOSE_WIN", max(0, minutes)
 
 
 class LiveTrading:
@@ -1373,6 +1389,43 @@ class LiveTrading:
             _t1 = time.perf_counter()
             self.last_fetch_latency_ms = round((_t1 - _t0) * 1000)
             map_positions = {p["symbol"]: p for p in all_raw_positions}
+            recent_close_by_symbol: Dict[str, Dict[str, Any]] = {}
+            if bool(getattr(self.config.strategy, "signal_post_close_cooldown_enabled", True)):
+                close_lookback_hours = int(
+                    getattr(self.config.strategy, "signal_post_close_lookback_hours", 24)
+                )
+                try:
+                    recent_trades = await asyncio.to_thread(
+                        get_trades_since,
+                        datetime.now(timezone.utc) - timedelta(hours=close_lookback_hours),
+                    )
+                    for trade in recent_trades:
+                        symbol_key = _normalize_symbol_key(getattr(trade, "symbol", ""))
+                        if not symbol_key:
+                            continue
+                        last_close_at = getattr(trade, "exited_at", None)
+                        if not isinstance(last_close_at, datetime):
+                            continue
+                        existing = recent_close_by_symbol.get(symbol_key)
+                        if existing and existing["last_close_at"] >= last_close_at:
+                            continue
+                        last_close_reason = str(getattr(trade, "exit_reason", "") or "")
+                        cooldown_kind, cooldown_minutes = _resolve_post_close_cooldown_kind_and_minutes(
+                            last_close_reason,
+                            self.config.strategy,
+                        )
+                        recent_close_by_symbol[symbol_key] = {
+                            "last_close_at": last_close_at,
+                            "last_close_reason": last_close_reason,
+                            "cooldown_kind": cooldown_kind,
+                            "cooldown_minutes": cooldown_minutes,
+                        }
+                except (OperationalError, DataError, ValueError) as e:
+                    logger.warning(
+                        "Post-close cooldown source unavailable; proceeding without post-close gating",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
             
             # Store latest futures tickers for use in _handle_signal and other call sites
             self.latest_futures_tickers = map_futures_tickers
@@ -1847,18 +1900,65 @@ class LiveTrading:
                     if signal.signal_type != SignalType.NO_SIGNAL:
                         # Signal cooldown: prevent the same symbol from re-signalling
                         # every cycle (which caused the SPX compounding bug).
-                        # Once a signal fires for a symbol, suppress re-signals for configured cooldown.
-                        cooldown_params = _resolve_signal_cooldown_params(self.config.strategy, spot_symbol)
-                        cooldown_hours = float(cooldown_params["cooldown_hours"])
+                        # Split semantics:
+                        # - IN_POSITION cooldown (short): while symbol has active position.
+                        # - POST_CLOSE cooldown: based on latest close reason and age.
+                        cooldown_params = _resolve_signal_cooldown_params(
+                            self.config.strategy,
+                            spot_symbol,
+                        )
+                        in_position_cooldown_hours = float(cooldown_params["cooldown_hours"])
                         cooldown_canary_applied = bool(cooldown_params["canary_applied"])
-                        cooldown_until = self._signal_cooldown.get(spot_symbol)
+                        position_size = Decimal("0")
+                        if position_data:
+                            try:
+                                position_size = abs(Decimal(str(position_data.get("size", 0) or 0)))
+                            except (ArithmeticError, ValueError, TypeError):
+                                position_size = Decimal("0")
+                        has_position = bool(position_data) and position_size > 0
+                        last_open_at = None
+                        if position_data:
+                            last_open_at = (
+                                position_data.get("opened_at")
+                                or position_data.get("openedAt")
+                                or position_data.get("open_time")
+                                or position_data.get("timestamp")
+                            )
+                        symbol_key = _normalize_symbol_key(spot_symbol)
+                        close_ctx = recent_close_by_symbol.get(symbol_key)
                         now_cd = datetime.now(timezone.utc)
+                        cooldown_kind = None
+                        cooldown_until = None
+                        last_close_at = None
+                        last_close_reason = None
+                        if has_position:
+                            cooldown_kind = "IN_POSITION"
+                            cooldown_until = self._signal_cooldown.get(spot_symbol)
+                            if cooldown_until is None:
+                                cooldown_until = now_cd + timedelta(hours=in_position_cooldown_hours)
+                                self._signal_cooldown[spot_symbol] = cooldown_until
+                        else:
+                            # Prevent stale in-position cooldown from suppressing flat symbols.
+                            self._signal_cooldown.pop(spot_symbol, None)
+                            if close_ctx:
+                                cooldown_kind = str(close_ctx["cooldown_kind"])
+                                last_close_at = close_ctx["last_close_at"]
+                                last_close_reason = close_ctx["last_close_reason"]
+                                cooldown_until = last_close_at + timedelta(
+                                    minutes=int(close_ctx["cooldown_minutes"])
+                                )
                         if cooldown_until and now_cd < cooldown_until:
                             logger.info(
                                 "SIGNAL_SUPPRESSED_COOLDOWN",
                                 symbol=spot_symbol,
-                                cooldown_hours=cooldown_hours,
-                                cooldown_until=cooldown_until.isoformat(),
+                                has_position=has_position,
+                                cooldown_kind=cooldown_kind or "GLOBAL_THROTTLE",
+                                cooldown_hours=in_position_cooldown_hours if cooldown_kind == "IN_POSITION" else None,
+                                cooldown_minutes=int(close_ctx["cooldown_minutes"]) if close_ctx else None,
+                                last_open_at=str(last_open_at) if last_open_at else None,
+                                last_close_at=last_close_at.isoformat() if isinstance(last_close_at, datetime) else None,
+                                last_close_reason=last_close_reason,
+                                cooldown_until=cooldown_until.isoformat() if isinstance(cooldown_until, datetime) else str(cooldown_until),
                                 cooldown_remaining_seconds=max(
                                     0,
                                     int((cooldown_until - now_cd).total_seconds()),
@@ -1900,9 +2000,10 @@ class LiveTrading:
                                 return  # Skip this coin — spread too wide right now
 
                             # Record cooldown for this symbol
-                            self._signal_cooldown[spot_symbol] = now_cd + timedelta(
-                                hours=cooldown_hours
-                            )
+                            if has_position:
+                                self._signal_cooldown[spot_symbol] = now_cd + timedelta(
+                                    hours=in_position_cooldown_hours
+                                )
                         
                             # Collect signal for auction mode (if enabled)
                             if self.auction_allocator and is_tradable:
