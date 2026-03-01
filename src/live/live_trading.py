@@ -1711,10 +1711,33 @@ class LiveTrading:
         # Semaphore to control concurrency for candle fetching.
         # Most time is I/O-bound (waiting on Kraken API), so higher concurrency is safe.
         sem = asyncio.Semaphore(50)
+        analysis_funnel: Dict[str, Any] = {
+            "universe_total": len(market_symbols),
+            "eligible_symbols": 0,
+            "symbols_analyzed": 0,
+            "symbols_skipped_by_reason": {},
+            "setups_found": 0,
+            "signals_scored": 0,
+            "signals_above_threshold": 0,
+            "signals_generated": 0,
+            "suppress_in_position": 0,
+            "suppress_post_close_win": 0,
+            "suppress_post_close_loss": 0,
+            "suppress_global_open_throttle": 0,
+            "suppress_other": 0,
+        }
+
+        def _af_inc(key: str, amount: int = 1) -> None:
+            analysis_funnel[key] = int(analysis_funnel.get(key, 0) or 0) + amount
+
+        def _af_skip(reason: str) -> None:
+            skips = analysis_funnel.setdefault("symbols_skipped_by_reason", {})
+            skips[reason] = int(skips.get(reason, 0) or 0) + 1
         
         async def process_coin(spot_symbol: str):
             async with sem:
                 try:
+                    _af_inc("symbols_analyzed")
                     # Use futures tickers for improved mapping
                     futures_symbol = self.futures_adapter.map_spot_to_futures(spot_symbol, futures_tickers=map_futures_tickers)
                     has_spot = spot_symbol in map_spot_tickers
@@ -1733,6 +1756,7 @@ class LiveTrading:
                         )
                     
                     if not has_spot and not has_futures:
+                        _af_skip("no_ticker_spot_and_futures")
                         return  # Skip if no ticker (spot or futures)
 
                     if has_spot:
@@ -1780,6 +1804,10 @@ class LiveTrading:
                             self._last_no_spec_log = last_map
                     
                     is_tradable = skip_reason is None
+                    if is_tradable:
+                        _af_inc("eligible_symbols")
+                    else:
+                        _af_skip(skip_reason or "not_tradable")
 
                     # --- STAGE A: Futures ticker sanity (pre-I/O) ---
                     # Check spread + volume from already-fetched futures ticker.
@@ -1794,6 +1822,7 @@ class LiveTrading:
                             thresholds=self.sanity_thresholds,
                         )
                         if not stage_a.passed:
+                            _af_skip(f"stage_a_{stage_a.reason or 'failed'}")
                             self.data_quality_tracker.record_result(
                                 spot_symbol, passed=False, reason=stage_a.reason,
                             )
@@ -1873,6 +1902,7 @@ class LiveTrading:
                         thresholds=self.sanity_thresholds,
                     )
                     if not stage_b.passed:
+                        _af_skip(f"stage_b_{stage_b.reason or 'failed'}")
                         self.data_quality_tracker.record_result(
                             spot_symbol, passed=False, reason=stage_b.reason,
                         )
@@ -1893,6 +1923,10 @@ class LiveTrading:
                         refine_candles_1h=self.candle_manager.get_candles(spot_symbol, "1h"),
                         refine_candles_15m=candles,
                     )
+                    _af_inc("signals_scored")
+                    if signal.signal_type != SignalType.NO_SIGNAL:
+                        _af_inc("setups_found")
+                        _af_inc("signals_above_threshold")
                     
                     # Pass context to signal for execution (mark price for futures)
                     # Signal is spot-based, execution is futures-based.
@@ -1948,6 +1982,17 @@ class LiveTrading:
                                     minutes=int(close_ctx["cooldown_minutes"])
                                 )
                         if cooldown_until and now_cd < cooldown_until:
+                            kind = (cooldown_kind or "GLOBAL_THROTTLE").strip().upper()
+                            if kind == "IN_POSITION":
+                                _af_inc("suppress_in_position")
+                            elif kind == "POST_CLOSE_WIN":
+                                _af_inc("suppress_post_close_win")
+                            elif kind == "POST_CLOSE_LOSS":
+                                _af_inc("suppress_post_close_loss")
+                            elif kind == "GLOBAL_THROTTLE":
+                                _af_inc("suppress_global_open_throttle")
+                            else:
+                                _af_inc("suppress_other")
                             logger.info(
                                 "SIGNAL_SUPPRESSED_COOLDOWN",
                                 symbol=spot_symbol,
@@ -1997,6 +2042,7 @@ class LiveTrading:
                                 )
 
                             if not spread_ok:
+                                _af_skip("spread_guard")
                                 return  # Skip this coin — spread too wide right now
 
                             # Record cooldown for this symbol
@@ -2008,6 +2054,7 @@ class LiveTrading:
                             # Collect signal for auction mode (if enabled)
                             if self.auction_allocator and is_tradable:
                                 self.auction_signals_this_tick.append((signal, spot_price, mark_price))
+                                _af_inc("signals_generated")
                         
                             if not is_tradable:
                                 logger.warning(
@@ -2098,7 +2145,11 @@ class LiveTrading:
         # and `process_coin()` can still trade them via futures tickers even without spot tickers.
         # Data quality filter: exclude SUSPENDED/DEGRADED-skipped symbols at scheduling level.
         analyzable = [s for s in market_symbols if self.data_quality_tracker.should_analyze(s)]
+        analysis_funnel["symbols_skipped_by_reason"]["data_quality_gate"] = max(
+            0, len(market_symbols) - len(analyzable)
+        )
         await asyncio.gather(*[process_coin(s) for s in analyzable], return_exceptions=True)
+        self._analysis_funnel_metrics = analysis_funnel
         
         # Run auction mode allocation (if enabled) - after all signals processed
         if self.auction_allocator:

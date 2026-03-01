@@ -1150,13 +1150,27 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             reasons=plan.reasons,
         )
         cycle_num = int(getattr(lt, "_last_cycle_count", 0) or 0)
+        analysis_funnel = getattr(lt, "_analysis_funnel_metrics", {}) or {}
         funnel_payload = {
             "cycle": cycle_num if cycle_num > 0 else None,
             "cycle_phase": "main_loop" if cycle_num > 0 else "startup_hydration",
             "symbols_scanned": len(lt._market_symbols()) if hasattr(lt, "_market_symbols") else None,
+            "universe_total": analysis_funnel.get("universe_total"),
+            "eligible_symbols": analysis_funnel.get("eligible_symbols"),
+            "symbols_analyzed": analysis_funnel.get("symbols_analyzed"),
+            "symbols_skipped_by_reason": analysis_funnel.get("symbols_skipped_by_reason"),
+            "setups_found": analysis_funnel.get("setups_found"),
+            "signals_scored": analysis_funnel.get("signals_scored"),
+            "signals_above_threshold": analysis_funnel.get("signals_above_threshold"),
+            "signals_generated": analysis_funnel.get("signals_generated"),
             "signals_raw": pre_filter_count,
             "signals_after_position_prefilter": signals_count,
             "signals_after_cooldown": signals_after_cooldown,
+            "suppress_in_position": analysis_funnel.get("suppress_in_position", 0),
+            "suppress_post_close_win": analysis_funnel.get("suppress_post_close_win", 0),
+            "suppress_post_close_loss": analysis_funnel.get("suppress_post_close_loss", 0),
+            "suppress_global_open_throttle": analysis_funnel.get("suppress_global_open_throttle", 0),
+            "suppress_other": analysis_funnel.get("suppress_other", 0),
             "risk_approved": risk_approved_count,
             "risk_rejected": risk_rejected_count,
             "auction_candidates_created": len(candidate_signals),
