@@ -337,7 +337,7 @@ class InvariantMonitor:
                             f"Current: ${confirmed_equity:.2f}\n"
                             f"Computed drawdown: {drawdown_pct:.1%}\n\n"
                             f"Action: System entering DEGRADED (not HALTED).\n"
-                            f"Run: python -m src.tools.safety_reset --mode soft",
+                            f"Run: python -m src.tools.safety_reset --mode soft --reset-peak-to-current --i-understand",
                             urgent=True,
                         )
                     except Exception:

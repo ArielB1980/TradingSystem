@@ -104,6 +104,30 @@ def _clear_legacy_files():
                 print(f"  WARNING: Could not remove {f}: {e}")
 
 
+def _sync_legacy_peak_equity(peak_equity: Decimal | None) -> None:
+    """
+    Keep legacy peak_equity_state.json in sync with unified safety state.
+
+    InvariantMonitor still reads the legacy file during migration, so resets
+    must update both stores to avoid stale-peak false positives after restart.
+    """
+    if peak_equity is None:
+        return
+    try:
+        from src.safety.invariant_monitor import _peak_equity_path
+
+        path = _peak_equity_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "peak_equity": str(peak_equity),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"  Synced legacy peak file: {path}")
+    except (OSError, ValueError, TypeError, ImportError) as e:
+        print(f"  WARNING: Failed to sync legacy peak file: {e}")
+
+
 async def _fetch_current_equity() -> Decimal:
     """Fetch current equity from exchange (requires API keys in env)."""
     from src.data.kraken_client import KrakenClient
@@ -278,6 +302,7 @@ Examples:
         new_peak_equity=new_peak,
     )
     print(f"  Unified safety state reset: OK")
+    _sync_legacy_peak_equity(new_state.peak_equity)
 
     # Clear legacy files
     _clear_legacy_files()
