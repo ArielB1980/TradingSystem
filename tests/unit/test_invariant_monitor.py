@@ -18,6 +18,7 @@ from src.safety.invariant_monitor import (
     get_invariant_monitor,
     init_invariant_monitor,
 )
+from src.utils.kill_switch import KillSwitchReason
 
 
 @pytest.fixture(autouse=True)
@@ -140,6 +141,7 @@ class TestInvariantMonitor:
         assert not monitor.is_trading_allowed()
         assert monitor.is_management_allowed()
         assert kill_switch.activated
+        assert kill_switch.reason == KillSwitchReason.LIQUIDATION_BREACH
     
     @pytest.mark.asyncio
     async def test_max_notional_triggers_halt(self, monitor_with_kill_switch):
@@ -274,6 +276,23 @@ class TestInvariantMonitor:
         
         assert state == SystemState.HALTED
         assert kill_switch.activated
+        assert kill_switch.reason == KillSwitchReason.API_ERROR
+
+    @pytest.mark.asyncio
+    async def test_margin_critical_uses_margin_kill_reason(self, monitor_with_kill_switch):
+        """Pure margin-utilization critical should map to MARGIN_CRITICAL."""
+        monitor, kill_switch = monitor_with_kill_switch
+
+        state = await monitor.check_all(
+            current_equity=Decimal("100000"),
+            open_positions=[],
+            margin_utilization=Decimal("0.95"),  # Above 92% hard cap
+            available_margin=Decimal("5000"),
+        )
+
+        assert state == SystemState.HALTED
+        assert kill_switch.activated
+        assert kill_switch.reason == KillSwitchReason.MARGIN_CRITICAL
     
     def test_get_status(self, monitor):
         """Test status dict generation."""

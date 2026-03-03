@@ -222,6 +222,37 @@ class InvariantMonitor:
     def set_kill_switch(self, kill_switch: KillSwitch):
         """Set kill switch for emergency halt."""
         self.kill_switch = kill_switch
+
+    @staticmethod
+    def _select_kill_switch_reason(critical_violations: List[InvariantViolation]) -> KillSwitchReason:
+        """
+        Map critical invariant(s) to the most accurate kill-switch reason.
+
+        CRITICAL: auto-recovery is only allowed for MARGIN_CRITICAL. If we label
+        non-margin halts as MARGIN_CRITICAL, the system can oscillate by clearing
+        a halt that should remain latched (for example drawdown/equity floor/API faults).
+        """
+        critical_invariants = {v.invariant for v in critical_violations if v.severity == "CRITICAL"}
+
+        # Pure margin pressure can use margin-specific reason and recovery policy.
+        if critical_invariants == {"max_margin_utilization_pct"}:
+            return KillSwitchReason.MARGIN_CRITICAL
+
+        # Connectivity saturation should be explicit for incident triage.
+        if "max_api_errors_per_minute" in critical_invariants:
+            return KillSwitchReason.API_ERROR
+
+        # Capital protection and exposure breaches are risk emergencies.
+        if critical_invariants.intersection({
+            "max_equity_drawdown_pct",
+            "min_equity_floor_usd",
+            "max_open_notional_usd",
+            "max_concurrent_positions",
+        }):
+            return KillSwitchReason.LIQUIDATION_BREACH
+
+        # Fallback for unexpected/unknown critical invariant.
+        return KillSwitchReason.DATA_FAILURE
     
     async def check_all(
         self,
@@ -471,18 +502,22 @@ class InvariantMonitor:
         
         old_state = self.state
         
+        critical_violations = [v for v in violations if v.severity == "CRITICAL"]
+        kill_reason = self._select_kill_switch_reason(critical_violations)
+
         if critical_count >= 2:
             # Multiple critical violations = EMERGENCY
             self.state = SystemState.EMERGENCY
             if self.kill_switch:
                 await self.kill_switch.activate(
-                    KillSwitchReason.MARGIN_CRITICAL,
+                    kill_reason,
                     emergency=True
                 )
             logger.critical(
                 "SYSTEM_EMERGENCY",
                 violations=[str(v) for v in violations],
                 critical_count=critical_count,
+                kill_switch_reason=kill_reason.value,
                 action="EMERGENCY_FLATTEN",
             )
         elif critical_count == 1:
@@ -490,13 +525,14 @@ class InvariantMonitor:
             self.state = SystemState.HALTED
             if self.kill_switch:
                 await self.kill_switch.activate(
-                    KillSwitchReason.MARGIN_CRITICAL,
+                    kill_reason,
                     emergency=False
                 )
             logger.critical(
                 "SYSTEM_HALTED",
                 violations=[str(v) for v in violations],
                 critical_count=critical_count,
+                kill_switch_reason=kill_reason.value,
                 action="HALT_NEW_ENTRIES",
             )
         elif warning_count >= 2:
