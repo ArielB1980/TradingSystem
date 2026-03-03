@@ -1216,6 +1216,7 @@ async def run_auction_allocation(lt: "LiveTrading", raw_positions: List[Dict]) -
             "signals_after_cooldown": signals_after_cooldown,
             "suppress_in_position": analysis_funnel.get("suppress_in_position", 0),
             "suppress_post_close_win": analysis_funnel.get("suppress_post_close_win", 0),
+            "suppress_post_close_strategic": analysis_funnel.get("suppress_post_close_strategic", 0),
             "suppress_post_close_loss": analysis_funnel.get("suppress_post_close_loss", 0),
             "suppress_global_open_throttle": analysis_funnel.get("suppress_global_open_throttle", 0),
             "suppress_other": analysis_funnel.get("suppress_other", 0),

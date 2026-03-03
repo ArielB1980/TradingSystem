@@ -371,6 +371,7 @@ class StrategyConfig(BaseSettings):
     signal_post_close_lookback_hours: int = Field(default=24, ge=1, le=168)
     signal_post_close_cooldown_win_minutes: int = Field(default=30, ge=0, le=720)
     signal_post_close_cooldown_loss_minutes: int = Field(default=120, ge=0, le=1440)
+    signal_post_close_cooldown_strategic_minutes: int = Field(default=120, ge=0, le=1440)
     bos_confirmation_candles: int = Field(default=3, ge=1, le=10)
     require_bos_confirmation: bool = Field(default=False)  # Optional filter for higher quality
     fvg_mitigation_mode: Literal["touched", "partial", "full"] = "touched"

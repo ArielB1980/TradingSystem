@@ -66,6 +66,20 @@ def test_post_close_cooldown_classifies_tp_as_win_bucket():
     assert minutes == 20
 
 
+def test_post_close_cooldown_classifies_strategic_close_with_dedicated_bucket():
+    cfg = SimpleNamespace(
+        signal_post_close_cooldown_loss_minutes=180,
+        signal_post_close_cooldown_win_minutes=20,
+        signal_post_close_cooldown_strategic_minutes=90,
+    )
+    kind, minutes = _resolve_post_close_cooldown_kind_and_minutes(
+        "AUCTION_STRATEGIC_CLOSE time_based",
+        cfg,
+    )
+    assert kind == "POST_CLOSE_STRATEGIC"
+    assert minutes == 90
+
+
 def test_4h_warmup_diagnostic_emits_for_canary_symbol_with_insufficient_candles():
     cfg = SimpleNamespace(
         signal_cooldown_canary_symbols=["BTC/USD", "ETH/USD"],

@@ -98,6 +98,12 @@ def _resolve_post_close_cooldown_kind_and_minutes(
     Classify post-close cooldown bucket from exit reason.
     """
     reason = (exit_reason or "").strip().lower()
+    strategic_markers = ("time_based", "strategic_close", "auction_strategic_close")
+    if any(marker in reason for marker in strategic_markers):
+        minutes = int(
+            getattr(strategy_config, "signal_post_close_cooldown_strategic_minutes", 120)
+        )
+        return "POST_CLOSE_STRATEGIC", max(0, minutes)
     loss_markers = ("stop", "invalidation", "loss", "liquidation")
     if any(marker in reason for marker in loss_markers):
         minutes = int(getattr(strategy_config, "signal_post_close_cooldown_loss_minutes", 120))
@@ -2039,6 +2045,8 @@ class LiveTrading:
                                 _af_inc("suppress_in_position")
                             elif kind == "POST_CLOSE_WIN":
                                 _af_inc("suppress_post_close_win")
+                            elif kind == "POST_CLOSE_STRATEGIC":
+                                _af_inc("suppress_post_close_strategic")
                             elif kind == "POST_CLOSE_LOSS":
                                 _af_inc("suppress_post_close_loss")
                             elif kind == "GLOBAL_THROTTLE":
