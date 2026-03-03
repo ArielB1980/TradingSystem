@@ -1062,6 +1062,129 @@ class TestEnteredBookNotNaked:
             )
 
 
+class TestStopPendingGrace:
+    """Stop-pending grace should suppress only short-lived ambiguous naked states."""
+
+    @pytest.fixture
+    def mock_client(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def position_no_stop(self):
+        pos = ManagedPosition(
+            symbol="TIA/USD",
+            side=Side.SHORT,
+            position_id="test-grace-no-stop",
+            initial_size=Decimal("100"),
+            initial_entry_price=Decimal("0.33"),
+            initial_stop_price=Decimal("0.36"),
+            initial_tp1_price=Decimal("0.31"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.OPEN
+        pos.stop_order_id = None
+        from src.execution.position_state_machine import FillRecord
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-entry-tia",
+            order_id="entry-tia-1",
+            side=Side.SHORT,
+            qty=Decimal("100"),
+            price=Decimal("0.33"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        return pos
+
+    @pytest.mark.asyncio
+    async def test_recent_position_without_stop_uses_pending_grace(self, mock_client, position_no_stop):
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position_no_stop)
+
+        # Position still exists on exchange; no open stop visible yet.
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_TIAUSD", "contracts": 100}
+        ]
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig(stop_pending_grace_seconds=120))
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+        assert results.get("TIA/USD") is True
+
+    @pytest.mark.asyncio
+    async def test_old_position_without_stop_still_flags_naked(self, mock_client, position_no_stop):
+        reset_position_registry()
+        registry = get_position_registry()
+        registry.register_position(position_no_stop)
+
+        # Make the position old enough that grace no longer applies.
+        old = datetime.now(timezone.utc) - timedelta(seconds=300)
+        position_no_stop.created_at = old
+        position_no_stop.updated_at = old
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_TIAUSD", "contracts": 100}
+        ]
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig(stop_pending_grace_seconds=60))
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+        assert results.get("TIA/USD") is False
+
+    @pytest.mark.asyncio
+    async def test_layer2_alive_status_stays_protected_without_grace(self, mock_client):
+        reset_position_registry()
+        registry = get_position_registry()
+
+        pos = ManagedPosition(
+            symbol="AAVE/USD",
+            side=Side.SHORT,
+            position_id="test-grace-layer2",
+            initial_size=Decimal("1"),
+            initial_entry_price=Decimal("110"),
+            initial_stop_price=Decimal("114"),
+            initial_tp1_price=Decimal("106"),
+            initial_tp2_price=None,
+            initial_final_target=None,
+        )
+        pos.state = PositionState.OPEN
+        pos.stop_order_id = "stop-aave-1"
+        pos.created_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        pos.updated_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        from src.execution.position_state_machine import FillRecord
+        pos.entry_fills.append(FillRecord(
+            fill_id="fill-entry-aave",
+            order_id="entry-aave-1",
+            side=Side.SHORT,
+            qty=Decimal("1"),
+            price=Decimal("110"),
+            timestamp=datetime.now(timezone.utc),
+            is_entry=True,
+        ))
+        registry.register_position(pos)
+
+        mock_client.get_futures_open_orders.return_value = []
+        mock_client.get_all_futures_positions.return_value = [
+            {"symbol": "PF_AAVEUSD", "contracts": 1}
+        ]
+        mock_client.fetch_order.return_value = {
+            "id": "stop-aave-1",
+            "status": "entered_book",
+            "filled": 0,
+        }
+
+        enforcer = ProtectionEnforcer(mock_client, SafetyConfig(stop_pending_grace_seconds=30))
+        monitor = PositionProtectionMonitor(mock_client, registry, enforcer)
+
+        results = await monitor.check_all_positions()
+        assert results.get("AAVE/USD") is True
+
+
 class TestStopSemanticValidation:
     """
     Test: _warn_if_stop_semantically_wrong detects substantive mismatches

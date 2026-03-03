@@ -89,6 +89,8 @@ class SafetyConfig:
     
     # Protection settings
     emergency_exit_on_stop_fail: bool = True
+    # Grace window to avoid false "naked" alerts while stops are still attaching/visible
+    stop_pending_grace_seconds: int = 90
     
     # Event ordering
     reject_stale_events: bool = True
@@ -820,6 +822,8 @@ class PositionProtectionMonitor:
         self._counters_reset_at: datetime = datetime.now(timezone.utc)
         self.persistence = persistence
         self._running = False
+        # Per-symbol snapshot of the most recent Layer 2 stop lookup outcome
+        self._layer2_last_status: Dict[str, str] = {}
 
         # ── Layer 3 / self-heal counters ──
         # Readable from health_monitor to detect systemic instability.
@@ -914,8 +918,17 @@ class PositionProtectionMonitor:
                     position,
                     exchange_orders
                 )
+                layer1_seen_orders_count = sum(
+                    1
+                    for o in exchange_orders
+                    if position_symbol_matches_order(position.symbol, str(o.get("symbol") or ""))
+                )
                 
                 is_protected = layer1_protected
+                layer2_status = "not_run"
+                layer3_attempted = False
+                layer3_succeeded = False
+                self._layer2_last_status[position.symbol] = "not_run"
                 
                 # ---- LAYER 2: Stop-fill verification before declaring naked ----
                 # Check the specific order ID stored on the position.
@@ -923,6 +936,7 @@ class PositionProtectionMonitor:
                     layer2_protected = await self._check_stop_was_filled(
                         position, exchange_size
                     )
+                    layer2_status = self._layer2_last_status.get(position.symbol, "unknown")
                     if layer2_protected:
                         logger.info(
                             "Protection check: Layer 1 missed stop but Layer 2 confirmed ALIVE by ID",
@@ -936,9 +950,11 @@ class PositionProtectionMonitor:
                 # by protection_ops but in-memory position wasn't updated).  Search
                 # ALL recent orders for this symbol to find any alive stop we missed.
                 if not is_protected:
+                    layer3_attempted = True
                     layer3_protected = await self._check_any_stop_for_symbol(
                         position, exchange_orders
                     )
+                    layer3_succeeded = layer3_protected
                     if layer3_protected:
                         logger.info(
                             "Protection check: Layer 3 found alive stop via broad search",
@@ -946,16 +962,59 @@ class PositionProtectionMonitor:
                         )
                     is_protected = layer3_protected
                 
+                # ---- PENDING-GRACE OVERRIDE (reduces false-positive naked alerts) ----
+                # Treat newly-updated/open positions as temporarily protected when stop
+                # attach/visibility is still settling and Layer 2 is inconclusive.
+                if not is_protected:
+                    now = datetime.now(timezone.utc)
+                    position_age_seconds = max(0, int((now - position.created_at).total_seconds()))
+                    updated_age_seconds = max(0, int((now - position.updated_at).total_seconds()))
+                    stop_order_id_present = bool(position.stop_order_id)
+                    within_grace = updated_age_seconds <= self.enforcer.config.stop_pending_grace_seconds
+                    layer2_ambiguous = layer2_status in {
+                        "not_run",
+                        "fetch_not_supported",
+                        "no_order_data",
+                    }
+                    if within_grace and (not stop_order_id_present or layer2_ambiguous):
+                        logger.warning(
+                            "TEMP_PROTECTION_PENDING",
+                            symbol=position.symbol,
+                            qty=str(position.remaining_qty),
+                            exchange_qty=exchange_size,
+                            position_age_seconds=position_age_seconds,
+                            updated_age_seconds=updated_age_seconds,
+                            stop_order_id_present=stop_order_id_present,
+                            stop_order_id=position.stop_order_id or "none",
+                            layer1_seen_orders_count=layer1_seen_orders_count,
+                            layer2_fetch_order_status=layer2_status,
+                            self_heal_attempted=layer3_attempted,
+                            self_heal_succeeded=layer3_succeeded,
+                            grace_seconds=self.enforcer.config.stop_pending_grace_seconds,
+                        )
+                        results[position.symbol] = True
+                        continue
+
                 results[position.symbol] = is_protected
                 
                 if not is_protected:
                     # CRITICAL: Position is truly naked on exchange!
+                    now = datetime.now(timezone.utc)
+                    position_age_seconds = max(0, int((now - position.created_at).total_seconds()))
+                    updated_age_seconds = max(0, int((now - position.updated_at).total_seconds()))
                     logger.critical(
                         "NAKED POSITION DETECTED",
                         symbol=position.symbol,
                         qty=str(position.remaining_qty),
                         exchange_qty=exchange_size,
                         stop_order_id=position.stop_order_id or "none",
+                        position_age_seconds=position_age_seconds,
+                        updated_age_seconds=updated_age_seconds,
+                        stop_order_id_present=bool(position.stop_order_id),
+                        layer1_seen_orders_count=layer1_seen_orders_count,
+                        layer2_fetch_order_status=layer2_status,
+                        self_heal_attempted=layer3_attempted,
+                        self_heal_succeeded=layer3_succeeded,
                     )
         
         return results
@@ -1167,6 +1226,7 @@ class PositionProtectionMonitor:
         """
         fetch_order = getattr(self.client, "fetch_order", None)
         if not fetch_order:
+            self._layer2_last_status[position.symbol] = "fetch_not_supported"
             return False  # Can't verify, treat as naked
 
         stop_oid = position.stop_order_id
@@ -1176,6 +1236,7 @@ class PositionProtectionMonitor:
         try:
             order_data = await fetch_order(stop_oid, sym)
         except (OperationalError, DataError) as e:
+            self._layer2_last_status[position.symbol] = "fetch_error"
             logger.warning(
                 "Stop-fill verification: fetch_order failed",
                 symbol=position.symbol,
@@ -1186,9 +1247,11 @@ class PositionProtectionMonitor:
             return False  # Can't verify, treat as naked
 
         if not order_data:
+            self._layer2_last_status[position.symbol] = "no_order_data"
             return False
 
         status = str(order_data.get("status") or "").lower()
+        self._layer2_last_status[position.symbol] = f"status:{status or 'unknown'}"
         filled_raw = order_data.get("filled")
         filled = float(filled_raw if filled_raw is not None else 0)
 
