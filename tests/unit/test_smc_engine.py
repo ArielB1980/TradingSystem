@@ -48,7 +48,7 @@ def test_smc_engine_deterministic():
     candles_1h = _make_candles("BTC/USD", "1h", 200)
     candles_15m = _make_candles("BTC/USD", "15m", 200)
     
-    config = StrategyConfig()
+    config = StrategyConfig(signal_structure_dedupe_enabled=False)
     engine = SMCEngine(config)
     
     # Generate signal twice with same inputs (4H Decision Authority)
@@ -142,3 +142,19 @@ def test_fvg_min_size_global_threshold_applies_to_all_symbols():
     assert engine._find_fair_value_gap(candles, "bullish", symbol="BTC/USD") is not None
     # Same setup should also pass for non-canary symbols under global threshold.
     assert engine._find_fair_value_gap(candles, "bullish", symbol="LINK/USD") is not None
+
+
+def test_signal_structure_dedupe_window_suppresses_repeated_fingerprint():
+    config = StrategyConfig(
+        signal_structure_dedupe_enabled=True,
+        signal_structure_dedupe_minutes=45,
+    )
+    engine = SMCEngine(config)
+
+    now = datetime(2026, 3, 4, 0, 0, tzinfo=timezone.utc)
+    window = timedelta(minutes=config.signal_structure_dedupe_minutes)
+    fingerprint = "UNI/USD|4H|short|OB|2026-03-04T00:00:00+00:00|3.9890000000|4.1120000000|3.7420000000"
+
+    assert engine._is_duplicate_structure_signal(fingerprint, now, window) is False
+    assert engine._is_duplicate_structure_signal(fingerprint, now + timedelta(minutes=5), window) is True
+    assert engine._is_duplicate_structure_signal(fingerprint, now + timedelta(minutes=46), window) is False

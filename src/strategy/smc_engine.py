@@ -4,7 +4,7 @@ SMC (Smart Money Concepts) signal generation engine.
 Design lock enforced: Operates on spot market data ONLY.
 No futures prices, funding data, or order book data may be accessed.
 """
-from typing import List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 import os
@@ -97,6 +97,8 @@ class SMCEngine:
         self.indicator_cache: Dict[Tuple[str, datetime], Dict] = {}
         self.cache_max_size = 1000  # Prevent unbounded growth
         self.cache_max_age = timedelta(hours=2)  # Configurable
+        self._signal_fingerprint_last_seen: Dict[str, datetime] = {}
+        self._signal_fingerprint_cache_max_size = 5000
 
         # Fibonacci engine for confluence scoring
         self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
@@ -156,6 +158,57 @@ class SMCEngine:
                 k: self.indicator_cache[k] 
                 for k in sorted_keys[:self.cache_max_size]
             }
+
+    @staticmethod
+    def _normalize_dt(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    def _build_structure_fingerprint(
+        self,
+        symbol: str,
+        decision_tf_label: str,
+        structure_type: str,
+        structure_timestamp: Optional[Any],
+        signal: Signal,
+    ) -> str:
+        ts = self._normalize_dt(structure_timestamp)
+        ts_key = ts.isoformat() if ts else "none"
+        return "|".join(
+            [
+                self._normalize_symbol_key(symbol),
+                decision_tf_label,
+                signal.signal_type.value,
+                structure_type,
+                ts_key,
+                f"{signal.entry_price:.10f}",
+                f"{signal.stop_loss:.10f}",
+                f"{signal.take_profit:.10f}" if signal.take_profit is not None else "none",
+            ]
+        )
+
+    def _prune_signal_fingerprint_cache(self, now: datetime, debounce_window: timedelta) -> None:
+        if len(self._signal_fingerprint_last_seen) < self._signal_fingerprint_cache_max_size:
+            return
+        cutoff = now - (debounce_window * 4)
+        self._signal_fingerprint_last_seen = {
+            k: v for k, v in self._signal_fingerprint_last_seen.items() if v > cutoff
+        }
+
+    def _is_duplicate_structure_signal(self, fingerprint: str, now: datetime, debounce_window: timedelta) -> bool:
+        previous = self._signal_fingerprint_last_seen.get(fingerprint)
+        if previous and now - previous < debounce_window:
+            return True
+        self._signal_fingerprint_last_seen[fingerprint] = now
+        self._prune_signal_fingerprint_cache(now, debounce_window)
+        return False
     
     def generate_signal(
         self,
@@ -818,7 +871,39 @@ class SMCEngine:
                     structure_ts = structure_signal['order_block'].get('timestamp')
                 elif structure_signal.get('fvg'):
                     structure_ts = structure_signal['fvg'].get('timestamp')
-            
+
+            dedupe_minutes = int(getattr(self.config, "signal_structure_dedupe_minutes", 0) or 0)
+            dedupe_enabled = bool(getattr(self.config, "signal_structure_dedupe_enabled", False)) and dedupe_minutes > 0
+            if dedupe_enabled:
+                now_utc = datetime.now(timezone.utc)
+                debounce_window = timedelta(minutes=dedupe_minutes)
+                fingerprint = self._build_structure_fingerprint(
+                    symbol=symbol,
+                    decision_tf_label=decision_tf_label,
+                    structure_type=structure_type,
+                    structure_timestamp=structure_ts,
+                    signal=signal,
+                )
+                if self._is_duplicate_structure_signal(fingerprint, now_utc, debounce_window):
+                    logger.info(
+                        "SIGNAL_SUPPRESSED_DUPLICATE_STRUCTURE",
+                        symbol=symbol,
+                        decision_tf=decision_tf_label,
+                        structure_type=structure_type,
+                        structure_timestamp=str(structure_ts) if structure_ts else None,
+                        debounce_minutes=dedupe_minutes,
+                        fingerprint=fingerprint,
+                    )
+                    signal = self._no_signal(
+                        symbol,
+                        reasoning_parts + [f"⏸ Duplicate structure suppressed for {dedupe_minutes}m debounce window"],
+                        effective_decision_candles[-1] if effective_decision_candles else None,
+                        adx=adx_value,
+                        atr=atr_value if isinstance(atr_value, Decimal) else Decimal(str(atr_value)),
+                        regime=signal.regime,
+                    )
+                    return signal
+
             logger.info(
                 "Signal generated with 4H decision authority",
                 symbol=symbol,

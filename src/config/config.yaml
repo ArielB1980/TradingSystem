@@ -240,6 +240,8 @@ strategy:
   signal_post_close_cooldown_win_minutes: 15
   signal_post_close_cooldown_loss_minutes: 120
   signal_post_close_cooldown_strategic_minutes: 120  # Longer lock after AUCTION_STRATEGIC_CLOSE/time-based exits
+  signal_structure_dedupe_enabled: true  # Suppress duplicate same-structure signals
+  signal_structure_dedupe_minutes: 45  # Debounce window per structure fingerprint
   
   # V2.3: Entry Zone Tolerance (Allows "near" OB/FVG entries)
   entry_zone_tolerance_pct: 0.05  # 5% buffer (aggressive widening)
