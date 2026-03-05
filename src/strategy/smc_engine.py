@@ -4,9 +4,10 @@ SMC (Smart Money Concepts) signal generation engine.
 Design lock enforced: Operates on spot market data ONLY.
 No futures prices, funding data, or order book data may be accessed.
 """
-from typing import Any, List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict, Tuple, Literal
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 import os
 import pandas as pd
 from src.domain.models import Candle, Signal, SignalType, SetupType
@@ -22,6 +23,15 @@ from src.storage.repository import count_recent_stopouts
 import uuid
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class HigherTFContext:
+    weekly_fib_zone_low: Optional[Decimal] = None
+    weekly_fib_zone_high: Optional[Decimal] = None
+    daily_bias: Literal["bullish", "bearish", "neutral"] = "neutral"
+    allowed_entry: bool = True
+    weekly_confluence_bonus: float = 0.0
 
 
 _stopout_cache: dict = {}  # key: (symbol, lookback_hours) -> (count, expires_at)
@@ -99,6 +109,7 @@ class SMCEngine:
         self.cache_max_age = timedelta(hours=2)  # Configurable
         self._signal_fingerprint_last_seen: Dict[str, datetime] = {}
         self._signal_fingerprint_cache_max_size = 5000
+        self._higher_tf_candle_context: Dict[str, Dict[str, List[Candle]]] = {}
 
         # Fibonacci engine for confluence scoring
         self.fibonacci_engine = FibonacciEngine(lookback_bars=100)
@@ -209,6 +220,89 @@ class SMCEngine:
         self._signal_fingerprint_last_seen[fingerprint] = now
         self._prune_signal_fingerprint_cache(now, debounce_window)
         return False
+
+    @staticmethod
+    def _to_weekly_candles(daily_candles: List[Candle]) -> List[Candle]:
+        """Aggregate 1D candles into synthetic 1W candles (UTC calendar week)."""
+        if not daily_candles:
+            return []
+
+        grouped: Dict[Tuple[int, int], List[Candle]] = {}
+        for candle in daily_candles:
+            iso = candle.timestamp.isocalendar()
+            grouped.setdefault((iso.year, iso.week), []).append(candle)
+
+        weekly: List[Candle] = []
+        for _, week_rows in sorted(grouped.items(), key=lambda item: item[0]):
+            week_rows = sorted(week_rows, key=lambda c: c.timestamp)
+            first = week_rows[0]
+            last = week_rows[-1]
+            weekly.append(
+                Candle(
+                    timestamp=first.timestamp,
+                    symbol=first.symbol,
+                    timeframe="1w",
+                    open=first.open,
+                    high=max(c.high for c in week_rows),
+                    low=min(c.low for c in week_rows),
+                    close=last.close,
+                    volume=sum((c.volume for c in week_rows), Decimal("0")),
+                )
+            )
+        return weekly
+
+    def _detect_daily_bos_bias(self, daily_candles: List[Candle]) -> Literal["bullish", "bearish", "neutral"]:
+        if len(daily_candles) < max(10, self.config.bos_confirmation_candles + 5):
+            return "neutral"
+        bullish_bos = self._detect_break_of_structure(daily_candles, "bullish")
+        bearish_bos = self._detect_break_of_structure(daily_candles, "bearish")
+        if bullish_bos and not bearish_bos:
+            return "bullish"
+        if bearish_bos and not bullish_bos:
+            return "bearish"
+        return "neutral"
+
+    def _detect_higher_tf_context(self, symbol: str) -> HigherTFContext:
+        """
+        Build 1W->1D context used to guide 4H signal generation.
+
+        v1 is intentionally soft/canary-safe: outside weekly zone applies a score
+        penalty later instead of hard-rejecting entries.
+        """
+        symbol_ctx = self._higher_tf_candle_context.get(symbol, {})
+        daily_candles = symbol_ctx.get("1d", [])
+        weekly_candles = symbol_ctx.get("1w") or self._to_weekly_candles(daily_candles)
+        decision_candles = symbol_ctx.get("4h", [])
+        current_price = (decision_candles[-1].close if decision_candles else (daily_candles[-1].close if daily_candles else None))
+        if not current_price:
+            return HigherTFContext(
+                daily_bias="neutral",
+            )
+
+        daily_bias = self._detect_daily_bos_bias(daily_candles)
+        weekly_fibs = self.fibonacci_engine.calculate_levels(weekly_candles, "1w")
+        if not weekly_fibs:
+            return HigherTFContext(
+                daily_bias=daily_bias,
+            )
+
+        zone_low = min(weekly_fibs.fib_0_618, weekly_fibs.fib_0_786)
+        zone_high = max(weekly_fibs.fib_0_618, weekly_fibs.fib_0_786)
+        inside_zone = zone_low <= current_price <= zone_high
+        daily_aligned = daily_bias != "neutral"
+        allowed_entry = inside_zone or not bool(getattr(self.config, "higher_tf_enabled", False))
+
+        weekly_weight = float(getattr(self.config, "weekly_fib_confluence_weight", 0.25))
+        daily_weight = float(getattr(self.config, "daily_bias_weight", 0.15))
+        weekly_confluence_bonus = weekly_weight + (daily_weight if daily_aligned else 0.0)
+
+        return HigherTFContext(
+            weekly_fib_zone_low=zone_low,
+            weekly_fib_zone_high=zone_high,
+            daily_bias=daily_bias,
+            allowed_entry=allowed_entry,
+            weekly_confluence_bonus=weekly_confluence_bonus if inside_zone else 0.0,
+        )
     
     def generate_signal(
         self,
@@ -301,6 +395,13 @@ class SMCEngine:
                 ema200_slope="flat"
             )
 
+        # Preserve existing generate_signal interface while enabling HTF context.
+        self._higher_tf_candle_context[symbol] = {
+            "1d": regime_candles_1d,
+            "1w": self._to_weekly_candles(regime_candles_1d),
+            "4h": decision_candles_4h,
+        }
+
         bias = "neutral"
         structure_signal = None
         structure_decision = None  # Decision structure (from effective decision TF)
@@ -309,6 +410,8 @@ class SMCEngine:
         atr_ratio = None
         tp_candidates = []
         used_tolerance = False  # Track if entry zone tolerance was used
+        higher_tf_context: Optional[HigherTFContext] = None
+        higher_tf_penalty = 0.0
         
         # Logic Flow
         signal = None
@@ -418,6 +521,25 @@ class SMCEngine:
                 regime_early = self._classify_regime_from_structure(structure_decision)
                 reasoning_parts.append(f"✅ {decision_tf_label} Decision Structure Found")
                 reasoning_parts.append(f"📊 Market Regime: {regime_early}")
+                if getattr(self.config, "higher_tf_enabled", False):
+                    higher_tf_context = self._detect_higher_tf_context(symbol)
+                    logger.info(
+                        "higher_tf_context",
+                        symbol=symbol,
+                        weekly_zone_low=str(higher_tf_context.weekly_fib_zone_low) if higher_tf_context.weekly_fib_zone_low is not None else None,
+                        weekly_zone_high=str(higher_tf_context.weekly_fib_zone_high) if higher_tf_context.weekly_fib_zone_high is not None else None,
+                        daily_bias=higher_tf_context.daily_bias,
+                        allowed_entry=higher_tf_context.allowed_entry,
+                    )
+                    if not higher_tf_context.allowed_entry:
+                        higher_tf_penalty = float(getattr(self.config, "higher_tf_penalty_outside_zone", -18.0))
+                        logger.info(
+                            "higher_tf_penalty_applied",
+                            symbol=symbol,
+                            reason="outside_weekly_zone",
+                            penalty=higher_tf_penalty,
+                        )
+                        reasoning_parts.append(f"⚠ Higher-TF outside weekly zone: penalty {higher_tf_penalty:.1f}")
 
         import traceback
         
@@ -751,6 +873,16 @@ class SMCEngine:
                         cost_bps,
                         bias
                     )
+                    if getattr(self.config, "higher_tf_enabled", False) and higher_tf_context:
+                        score_obj.total_score += higher_tf_context.weekly_confluence_bonus
+                        reasoning_parts.append(
+                            f"📊 Higher-TF bonus applied: +{higher_tf_context.weekly_confluence_bonus:.2f}"
+                        )
+                    if getattr(self.config, "higher_tf_enabled", False) and higher_tf_penalty != 0.0:
+                        score_obj.total_score += higher_tf_penalty
+                        reasoning_parts.append(
+                            f"📊 Higher-TF penalty applied: {higher_tf_penalty:.2f}"
+                        )
                     
                     # Apply tolerance penalty if entry used zone tolerance
                     if used_tolerance:
@@ -768,6 +900,8 @@ class SMCEngine:
                             "htf": float(score_obj.htf_alignment),
                             "adx": float(score_obj.adx_strength),
                             "cost": float(score_obj.cost_efficiency),
+                            "higher_tf_bonus": float(higher_tf_context.weekly_confluence_bonus) if higher_tf_context else 0.0,
+                            "higher_tf_penalty": float(higher_tf_penalty),
                             "total": float(score_obj.total_score),
                             "threshold": float(threshold),
                         }
@@ -820,7 +954,9 @@ class SMCEngine:
                                 "fib": score_obj.fib_confluence,
                                 "htf": score_obj.htf_alignment,
                                 "adx": score_obj.adx_strength,
-                                "cost": score_obj.cost_efficiency
+                                "cost": score_obj.cost_efficiency,
+                                "higher_tf_bonus": higher_tf_context.weekly_confluence_bonus if higher_tf_context else 0.0,
+                                "higher_tf_penalty": higher_tf_penalty
                             },
                             structure_info=structure_signal or {},
                             meta_info={
