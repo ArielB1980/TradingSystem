@@ -18,6 +18,7 @@ def _strategy() -> StrategyConfig:
     return StrategyConfig(
         memory_enabled=True,
         thesis_alerts_enabled=True,
+        thesis_alert_open_positions_only=False,
         thesis_observe_only=False,
         thesis_management_enabled=True,
         thesis_early_exit_threshold=35.0,

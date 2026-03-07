@@ -9,7 +9,7 @@ import uuid
 from src.memory.thesis import Thesis
 from src.monitoring.logger import get_logger
 from src.monitoring.alerting import send_alert_sync
-from src.storage.repository import get_latest_thesis_for_symbol, upsert_thesis
+from src.storage.repository import get_active_position, get_latest_thesis_for_symbol, upsert_thesis
 
 logger = get_logger(__name__)
 
@@ -26,6 +26,19 @@ class InstitutionalMemoryManager:
 
     def _alerts_enabled(self) -> bool:
         return bool(getattr(self.config, "thesis_alerts_enabled", False))
+
+    def _should_alert_symbol(self, symbol: str) -> bool:
+        """
+        Guard thesis state alerts to actionable contexts.
+        By default, only emit when the symbol has an active open position.
+        """
+        if not bool(getattr(self.config, "thesis_alert_open_positions_only", True)):
+            return True
+        try:
+            return get_active_position(symbol) is not None
+        except Exception:
+            # Fail-open is unsafe for noise; fail-closed to avoid alert storms.
+            return False
 
     def is_enabled_for_symbol(self, symbol: str) -> bool:
         if not self._enabled():
@@ -219,6 +232,8 @@ class InstitutionalMemoryManager:
         snapshot: Dict[str, Any],
     ) -> None:
         if not self._alerts_enabled():
+            return
+        if not self._should_alert_symbol(thesis.symbol):
             return
         threshold = self._to_float(getattr(self.config, "thesis_early_exit_threshold", 35.0), 35.0)
         conviction = float(snapshot.get("conviction", thesis.current_conviction))

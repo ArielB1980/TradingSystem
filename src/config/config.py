@@ -420,6 +420,10 @@ class StrategyConfig(BaseSettings):
     thesis_early_exit_threshold: float = Field(default=35.0, ge=1.0, le=99.0)
     thesis_reentry_block_threshold: float = Field(default=25.0, ge=1.0, le=99.0)
     thesis_alerts_enabled: bool = Field(default=False, description="Enable thesis-only Telegram alerts")
+    thesis_alert_open_positions_only: bool = Field(
+        default=True,
+        description="Only send thesis state alerts for symbols with active open positions",
+    )
     thesis_low_conviction_tighten_factor: float = Field(default=0.75, ge=0.25, le=1.0)
     thesis_high_conviction_relax_factor: float = Field(default=1.1, ge=1.0, le=2.0)
     thesis_partial_reduce_high_conviction_factor: float = Field(default=0.85, ge=0.5, le=1.0)

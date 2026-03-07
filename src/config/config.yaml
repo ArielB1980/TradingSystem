@@ -252,6 +252,7 @@ strategy:
   thesis_early_exit_threshold: 35.0
   thesis_reentry_block_threshold: 25.0
   thesis_alerts_enabled: true
+  thesis_alert_open_positions_only: true
   thesis_low_conviction_tighten_factor: 0.75
   thesis_high_conviction_relax_factor: 1.1
   thesis_partial_reduce_high_conviction_factor: 0.85
